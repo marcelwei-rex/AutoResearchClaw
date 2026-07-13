@@ -189,6 +189,78 @@ def validate_single_invocation_aggregate(
     return invocation, aggregate
 
 
+def build_stage12_evidence_texts(
+    structured_results_text: str,
+    *,
+    contract: ExperimentContract,
+    evaluator_schema: str,
+) -> tuple[str, str]:
+    """Normalize one evaluator result into replayable Stage 12 evidence."""
+    structured_results = _parse_object(structured_results_text, "evaluator results")
+    observations = _validate_evaluator_result(
+        structured_results, contract, evaluator_schema
+    )
+    invocation = {
+        "schema_version": 1,
+        "invocation_policy_version": 1,
+        "ordinal": 1,
+        "status": "completed",
+        "evaluator_schema": evaluator_schema,
+        "metric_observations": observations,
+        "structured_results": structured_results,
+    }
+    aggregate = {
+        "schema_version": 1,
+        "aggregation_policy_version": 1,
+        "evaluator_schema": evaluator_schema,
+        "source_ordinals": [1],
+        "metric_observations": observations,
+        "structured_results": structured_results,
+    }
+    invocation_text = canonical_authority_json_text(invocation)
+    aggregate_text = canonical_authority_json_text(aggregate)
+    validate_single_invocation_aggregate(
+        invocation_text, aggregate_text, contract=contract
+    )
+    return invocation_text, aggregate_text
+
+
+def canonical_authority_json_text(value: object) -> str:
+    """Serialize strict authority JSON without a Decimal-to-float conversion."""
+    return _authority_json_value(value) + "\n"
+
+
+def _authority_json_value(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, Decimal):
+        return canonical_decimal(value)
+    if isinstance(value, float):
+        raise CanonicalExperimentEvidenceError(
+            "authority JSON must not contain binary float values"
+        )
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_authority_json_value(item) for item in value) + "]"
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise CanonicalExperimentEvidenceError(
+                "authority JSON object keys must be strings"
+            )
+        return "{" + ",".join(
+            json.dumps(key, ensure_ascii=False) + ":" + _authority_json_value(value[key])
+            for key in sorted(value)
+        ) + "}"
+    raise CanonicalExperimentEvidenceError(
+        f"unsupported authority JSON type: {type(value).__name__}"
+    )
+
+
 def _validate_evaluator_result(
     value: object,
     contract: ExperimentContract,

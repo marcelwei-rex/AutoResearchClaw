@@ -110,7 +110,6 @@ class TestStage12HardGuards:
         mock_sandbox.run_project.return_value = result_mock
 
         with patch("researchclaw.experiment.factory.create_sandbox", return_value=mock_sandbox), \
-             patch("researchclaw.pipeline.stage_impls._execution._ensure_sandbox_deps"), \
              patch("researchclaw.pipeline.stage_impls._execution._load_sealed_candidate", return_value=_fake_candidate), \
              patch("researchclaw.pipeline.stage_impls._execution._read_prior_artifact", return_value=""), \
              patch("researchclaw.pipeline.stage_impls._execution._utcnow_iso", return_value="2026-01-01T00:00:00Z"):
@@ -134,8 +133,10 @@ class TestStage12HardGuards:
         assert sr.status == StageStatus.FAILED
         assert "zero real metrics" in (sr.error or "").lower() or "failed" in (sr.error or "").lower()
 
-    def test_suspiciously_fast_no_metrics_returns_failed(self, stage_dir: Path, run_dir: Path) -> None:
-        """Experiment 'completed' in <30s with zero metrics must return FAILED."""
+    def test_unsealed_fast_result_cannot_bypass_canonical_preflight(
+        self, stage_dir: Path, run_dir: Path
+    ) -> None:
+        """A sandbox result cannot substitute for sealed canonical inputs."""
         cfg = _make_config(time_budget_sec=7200)
         result = MagicMock()
         result.returncode = 0
@@ -147,10 +148,12 @@ class TestStage12HardGuards:
 
         sr = self._call_experiment_run(stage_dir, run_dir, cfg, result)
         assert sr.status == StageStatus.FAILED
-        assert "misclassified" in (sr.error or "").lower() or "zero real metrics" in (sr.error or "").lower()
+        assert "canonical stage 12 preflight failed" in (sr.error or "").lower()
 
-    def test_completed_with_metrics_returns_done(self, stage_dir: Path, run_dir: Path) -> None:
-        """Experiment with real metrics should still return DONE."""
+    def test_sandbox_metrics_are_not_canonical_authority(
+        self, stage_dir: Path, run_dir: Path
+    ) -> None:
+        """A metrics dict returned by the sandbox is not result-set authority."""
         cfg = _make_config()
         result = MagicMock()
         result.returncode = 0
@@ -161,7 +164,8 @@ class TestStage12HardGuards:
         result.elapsed_sec = 120.0
 
         sr = self._call_experiment_run(stage_dir, run_dir, cfg, result)
-        assert sr.status == StageStatus.DONE
+        assert sr.status == StageStatus.FAILED
+        assert "canonical stage 12 preflight failed" in (sr.error or "").lower()
 
     def test_stdout_failure_no_metrics_returns_failed(self, stage_dir: Path, run_dir: Path) -> None:
         """Experiment with failure signals in stdout and no metrics returns FAILED."""
@@ -237,14 +241,14 @@ class TestStage20HardGuard:
 # Test: Stage 12 duration anomaly logging
 # ---------------------------------------------------------------------------
 
-class TestStage12DurationAnomaly:
-    """Verify that suspiciously short experiments are detected."""
+class TestStage12CanonicalAuthority:
+    """Verify that legacy timing and stdout selectors are absent."""
 
-    def test_fast_completion_warning_exists(self) -> None:
-        """The P1 fast-completion warning (<5s) should still exist in code."""
+    def test_stage12_uses_controller_and_not_legacy_result_selectors(self) -> None:
         import inspect
         from researchclaw.pipeline.stage_impls._execution import _execute_experiment_run
 
         source = inspect.getsource(_execute_experiment_run)
-        # The original P1 check is still there
-        assert "trivially easy" in source or "suspiciously fast" in source
+        assert "controller.run_project(" in source
+        assert "_latest_sandbox_project_results" not in source
+        assert "_parse_metrics_from_stdout" not in source

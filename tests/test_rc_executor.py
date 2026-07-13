@@ -3179,21 +3179,20 @@ class TestPartialTimeoutStatus:
         stage_dir = run_dir / "stage-12"
         stage_dir.mkdir(parents=True, exist_ok=True)
 
-        rc_executor._execute_experiment_run(
+        result = rc_executor._execute_experiment_run(
             stage_dir, run_dir, cfg, adapters
         )
 
-        run_file = stage_dir / "runs" / "run-1.json"
-        assert run_file.exists()
-        payload = json.loads(run_file.read_text(encoding="utf-8"))
-        # Should be "partial" since metrics were captured before timeout
-        assert payload["timed_out"] is True
-        # Status should be "partial" if metrics captured, "failed" if not
-        if payload["metrics"]:
-            assert payload["status"] == "partial"
-        else:
-            # Subprocess stdout may not flush before kill on some platforms
-            assert payload["status"] == "failed"
+        assert result.status == StageStatus.FAILED
+        assert not (stage_dir / "experiment_result_set.json").exists()
+        journal = [
+            json.loads(line)
+            for line in (stage_dir / "execution_invocation_journal.jsonl")
+            .read_text(encoding="utf-8")
+            .split("\n")
+            if line
+        ]
+        assert journal[-1]["status"] == "failed"
 
 
 class TestTimeoutAwareRefine:
@@ -4522,15 +4521,19 @@ class TestStdoutFailureDetection:
             stage_dir, run_dir, cfg, adapters
         )
 
-        # Check the run payload
-        runs_dir = stage_dir / "runs"
-        run_file = runs_dir / "run-1.json"
-        assert run_file.exists()
-        payload = json.loads(run_file.read_text())
-        assert payload["status"] == "failed"
+        assert result.status == StageStatus.FAILED
+        assert not (stage_dir / "experiment_result_set.json").exists()
+        journal = [
+            json.loads(line)
+            for line in (stage_dir / "execution_invocation_journal.jsonl")
+            .read_text(encoding="utf-8")
+            .split("\n")
+            if line
+        ]
+        assert journal[-1]["status"] == "failed"
 
-    def test_clean_exit_no_fail_signal_marks_completed(self, tmp_path: Path) -> None:
-        """Exit code 0 + valid metrics + no FAIL signal → status='completed'."""
+    def test_stdout_metric_without_evaluator_result_is_not_authority(self, tmp_path: Path) -> None:
+        """Stdout metrics cannot replace the domain-owned evaluator result."""
         from researchclaw.pipeline.executor import _execute_experiment_run
 
         run_dir = tmp_path / "run"
@@ -4580,9 +4583,16 @@ class TestStdoutFailureDetection:
             stage_dir, run_dir, cfg, adapters
         )
 
-        runs_dir = stage_dir / "runs"
-        payload = json.loads((runs_dir / "run-1.json").read_text())
-        assert payload["status"] == "completed"
+        assert result.status == StageStatus.FAILED
+        assert not (stage_dir / "experiment_result_set.json").exists()
+        journal = [
+            json.loads(line)
+            for line in (stage_dir / "execution_invocation_journal.jsonl")
+            .read_text(encoding="utf-8")
+            .split("\n")
+            if line
+        ]
+        assert journal[-1]["status"] == "failed"
 
 
 class TestMetricValUndefined:

@@ -117,11 +117,15 @@ CONTRACTS: dict[Stage, StageContract] = {
     # Phase E: Experiment Execution
     Stage.EXPERIMENT_RUN: StageContract(
         stage=Stage.EXPERIMENT_RUN,
-        input_files=("schedule.json", "experiment/"),
-        output_files=("runs/",),
-        dod="All scheduled experiment runs completed with artifacts",
+        input_files=(),
+        output_files=(
+            "experiment_result_set.json",
+            "execution_invocation_journal.jsonl",
+            "evidence-v1/",
+        ),
+        dod="Single invocation and canonical Stage 12 result set replay successfully",
         error_code="E12_RUN_FAIL",
-        max_retries=2,
+        max_retries=0,
     ),
     Stage.ITERATIVE_REFINE: StageContract(
         stage=Stage.ITERATIVE_REFINE,

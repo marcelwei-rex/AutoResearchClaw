@@ -207,10 +207,10 @@ def test_executor_treats_code_generation_as_gate_for_hep_ph(tmp_path, monkeypatc
 # ---------------------------------------------------------------------------
 
 
-def test_incremental_snapshot_warns_when_cumulative_footprint_exceeds_threshold(
+def test_canonical_stage12_rejects_legacy_collider_incremental_mode(
     tmp_path, monkeypatch, caplog
 ):
-    """When sum(stage-12*) > 20 GB, log a WARN but do not abort."""
+    """C1-A supports only sandbox/docker and never enters legacy snapshot code."""
     import logging
     from dataclasses import replace
 
@@ -257,11 +257,13 @@ def test_incremental_snapshot_warns_when_cumulative_footprint_exceeds_threshold(
     ))
 
     with caplog.at_level(logging.WARNING, logger=exec_mod.logger.name):
-        _ = exec_mod._execute_experiment_run(
+        result = exec_mod._execute_experiment_run(
             stage_dir=s12, run_dir=run_dir, config=cfg, adapters=AdapterBundle()
         )
 
-    assert any("incremental footprint" in r.message.lower() for r in caplog.records)
+    assert result.status.value == "failed"
+    assert "does not support experiment mode" in (result.error or "")
+    assert not any("incremental footprint" in r.message.lower() for r in caplog.records)
 
 
 def test_estimate_stage12_footprint_bytes_sums_all_versions(tmp_path):
@@ -488,8 +490,10 @@ def test_prepare_workspace_incremental_skipped_when_no_artifacts(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_stage12_snapshots_existing_workspace_when_incremental(tmp_path, monkeypatch):
-    """Re-entering Stage 12 with incremental=True must copy old stage-12 to stage-12_v1."""
+def test_canonical_stage12_archives_old_workspace_before_rejecting_collider_mode(
+    tmp_path, monkeypatch
+):
+    """Rerun invalidation precedes unsupported-mode preflight failure."""
     from researchclaw.adapters import AdapterBundle
     from researchclaw.experiment import collider_agent_sandbox as ca_mod
     from researchclaw.experiment.sandbox import SandboxResult
@@ -535,25 +539,23 @@ def test_stage12_snapshots_existing_workspace_when_incremental(tmp_path, monkeyp
         collider_agent=replace(cfg.experiment.collider_agent, incremental=True),
     ))
 
-    _ = _execute_experiment_run(
+    result = _execute_experiment_run(
         stage_dir=s12,
         run_dir=run_dir,
         config=cfg,
         adapters=AdapterBundle(),
     )
 
-    # Snapshot exists and contains the prior metrics
-    assert (run_dir / "stage-12_v1" / "runs" / "results.json").is_file()
-    snap_text = (run_dir / "stage-12_v1" / "runs" / "results.json").read_text(encoding="utf-8")
-    assert "0.5" in snap_text
-    # Live stage-12 still present
-    assert (run_dir / "stage-12" / "runs").exists()
-    # Incremental audit sidecar
-    assert (run_dir / "stage-12_v1" / "INCREMENTAL_SNAPSHOT.txt").is_file()
+    assert result.status.value == "failed"
+    assert "does not support experiment mode" in (result.error or "")
+    assert (run_dir / "stage-12_v1/runs/results.json").is_file()
+    assert not (run_dir / "stage-12/runs/results.json").exists()
 
 
-def test_stage12_no_snapshot_when_workspace_empty(tmp_path, monkeypatch):
-    """No prior models/ or events/ artifacts: skip the snapshot even if incremental=True."""
+def test_canonical_stage12_archives_any_nonempty_unsupported_generation(
+    tmp_path, monkeypatch
+):
+    """Generation rollover is directory-based, not legacy workspace-content based."""
     from dataclasses import replace
     from researchclaw.adapters import AdapterBundle
     from researchclaw.experiment import collider_agent_sandbox as ca_mod
@@ -586,8 +588,8 @@ def test_stage12_no_snapshot_when_workspace_empty(tmp_path, monkeypatch):
 
     _ = _execute_experiment_run(s12, run_dir, cfg, AdapterBundle())
 
-    # No snapshot because nothing was there to snapshot
-    assert not (run_dir / "stage-12_v1").exists()
+    assert (run_dir / "stage-12_v1/runs").is_dir()
+    assert not (run_dir / "stage-12/runs").exists()
 
 
 # ---------------------------------------------------------------------------

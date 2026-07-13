@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from researchclaw.config import DockerSandboxConfig
@@ -93,6 +94,8 @@ _IMPORT_TO_PIP = {
 
 
 class DockerSandbox:
+    backend_kind = "docker"
+
     """Execute experiment code inside a Docker container.
 
     Same public API as :class:`ExperimentSandbox` so the pipeline can use
@@ -199,12 +202,15 @@ class DockerSandbox:
                 metrics={},
             )
 
-        return self._execute(
-            staging,
-            entry_point=entry_point,
-            timeout_sec=timeout_sec,
-            entry_args=args,
-            env_overrides=env_overrides,
+        return replace(
+            self._execute(
+                staging,
+                entry_point=entry_point,
+                timeout_sec=timeout_sec,
+                entry_args=args,
+                env_overrides=env_overrides,
+            ),
+            output_dir=staging,
         )
 
     # ------------------------------------------------------------------

@@ -1506,7 +1506,12 @@ def test_external_and_direct_stage12_entrypoints_block_before_reads(tmp_path: Pa
     with pytest.raises(CanonicalEvidenceMigrationIncomplete):
         memory.recall_best_configs("task")
     with pytest.raises(CanonicalEvidenceMigrationIncomplete):
-        CanonicalExecutionController().acquire(generation_binding_sha256=SHA)
+        CanonicalExecutionController(missing / "stage-12").acquire(
+            generation_binding_sha256=SHA,
+            experiment_contract_sha256=SHA,
+            sealed_candidate_manifest_sha256=SHA,
+            config_semantic_sha256=SHA,
+        )
     with pytest.raises(PermissionError, match="lease_required"):
         require_controller_lease(None)
 
@@ -1517,11 +1522,25 @@ def test_external_and_direct_stage12_entrypoints_block_before_reads(tmp_path: Pa
 
 
 def test_stage12_guard_precedes_sandbox_import_and_artifact_reads() -> None:
+    from researchclaw.pipeline.stage_impls import _execution as execution_impl
+
     source = inspect.getsource(_execute_experiment_run)
     guard = source.index('require_canonical_evidence_capabilities("stage12.execute_experiment_run")')
     sandbox_import = source.index("from researchclaw.experiment.factory import create_sandbox")
-    prior_artifact_read = source.index("_read_prior_artifact")
-    assert guard < sandbox_import < prior_artifact_read
+    sealed_artifact_read = source.index("_load_sealed_candidate")
+    assert guard < sandbox_import < sealed_artifact_read
+    assert "sandbox.run_project(" not in source
+    assert "_ensure_sandbox_deps" not in source
+    assert source.index("controller.acquire(") < source.index("sandbox = create_sandbox(")
+    assert source.index(
+        "validate_experiment_result_set(run_dir, config, result_set_text)"
+    ) < source.index(
+        '_atomic_write_text(stage_dir / "experiment_result_set.json", result_set_text)'
+    )
+    assert "def _latest_sandbox_project_results" not in inspect.getsource(execution_impl)
+    legacy = inspect.getsource(execution_impl._execute_legacy_experiment_run)
+    assert "legacy_stage12_execution_removed" in legacy
+    assert "run_project(" not in legacy
 
 
 def test_stage13_and_repair_guards_precede_sandbox_or_artifact_access(

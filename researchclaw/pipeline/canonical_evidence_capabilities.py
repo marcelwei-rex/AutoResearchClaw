@@ -21,11 +21,11 @@ REQUIRED_CAPABILITIES = (
     "independent_release_reconstruction",
 )
 
-# C0 deliberately leaves the runtime blocked. Later migration commits may only
-# change their owned component from 0 to CAPABILITY_SCHEMA_VERSION.
+# Partial migration deliberately leaves the runtime blocked. Each milestone may
+# only change its owned component from 0 to CAPABILITY_SCHEMA_VERSION.
 CANONICAL_EVIDENCE_CAPABILITIES: dict[str, int] = {
     "stage10_sealed_input": CAPABILITY_SCHEMA_VERSION,
-    "stage12_result_set": 0,
+    "stage12_result_set": CAPABILITY_SCHEMA_VERSION,
     "stage13_refinement_set": 0,
     "stage14_candidate_and_promotion": 0,
     "shared_accessor": 0,

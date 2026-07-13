@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
 import yaml
 
+import researchclaw.pipeline.canonical_execution_controller as controller_module
+from researchclaw.pipeline.stage_impls import _execution
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
 from researchclaw.experiment_runtime.contract import (
@@ -18,7 +22,7 @@ from researchclaw.experiment_runtime.contract import (
 from researchclaw.experiment_runtime.scaffold import render_main_py
 from researchclaw.pipeline.stage_impls._execution import (
     _execute_experiment_run,
-    _latest_sandbox_project_results,
+    _execute_legacy_experiment_run,
     _load_sealed_candidate,
     _scaffold_sha256,
 )
@@ -26,10 +30,19 @@ from researchclaw.pipeline.stage_impls._code_generation import (
     _execute_code_generation,
     _seal_selected_candidate,
 )
-from researchclaw.pipeline.stages import StageStatus
+from researchclaw.pipeline.executor import execute_stage
+from researchclaw.pipeline.contracts import CONTRACTS
+from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.literature.citation_policy import write_active_config_binding
 from researchclaw.pipeline.canonical_evidence_capabilities import (
     CanonicalEvidenceMigrationIncomplete,
+)
+from researchclaw.pipeline.canonical_execution_controller import (
+    CanonicalExecutionController,
+)
+from researchclaw.pipeline.canonical_experiment_evidence import (
+    parse_execution_invocation_journal,
+    validate_experiment_result_set,
 )
 
 
@@ -100,6 +113,12 @@ def test_stage12_rejects_when_manifest_missing(tmp_path: Path) -> None:
 
     with pytest.raises(CanonicalEvidenceMigrationIncomplete):
         _execute_experiment_run(run / "stage-12", run, cfg, AdapterBundle())
+
+
+def test_canonical_stage12_contract_has_no_generic_inputs_or_retries() -> None:
+    contract = CONTRACTS[Stage.EXPERIMENT_RUN]
+    assert contract.input_files == ()
+    assert contract.max_retries == 0
 
 
 def test_stage12_loads_valid_sealed_candidate(tmp_path: Path) -> None:
@@ -252,20 +271,468 @@ def test_stage10_scaffold_candidate_runs_in_stage12(tmp_path: Path) -> None:
         )
 
 
-def test_latest_sandbox_project_results_accepts_legacy_project_dir(tmp_path: Path) -> None:
-    runs = tmp_path / "runs"
-    legacy = runs / "sandbox" / "_project"
-    legacy.mkdir(parents=True)
-    expected = legacy / "results.json"
-    expected.write_text("{}", encoding="utf-8")
+def test_canonical_stage12_publishes_and_replays_single_invocation(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run = tmp_path / "run"
+    cfg = _cfg(tmp_path)
+    _write_contract(run, cfg)
+    (run / "stage-09/exp_plan.yaml").write_text("objectives: []\n", encoding="utf-8")
+    stage10 = _execute_code_generation(
+        run / "stage-10", run, cfg, AdapterBundle(), llm=None
+    )
+    assert stage10.status == StageStatus.DONE
 
-    assert _latest_sandbox_project_results(runs) == expected
+    result = _execute_experiment_run(
+        run / "stage-12", run, cfg, AdapterBundle()
+    )
+
+    assert result.status == StageStatus.DONE
+    manifest = validate_experiment_result_set(run, cfg)
+    assert manifest["execution_statuses"] == [{
+        "ordinal": 1,
+        "status": "completed",
+        "result_path": "stage-12/evidence-v1/run-1.json",
+        "failure_code": None,
+    }]
+    journal = parse_execution_invocation_journal(
+        (run / "stage-12/execution_invocation_journal.jsonl").read_text(encoding="utf-8")
+    )
+    assert [record["event"] for record in journal] == ["started", "terminal"]
+    assert journal[1]["status"] == "completed"
 
 
-def test_latest_sandbox_project_results_returns_missing_sentinel(tmp_path: Path) -> None:
-    runs = tmp_path / "runs"
-    (runs / "sandbox").mkdir(parents=True)
-    result = _latest_sandbox_project_results(runs)
+def test_canonical_stage12_failed_invocation_publishes_no_manifest(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run = tmp_path / "run"
+    cfg = _cfg(tmp_path)
+    contract_path = _write_contract(run, cfg)
+    experiment = run / "stage-10/experiment"
+    experiment.mkdir(parents=True)
+    (experiment / "main.py").write_text(
+        render_main_py(load_contract(contract_path)), encoding="utf-8"
+    )
+    (experiment / "detector_plugin.py").write_text(
+        """import numpy as np
 
-    assert not result.exists()
-    assert "__no_sandbox_results__" in result.as_posix()
+class DetectorPlugin:
+    def fit(self, X, y):
+        return self
+
+    def predict(self, X):
+        return np.full(len(X), np.nan)
+""",
+        encoding="utf-8",
+    )
+    _seal_selected_candidate(run / "stage-10", experiment, contract_path, cfg)
+
+    result = _execute_experiment_run(
+        run / "stage-12", run, cfg, AdapterBundle()
+    )
+
+    assert result.status == StageStatus.FAILED
+    assert not (run / "stage-12/experiment_result_set.json").exists()
+    assert not (run / "stage-12/evidence-v1").exists()
+    journal = parse_execution_invocation_journal(
+        (run / "stage-12/execution_invocation_journal.jsonl").read_text(encoding="utf-8")
+    )
+    assert journal[-1]["status"] == "failed"
+
+
+def test_controller_rejects_hidden_retry_after_failed_invocation(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    controller = CanonicalExecutionController.prepare_generation(
+        run, run / "stage-12"
+    )
+    lease = controller.acquire(
+        generation_binding_sha256="1" * 64,
+        experiment_contract_sha256="2" * 64,
+        sealed_candidate_manifest_sha256="3" * 64,
+        config_semantic_sha256="4" * 64,
+    )
+    sandbox_root = controller.prepare_invocation_workspace(lease)
+
+    class FailingSandbox:
+        backend_kind = "subprocess"
+        calls = 0
+
+        def run_project(self, project_dir: Path, *, timeout_sec: int) -> object:
+            del project_dir, timeout_sec
+            self.calls += 1
+            output = sandbox_root / "_project_1"
+            output.mkdir()
+            return SimpleNamespace(returncode=1, output_dir=output)
+
+    sandbox = FailingSandbox()
+    controller.run_project(lease, sandbox, tmp_path, timeout_sec=1)
+    with pytest.raises(RuntimeError, match="already_consumed"):
+        controller.run_project(lease, sandbox, tmp_path, timeout_sec=1)
+    controller.fail(lease, failure_code="sandbox_execution_failed_v1")
+    with pytest.raises(RuntimeError, match="already_acquired"):
+        controller.acquire(
+            generation_binding_sha256="1" * 64,
+            experiment_contract_sha256="2" * 64,
+            sealed_candidate_manifest_sha256="3" * 64,
+            config_semantic_sha256="4" * 64,
+        )
+    assert sandbox.calls == 1
+    controller.close()
+
+
+def test_controller_rejects_output_from_archived_generation(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    archived_output = run / "stage-12_v1/diagnostics/invocation-1/sandbox/_project_1"
+    archived_output.mkdir(parents=True)
+    controller = CanonicalExecutionController.prepare_generation(
+        run, run / "stage-12"
+    )
+    lease = controller.acquire(
+        generation_binding_sha256="1" * 64,
+        experiment_contract_sha256="2" * 64,
+        sealed_candidate_manifest_sha256="3" * 64,
+        config_semantic_sha256="4" * 64,
+    )
+    controller.prepare_invocation_workspace(lease)
+
+    class ArchivedOutputSandbox:
+        backend_kind = "subprocess"
+
+        def run_project(self, project_dir: Path, *, timeout_sec: int) -> object:
+            del project_dir, timeout_sec
+            return SimpleNamespace(returncode=0, output_dir=archived_output)
+
+    with pytest.raises(RuntimeError, match="output_directory_unbound"):
+        controller.run_project(
+            lease, ArchivedOutputSandbox(), tmp_path, timeout_sec=1
+        )
+    controller.fail(lease, failure_code="output_directory_unbound_v1")
+    controller.close()
+
+
+def test_legacy_stage12_entrypoint_is_unconditionally_removed(tmp_path: Path) -> None:
+    with pytest.raises(PermissionError, match="legacy_stage12_execution_removed"):
+        _execute_legacy_experiment_run(
+            tmp_path / "stage-12",
+            tmp_path,
+            _cfg(tmp_path),
+            AdapterBundle(),
+        )
+
+
+def test_canonical_stage12_rejects_runner_output_outside_invocation_workspace(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "run"
+    cfg = _cfg(tmp_path)
+    _write_contract(run, cfg)
+    (run / "stage-09/exp_plan.yaml").write_text("objectives: []\n", encoding="utf-8")
+    assert _execute_code_generation(
+        run / "stage-10", run, cfg, AdapterBundle(), llm=None
+    ).status == StageStatus.DONE
+    assert _execute_experiment_run(
+        run / "stage-12", run, cfg, AdapterBundle()
+    ).status == StageStatus.DONE
+    evaluator_text = next(
+        (run / "stage-12/diagnostics/invocation-1/sandbox").glob("*/results.json")
+    ).read_text(encoding="utf-8")
+    exact_output = tmp_path / "exact-output"
+    newer_sibling = tmp_path / "newer-sibling"
+    exact_output.mkdir()
+    newer_sibling.mkdir()
+    (exact_output / "results.json").write_text(evaluator_text, encoding="utf-8")
+    (newer_sibling / "results.json").write_text("{}\n", encoding="utf-8")
+
+    class ExactOutputSandbox:
+        backend_kind = "subprocess"
+
+        def run_project(self, project_dir: Path, *, timeout_sec: int) -> object:
+            del project_dir, timeout_sec
+            return SimpleNamespace(
+                returncode=0,
+                timed_out=False,
+                output_dir=exact_output,
+            )
+
+    monkeypatch.setattr(
+        "researchclaw.experiment.factory.create_sandbox",
+        lambda *args, **kwargs: ExactOutputSandbox(),
+    )
+
+    result = _execute_experiment_run(
+        run / "stage-12", run, cfg, AdapterBundle()
+    )
+
+    assert result.status == StageStatus.FAILED
+    assert "output_directory_unbound" in (result.error or "")
+    assert not (run / "stage-12/experiment_result_set.json").exists()
+
+
+def test_canonical_stage12_rejects_docker_to_subprocess_fallback(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _cfg(tmp_path)
+    cfg = replace(
+        cfg,
+        experiment=replace(
+            cfg.experiment,
+            mode="docker",
+            sandbox=replace(cfg.experiment.sandbox, allow_docker_fallback=True),
+        ),
+    )
+    run = tmp_path / "run"
+    _write_contract(run, cfg)
+    (run / "stage-09/exp_plan.yaml").write_text("objectives: []\n", encoding="utf-8")
+    assert _execute_code_generation(
+        run / "stage-10", run, cfg, AdapterBundle(), llm=None
+    ).status == StageStatus.DONE
+    monkeypatch.setattr(
+        "researchclaw.experiment.docker_sandbox.DockerSandbox.check_docker_available",
+        lambda: False,
+    )
+
+    result = _execute_experiment_run(
+        run / "stage-12", run, cfg, AdapterBundle()
+    )
+
+    assert result.status == StageStatus.FAILED
+    assert "backend does not match" in (result.error or "")
+    assert not (run / "stage-12/experiment_result_set.json").exists()
+    journal = parse_execution_invocation_journal(
+        (run / "stage-12/execution_invocation_journal.jsonl").read_text(encoding="utf-8")
+    )
+    assert journal[-1]["status"] == "failed"
+
+
+def test_stage12_partial_evidence_write_never_enters_canonical_namespace(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "run"
+    cfg = _cfg(tmp_path)
+    _write_contract(run, cfg)
+    (run / "stage-09/exp_plan.yaml").write_text("objectives: []\n", encoding="utf-8")
+    assert _execute_code_generation(
+        run / "stage-10", run, cfg, AdapterBundle(), llm=None
+    ).status == StageStatus.DONE
+    original_write = _execution._atomic_write_text
+
+    def fail_second_evidence_write(path: Path, text: str) -> None:
+        if path.name == "results.json" and path.parent.name == ".evidence-v1.staging":
+            raise OSError("simulated aggregate write interruption")
+        original_write(path, text)
+
+    monkeypatch.setattr(_execution, "_atomic_write_text", fail_second_evidence_write)
+
+    result = _execute_experiment_run(
+        run / "stage-12", run, cfg, AdapterBundle()
+    )
+
+    assert result.status == StageStatus.FAILED
+    assert not (run / "stage-12/evidence-v1").exists()
+    assert not (run / "stage-12/.evidence-v1.staging").exists()
+    assert not (run / "stage-12/experiment_result_set.json").exists()
+
+
+def test_stage12_full_replay_precedes_manifest_publication(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "run"
+    cfg = _cfg(tmp_path)
+    _write_contract(run, cfg)
+    (run / "stage-09/exp_plan.yaml").write_text("objectives: []\n", encoding="utf-8")
+    assert _execute_code_generation(
+        run / "stage-10", run, cfg, AdapterBundle(), llm=None
+    ).status == StageStatus.DONE
+    original_validate = _execution.validate_experiment_result_set
+
+    def fail_prepublication_replay(
+        replay_run: Path, replay_config: RCConfig, text: str | None = None
+    ) -> dict[str, object]:
+        if text is not None:
+            raise RuntimeError("simulated prepublication replay interruption")
+        return original_validate(replay_run, replay_config, text)
+
+    monkeypatch.setattr(
+        _execution, "validate_experiment_result_set", fail_prepublication_replay
+    )
+
+    result = _execute_experiment_run(
+        run / "stage-12", run, cfg, AdapterBundle()
+    )
+
+    assert result.status == StageStatus.FAILED
+    assert not (run / "stage-12/experiment_result_set.json").exists()
+    assert not (run / "stage-12/evidence-v1").exists()
+
+
+def test_execute_stage_invalidates_old_authority_before_input_preflight(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run = tmp_path / "run"
+    cfg = _cfg(tmp_path)
+    stage12 = run / "stage-12"
+    stage12.mkdir(parents=True)
+    (stage12 / "experiment_result_set.json").write_text("stale\n", encoding="utf-8")
+    (run / "canonical_experiment_evidence.json").write_text("stale\n", encoding="utf-8")
+
+    result = execute_stage(
+        Stage.EXPERIMENT_RUN,
+        run_dir=run,
+        run_id="rerun",
+        config=cfg,
+        adapters=AdapterBundle(),
+    )
+
+    assert result.status == StageStatus.FAILED
+    assert not (run / "stage-12/experiment_result_set.json").exists()
+    assert not (run / "canonical_experiment_evidence.json").exists()
+    assert not (run / "stage-12_v1/experiment_result_set.json").exists()
+
+
+def test_stage12_rejects_symlink_lock_path(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    target = tmp_path / "lock-target"
+    target.write_text("do not touch\n", encoding="utf-8")
+    (run / ".canonical_experiment_evidence.lock").symlink_to(target)
+
+    with pytest.raises(RuntimeError, match="lock_unsafe"):
+        CanonicalExecutionController.prepare_generation(run, run / "stage-12")
+
+    assert target.read_text(encoding="utf-8") == "do not touch\n"
+
+
+def test_stage12_rejects_concurrent_generation_controller(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    first = CanonicalExecutionController.prepare_generation(run, run / "stage-12")
+    try:
+        with pytest.raises(RuntimeError, match="generation_locked"):
+            CanonicalExecutionController.prepare_generation(run, run / "stage-12")
+    finally:
+        first.close()
+
+
+def test_canonical_stage12_manifest_write_failure_leaves_no_manifest(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "run"
+    cfg = _cfg(tmp_path)
+    _write_contract(run, cfg)
+    (run / "stage-09/exp_plan.yaml").write_text("objectives: []\n", encoding="utf-8")
+    assert _execute_code_generation(
+        run / "stage-10", run, cfg, AdapterBundle(), llm=None
+    ).status == StageStatus.DONE
+    original_write = _execution._atomic_write_text
+
+    def fail_manifest_write(path: Path, text: str) -> None:
+        if path.name == "experiment_result_set.json":
+            raise OSError("simulated manifest publication failure")
+        original_write(path, text)
+
+    monkeypatch.setattr(_execution, "_atomic_write_text", fail_manifest_write)
+
+    result = _execute_experiment_run(
+        run / "stage-12", run, cfg, AdapterBundle()
+    )
+
+    assert result.status == StageStatus.FAILED
+    assert not (run / "stage-12/experiment_result_set.json").exists()
+    journal = parse_execution_invocation_journal(
+        (run / "stage-12/execution_invocation_journal.jsonl").read_text(encoding="utf-8")
+    )
+    assert journal[-1]["status"] == "completed"
+
+
+def test_stage12_archive_interruption_invalidates_manifest_before_rollover(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "run"
+    stage12 = run / "stage-12"
+    stage12.mkdir(parents=True)
+    manifest = stage12 / "experiment_result_set.json"
+    manifest.write_text("stale\n", encoding="utf-8")
+    journal = stage12 / "execution_invocation_journal.jsonl"
+    journal.write_text("diagnostic history\n", encoding="utf-8")
+    root_manifest = run / "canonical_experiment_evidence.json"
+    root_manifest.write_text("stale\n", encoding="utf-8")
+
+    def fail_rollover(source: Path, destination: Path) -> None:
+        del source, destination
+        raise OSError("simulated archive interruption")
+
+    monkeypatch.setattr(controller_module.os, "replace", fail_rollover)
+
+    with pytest.raises(OSError, match="archive interruption"):
+        CanonicalExecutionController.prepare_generation(run, stage12)
+
+    assert not manifest.exists()
+    assert journal.exists()
+    assert not root_manifest.exists()
+    assert not (run / "stage-12_v1").exists()
+
+
+def test_canonical_stage12_rerun_archives_prior_generation_and_invalidates_root(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run = tmp_path / "run"
+    cfg = _cfg(tmp_path)
+    _write_contract(run, cfg)
+    (run / "stage-09/exp_plan.yaml").write_text("objectives: []\n", encoding="utf-8")
+    assert _execute_code_generation(
+        run / "stage-10", run, cfg, AdapterBundle(), llm=None
+    ).status == StageStatus.DONE
+    assert _execute_experiment_run(
+        run / "stage-12", run, cfg, AdapterBundle()
+    ).status == StageStatus.DONE
+    first_journal = (run / "stage-12/execution_invocation_journal.jsonl").read_text(
+        encoding="utf-8"
+    )
+    (run / "canonical_experiment_evidence.json").write_text("stale\n", encoding="utf-8")
+    (run / "experiment_summary_best.json").write_text("stale\n", encoding="utf-8")
+    stage13 = run / "stage-13"
+    stage13.mkdir()
+    (stage13 / "refinement_result_set.json").write_text("stale\n", encoding="utf-8")
+
+    rerun = _execute_experiment_run(
+        run / "stage-12", run, cfg, AdapterBundle()
+    )
+
+    assert rerun.status == StageStatus.DONE
+    assert (run / "stage-12_v1/execution_invocation_journal.jsonl").read_text(
+        encoding="utf-8"
+    ) == first_journal
+    assert validate_experiment_result_set(run, cfg)
+    assert not (run / "canonical_experiment_evidence.json").exists()
+    assert not (run / "experiment_summary_best.json").exists()
+    assert not (stage13 / "refinement_result_set.json").exists()

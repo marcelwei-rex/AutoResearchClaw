@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Protocol
 
@@ -293,10 +293,13 @@ class SandboxResult:
     elapsed_sec: float
     metrics: dict[str, object]
     timed_out: bool = False
+    output_dir: Path | None = None
 
 
 class SandboxProtocol(Protocol):
     """Structural type for sandbox backends (ExperimentSandbox, DockerSandbox)."""
+
+    backend_kind: str
 
     def run(self, code: str, *, timeout_sec: int = 300) -> SandboxResult: ...
 
@@ -312,6 +315,8 @@ class SandboxProtocol(Protocol):
 
 
 class ExperimentSandbox:
+    backend_kind = "subprocess"
+
     def __init__(self, config: SandboxConfig, workdir: Path) -> None:
         self.config: SandboxConfig = config
         self.workdir: Path = workdir.resolve()
@@ -477,7 +482,7 @@ class ExperimentSandbox:
                 exc, elapsed_sec=time.monotonic() - start
             )
 
-        return result
+        return replace(result, output_dir=sandbox_project)
 
     @staticmethod
     def _inject_harness(target_dir: Path) -> None:

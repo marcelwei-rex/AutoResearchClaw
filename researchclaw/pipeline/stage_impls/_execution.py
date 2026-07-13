@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
+import shutil
 import time as _time
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,7 @@ from researchclaw.experiment.validator import (
     validate_code,
 )
 from researchclaw.llm.client import LLMClient
+from researchclaw.literature.evidence_cards import canonical_json_text
 from researchclaw.pipeline._domain import _detect_domain
 from researchclaw.pipeline._helpers import (
     StageResult,
@@ -47,7 +50,17 @@ from researchclaw.pipeline._helpers import (
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidenceError,
+    build_stage12_evidence_texts,
+    invocation_generation_binding_sha256,
+    parse_experiment_result_set,
+    semantic_config_sha256,
+    sha256_text,
+    validate_experiment_result_set,
     validate_selected_candidate_manifest,
+)
+from researchclaw.pipeline.canonical_execution_controller import (
+    CanonicalExecutionController,
+    InvocationLease,
 )
 from researchclaw.prompts import PromptManager
 
@@ -168,22 +181,26 @@ def _load_sealed_candidate(run_dir: Path, config: RCConfig) -> Path:
     return selected_dir
 
 
-def _latest_sandbox_project_results(runs_dir: Path) -> Path:
-    sandbox_dir = runs_dir / "sandbox"
-    candidates = [
-        p / "results.json"
-        for p in sandbox_dir.iterdir()
-        if p.is_dir()
-        and (
-            p.name == "_project"
-            or p.name.startswith("_project_")
-            or p.name.startswith("_docker_project_")
-        )
-    ] if sandbox_dir.is_dir() else []
-    existing = [p for p in candidates if p.is_file()]
-    if not existing:
-        return runs_dir / "sandbox" / "__no_sandbox_results__" / "results.json"
-    return sorted(existing, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+def _execute_legacy_experiment_run(
+    stage_dir: Path,
+    run_dir: Path,
+    config: RCConfig,
+    adapters: AdapterBundle,
+    *,
+    llm: LLMClient | None = None,
+    prompts: PromptManager | None = None,
+) -> StageResult:
+    del stage_dir, run_dir, config, adapters, llm, prompts
+    raise PermissionError("legacy_stage12_execution_removed")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    temp = path.with_name(f".{path.name}.tmp")
+    try:
+        temp.write_text(text, encoding="utf-8")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def _execute_experiment_run(
@@ -195,485 +212,247 @@ def _execute_experiment_run(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    """Publish the C1-A single-invocation canonical Stage 12 result set."""
+    del adapters, llm, prompts
     from researchclaw.pipeline.canonical_evidence_capabilities import (
         require_canonical_evidence_capabilities,
     )
 
     require_canonical_evidence_capabilities("stage12.execute_experiment_run")
     from researchclaw.experiment.factory import create_sandbox
-    from researchclaw.experiment.runner import ExperimentRunner
 
-    schedule_text = _read_prior_artifact(run_dir, "schedule.json") or "{}"
-    runs_dir = stage_dir / "runs"
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    mode = config.experiment.mode
+    controller: CanonicalExecutionController | None = None
 
-    # Phase 2 sealed-boundary invariant: Stage 12 reads only the Stage 10
-    # selected candidate after manifest/hash/default-deny verification.
-    # ColliderAgent mode uses a prompt file (collider_plan.md), not a Python
-    # selected candidate — its integrity model is different and does not
-    # require the sealed manifest gate (the contract gate still applies via
-    # release_check).
-    if mode != "collider_agent":
-        try:
-            sealed_candidate_dir = _load_sealed_candidate(run_dir, config)
-        except RuntimeError as exc:
-            error = str(exc)
-            logger.error("Stage 12: %s", error)
-            return StageResult(
-                stage=Stage.EXPERIMENT_RUN,
-                status=StageStatus.FAILED,
-                artifacts=(),
-                evidence_refs=(),
-                error=error,
-            )
-        exp_dir_path = str(sealed_candidate_dir)
-        code_text = ""
-        main_path = sealed_candidate_dir / "main.py"
-        try:
-            code_text = main_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            code_text = ""
-        if not code_text:
-            error = "sealed selected_candidate/main.py missing or unreadable"
-            return StageResult(
-                stage=Stage.EXPERIMENT_RUN,
-                status=StageStatus.FAILED,
-                artifacts=(),
-                evidence_refs=(),
-                error=error,
-            )
-    else:
-        exp_dir_path = ""
-        code_text = ""
+    def finish(result: StageResult) -> StageResult:
+        if controller is not None:
+            controller.close()
+        return result
 
-    # ── ColliderAgent physics mode ─────────────────────────────────────
-    if mode == "collider_agent":
-        from researchclaw.experiment.collider_agent_sandbox import ColliderAgentSandbox
-
-        # Read physics prompt from Stage 10 artifact (collider_plan.md)
-        # or fall back to the experiment design plan
-        prompt_text = _read_prior_artifact(run_dir, "collider_plan.md") or ""
-        if not prompt_text:
-            # Try exp_plan.yaml as fallback — Stage 9 artifact
-            prompt_text = _read_prior_artifact(run_dir, "exp_plan.yaml") or ""
-        if not prompt_text:
-            logger.warning(
-                "Stage 12 (collider_agent): no collider_plan.md found — "
-                "using generic placeholder prompt"
-            )
-            prompt_text = (
-                "# Physics Analysis Task\n\n"
-                "Run the collider physics pipeline for the configured topic.\n"
-                "Generate exclusion contours and output figures to output/figures/.\n"
-            )
-
-        ca_cfg = config.experiment.collider_agent
-        workspace = runs_dir / (ca_cfg.working_dir or "collider_workspace")
-
-        # Incremental re-entry: snapshot prior workspace under stage-12_v{N}
-        # BEFORE the sandbox prepares the new prompt, so the merge step can
-        # recover the previous results.json. Only fires when prior workspace
-        # is non-empty (models/ or events/ contain artifacts).
-        if (
-            getattr(ca_cfg, "incremental", False)
-            and workspace.is_dir()
-            and (
-                ((workspace / "models").is_dir() and any((workspace / "models").iterdir()))
-                or ((workspace / "events").is_dir() and any((workspace / "events").iterdir()))
-            )
-        ):
-            import shutil as _shutil_inc
-
-            existing_versions = sorted(
-                p for p in run_dir.glob("stage-12_v*")
-                if p.is_dir() and p.name.replace("stage-12_v", "").isdigit()
-            )
-            next_v = (
-                int(existing_versions[-1].name.replace("stage-12_v", "")) + 1
-                if existing_versions
-                else 1
-            )
-            snap_dir = run_dir / f"stage-12_v{next_v}"
-            try:
-                _shutil_inc.copytree(stage_dir, snap_dir, symlinks=False)
-                logger.info(
-                    "Incremental snapshot: %s → %s",
-                    stage_dir.name,
-                    snap_dir.name,
-                )
-            except OSError as _snap_err:
-                logger.warning(
-                    "Incremental snapshot failed: %s — proceeding without history",
-                    _snap_err,
-                )
-            else:
-                _summary_lines = [
-                    f"timestamp: {_utcnow_iso()}",
-                    "trigger: incremental re-entry",
-                ]
-                _prev_results = runs_dir / "results.json"
-                if _prev_results.is_file():
-                    try:
-                        _pr = json.loads(_prev_results.read_text(encoding="utf-8"))
-                        _summary_lines.append(
-                            f"prior_metrics: {json.dumps(_pr.get('metrics', {}))[:300]}"
-                        )
-                    except (OSError, json.JSONDecodeError):
-                        pass
-                (snap_dir / "INCREMENTAL_SNAPSHOT.txt").write_text(
-                    "\n".join(_summary_lines) + "\n", encoding="utf-8"
-                )
-                # Disk-guard: warn (do not abort) when cumulative footprint > 20 GB
-                _footprint = _estimate_stage12_footprint_bytes(run_dir)
-                _GB = 1024 * 1024 * 1024
-                if _footprint > 20 * _GB:
-                    logger.warning(
-                        "Incremental footprint cumulative across stage-12*/ is "
-                        "%.1f GB. Consider `rm -rf %s/stage-12_v*` to reclaim space.",
-                        _footprint / _GB,
-                        run_dir,
-                    )
-
-        workspace.mkdir(parents=True, exist_ok=True)
-
-        sandbox = ColliderAgentSandbox(ca_cfg, workspace)
-        result = sandbox.run(prompt_text, timeout_sec=ca_cfg.timeout_sec)
-
-        # Read structured results.json written by ColliderAgentSandbox
-        structured_results = None
-        results_json_path = workspace / "results.json"
-        if results_json_path.exists():
-            try:
-                import json as _json
-                structured_results = _json.loads(results_json_path.read_text(encoding="utf-8"))
-                # Copy to runs dir for easy access
-                (runs_dir / "results.json").write_text(
-                    results_json_path.read_text(encoding="utf-8"), encoding="utf-8"
-                )
-            except Exception:  # noqa: BLE001
-                structured_results = None
-
-        if result.returncode == 0 and not result.timed_out:
-            run_status = "completed"
-        elif result.timed_out and result.metrics:
-            run_status = "partial"
-        else:
-            run_status = "failed"
-
-        run_payload: dict[str, Any] = {
-            "run_id": "run-1",
-            "task_id": "collider-agent-main",
-            "status": run_status,
-            "metrics": result.metrics,
-            "elapsed_sec": result.elapsed_sec,
-            "stdout": result.stdout[:4000] if result.stdout else "",
-            "stderr": result.stderr[:2000] if result.stderr else "",
-            "timed_out": result.timed_out,
-            "completed_at": _utcnow_iso(),
-        }
-        if structured_results is not None:
-            run_payload["structured_results"] = structured_results
-
-        import json as _json_io
-        (runs_dir / "run-1.json").write_text(
-            _json_io.dumps(run_payload, indent=2), encoding="utf-8"
+    try:
+        controller = CanonicalExecutionController.prepare_generation(
+            run_dir, stage_dir
         )
-
-        return StageResult(
+    except (OSError, RuntimeError) as exc:
+        return finish(StageResult(
             stage=Stage.EXPERIMENT_RUN,
-            status=StageStatus.DONE,
-            artifacts=("runs/",),
-            evidence_refs=("stage-12/runs/",),
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error=f"Canonical Stage 12 generation preparation failed: {exc}",
+        ))
+
+    mode = config.experiment.mode
+    if mode not in {"sandbox", "docker"}:
+        return finish(StageResult(
+            stage=Stage.EXPERIMENT_RUN,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error=f"Canonical Stage 12 does not support experiment mode: {mode}",
+        ))
+
+    try:
+        selected_dir = _load_sealed_candidate(run_dir, config)
+        seal_path = run_dir / "stage-10/selected_candidate_manifest.json"
+        seal_text = seal_path.read_text(encoding="utf-8")
+        seal = validate_selected_candidate_manifest(run_dir, config, seal_text)
+        contract_path = run_dir / seal["contract_path"]
+        contract = load_contract(contract_path)
+    except (OSError, UnicodeDecodeError, RuntimeError, ContractValidationError) as exc:
+        return finish(StageResult(
+            stage=Stage.EXPERIMENT_RUN,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error=f"Canonical Stage 12 preflight failed: {exc}",
+        ))
+
+    try:
+        evaluator_schema = "hpc_anomaly_detection_v1"
+        seal_sha256 = sha256_text(seal_text)
+        config_sha256 = semantic_config_sha256(config)
+        if config_sha256 != seal["config_semantic_sha256"]:
+            raise CanonicalExperimentEvidenceError(
+                "active config does not match the sealed Stage 10 generation"
+            )
+        generation_binding = invocation_generation_binding_sha256(
+            experiment_contract_sha256=seal["contract_sha256"],
+            sealed_candidate_manifest_sha256=seal_sha256,
+            config_semantic_sha256=config_sha256,
+            experiment_mode=mode,
+            evaluator_schema=evaluator_schema,
         )
-    # ── End ColliderAgent mode ──────────────────────────────────────────
-
-    if mode in ("sandbox", "docker"):
-        # P7: Auto-install missing dependencies before subprocess sandbox
-        if mode == "sandbox":
-            _all_code = code_text
-            if exp_dir_path and Path(exp_dir_path).is_dir():
-                for _pyf in Path(exp_dir_path).glob("*.py"):
-                    try:
-                        _all_code += "\n" + _pyf.read_text(encoding="utf-8")
-                    except (OSError, UnicodeDecodeError):
-                        pass
-            _ensure_sandbox_deps(_all_code, config.experiment.sandbox.python_path)
-
+    except Exception as exc:  # noqa: BLE001
+        return finish(StageResult(
+            stage=Stage.EXPERIMENT_RUN,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error=f"Canonical Stage 12 setup failed: {exc}",
+        ))
+    lease: InvocationLease | None = None
+    evidence_dir = stage_dir / "evidence-v1"
+    evidence_staging = stage_dir / ".evidence-v1.staging"
+    try:
+        lease = controller.acquire(
+            generation_binding_sha256=generation_binding,
+            experiment_contract_sha256=seal["contract_sha256"],
+            sealed_candidate_manifest_sha256=seal_sha256,
+            config_semantic_sha256=config_sha256,
+        )
+        sandbox_root = controller.prepare_invocation_workspace(lease)
         sandbox = create_sandbox(
-            config.experiment, runs_dir / "sandbox", metadata_dir=stage_dir
+            config.experiment,
+            sandbox_root,
+            metadata_dir=stage_dir,
         )
-        # Use run_project for multi-file, run for single-file
-        sandbox_start_time = _time.time()
-        if exp_dir_path and Path(exp_dir_path).is_dir():
-            result = sandbox.run_project(
-                Path(exp_dir_path), timeout_sec=config.experiment.time_budget_sec
+        expected_backend = "subprocess" if mode == "sandbox" else "docker"
+        if getattr(sandbox, "backend_kind", None) != expected_backend:
+            raise CanonicalExperimentEvidenceError(
+                "canonical sandbox backend does not match requested experiment mode"
             )
-        else:
-            result = sandbox.run(
-                code_text, timeout_sec=config.experiment.time_budget_sec
-            )
-        # Try to read structured results.json from sandbox working dir
-        structured_results: dict[str, Any] | None = None
-        results_json_path = _latest_sandbox_project_results(runs_dir)
-        if results_json_path.exists():
-            try:
-                if results_json_path.stat().st_mtime <= sandbox_start_time:
-                    error = "Stage 12 sandbox results.json is stale pre-execution output"
-                    logger.error(error)
-                    return StageResult(
-                        stage=Stage.EXPERIMENT_RUN,
-                        status=StageStatus.FAILED,
-                        artifacts=(),
-                        evidence_refs=(),
-                        error=error,
-                    )
-            except OSError:
-                pass
-            try:
-                structured_results = json.loads(
-                    results_json_path.read_text(encoding="utf-8")
-                )
-                # Copy results.json to runs dir for easy access
-                (runs_dir / "results.json").write_text(
-                    results_json_path.read_text(encoding="utf-8"),
-                    encoding="utf-8",
-                )
-            except (json.JSONDecodeError, OSError):
-                structured_results = None
-
-        # If sandbox metrics are empty, try to parse from stdout
-        effective_metrics = result.metrics
-        if not effective_metrics and result.stdout:
-            effective_metrics = _parse_metrics_from_stdout(result.stdout)
-
-        # Determine run status: completed / partial (timed out with data) / failed
-        # R6-2: Detect stdout failure signals even when exit code is 0
-        _stdout_has_failure = bool(
-            result.stdout
-            and not effective_metrics
-            and any(
-                sig in result.stdout
-                for sig in ("FAIL:", "NaN/divergence", "Traceback (most recent")
-            )
+        result = controller.run_project(
+            lease,
+            sandbox,
+            selected_dir,
+            timeout_sec=config.experiment.time_budget_sec,
         )
-        if result.returncode == 0 and not result.timed_out and not _stdout_has_failure:
-            run_status = "completed"
-        elif result.timed_out and effective_metrics:
-            run_status = "partial"
-            logger.warning(
-                "Experiment timed out but captured %d partial metrics",
-                len(effective_metrics),
-            )
-        else:
-            run_status = "failed"
-            if _stdout_has_failure:
-                logger.warning(
-                    "Experiment exited cleanly but stdout contains failure signals"
-                )
-
-        # P1: Warn if experiment completed suspiciously fast (trivially easy benchmark)
-        if run_status == "completed" and result.elapsed_sec and result.elapsed_sec < 5.0:
-            logger.warning(
-                "Stage 12: Experiment completed in %.2fs — benchmark may be trivially easy. "
-                "Consider increasing task difficulty.",
-                result.elapsed_sec,
-            )
-
-        run_payload: dict[str, Any] = {
-            "run_id": "run-1",
-            "task_id": "sandbox-main",
-            "status": run_status,
-            "metrics": effective_metrics,
-            "elapsed_sec": result.elapsed_sec,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "timed_out": result.timed_out,
-            "completed_at": _utcnow_iso(),
-        }
-        if structured_results is not None:
-            run_payload["structured_results"] = structured_results
-        # Auto-generate results.json from parsed metrics if sandbox didn't produce one
-        if structured_results is None and effective_metrics:
-            auto_results = {"source": "stdout_parsed", "metrics": effective_metrics}
-            (runs_dir / "results.json").write_text(
-                json.dumps(auto_results, indent=2), encoding="utf-8"
-            )
-            logger.info("Stage 12: Auto-generated results.json from stdout metrics (%d keys)", len(effective_metrics))
-        (runs_dir / "run-1.json").write_text(
-            json.dumps(run_payload, indent=2), encoding="utf-8"
-        )
-
-        # R11-6: Time budget adequacy check
-        if result.timed_out or (result.elapsed_sec and result.elapsed_sec > config.experiment.time_budget_sec * 0.9):
-            # Parse stdout to estimate how many conditions/seeds completed
-            _stdout = result.stdout or ""
-            _completed_conditions = set()
-            _completed_seeds = 0
-            for _line in _stdout.splitlines():
-                if "condition=" in _line and "seed=" in _line:
-                    _completed_seeds += 1
-                    _cond_match = re.match(r".*condition=(\S+)", _line)
-                    if _cond_match:
-                        _completed_conditions.add(_cond_match.group(1))
-            _time_budget_warning = {
-                "timed_out": result.timed_out,
-                "elapsed_sec": result.elapsed_sec,
-                "budget_sec": config.experiment.time_budget_sec,
-                "conditions_completed": sorted(_completed_conditions),
-                "total_seed_runs": _completed_seeds,
-                "warning": (
-                    f"Experiment used {result.elapsed_sec:.0f}s of "
-                    f"{config.experiment.time_budget_sec}s budget. "
-                    f"Only {len(_completed_conditions)} conditions completed "
-                    f"({_completed_seeds} seed-runs). Consider increasing "
-                    f"time_budget_sec for more complete results."
-                ),
-            }
-            logger.warning(
-                "Stage 12: %s", _time_budget_warning["warning"]
-            )
-            (stage_dir / "time_budget_warning.json").write_text(
-                json.dumps(_time_budget_warning, indent=2), encoding="utf-8"
-            )
-
-        # FIX-8: Validate seed count from structured results
-        if structured_results and isinstance(structured_results, dict):
-            _sr_conditions = structured_results.get("conditions", structured_results.get("per_condition", {}))
-            if isinstance(_sr_conditions, dict):
-                for _cname, _cdata in _sr_conditions.items():
-                    if isinstance(_cdata, dict):
-                        _seeds_run = _cdata.get("seeds_run", _cdata.get("n_seeds", 0))
-                        if isinstance(_seeds_run, (int, float)) and 0 < _seeds_run < 3:
-                            logger.warning(
-                                "Stage 12: Condition '%s' ran only %d seed(s) — "
-                                "minimum 3 required for statistical validity",
-                                _cname, int(_seeds_run),
-                            )
-
-    elif mode == "simulated":
-        schedule = _safe_json_loads(schedule_text, {})
-        tasks = schedule.get("tasks", []) if isinstance(schedule, dict) else []
-        if not isinstance(tasks, list):
-            tasks = []
-        for idx, task in enumerate(tasks or [{"id": "task-1", "name": "simulated"}]):
-            task_id = (
-                str(task.get("id", f"task-{idx + 1}"))
-                if isinstance(task, dict)
-                else f"task-{idx + 1}"
-            )
-            payload = {
-                "run_id": f"run-{idx + 1}",
-                "task_id": task_id,
-                "status": "simulated",
-                "key_metrics": {
-                    config.experiment.metric_key: round(0.3 + idx * 0.03, 4),
-                    "secondary_metric": round(0.6 - idx * 0.04, 4),
-                },
-                "notes": "Simulated run result",
-                "completed_at": _utcnow_iso(),
-            }
-            run_id = str(payload["run_id"])
-            (runs_dir / f"{_safe_filename(run_id)}.json").write_text(
-                json.dumps(payload, indent=2), encoding="utf-8"
-            )
-    else:
-        runner = ExperimentRunner(config.experiment, runs_dir / "workspace")
-        history = runner.run_loop(code_text, run_id=f"exp-{run_dir.name}", llm=llm)
-        runner.save_history(stage_dir / "experiment_history.json")
-        for item in history.results:
-            payload = {
-                "run_id": f"run-{item.iteration}",
-                "task_id": item.run_id,
-                "status": "completed" if item.error is None else "failed",
-                "metrics": item.metrics,
-                "primary_metric": item.primary_metric,
-                "improved": item.improved,
-                "kept": item.kept,
-                "elapsed_sec": item.elapsed_sec,
-                "error": item.error,
-                "completed_at": _utcnow_iso(),
-            }
-            run_id = str(payload["run_id"])
-            (runs_dir / f"{_safe_filename(run_id)}.json").write_text(
-                json.dumps(payload, indent=2), encoding="utf-8"
-            )
-    # ---- Hard guard: block pipeline when experiment produced no real data ----
-    # Issue #165 / fabrication-guard: An experiment that completes in seconds
-    # with zero metrics (or only noise) must NOT proceed to paper writing.
-    # The old code always returned DONE, which let fabricated papers through.
-    _has_real_metrics = False
-    if mode in ("sandbox", "docker"):
-        # Check that we have at least one non-trivial float metric
-        _real_metric_count = sum(
-            1 for k, v in (effective_metrics or {}).items()
-            if isinstance(v, (int, float)) and not math.isnan(v) and not math.isinf(v)
-        )
-        _has_real_metrics = _real_metric_count > 0
-        if not _has_real_metrics and run_status == "failed":
-            logger.error(
-                "Stage 12: Experiment FAILED and produced zero real metrics. "
-                "Refusing to mark as DONE to prevent fabricated results downstream."
-            )
-            return StageResult(
+        if result.returncode != 0 or result.timed_out:
+            controller.fail(lease, failure_code="sandbox_execution_failed_v1")
+            return finish(StageResult(
                 stage=Stage.EXPERIMENT_RUN,
                 status=StageStatus.FAILED,
-                artifacts=("runs/",),
-                evidence_refs=("stage-12/runs/",),
-                error=(
-                    f"Experiment failed with zero real metrics "
-                    f"(status={run_status}, elapsed={result.elapsed_sec:.1f}s). "
-                    f"Pipeline must not proceed to paper writing without experiment data."
-                ),
-            )
-        if not _has_real_metrics and _stdout_has_failure:
-            logger.error(
-                "Stage 12: Experiment crashed (failure signals in stdout) with zero "
-                "real metrics. Refusing to mark as DONE."
-            )
-            return StageResult(
-                stage=Stage.EXPERIMENT_RUN,
-                status=StageStatus.FAILED,
-                artifacts=("runs/",),
-                evidence_refs=("stage-12/runs/",),
-                error=(
-                    f"Experiment crashed with failure signals in stdout and zero "
-                    f"real metrics (elapsed={result.elapsed_sec:.1f}s). "
-                    f"Pipeline must not proceed without experiment data."
-                ),
-            )
-        # Anomaly detection: suspiciously fast completion with empty metrics
+                artifacts=("execution_invocation_journal.jsonl", "diagnostics/"),
+                evidence_refs=(),
+                error="Canonical Stage 12 sandbox invocation failed",
+            ))
+        output_dir = result.output_dir
         if (
-            run_status == "completed"
-            and not _has_real_metrics
-            and result.elapsed_sec is not None
-            and result.elapsed_sec < 30.0
+            not isinstance(output_dir, Path)
+            or output_dir.is_symlink()
+            or not output_dir.is_dir()
         ):
-            logger.error(
-                "Stage 12: Experiment 'completed' in %.1fs with zero real metrics "
-                "(time_budget=%ds). This is almost certainly a crash that was "
-                "misclassified. Refusing to mark as DONE.",
-                result.elapsed_sec,
-                config.experiment.time_budget_sec,
+            raise CanonicalExperimentEvidenceError(
+                "sandbox did not return an exact output directory"
             )
-            return StageResult(
-                stage=Stage.EXPERIMENT_RUN,
-                status=StageStatus.FAILED,
-                artifacts=("runs/",),
-                evidence_refs=("stage-12/runs/",),
-                error=(
-                    f"Experiment 'completed' in {result.elapsed_sec:.1f}s with zero "
-                    f"real metrics (budget was {config.experiment.time_budget_sec}s). "
-                    f"Likely a misclassified crash. Pipeline must not proceed "
-                    f"without experiment data."
-                ),
+        evaluator_path = output_dir / "results.json"
+        if evaluator_path.is_symlink() or not evaluator_path.is_file():
+            raise CanonicalExperimentEvidenceError(
+                "sandbox did not publish evaluator results.json"
             )
-    return StageResult(
+        structured_text = evaluator_path.read_text(encoding="utf-8")
+        invocation_text, aggregate_text = build_stage12_evidence_texts(
+            structured_text,
+            contract=contract,
+            evaluator_schema=evaluator_schema,
+        )
+        evidence_staging.mkdir()
+        run_path = evidence_staging / "run-1.json"
+        aggregate_path = evidence_staging / "results.json"
+        _atomic_write_text(run_path, invocation_text)
+        _atomic_write_text(aggregate_path, aggregate_text)
+        if evidence_dir.exists() or evidence_dir.is_symlink():
+            raise CanonicalExperimentEvidenceError(
+                "canonical Stage 12 evidence namespace already exists"
+            )
+        os.replace(evidence_staging, evidence_dir)
+        controller.complete(lease, result_sha256=sha256_text(invocation_text))
+        lease = None
+    except Exception as exc:  # noqa: BLE001
+        cleanup_error = ""
+        try:
+            for path in (evidence_staging, evidence_dir):
+                if path.is_symlink():
+                    path.unlink()
+                elif path.exists():
+                    shutil.rmtree(path)
+        except OSError as cleanup_exc:
+            cleanup_error = f"; partial evidence cleanup failed: {cleanup_exc}"
+        if lease is not None:
+            try:
+                controller.fail(lease, failure_code="evaluator_publication_failed_v1")
+            except Exception:  # noqa: BLE001
+                pass
+        return finish(StageResult(
+            stage=Stage.EXPERIMENT_RUN,
+            status=StageStatus.FAILED,
+            artifacts=("execution_invocation_journal.jsonl", "diagnostics/"),
+            evidence_refs=(),
+            error=f"Canonical Stage 12 publication failed: {exc}{cleanup_error}",
+        ))
+
+    journal_text = controller.journal_path.read_text(encoding="utf-8")
+    result_set = {
+        "schema_version": 1,
+        "result_set_policy_version": 1,
+        "result_set_type": "stage12_baseline",
+        "experiment_mode": mode,
+        "experiment_contract_path": seal["contract_path"],
+        "experiment_contract_sha256": seal["contract_sha256"],
+        "sealed_candidate_manifest_path": "stage-10/selected_candidate_manifest.json",
+        "sealed_candidate_manifest_sha256": seal_sha256,
+        "run_config_path": seal["run_config_path"],
+        "run_config_sha256": seal["run_config_sha256"],
+        "config_semantic_policy_version": seal["config_semantic_policy_version"],
+        "config_semantic_sha256": seal["config_semantic_sha256"],
+        "claim_scope": contract.claim_scope,
+        "dataset_origin": contract.dataset_origin,
+        "evaluator_schema": evaluator_schema,
+        "invocation_journal": {
+            "path": "stage-12/execution_invocation_journal.jsonl",
+            "sha256": sha256_text(journal_text),
+        },
+        "execution_statuses": [{
+            "ordinal": 1,
+            "status": "completed",
+            "result_path": "stage-12/evidence-v1/run-1.json",
+            "failure_code": None,
+        }],
+        "evidence_files": [
+            {
+                "path": "stage-12/evidence-v1/results.json",
+                "sha256": sha256_text(aggregate_text),
+            },
+            {
+                "path": "stage-12/evidence-v1/run-1.json",
+                "sha256": sha256_text(invocation_text),
+            },
+        ],
+    }
+    result_set_text = canonical_json_text(result_set)
+    try:
+        parse_experiment_result_set(result_set_text)
+        validate_experiment_result_set(run_dir, config, result_set_text)
+        _atomic_write_text(stage_dir / "experiment_result_set.json", result_set_text)
+        validate_experiment_result_set(run_dir, config)
+    except Exception as exc:  # noqa: BLE001
+        (stage_dir / "experiment_result_set.json").unlink(missing_ok=True)
+        cleanup_error = ""
+        try:
+            if evidence_dir.is_symlink():
+                evidence_dir.unlink()
+            elif evidence_dir.exists():
+                shutil.rmtree(evidence_dir)
+        except OSError as cleanup_exc:
+            cleanup_error = f"; canonical evidence cleanup failed: {cleanup_exc}"
+        return finish(StageResult(
+            stage=Stage.EXPERIMENT_RUN,
+            status=StageStatus.FAILED,
+            artifacts=("execution_invocation_journal.jsonl", "diagnostics/"),
+            evidence_refs=(),
+            error=f"Canonical Stage 12 manifest replay failed: {exc}{cleanup_error}",
+        ))
+    return finish(StageResult(
         stage=Stage.EXPERIMENT_RUN,
         status=StageStatus.DONE,
-        artifacts=("runs/",),
-        evidence_refs=("stage-12/runs/",),
-    )
+        artifacts=(
+            "experiment_result_set.json",
+            "execution_invocation_journal.jsonl",
+            "evidence-v1/",
+            "diagnostics/",
+        ),
+        evidence_refs=("stage-12/experiment_result_set.json",),
+    ))
 
 
 def _execute_iterative_refine(
