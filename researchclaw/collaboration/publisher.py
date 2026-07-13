@@ -36,6 +36,11 @@ class ArtifactPublisher:
         Returns:
             Number of artifacts published.
         """
+        from researchclaw.pipeline.canonical_evidence_capabilities import (
+            require_canonical_evidence_capabilities,
+        )
+
+        require_canonical_evidence_capabilities("ArtifactPublisher.publish_from_run_dir")
         artifacts: dict[str, Any] = {}
 
         # Literature summary (from stage 7 - synthesis)
@@ -75,6 +80,11 @@ class ArtifactPublisher:
 
     def _extract_experiments(self, run_dir: Path) -> Any:
         """Extract experiment results from stage 14."""
+        from researchclaw.pipeline.canonical_evidence_capabilities import (
+            require_canonical_evidence_capabilities,
+        )
+
+        require_canonical_evidence_capabilities("ArtifactPublisher._extract_experiments")
         for stage_dir in run_dir.glob("stage-14*"):
             summary = stage_dir / "experiment_summary.json"
             if summary.exists():

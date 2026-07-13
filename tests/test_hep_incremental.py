@@ -6,6 +6,8 @@ import json
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
+
 from researchclaw.config import ColliderAgentConfig
 
 

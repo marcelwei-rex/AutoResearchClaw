@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
+
 from researchclaw.collaboration.repository import ResearchRepository
 from researchclaw.collaboration.publisher import ArtifactPublisher
 from researchclaw.collaboration.subscriber import ArtifactSubscriber

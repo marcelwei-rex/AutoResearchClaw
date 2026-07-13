@@ -8,6 +8,8 @@ from typing import Any, cast
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
+
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
 from researchclaw.pipeline import runner as rc_runner

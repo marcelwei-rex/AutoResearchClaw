@@ -23,7 +23,7 @@ from researchclaw.pipeline._helpers import (
     _build_context_preamble,
     _chat_with_prompt,
     _extract_yaml_block,
-    _get_evolution_overlay,
+    _get_pipeline_evolution_overlay,
     _load_hardware_profile,
     _read_prior_artifact,
     _safe_json_loads,
@@ -222,7 +222,7 @@ def _execute_experiment_design(
         _per_condition_sec = int(config.experiment.time_budget_sec * 0.7 / 6)
         _tier1 = "CIFAR-10, CIFAR-100, MNIST, FashionMNIST, STL-10, SVHN"
 
-        _overlay = _get_evolution_overlay(run_dir, "experiment_design")
+        _overlay = _get_pipeline_evolution_overlay(run_dir, "experiment_design")
         sp = _pm.for_stage(
             "experiment_design",
             evolution_overlay=_overlay,

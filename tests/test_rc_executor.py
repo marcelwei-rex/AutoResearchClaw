@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
 import yaml
 
 from researchclaw.adapters import AdapterBundle
@@ -534,29 +536,32 @@ def _write_experiment_contract(run_dir: Path, cfg: RCConfig) -> Path:
     stage_dir = run_dir / "stage-09"
     stage_dir.mkdir(parents=True, exist_ok=True)
     contract_path = stage_dir / "experiment_contract.yaml"
-    dump_contract(derive_contract(cfg, {"datasets": ["synthetic traces"]}), contract_path)
+    contract = derive_contract(cfg, {"datasets": ["synthetic traces"]})
+    # These legacy execution tests intentionally exercise model-owned main.py
+    # below the simulated C5 gate; pipeline_validation now requires scaffold bytes.
+    dump_contract(replace(contract, claim_scope="exploratory"), contract_path)
     return contract_path
 
 
 def _write_sealed_candidate(run_dir: Path, cfg: RCConfig, main_code: str) -> Path:
-    from researchclaw.pipeline.stage_impls._execution import _scaffold_sha256
-
-    contract_path = _write_experiment_contract(run_dir, cfg)
-    selected = run_dir / "stage-10" / "selected_candidate"
-    selected.mkdir(parents=True, exist_ok=True)
-    main = selected / "main.py"
-    main.write_text(main_code, encoding="utf-8")
-    manifest = {
-        "schema_version": 1,
-        "contract_sha256": sha256_file(contract_path),
-        "scaffold_sha256": _scaffold_sha256(),
-        "entry_point": "main.py",
-        "files": {"main.py": {"sha256": sha256_file(main)}},
-    }
-    (run_dir / "stage-10" / "selected_candidate_manifest.json").write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8"
+    from researchclaw.literature.citation_policy import write_active_config_binding
+    from researchclaw.pipeline.stage_impls._code_generation import (
+        _seal_selected_candidate,
     )
-    return selected
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = run_dir / "config.yaml"
+    if not snapshot.exists():
+        raw = json.loads(json.dumps(cfg.to_dict()))
+        snapshot.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+        write_active_config_binding(run_dir, snapshot)
+    contract_path = _write_experiment_contract(run_dir, cfg)
+    experiment = run_dir / "stage-10" / "experiment"
+    experiment.mkdir(parents=True, exist_ok=True)
+    main = experiment / "main.py"
+    main.write_text(main_code, encoding="utf-8")
+    _seal_selected_candidate(run_dir / "stage-10", experiment, contract_path, cfg)
+    return run_dir / "stage-10" / "selected_candidate"
 
 
 def test_executor_map_has_25_entries() -> None:

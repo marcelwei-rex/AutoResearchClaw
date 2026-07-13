@@ -40,12 +40,20 @@ from researchclaw.pipeline._helpers import (
     _extract_code_block,
     _extract_multi_file_blocks,
     _extract_yaml_block,
-    _get_evolution_overlay,
+    _get_pipeline_evolution_overlay,
     _load_hardware_profile,
     _read_prior_artifact,
     _safe_json_loads,
     _utcnow_iso,
 )
+from researchclaw.pipeline.canonical_experiment_evidence import (
+    CONFIG_SEMANTIC_POLICY_VERSION,
+    SEAL_POLICY_VERSION,
+    STAGE10_SEAL_SCHEMA_VERSION,
+    semantic_config_sha256,
+    validate_selected_candidate_manifest,
+)
+from researchclaw.literature.citation_policy import resolve_active_config_snapshot
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
 
@@ -192,9 +200,40 @@ def _seal_selected_candidate(
     stage_dir: Path,
     exp_dir: Path,
     contract_path: Path,
-    *,
-    scaffold_owned_files: set[str] | None = None,
-    plugin_owned_files: set[str] | None = None,
+    config: RCConfig,
+) -> tuple[str, str]:
+    """Publish the Stage 10 seal transactionally or leave no canonical pair."""
+    manifest_path = stage_dir / "selected_candidate_manifest.json"
+    manifest_tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    selected_dir = stage_dir / "selected_candidate"
+    if manifest_path.exists():
+        manifest_path.unlink()
+    if manifest_tmp_path.exists():
+        manifest_tmp_path.unlink()
+    if selected_dir.exists():
+        shutil.rmtree(selected_dir)
+    try:
+        return _seal_selected_candidate_impl(
+            stage_dir,
+            exp_dir,
+            contract_path,
+            config,
+        )
+    except Exception:
+        if manifest_path.exists():
+            manifest_path.unlink()
+        if manifest_tmp_path.exists():
+            manifest_tmp_path.unlink()
+        if selected_dir.exists():
+            shutil.rmtree(selected_dir)
+        raise
+
+
+def _seal_selected_candidate_impl(
+    stage_dir: Path,
+    exp_dir: Path,
+    contract_path: Path,
+    config: RCConfig,
 ) -> tuple[str, str]:
     """Copy code-only selected candidate files and write the sealing manifest."""
     selected_dir = stage_dir / "selected_candidate"
@@ -205,8 +244,8 @@ def _seal_selected_candidate(
     manifest_files: dict[str, dict[str, str]] = {}
     scaffold_files: dict[str, dict[str, str]] = {}
     plugin_files: dict[str, dict[str, str]] = {}
-    scaffold_owned_files = scaffold_owned_files or set()
-    plugin_owned_files = plugin_owned_files or set()
+    contract = load_contract(contract_path)
+    scaffold_owned_files = {"main.py"} if contract.claim_scope == "pipeline_validation" else set()
     for src in sorted(exp_dir.glob("*.py")):
         if not src.is_file():
             continue
@@ -216,28 +255,60 @@ def _seal_selected_candidate(
         manifest_files[src.name] = {"sha256": sha}
         if src.name in scaffold_owned_files:
             scaffold_files[src.name] = {"sha256": sha, "owner": "scaffold"}
-        elif src.name in plugin_owned_files:
-            plugin_files[src.name] = {"sha256": sha, "owner": "model"}
 
     if not manifest_files:
         raise RuntimeError("selected_candidate contains no Python files")
     if "main.py" not in manifest_files:
         raise RuntimeError("selected_candidate missing required main.py")
+    if contract.claim_scope == "pipeline_validation":
+        if set(manifest_files) != {"main.py", "detector_plugin.py"}:
+            raise RuntimeError(
+                "pipeline_validation selected_candidate must contain exactly "
+                "main.py and detector_plugin.py"
+            )
+        expected_main = render_main_py(contract).encode("utf-8")
+        if (selected_dir / "main.py").read_bytes() != expected_main:
+            raise RuntimeError("scaffold-owned main.py differs from canonical renderer")
+
+    run_dir = stage_dir.parent
+    canonical_contract = find_stage09_contract(run_dir)
+    if canonical_contract is None or canonical_contract.resolve() != contract_path.resolve():
+        raise RuntimeError("Stage 10 contract does not match canonical Stage 9 selector")
+    contract_relative = contract_path.relative_to(run_dir).as_posix()
+    config_relative, _config_text, config_sha256 = resolve_active_config_snapshot(
+        run_dir, config
+    )
+    unowned = set(manifest_files) - set(scaffold_files) - set(plugin_files)
+    for name in sorted(unowned):
+        plugin_files[name] = {
+            "sha256": manifest_files[name]["sha256"],
+            "owner": "model",
+        }
 
     manifest = {
-        "schema_version": 1,
-        "generated": _utcnow_iso(),
-        "contract_path": "stage-09/experiment_contract.yaml",
+        "schema_version": STAGE10_SEAL_SCHEMA_VERSION,
+        "seal_policy_version": SEAL_POLICY_VERSION,
+        "producer_input_type": "sealed_python_candidate",
+        "contract_path": contract_relative,
         "contract_sha256": sha256_file(contract_path),
+        "run_config_path": config_relative,
+        "run_config_sha256": config_sha256,
+        "config_semantic_policy_version": CONFIG_SEMANTIC_POLICY_VERSION,
+        "config_semantic_sha256": semantic_config_sha256(config),
         "scaffold_sha256": _scaffold_sha256(),
         "entry_point": "main.py",
         "files": manifest_files,
+        "scaffold_files": scaffold_files,
+        "plugin_files": plugin_files,
     }
-    if scaffold_files or plugin_files:
-        manifest["scaffold_files"] = scaffold_files
-        manifest["plugin_files"] = plugin_files
     manifest_path = stage_dir / "selected_candidate_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    manifest_tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    manifest_tmp_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest_tmp_path.replace(manifest_path)
+    validate_selected_candidate_manifest(run_dir, config, manifest_path.read_text(encoding="utf-8"))
     return "selected_candidate/", "selected_candidate_manifest.json"
 
 
@@ -591,11 +662,7 @@ def _execute_pipeline_validation_plugin_generation(
 
     try:
         selected_artifact, manifest_artifact = _seal_selected_candidate(
-            stage_dir,
-            exp_dir,
-            contract_path,
-            scaffold_owned_files={"main.py"},
-            plugin_owned_files={"detector_plugin.py"},
+            stage_dir, exp_dir, contract_path, config
         )
     except Exception as exc:  # noqa: BLE001
         error = f"Stage 10 sealing failed: {exc}"
@@ -1415,7 +1482,7 @@ def _execute_code_generation(
             f"`{_md}` — use direction={'lower' if _md == 'minimize' else 'higher'} "
             f"in METRIC_DEF. You MUST NOT use the opposite direction."
         )
-        _overlay = _get_evolution_overlay(run_dir, "code_generation")
+        _overlay = _get_pipeline_evolution_overlay(run_dir, "code_generation")
         sp = _pm.for_stage(
             "code_generation",
             evolution_overlay=_overlay,
@@ -2308,7 +2375,7 @@ Multi-file experiment project with {len(files)} file(s): {file_list}
 
     try:
         selected_artifact, manifest_artifact = _seal_selected_candidate(
-            stage_dir, exp_dir, contract_path
+            stage_dir, exp_dir, contract_path, config
         )
     except Exception as exc:  # noqa: BLE001
         error = f"Stage 10 sealing failed: {exc}"

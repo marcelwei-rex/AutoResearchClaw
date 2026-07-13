@@ -46,7 +46,7 @@ from researchclaw.pipeline._helpers import (
     _extract_paper_title,
     _generate_framework_diagram_prompt,
     _generate_neurips_checklist,
-    _get_evolution_overlay,
+    _get_pipeline_evolution_overlay,
     _read_best_analysis,
     _read_prior_artifact,
     _safe_json_loads,
@@ -447,7 +447,7 @@ def _execute_paper_outline(
             _asg = _pm.block("academic_style_guide")
         except (KeyError, Exception):
             _asg = ""
-        _overlay = _get_evolution_overlay(run_dir, "paper_outline")
+        _overlay = _get_pipeline_evolution_overlay(run_dir, "paper_outline")
         sp = _pm.for_stage(
             "paper_outline",
             evolution_overlay=_overlay,
@@ -842,7 +842,7 @@ def _write_paper_sections(
     except (KeyError, Exception):  # noqa: BLE001
         _writing_structure = ""
 
-    _overlay = _get_evolution_overlay(run_dir, "paper_draft")
+    _overlay = _get_pipeline_evolution_overlay(run_dir, "paper_draft")
     system = pm.for_stage(
         "paper_draft",
         evolution_overlay=_overlay,

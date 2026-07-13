@@ -5,22 +5,32 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
 from researchclaw.experiment_runtime.contract import (
     derive_contract,
     dump_contract,
+    load_contract,
     sha256_file,
 )
+from researchclaw.experiment_runtime.scaffold import render_main_py
 from researchclaw.pipeline.stage_impls._execution import (
     _execute_experiment_run,
     _latest_sandbox_project_results,
     _load_sealed_candidate,
     _scaffold_sha256,
 )
-from researchclaw.pipeline.stage_impls._code_generation import _execute_code_generation
+from researchclaw.pipeline.stage_impls._code_generation import (
+    _execute_code_generation,
+    _seal_selected_candidate,
+)
 from researchclaw.pipeline.stages import StageStatus
+from researchclaw.literature.citation_policy import write_active_config_binding
+from researchclaw.pipeline.canonical_evidence_capabilities import (
+    CanonicalEvidenceMigrationIncomplete,
+)
 
 
 def _cfg(tmp_path: Path) -> RCConfig:
@@ -53,6 +63,12 @@ def _cfg(tmp_path: Path) -> RCConfig:
 
 
 def _write_contract(run: Path, cfg: RCConfig) -> Path:
+    run.mkdir(parents=True, exist_ok=True)
+    snapshot = run / "config.yaml"
+    if not snapshot.exists():
+        raw = json.loads(json.dumps(cfg.to_dict()))
+        snapshot.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+        write_active_config_binding(run, snapshot)
     contract = derive_contract(cfg, {"datasets": ["synthetic traces"]})
     path = run / "stage-09" / "experiment_contract.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,26 +78,18 @@ def _write_contract(run: Path, cfg: RCConfig) -> Path:
 
 def _write_selected_candidate(run: Path, cfg: RCConfig) -> Path:
     contract_path = _write_contract(run, cfg)
-    selected = run / "stage-10" / "selected_candidate"
-    selected.mkdir(parents=True, exist_ok=True)
-    main = selected / "main.py"
-    main.write_text(
-        "import json\n"
-        "with open('results.json', 'w', encoding='utf-8') as f:\n"
-        "    json.dump({'dataset_origin': 'synthetic', 'metrics': {'detection_f1': 0.5}}, f)\n",
+    experiment = run / "stage-10" / "experiment"
+    experiment.mkdir(parents=True, exist_ok=True)
+    (experiment / "main.py").write_text(
+        render_main_py(load_contract(contract_path)),
         encoding="utf-8",
     )
-    manifest = {
-        "schema_version": 1,
-        "contract_sha256": sha256_file(contract_path),
-        "scaffold_sha256": _scaffold_sha256(),
-        "entry_point": "main.py",
-        "files": {"main.py": {"sha256": sha256_file(main)}},
-    }
-    (run / "stage-10" / "selected_candidate_manifest.json").write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8"
+    (experiment / "detector_plugin.py").write_text(
+        "def fit(X, y):\n    return None\n\ndef predict(X):\n    return [0] * len(X)\n",
+        encoding="utf-8",
     )
-    return selected
+    _seal_selected_candidate(run / "stage-10", experiment, contract_path, cfg)
+    return run / "stage-10" / "selected_candidate"
 
 
 def test_stage12_rejects_when_manifest_missing(tmp_path: Path) -> None:
@@ -90,10 +98,8 @@ def test_stage12_rejects_when_manifest_missing(tmp_path: Path) -> None:
     _write_contract(run, cfg)
     (run / "stage-10" / "selected_candidate").mkdir(parents=True)
 
-    result = _execute_experiment_run(run / "stage-12", run, cfg, AdapterBundle())
-
-    assert result.status == StageStatus.FAILED
-    assert "sealed candidate manifest missing" in (result.error or "")
+    with pytest.raises(CanonicalEvidenceMigrationIncomplete):
+        _execute_experiment_run(run / "stage-12", run, cfg, AdapterBundle())
 
 
 def test_stage12_loads_valid_sealed_candidate(tmp_path: Path) -> None:
@@ -101,7 +107,7 @@ def test_stage12_loads_valid_sealed_candidate(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     selected = _write_selected_candidate(run, cfg)
 
-    assert _load_sealed_candidate(run) == selected
+    assert _load_sealed_candidate(run, cfg) == selected
 
 
 def test_stage12_rejects_contract_hash_mismatch(tmp_path: Path) -> None:
@@ -113,8 +119,8 @@ def test_stage12_rejects_contract_hash_mismatch(tmp_path: Path) -> None:
     manifest["contract_sha256"] = "0" * 64
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="contract_sha256 mismatch"):
-        _load_sealed_candidate(run)
+    with pytest.raises(RuntimeError, match="contract hash mismatch"):
+        _load_sealed_candidate(run, cfg)
 
 
 def test_stage12_rejects_scaffold_hash_mismatch(tmp_path: Path) -> None:
@@ -126,8 +132,8 @@ def test_stage12_rejects_scaffold_hash_mismatch(tmp_path: Path) -> None:
     manifest["scaffold_sha256"] = "0" * 64
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="scaffold_sha256 mismatch"):
-        _load_sealed_candidate(run)
+    with pytest.raises(RuntimeError, match="scaffold hash mismatch"):
+        _load_sealed_candidate(run, cfg)
 
 
 def test_stage12_rejects_file_hash_mismatch(tmp_path: Path) -> None:
@@ -136,8 +142,8 @@ def test_stage12_rejects_file_hash_mismatch(tmp_path: Path) -> None:
     selected = _write_selected_candidate(run, cfg)
     (selected / "main.py").write_text("print('tampered')\n", encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="sha256 mismatch"):
-        _load_sealed_candidate(run)
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        _load_sealed_candidate(run, cfg)
 
 
 def test_stage12_rejects_unmanifested_file(tmp_path: Path) -> None:
@@ -146,8 +152,8 @@ def test_stage12_rejects_unmanifested_file(tmp_path: Path) -> None:
     selected = _write_selected_candidate(run, cfg)
     (selected / "helper.py").write_text("x = 1\n", encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="unmanifested files"):
-        _load_sealed_candidate(run)
+    with pytest.raises(RuntimeError, match="file-set mismatch"):
+        _load_sealed_candidate(run, cfg)
 
 
 @pytest.mark.parametrize("name", ["results.json", "smoke_results.json", "metrics.json"])
@@ -162,8 +168,8 @@ def test_stage12_rejects_banned_files(tmp_path: Path, name: str) -> None:
     manifest["files"][name] = {"sha256": sha256_file(path)}
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="may list only Python files|banned files"):
-        _load_sealed_candidate(run)
+    with pytest.raises(RuntimeError, match="Python files|owner maps"):
+        _load_sealed_candidate(run, cfg)
 
 
 @pytest.mark.parametrize("name", ["runs", "attempts", "candidates", ".smoke_sandbox"])
@@ -173,8 +179,8 @@ def test_stage12_rejects_directories(tmp_path: Path, name: str) -> None:
     selected = _write_selected_candidate(run, cfg)
     (selected / name).mkdir()
 
-    with pytest.raises(RuntimeError, match="directories in selected_candidate"):
-        _load_sealed_candidate(run)
+    with pytest.raises(RuntimeError, match="flat regular-file"):
+        _load_sealed_candidate(run, cfg)
 
 
 def test_stage12_rejects_owner_sets_that_do_not_match_files(tmp_path: Path) -> None:
@@ -189,8 +195,8 @@ def test_stage12_rejects_owner_sets_that_do_not_match_files(tmp_path: Path) -> N
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="owner file sets"):
-        _load_sealed_candidate(run)
+    with pytest.raises(RuntimeError, match="owner maps"):
+        _load_sealed_candidate(run, cfg)
 
 
 def test_stage12_rejects_invalid_scaffold_owner(tmp_path: Path) -> None:
@@ -216,8 +222,8 @@ def test_stage12_rejects_invalid_scaffold_owner(tmp_path: Path) -> None:
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="scaffold owner invalid"):
-        _load_sealed_candidate(run)
+    with pytest.raises(RuntimeError, match="invalid owner"):
+        _load_sealed_candidate(run, cfg)
 
 
 def test_stage10_scaffold_candidate_runs_in_stage12(tmp_path: Path) -> None:
@@ -237,20 +243,13 @@ def test_stage10_scaffold_candidate_runs_in_stage12(tmp_path: Path) -> None:
     )
     assert stage10.status == StageStatus.DONE
 
-    stage12 = _execute_experiment_run(
-        run / "stage-12",
-        run,
-        cfg,
-        AdapterBundle(),
-    )
-
-    assert stage12.status == StageStatus.DONE
-    results = json.loads(
-        (run / "stage-12" / "runs" / "results.json").read_text(encoding="utf-8")
-    )
-    assert results["evaluator_owner"] == "scaffold"
-    assert results["dataset_origin"] == "synthetic"
-    assert "detection_f1" in results["metrics"]
+    with pytest.raises(CanonicalEvidenceMigrationIncomplete):
+        _execute_experiment_run(
+            run / "stage-12",
+            run,
+            cfg,
+            AdapterBundle(),
+        )
 
 
 def test_latest_sandbox_project_results_accepts_legacy_project_dir(tmp_path: Path) -> None:

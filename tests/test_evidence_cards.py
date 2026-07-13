@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
 import yaml
 
 from researchclaw.adapters import AdapterBundle

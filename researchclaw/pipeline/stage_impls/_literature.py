@@ -59,7 +59,7 @@ from researchclaw.pipeline._helpers import (
     _chat_with_prompt,
     _extract_topic_keywords,
     _extract_yaml_block,
-    _get_evolution_overlay,
+    _get_pipeline_evolution_overlay,
     _read_prior_artifact,
     _safe_filename,
     _safe_json_loads,
@@ -137,7 +137,7 @@ def _execute_search_strategy(
     sources: list[dict[str, Any]] | None = None
     if llm is not None:
         _pm = prompts or PromptManager()
-        _overlay = _get_evolution_overlay(run_dir, "search_strategy")
+        _overlay = _get_pipeline_evolution_overlay(run_dir, "search_strategy")
         sp = _pm.for_stage("search_strategy", evolution_overlay=_overlay, topic=topic, problem_tree=problem_tree)
         resp = _chat_with_prompt(
             llm,
@@ -483,7 +483,7 @@ def _execute_literature_collect(
     if not candidates and llm is not None:
         plan_text = _read_prior_artifact(run_dir, "search_plan.yaml") or ""
         _pm = prompts or PromptManager()
-        _overlay = _get_evolution_overlay(run_dir, "literature_collect")
+        _overlay = _get_pipeline_evolution_overlay(run_dir, "literature_collect")
         sp = _pm.for_stage("literature_collect", evolution_overlay=_overlay, topic=topic, plan_text=plan_text)
         resp = _chat_with_prompt(
             llm,
@@ -1041,7 +1041,7 @@ def _screen_candidate_batch(
         f"EXPECTED SOURCE IDENTITIES: {json.dumps(expected_ids)}\n"
     )
     manager = prompts or PromptManager()
-    overlay = _get_evolution_overlay(run_dir, "literature_screen")
+    overlay = _get_pipeline_evolution_overlay(run_dir, "literature_screen")
     stage_prompt = manager.for_stage(
         "literature_screen",
         evolution_overlay=overlay,
@@ -1348,7 +1348,7 @@ def _extract_evidence_card_batch(
     manager = prompts or PromptManager()
     stage_prompt = manager.for_stage(
         "knowledge_extract",
-        evolution_overlay=_get_evolution_overlay(run_dir, "knowledge_extract"),
+        evolution_overlay=_get_pipeline_evolution_overlay(run_dir, "knowledge_extract"),
         shortlist="",
     )
     response = _chat_with_prompt(

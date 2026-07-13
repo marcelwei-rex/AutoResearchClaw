@@ -93,6 +93,19 @@ class ResearchClawMCPServer:
 
     async def _handle_get_results(self, args: dict[str, Any]) -> dict[str, Any]:
         """Get experiment results."""
+        from researchclaw.pipeline.canonical_evidence_capabilities import (
+            CanonicalEvidenceMigrationIncomplete,
+            require_canonical_evidence_capabilities,
+        )
+
+        try:
+            require_canonical_evidence_capabilities("mcp.get_experiment_results")
+        except CanonicalEvidenceMigrationIncomplete as exc:
+            return {
+                "success": False,
+                "error": str(exc),
+                "error_code": exc.code,
+            }
         run_id = args["run_id"]
         run_dir = _validated_run_dir(run_id)
         results_file = run_dir / "experiment_results.json"

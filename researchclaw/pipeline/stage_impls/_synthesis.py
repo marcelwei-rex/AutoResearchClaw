@@ -17,7 +17,7 @@ from researchclaw.literature.evidence_cards import (
 from researchclaw.pipeline._helpers import (
     StageResult,
     _default_hypotheses,
-    _get_evolution_overlay,
+    _get_pipeline_evolution_overlay,
     _multi_perspective_generate,
     _parse_jsonl_rows,
     _read_prior_artifact,
@@ -68,7 +68,7 @@ def _execute_synthesis(
 
     if llm is not None:
         _pm = prompts or PromptManager()
-        _overlay = _get_evolution_overlay(run_dir, "synthesis")
+        _overlay = _get_pipeline_evolution_overlay(run_dir, "synthesis")
         sp = _pm.for_stage(
             "synthesis",
             evolution_overlay=_overlay,

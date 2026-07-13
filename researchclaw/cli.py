@@ -176,6 +176,29 @@ def cmd_run(args: argparse.Namespace) -> int:
         config_path, check_paths=False, profile_override=profile_override
     )
 
+    # C0-C4: reject Stage 12+ before preflight, run-directory creation, config
+    # snapshot writes, or any pipeline side effect.
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        CanonicalEvidenceMigrationIncomplete,
+        require_canonical_evidence_capabilities,
+    )
+    from researchclaw.pipeline.stages import Stage as _CapabilityStage
+
+    requested_to_valid = True
+    try:
+        requested_to = _CapabilityStage[to_stage_name.upper()] if to_stage_name else None
+    except KeyError:
+        requested_to = None
+        requested_to_valid = False
+    if requested_to_valid and (
+        requested_to is None or int(requested_to) >= int(_CapabilityStage.EXPERIMENT_RUN)
+    ):
+        try:
+            require_canonical_evidence_capabilities("cli.run")
+        except CanonicalEvidenceMigrationIncomplete as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
     # If the user deployed a profile, force every detector call to agree
     # with it — otherwise Stage 10/18/22 may keyword-detect a different
     # domain from the topic and mix prompt styles.
@@ -1003,7 +1026,7 @@ def cmd_report(args: argparse.Namespace) -> int:
 
     try:
         report = generate_report(run_dir)
-    except (FileNotFoundError, ValueError) as e:
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 

@@ -8,6 +8,8 @@ from typing import Any, cast
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
+
 from researchclaw.pipeline.stage_impls import _review_publish
 from researchclaw.pipeline.stage_impls._paper_writing import (
     PaperSectionContractError,

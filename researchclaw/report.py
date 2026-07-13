@@ -25,6 +25,11 @@ def generate_report(run_dir: Path) -> str:
         FileNotFoundError: If run_dir doesn't exist.
         ValueError: If run_dir has no pipeline_summary.json.
     """
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities("report.generate_report")
     if not run_dir.exists():
         raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
@@ -94,6 +99,11 @@ def _paper_section(run_dir: Path) -> str:
 
 
 def _experiment_section(run_dir: Path) -> str:
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities("report._experiment_section")
     lines = ["## Experiments"]
 
     code_path = run_dir / "stage-10" / "experiment_code.py"
@@ -199,5 +209,10 @@ def print_report(run_dir: Path) -> None:
 
 
 def write_report(run_dir: Path, output_path: Path) -> None:
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities("report.write_report")
     report = generate_report(run_dir)
     _ = output_path.write_text(report, encoding="utf-8")

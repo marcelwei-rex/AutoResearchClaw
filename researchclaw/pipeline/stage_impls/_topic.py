@@ -14,7 +14,7 @@ from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._domain import _detect_domain
 from researchclaw.pipeline._helpers import (
     StageResult,
-    _get_evolution_overlay,
+    _get_pipeline_evolution_overlay,
     _read_prior_artifact,
     _safe_json_loads,
     _utcnow_iso,
@@ -40,7 +40,7 @@ def _execute_topic_init(
     )
     if llm is not None:
         _pm = prompts or PromptManager()
-        _overlay = _get_evolution_overlay(run_dir, "topic_init")
+        _overlay = _get_pipeline_evolution_overlay(run_dir, "topic_init")
         sp = _pm.for_stage(
             "topic_init",
             evolution_overlay=_overlay,
@@ -126,7 +126,7 @@ def _execute_problem_decompose(
     goal_text = _read_prior_artifact(run_dir, "goal.md") or ""
     if llm is not None:
         _pm = prompts or PromptManager()
-        _overlay = _get_evolution_overlay(run_dir, "problem_decompose")
+        _overlay = _get_pipeline_evolution_overlay(run_dir, "problem_decompose")
         sp = _pm.for_stage(
             "problem_decompose",
             evolution_overlay=_overlay,

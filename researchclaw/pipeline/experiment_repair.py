@@ -299,6 +299,12 @@ def run_repair_loop(
     -------
     ExperimentRepairResult
     """
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities("experiment_repair.run_repair_loop")
+
     repair_cfg = config.experiment.repair
 
     # Load initial experiment summary
@@ -800,6 +806,14 @@ def _run_experiment_in_sandbox(
     Returns a dict with keys: stdout, stderr, returncode, metrics, elapsed_sec, timed_out.
     Returns None if sandbox creation fails.
     """
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities(
+        "experiment_repair.run_experiment_in_sandbox"
+    )
+
     try:
         from researchclaw.experiment.factory import create_sandbox
 

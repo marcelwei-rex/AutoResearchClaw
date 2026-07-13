@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
+
 
 class _DummyResponse:
     def __init__(self, payload: bytes) -> None:

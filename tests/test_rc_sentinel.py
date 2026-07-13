@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
+
 from researchclaw.pipeline import runner as rc_runner
 from researchclaw.pipeline.stages import Stage
 

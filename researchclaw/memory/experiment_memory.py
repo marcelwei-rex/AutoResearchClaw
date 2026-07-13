@@ -51,6 +51,7 @@ class ExperimentMemory:
         Returns:
             The generated memory entry ID.
         """
+        _require_experiment_memory_capability("record_hyperparams")
         hp_str = json.dumps(hyperparams, indent=2, default=str)
         content = (
             f"Task: {task_type}\n"
@@ -91,6 +92,7 @@ class ExperimentMemory:
         Returns:
             The generated memory entry ID.
         """
+        _require_experiment_memory_capability("record_architecture")
         content = (
             f"Task: {task_type}\n"
             f"Architecture: {architecture}\n"
@@ -128,6 +130,7 @@ class ExperimentMemory:
         Returns:
             The generated memory entry ID.
         """
+        _require_experiment_memory_capability("record_training_trick")
         content = (
             f"Trick: {trick}\n"
             f"Improvement: {improvement:+.1%}\n"
@@ -161,6 +164,7 @@ class ExperimentMemory:
         Returns:
             Formatted string of best configurations.
         """
+        _require_experiment_memory_capability("recall_best_configs")
         query = f"best hyperparameters and architecture for {task_type}"
         results = self._retriever.recall_by_text(
             query, category=CATEGORY, top_k=top_k, embed_fn=self._embed_fn
@@ -180,3 +184,11 @@ class ExperimentMemory:
             if hp:
                 parts.append(f"   Config: {json.dumps(hp, default=str)}")
         return "\n".join(parts)
+
+
+def _require_experiment_memory_capability(operation: str) -> None:
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities(f"ExperimentMemory.{operation}")

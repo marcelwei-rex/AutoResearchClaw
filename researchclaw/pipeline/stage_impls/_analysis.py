@@ -18,7 +18,7 @@ from researchclaw.pipeline._helpers import (
     _chat_with_prompt,
     _collect_experiment_results,
     _collect_json_context,
-    _get_evolution_overlay,
+    _get_pipeline_evolution_overlay,
     _multi_perspective_generate,
     _read_prior_artifact,
     _safe_json_loads,
@@ -1265,7 +1265,7 @@ def _execute_research_decision(
 
     if llm is not None:
         _pm = prompts or PromptManager()
-        _overlay = _get_evolution_overlay(run_dir, "research_decision")
+        _overlay = _get_pipeline_evolution_overlay(run_dir, "research_decision")
         sp = _pm.for_stage("research_decision", evolution_overlay=_overlay, analysis=analysis)
         _user = sp.user + _degenerate_hint + _diagnosis_hint + _ablation_refine_hint
         resp = _chat_with_prompt(llm, sp.system, _user)

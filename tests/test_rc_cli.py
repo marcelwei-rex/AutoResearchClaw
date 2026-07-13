@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
+
 from researchclaw import cli as rc_cli
 from researchclaw.config import resolve_config_path
 from researchclaw.pipeline.executor import StageResult

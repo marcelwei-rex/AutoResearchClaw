@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
+
 from researchclaw.memory.store import MemoryEntry, MemoryStore, VALID_CATEGORIES
 from researchclaw.memory.decay import time_decay_weight, confidence_update
 from researchclaw.memory.embeddings import EmbeddingProvider, _tokenize, _hash_token

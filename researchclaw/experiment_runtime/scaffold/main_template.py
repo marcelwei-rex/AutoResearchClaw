@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import json
 import time
+from decimal import Decimal, ROUND_HALF_EVEN, localcontext
 from pathlib import Path
 
 import numpy as np
@@ -65,6 +66,73 @@ from detector_plugin import DetectorPlugin
 
 CONTRACT = {constants}
 SEEDS = (42, 123, 256)
+DECIMAL_PRECISION = 50
+
+
+def _as_decimal(value):
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a metric value")
+    if isinstance(value, Decimal):
+        number = value
+    elif isinstance(value, int):
+        number = Decimal(value)
+    else:
+        raise TypeError("metric authority must originate as Decimal or integer")
+    if not number.is_finite():
+        raise ValueError("metric value must be finite")
+    return number
+
+
+def _decimal_mean(values):
+    numbers = [_as_decimal(value) for value in values]
+    if not numbers:
+        raise ValueError("cannot aggregate an empty metric sequence")
+    with localcontext() as context:
+        context.prec = DECIMAL_PRECISION
+        context.rounding = ROUND_HALF_EVEN
+        return sum(numbers, Decimal(0)) / Decimal(len(numbers))
+
+
+def _decimal_ratio(numerator, denominator):
+    if denominator <= 0:
+        raise ValueError("metric denominator must be positive")
+    with localcontext() as context:
+        context.prec = DECIMAL_PRECISION
+        context.rounding = ROUND_HALF_EVEN
+        return Decimal(numerator) / Decimal(denominator)
+
+
+def _json_number_text(value):
+    number = _as_decimal(value)
+    if number == 0:
+        return "0"
+    text = format(number, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def _json_text(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, Decimal):
+        return _json_number_text(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_json_text(item) for item in value) + "]"
+    if isinstance(value, dict):
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("JSON object keys must be strings")
+        return "{{" + ",".join(
+            json.dumps(key, ensure_ascii=False) + ":" + _json_text(value[key])
+            for key in sorted(value)
+        ) + "}}"
+    raise TypeError(f"unsupported JSON value: {{type(value).__name__}}")
 
 
 def _make_synthetic_hpc(seed: int, n_train: int = 240, n_test: int = 160):
@@ -95,9 +163,10 @@ def _as_binary_predictions(values, expected_len: int):
         raise ValueError(f"predict returned {{arr.shape[0]}} rows; expected {{expected_len}}")
     if arr.ndim > 1:
         arr = arr.reshape((expected_len, -1))[:, 0]
-    arr = np.where(arr.astype(float) >= 0.5, 1, 0).astype(int)
-    if not np.all(np.isfinite(arr)):
+    numeric = arr.astype(float)
+    if not np.all(np.isfinite(numeric)):
         raise ValueError("predict returned non-finite values")
+    arr = np.where(numeric >= 0.5, 1, 0).astype(int)
     return arr
 
 
@@ -108,43 +177,47 @@ def _score(y_true, y_pred):
     tn = int(np.sum((y_true == 0) & (y_pred == 0)))
     fp = int(np.sum((y_true == 0) & (y_pred == 1)))
     fn = int(np.sum((y_true == 1) & (y_pred == 0)))
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+    precision = _decimal_ratio(tp, max(tp + fp, 1))
+    recall = _decimal_ratio(tp, max(tp + fn, 1))
+    f1 = _decimal_ratio(2 * tp, max(2 * tp + fp + fn, 1))
     tpr = recall
-    tnr = tn / max(tn + fp, 1)
-    fpr = fp / max(fp + tn, 1)
-    accuracy = (tp + tn) / max(len(y_true), 1)
+    tnr = _decimal_ratio(tn, max(tn + fp, 1))
+    fpr = _decimal_ratio(fp, max(fp + tn, 1))
+    accuracy = _decimal_ratio(tp + tn, max(len(y_true), 1))
     return {{
-        "accuracy": float(accuracy),
-        "detection_f1": float(f1),
-        "precision": float(precision),
-        "tpr": float(tpr),
-        "tnr": float(tnr),
-        "fpr": float(fpr),
+        "accuracy": accuracy,
+        "detection_f1": f1,
+        "precision": precision,
+        "tpr": tpr,
+        "tnr": tnr,
+        "fpr": fpr,
     }}
 
 
 def run():
     per_seed = []
-    start = time.perf_counter()
+    start_ns = time.perf_counter_ns()
     for seed in SEEDS:
         x_train, y_train, x_test, y_test = _make_synthetic_hpc(seed)
         plugin = DetectorPlugin()
         fit_result = plugin.fit(x_train, y_train)
         if fit_result is not None:
             plugin = fit_result
-        predict_start = time.perf_counter()
+        predict_start_ns = time.perf_counter_ns()
         y_pred = _as_binary_predictions(plugin.predict(x_test), len(y_test))
-        latency_ms = (time.perf_counter() - predict_start) * 1000.0 / max(len(y_test), 1)
-        metrics = _score(y_test, y_pred)
-        metrics["latency_ms"] = float(latency_ms)
+        predict_elapsed_ns = time.perf_counter_ns() - predict_start_ns
+        latency_ms = _decimal_ratio(
+            predict_elapsed_ns,
+            max(len(y_test), 1) * 1_000_000,
+        )
+        metrics = {{key: _as_decimal(value) for key, value in _score(y_test, y_pred).items()}}
+        metrics["latency_ms"] = latency_ms
         per_seed.append({{"seed": seed, "metrics": metrics}})
 
     aggregate = {{}}
     for key in per_seed[0]["metrics"]:
-        aggregate[key] = float(np.mean([item["metrics"][key] for item in per_seed]))
-    elapsed = time.perf_counter() - start
+        aggregate[key] = _decimal_mean([item["metrics"][key] for item in per_seed])
+    elapsed = _decimal_ratio(time.perf_counter_ns() - start_ns, 1_000_000_000)
     metric_key = CONTRACT["metric_key"]
     results = {{
         "schema_version": 1,
@@ -153,17 +226,17 @@ def run():
         "dataset_name": CONTRACT["dataset_name"],
         "primary_metric": {{
             "key": metric_key,
-            "value": float(aggregate.get(metric_key, aggregate.get("detection_f1", 0.0))),
+            "value": aggregate.get(metric_key, aggregate.get("detection_f1", Decimal(0))),
             "direction": CONTRACT["metric_direction"],
         }},
         "metrics": aggregate,
         "seeds": list(SEEDS),
         "conditions": ["DetectorPlugin"],
         "per_seed": per_seed,
-        "runtime_sec": float(elapsed),
+        "runtime_sec": elapsed,
         "evaluator_owner": "scaffold",
     }}
-    Path("results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+    Path("results.json").write_text(_json_text(results) + "\\n", encoding="utf-8")
     print(f"{{metric_key}}: {{results['primary_metric']['value']:.6f}}")
     print("dataset_origin:", results["dataset_origin"])
 

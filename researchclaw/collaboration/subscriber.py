@@ -52,6 +52,13 @@ class ArtifactSubscriber:
         Returns:
             List of matching experiment artifacts.
         """
+        from researchclaw.pipeline.canonical_evidence_capabilities import (
+            require_canonical_evidence_capabilities,
+        )
+
+        require_canonical_evidence_capabilities(
+            "ArtifactSubscriber.find_similar_experiments"
+        )
         return self._repo.search(
             query, artifact_type="experiment_results", max_results=max_results
         )

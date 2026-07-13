@@ -821,6 +821,11 @@ def _get_evolution_overlay(
 
     Returns empty string if no relevant lessons/skills exist or on any error.
     """
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities("pipeline._get_evolution_overlay")
     parts: list[str] = []
 
     # --- Section 1: Evolution lessons + MetaClaw arc-* skills ---
@@ -850,6 +855,26 @@ def _get_evolution_overlay(
         pass
 
     return "\n".join(parts)
+
+
+def _get_pipeline_evolution_overlay(
+    run_dir: Path | None,
+    stage_name: str,
+    *,
+    config: object | None = None,
+    topic: str = "",
+) -> str:
+    """Return no overlay while C0-C4 blocks persistent experiment knowledge."""
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        CanonicalEvidenceMigrationIncomplete,
+    )
+
+    try:
+        return _get_evolution_overlay(
+            run_dir, stage_name, config=config, topic=topic
+        )
+    except CanonicalEvidenceMigrationIncomplete:
+        return ""
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
+
 from researchclaw.pipeline.stages import NONCRITICAL_STAGES, Stage, StageStatus
 from researchclaw.pipeline.stage_impls import _review_publish
 

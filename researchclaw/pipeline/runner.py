@@ -557,6 +557,14 @@ def execute_pipeline(
 ) -> list[StageResult]:
     """Execute pipeline stages sequentially from *from_stage* to *to_stage* (inclusive)."""
 
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        requested_range_requires_canonical_evidence,
+        require_canonical_evidence_capabilities,
+    )
+
+    if requested_range_requires_canonical_evidence(from_stage, to_stage):
+        require_canonical_evidence_capabilities("execute_pipeline")
+
     results: list[StageResult] = []
     started = False
     total_stages = len(STAGE_SEQUENCE)
@@ -2074,6 +2082,11 @@ def _metaclaw_post_pipeline(
     2. Record skill effectiveness feedback.
     3. Signal session end to MetaClaw proxy.
     """
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities("metaclaw_post_pipeline")
     bridge = getattr(config, "metaclaw_bridge", None)
     if not bridge or not getattr(bridge, "enabled", False):
         return

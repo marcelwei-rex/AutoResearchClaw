@@ -184,6 +184,11 @@ def extract_lessons(
     - Runtime warnings from experiment stderr → code_bug lesson
     - Metric anomalies (NaN, identical convergence) → metric_anomaly lesson
     """
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities("evolution.extract_lessons")
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     lessons: list[LessonEntry] = []
 
@@ -299,6 +304,11 @@ def _extract_runtime_lessons(
     run_dir: Path, timestamp: str, run_id: str
 ) -> list[LessonEntry]:
     """Extract fine-grained lessons from experiment run artifacts."""
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities("evolution._extract_runtime_lessons")
     import math
 
     lessons: list[LessonEntry] = []

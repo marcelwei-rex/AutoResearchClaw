@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
@@ -26,9 +27,11 @@ from researchclaw.experiment_runtime.contract import (
 )
 from researchclaw.experiment_runtime.scaffold import (
     PluginValidationError,
+    render_main_py,
     validate_detector_plugin,
 )
 from researchclaw.pipeline.stages import StageStatus
+from researchclaw.literature.citation_policy import write_active_config_binding
 
 
 def _cfg(tmp_path: Path) -> RCConfig:
@@ -107,6 +110,7 @@ def _write_stage9_contract(
     claim_scope: str | None = None,
     dataset_origin: str | None = None,
 ) -> None:
+    _write_config_snapshot(run_dir, cfg)
     stage9 = run_dir / "stage-09"
     stage9.mkdir(parents=True, exist_ok=True)
     contract_data = derive_contract(cfg, {"datasets": ["synthetic traces"]}).to_dict()
@@ -115,6 +119,16 @@ def _write_stage9_contract(
     if dataset_origin is not None:
         contract_data["dataset_origin"] = dataset_origin
     dump_contract(validate_contract_dict(contract_data), stage9 / "experiment_contract.yaml")
+
+
+def _write_config_snapshot(run_dir: Path, cfg: RCConfig) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = run_dir / "config.yaml"
+    if snapshot.exists():
+        return
+    raw = json.loads(json.dumps(cfg.to_dict()))
+    snapshot.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    write_active_config_binding(run_dir, snapshot)
 
 
 def test_stage10_smoke_gate_writes_quarantined_results(tmp_path: Path) -> None:
@@ -169,22 +183,29 @@ def test_stage10_selected_candidate_is_python_only(tmp_path: Path) -> None:
     stage10 = run_dir / "stage-10"
     exp_dir = stage10 / "experiment"
     cfg = _cfg(tmp_path)
+    _write_config_snapshot(run_dir, cfg)
     stage9.mkdir(parents=True)
     contract_path = stage9 / "experiment_contract.yaml"
-    dump_contract(derive_contract(cfg, {"datasets": ["synthetic"]}), contract_path)
-    _write_main(exp_dir)
+    contract = derive_contract(cfg, {"datasets": ["synthetic"]})
+    dump_contract(contract, contract_path)
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    (exp_dir / "main.py").write_text(render_main_py(contract), encoding="utf-8")
+    (exp_dir / "detector_plugin.py").write_text(
+        "def fit(X, y):\n    return None\n\ndef predict(X):\n    return [0] * len(X)\n",
+        encoding="utf-8",
+    )
     (exp_dir / "requirements.txt").write_text("numpy\n", encoding="utf-8")
     (exp_dir / "config.yaml").write_text("x: 1\n", encoding="utf-8")
     (exp_dir / "results.json").write_text("{}", encoding="utf-8")
 
-    _seal_selected_candidate(stage10, exp_dir, contract_path)
+    _seal_selected_candidate(stage10, exp_dir, contract_path, cfg)
 
     selected = stage10 / "selected_candidate"
-    assert sorted(p.name for p in selected.iterdir()) == ["main.py"]
+    assert sorted(p.name for p in selected.iterdir()) == ["detector_plugin.py", "main.py"]
     manifest = json.loads(
         (stage10 / "selected_candidate_manifest.json").read_text(encoding="utf-8")
     )
-    assert sorted(manifest["files"]) == ["main.py"]
+    assert sorted(manifest["files"]) == ["detector_plugin.py", "main.py"]
 
 
 def test_stage10_pipeline_validation_uses_scaffold_owned_main(tmp_path: Path) -> None:
@@ -192,6 +213,7 @@ def test_stage10_pipeline_validation_uses_scaffold_owned_main(tmp_path: Path) ->
     stage9 = run_dir / "stage-09"
     stage10 = run_dir / "stage-10"
     cfg = _cfg(tmp_path)
+    _write_config_snapshot(run_dir, cfg)
     stage9.mkdir(parents=True)
     dump_contract(derive_contract(cfg, {"datasets": ["synthetic"]}), stage9 / "experiment_contract.yaml")
     (stage9 / "exp_plan.yaml").write_text("objectives: []\n", encoding="utf-8")

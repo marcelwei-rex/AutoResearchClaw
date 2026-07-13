@@ -35,7 +35,7 @@ from researchclaw.pipeline._helpers import (
     _ensure_sandbox_deps,
     _extract_code_block,
     _extract_multi_file_blocks,
-    _get_evolution_overlay,
+    _get_pipeline_evolution_overlay,
     _load_hardware_profile,
     _parse_metrics_from_stdout,
     _read_prior_artifact,
@@ -45,6 +45,10 @@ from researchclaw.pipeline._helpers import (
     _write_stage_meta,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
+from researchclaw.pipeline.canonical_experiment_evidence import (
+    CanonicalExperimentEvidenceError,
+    validate_selected_candidate_manifest,
+)
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
@@ -69,7 +73,7 @@ def _execute_resource_planning(
     schedule_source = "template"
     if llm is not None:
         _pm = prompts or PromptManager()
-        _overlay = _get_evolution_overlay(run_dir, "resource_planning")
+        _overlay = _get_pipeline_evolution_overlay(run_dir, "resource_planning")
         sp = _pm.for_stage("resource_planning", evolution_overlay=_overlay, exp_plan=exp_plan)
         resp = _chat_with_prompt(
             llm,
@@ -147,7 +151,7 @@ def _scaffold_sha256() -> str:
     return runtime_scaffold_sha256()
 
 
-def _load_sealed_candidate(run_dir: Path) -> Path:
+def _load_sealed_candidate(run_dir: Path, config: RCConfig) -> Path:
     stage10_dir = run_dir / "stage-10"
     manifest_path = stage10_dir / "selected_candidate_manifest.json"
     if not manifest_path.is_file():
@@ -157,99 +161,9 @@ def _load_sealed_candidate(run_dir: Path) -> Path:
         raise RuntimeError("sealed selected_candidate directory missing")
 
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        validate_selected_candidate_manifest(run_dir, config)
+    except (CanonicalExperimentEvidenceError, OSError, UnicodeDecodeError) as exc:
         raise RuntimeError(f"sealed candidate manifest invalid: {exc}") from exc
-    if not isinstance(manifest, dict):
-        raise RuntimeError("sealed candidate manifest root must be an object")
-    if manifest.get("schema_version") != 1:
-        raise RuntimeError("sealed candidate manifest schema_version must be 1")
-
-    files_meta = manifest.get("files")
-    if not isinstance(files_meta, dict) or not files_meta:
-        raise RuntimeError("sealed candidate manifest files must be a non-empty object")
-
-    scaffold_files_meta = manifest.get("scaffold_files") or {}
-    plugin_files_meta = manifest.get("plugin_files") or {}
-    if scaffold_files_meta and not isinstance(scaffold_files_meta, dict):
-        raise RuntimeError("sealed candidate manifest scaffold_files must be an object")
-    if plugin_files_meta and not isinstance(plugin_files_meta, dict):
-        raise RuntimeError("sealed candidate manifest plugin_files must be an object")
-    if scaffold_files_meta or plugin_files_meta:
-        owned_files = set(scaffold_files_meta) | set(plugin_files_meta)
-        if owned_files != set(files_meta):
-            raise RuntimeError(
-                "sealed candidate owner file sets must exactly match files"
-            )
-        for name, meta in scaffold_files_meta.items():
-            if not isinstance(meta, dict) or meta.get("owner") != "scaffold":
-                raise RuntimeError(f"sealed candidate scaffold owner invalid for {name}")
-        for name, meta in plugin_files_meta.items():
-            if not isinstance(meta, dict) or meta.get("owner") != "model":
-                raise RuntimeError(f"sealed candidate plugin owner invalid for {name}")
-
-    manifest_files = {str(name) for name in files_meta.keys()}
-    if any("/" in name or "\\" in name or name in {"", ".", ".."} for name in manifest_files):
-        raise RuntimeError("sealed candidate manifest contains unsafe file names")
-    if any(not name.endswith(".py") for name in manifest_files):
-        raise RuntimeError("sealed candidate manifest may list only Python files")
-
-    actual_files = {p.name for p in selected_dir.iterdir() if p.is_file()}
-    actual_dirs = {p.name for p in selected_dir.iterdir() if p.is_dir()}
-    extra_files = actual_files - manifest_files
-    missing_files = manifest_files - actual_files
-    if extra_files:
-        raise RuntimeError(
-            "unmanifested files in selected_candidate: " + ", ".join(sorted(extra_files))
-        )
-    if missing_files:
-        raise RuntimeError(
-            "manifested files missing from selected_candidate: "
-            + ", ".join(sorted(missing_files))
-        )
-    if actual_dirs:
-        raise RuntimeError(
-            "directories in selected_candidate: " + ", ".join(sorted(actual_dirs))
-        )
-    banned_files = actual_files & _BANNED_SELECTED_FILES
-    if banned_files:
-        raise RuntimeError(
-            "banned files in selected_candidate: " + ", ".join(sorted(banned_files))
-        )
-    banned_dirs = actual_dirs & _BANNED_SELECTED_DIRS
-    if banned_dirs:
-        raise RuntimeError(
-            "banned directories in selected_candidate: " + ", ".join(sorted(banned_dirs))
-        )
-
-    contract_path = find_stage09_contract(run_dir)
-    if contract_path is None:
-        raise RuntimeError("stage-09 experiment_contract.yaml missing")
-    try:
-        load_contract(contract_path)
-    except ContractValidationError as exc:
-        raise RuntimeError(f"stage-09 experiment_contract.yaml invalid: {exc}") from exc
-    expected_contract_sha = str(manifest.get("contract_sha256") or "").strip()
-    if not expected_contract_sha:
-        raise RuntimeError("sealed candidate manifest missing contract_sha256")
-    if sha256_file(contract_path) != expected_contract_sha:
-        raise RuntimeError("sealed candidate contract_sha256 mismatch")
-
-    expected_scaffold_sha = str(manifest.get("scaffold_sha256") or "").strip()
-    if not expected_scaffold_sha:
-        raise RuntimeError("sealed candidate manifest missing scaffold_sha256")
-    if _scaffold_sha256() != expected_scaffold_sha:
-        raise RuntimeError("sealed candidate scaffold_sha256 mismatch")
-
-    for name, meta in files_meta.items():
-        if not isinstance(meta, dict):
-            raise RuntimeError(f"sealed candidate manifest entry invalid for {name}")
-        expected_sha = str(meta.get("sha256") or "").strip()
-        if not expected_sha:
-            raise RuntimeError(f"sealed candidate manifest missing sha256 for {name}")
-        actual_sha = sha256_file(selected_dir / str(name))
-        if actual_sha != expected_sha:
-            raise RuntimeError(f"sha256 mismatch for selected_candidate/{name}")
 
     return selected_dir
 
@@ -281,6 +195,11 @@ def _execute_experiment_run(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities("stage12.execute_experiment_run")
     from researchclaw.experiment.factory import create_sandbox
     from researchclaw.experiment.runner import ExperimentRunner
 
@@ -297,7 +216,7 @@ def _execute_experiment_run(
     # release_check).
     if mode != "collider_agent":
         try:
-            sealed_candidate_dir = _load_sealed_candidate(run_dir)
+            sealed_candidate_dir = _load_sealed_candidate(run_dir, config)
         except RuntimeError as exc:
             error = str(exc)
             logger.error("Stage 12: %s", error)
@@ -766,6 +685,12 @@ def _execute_iterative_refine(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities("stage13.execute_iterative_refine")
+
     from researchclaw.experiment.factory import create_sandbox
     from researchclaw.experiment.validator import format_issues_for_llm, validate_code
 
