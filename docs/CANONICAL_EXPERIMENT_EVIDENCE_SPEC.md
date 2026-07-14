@@ -1387,9 +1387,32 @@ until C5.
   fatal, regardless of stored condition names. LLM quality output uses one
   exact JSON schema that rejects duplicate keys and nonfinite values; malformed
   output cannot enter graceful degradation. One final Stage 04-19 rediscovery
-  plus canonical-snapshot fixpoint runs before either success-named output is
-  published.
-- C3-C: migrate Stage 21 archive consumers.
+  plus canonical-snapshot fixpoint runs before either report is published.
+  The reports remain diagnostic until `quality_gate_manifest.json` is published
+  last. That strict manifest exists only for a replayed `passed` result or a
+  policy-authorized `degraded` result; every FAILED result leaves it absent.
+  It binds both report hashes, canonical evidence, the Stage 19 publication,
+  threshold, graceful-degradation policy, score, and derived outcome.
+- C3-C: migrate Stage 21 archive consumers. Stage 21 loads the exact Stage 19
+  publication plus strict `quality_report.json`, `fabrication_flags.json`, and
+  final `quality_gate_manifest.json` bindings before any LLM call. It
+  independently reconstructs metric values, conditions, counts, and failure
+  state from canonical evidence and re-derives the passed/degraded outcome.
+  Its retrospective receives only the captured
+  revised paper, canonical Stage 14 analysis, canonical runtime topic, and a
+  fixed upstream-proceed statement; it does not reopen Stage 15 text, goal
+  files, evolution overlays, best-analysis selectors, or versioned stage
+  directories. `bundle_index.json` is a deterministic path/SHA-256 inventory
+  of the captured authority set and the generated archive, not a recursive
+  `stage-*` filesystem listing. Stage 21 rejects a symlink or non-directory
+  output namespace and invalidates `bundle_index.json` before touching the
+  archive. A final Stage 04-20 fixpoint runs before each success-named output
+  is published, and failure removes the index commit point before the archive.
+  Stage 20 and Stage 21 each hold the canonical output directory open with
+  `O_DIRECTORY | O_NOFOLLOW`; every owned-file create, readback, replace, and
+  unlink is relative to that same directory fd. Final publication also requires
+  the live run/stage paths to retain the captured device/inode identities, so a
+  parent replacement cannot redirect cleanup or authorize detached outputs.
 - C3-D: migrate Stage 22 export consumers.
 - C3-E: add the complete call-site and forbidden-scan guard, then set
   `stage19_22_consumers` to v1 only after Stage 18 through Stage 22 pass it.

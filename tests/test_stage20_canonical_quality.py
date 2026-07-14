@@ -10,6 +10,8 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 
 from researchclaw.adapters import AdapterBundle
+from researchclaw.pipeline import bound_output_namespace as output_namespace_module
+from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 from researchclaw.pipeline.stage19_input_bundle import (
     BoundArtifact,
     Stage19InputBundleError,
@@ -20,6 +22,9 @@ from researchclaw.pipeline.stage20_input_bundle import (
     Stage20InputBundleError,
     load_stage20_input_bundle,
     verify_stage20_input_bundle_unchanged,
+)
+from researchclaw.pipeline.stage20_publication import (
+    reconstruct_stage20_fabrication_state,
 )
 from researchclaw.pipeline import stage20_input_bundle as stage20_bundle_module
 from researchclaw.pipeline.stage_impls import _review_publish
@@ -253,6 +258,7 @@ def _run_quality_gate(
     summary_override: dict | None = None,
     llm_response: str | None = None,
     graceful_degradation: bool = False,
+    replace_parent_during_chat: tuple[Path, Path] | None = None,
 ) -> tuple[object, Path, str]:
     run_dir = tmp_path / "run"
     stage_dir = run_dir / "stage-20"
@@ -340,10 +346,12 @@ def _run_quality_gate(
             prompts.append(kwargs["revised"])
             return SimpleNamespace(system="system", user="user", json_mode=True, max_tokens=100)
 
-    monkeypatch.setattr(
-        _review_publish,
-        "_chat_with_prompt",
-        lambda *_a, **_k: SimpleNamespace(
+    def chat(*_args, **_kwargs):
+        if replace_parent_during_chat is not None:
+            detached, outside = replace_parent_during_chat
+            stage_dir.rename(detached)
+            stage_dir.symlink_to(outside, target_is_directory=True)
+        return SimpleNamespace(
             content=llm_response
             or json.dumps(
                 {
@@ -354,8 +362,9 @@ def _run_quality_gate(
                     "required_actions": [],
                 }
             )
-        ),
-    )
+        )
+
+    monkeypatch.setattr(_review_publish, "_chat_with_prompt", chat)
     (run_dir / "stage-14_v99").mkdir()
     (run_dir / "stage-14_v99/experiment_summary.json").write_text(
         json.dumps({"metrics_summary": {"shadow": {"mean": 999}}}),
@@ -391,6 +400,8 @@ def test_stage20_uses_only_canonical_summary_and_preserves_decimal(
     assert report["source_paper_sha256"] == hashlib.sha256(
         b"## Results\n\nCanonical metric [smith2024]."
     ).hexdigest()
+    manifest = json.loads((stage_dir / "quality_gate_manifest.json").read_text())
+    assert manifest["outcome"] == "passed"
 
 
 def test_stage20_fixpoint_failure_removes_success_named_outputs(
@@ -403,6 +414,7 @@ def test_stage20_fixpoint_failure_removes_success_named_outputs(
     assert result.status is StageStatus.FAILED
     assert not (stage_dir / "quality_report.json").exists()
     assert not (stage_dir / "fabrication_flags.json").exists()
+    assert not (stage_dir / "quality_gate_manifest.json").exists()
 
 
 def test_stage20_blocks_failed_condition_with_zero_metrics_despite_high_score(
@@ -424,6 +436,126 @@ def test_stage20_blocks_failed_condition_with_zero_metrics_despite_high_score(
     assert flags["experiment_failed"] is True
     assert flags["has_real_data"] is False
     assert flags["verified_values_count"] == 0
+    assert not (stage_dir / "quality_gate_manifest.json").exists()
+
+
+def test_stage20_failed_and_degraded_generations_have_distinct_commit_points(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    response = json.dumps(
+        {
+            "score_1_to_10": 2,
+            "verdict": "revise",
+            "strengths": ["bounded"],
+            "weaknesses": ["weak"],
+            "required_actions": ["repair"],
+        }
+    )
+    failed, failed_dir, _ = _run_quality_gate(
+        tmp_path / "failed",
+        monkeypatch,
+        llm_response=response,
+        graceful_degradation=False,
+    )
+    assert failed.status is StageStatus.FAILED
+    assert not (failed_dir / "quality_gate_manifest.json").exists()
+
+    degraded, degraded_dir, _ = _run_quality_gate(
+        tmp_path / "degraded",
+        monkeypatch,
+        llm_response=response,
+        graceful_degradation=True,
+    )
+    assert degraded.status is StageStatus.DONE
+    assert degraded.decision == "degraded"
+    manifest = json.loads((degraded_dir / "quality_gate_manifest.json").read_text())
+    assert manifest["outcome"] == "degraded"
+
+
+def test_stage20_rejects_parent_symlink_without_touching_external_manifest(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    external_manifest = outside / "quality_gate_manifest.json"
+    external_manifest.write_text("keep", encoding="utf-8")
+    stage_dir = run_dir / "stage-20"
+    stage_dir.symlink_to(outside, target_is_directory=True)
+
+    result = _review_publish._execute_quality_gate(
+        stage_dir, run_dir, SimpleNamespace(), AdapterBundle(), llm=None
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert external_manifest.read_text(encoding="utf-8") == "keep"
+
+
+def test_stage20_parent_replacement_during_llm_cannot_touch_external_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    external = {
+        name: outside / name
+        for name in (
+            "quality_report.json",
+            "fabrication_flags.json",
+            "quality_gate_manifest.json",
+        )
+    }
+    for path in external.values():
+        path.write_text("keep", encoding="utf-8")
+
+    result, _stage_dir, _prompt = _run_quality_gate(
+        tmp_path,
+        monkeypatch,
+        replace_parent_during_chat=(tmp_path / "detached-stage-20", outside),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert all(path.read_text(encoding="utf-8") == "keep" for path in external.values())
+    detached = tmp_path / "detached-stage-20"
+    assert not (detached / "quality_report.json").exists()
+    assert not (detached / "fabrication_flags.json").exists()
+    assert not (detached / "quality_gate_manifest.json").exists()
+
+
+def test_bound_output_write_preserves_original_error_when_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-20"
+    stage_dir.mkdir(parents=True)
+    output = BoundOutputNamespace.open(run_dir, stage_dir, "stage-20")
+    original_invalidate = output.invalidate
+    invalidation_calls = 0
+
+    def fail_cleanup(names: tuple[str, ...]) -> None:
+        nonlocal invalidation_calls
+        invalidation_calls += 1
+        if invalidation_calls == 1:
+            original_invalidate(names)
+            return
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(output, "invalidate", fail_cleanup)
+    monkeypatch.setattr(
+        output_namespace_module.os,
+        "write",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
+    )
+    try:
+        with pytest.raises(OSError, match="write failed") as raised:
+            output.write_text_atomic("quality_report.json", "payload")
+    finally:
+        output.close()
+
+    assert any(
+        "temporary output cleanup also failed: cleanup failed" in note
+        for note in getattr(raised.value, "__notes__", ())
+    )
 
 
 def test_stage20_registry_is_independent_of_global_decimal_precision() -> None:
@@ -443,12 +575,11 @@ def test_stage20_registry_is_independent_of_global_decimal_precision() -> None:
     try:
         for precision in (7, 28, 80):
             getcontext().prec = precision
-            registry = _review_publish._build_stage20_registry(
-                summary, metric_direction="maximize"
+            state = reconstruct_stage20_fabrication_state(
+                _evidence(summary),
+                SimpleNamespace(experiment=SimpleNamespace(metric_direction="maximize")),
             )
-            outputs.append(
-                tuple(sorted(_review_publish.canonical_decimal(v) for v in registry.values))
-            )
+            outputs.append(state.real_metric_values)
     finally:
         getcontext().prec = original_precision
     assert outputs[0] == outputs[1] == outputs[2]

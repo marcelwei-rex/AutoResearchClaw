@@ -9,7 +9,7 @@ import re
 import hashlib
 from collections.abc import Mapping
 from collections import Counter
-from decimal import ROUND_HALF_EVEN, localcontext
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +50,9 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     load_canonical_experiment_evidence,
     semantic_config_sha256,
 )
+from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 from researchclaw.pipeline.stage19_input_bundle import (
+    BoundArtifact,
     Stage19InputBundle,
     Stage19InputBundleError,
     load_stage19_input_bundle,
@@ -58,10 +60,23 @@ from researchclaw.pipeline.stage19_input_bundle import (
     verify_stage19_input_bundle_unchanged,
 )
 from researchclaw.pipeline.stage20_input_bundle import (
+    Stage20InputBundle,
     Stage20InputBundleError,
     load_stage20_input_bundle,
     parse_revision_evidence_binding,
     verify_stage20_input_bundle_unchanged,
+)
+from researchclaw.pipeline.stage20_publication import (
+    reconstruct_stage20_fabrication_state,
+    thaw_canonical_summary,
+)
+from researchclaw.pipeline.stage21_input_bundle import (
+    Stage21InputBundle,
+    Stage21InputBundleError,
+    load_stage21_input_bundle,
+    replay_stage21_input_bundle,
+    verify_stage21_input_bundle_unchanged,
+    verify_stage21_output_artifacts,
 )
 from researchclaw.pipeline._helpers import (
     StageResult,
@@ -1006,30 +1021,35 @@ def _execute_paper_revision(
 # ---------------------------------------------------------------------------
 
 
-def _thaw_authority_value(value: object) -> object:
-    """Copy a frozen accessor value without changing Decimal authority."""
+_STAGE20_OWNED_OUTPUTS = (
+    "quality_gate_manifest.json",
+    "quality_report.json",
+    "fabrication_flags.json",
+    "quality_gate_manifest.json.tmp",
+    "quality_report.json.tmp",
+    "fabrication_flags.json.tmp",
+)
 
-    if isinstance(value, Mapping):
-        return {str(key): _thaw_authority_value(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [_thaw_authority_value(item) for item in value]
-    return value
+
+def _bound_output_artifact(
+    output: BoundOutputNamespace, stage_name: str, name: str
+) -> BoundArtifact:
+    content = output.read_bytes(name)
+    return BoundArtifact(
+        path=f"{stage_name}/{name}",
+        sha256=hashlib.sha256(content).hexdigest(),
+        content=content,
+    )
 
 
-def _build_stage20_registry(
-    summary: dict[str, Any], *, metric_direction: str
-):
-    """Build every derived Decimal under the fixed Stage 20 arithmetic policy."""
-
-    from researchclaw.pipeline.verified_registry import VerifiedRegistry
-
-    with localcontext() as context:
-        context.prec = 50
-        context.rounding = ROUND_HALF_EVEN
-        return VerifiedRegistry.from_experiment(
-            summary,
-            metric_direction=metric_direction,
-        )
+def _output_invalidation_suffix(
+    output: BoundOutputNamespace, names: tuple[str, ...]
+) -> str:
+    try:
+        output.invalidate(names)
+    except OSError as exc:
+        return f"; output invalidation also failed: {exc}"
+    return ""
 
 
 def _normalize_quality_score(value: object) -> float:
@@ -1102,8 +1122,45 @@ def _execute_quality_gate(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
-    for owned_name in ("quality_report.json", "fabrication_flags.json"):
-        (stage_dir / owned_name).unlink(missing_ok=True)
+    output: BoundOutputNamespace | None = None
+    try:
+        output = BoundOutputNamespace.open(run_dir, stage_dir, "stage-20")
+        output.invalidate(_STAGE20_OWNED_OUTPUTS)
+    except OSError as exc:
+        if output is not None:
+            output.close()
+        return StageResult(
+            stage=Stage.QUALITY_GATE,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Stage 20 output namespace is unsafe: {exc}",
+            decision="retry",
+        )
+    assert output is not None
+    try:
+        return _execute_quality_gate_bound(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=llm,
+            prompts=prompts,
+            output=output,
+        )
+    finally:
+        output.close()
+
+
+def _execute_quality_gate_bound(
+    stage_dir: Path,
+    run_dir: Path,
+    config: RCConfig,
+    adapters: AdapterBundle,
+    *,
+    llm: LLMClient | None,
+    prompts: PromptManager | None,
+    output: BoundOutputNamespace,
+) -> StageResult:
     (run_dir / "degradation_signal.json").unlink(missing_ok=True)
     try:
         evidence = load_canonical_experiment_evidence(run_dir)
@@ -1140,12 +1197,9 @@ def _execute_quality_gate(
             allowlist=citation_authority.allowlist,
             plan=citation_authority.plan,
         )
-        experiment_summary = _thaw_authority_value(evidence.summary)
-        if not isinstance(experiment_summary, dict):
-            raise ValueError("canonical experiment summary is not an object")
-        registry = _build_stage20_registry(
-            experiment_summary,
-            metric_direction=canonical_config.experiment.metric_direction,
+        experiment_summary = thaw_canonical_summary(evidence)
+        fabrication_state = reconstruct_stage20_fabrication_state(
+            evidence, canonical_config
         )
     except (
         CanonicalExperimentEvidenceError,
@@ -1165,7 +1219,7 @@ def _execute_quality_gate(
             decision="retry",
         )
     report: dict[str, Any] | None = None
-    experiment_failed = not bool(registry.canonical_values)
+    experiment_failed = fabrication_state.experiment_failed
 
     if llm is not None:
         _pm = prompts or PromptManager()
@@ -1273,26 +1327,27 @@ def _execute_quality_gate(
         "stage19_publication_mode": stage20_inputs.publication_mode,
         "stage19_publication_binding_path": stage20_inputs.publication_binding.path,
         "stage19_publication_binding_sha256": stage20_inputs.publication_binding.sha256,
-        "experiment_failed": experiment_failed,
         "quality_score": score,
-        "real_metric_values": sorted(
-            {canonical_decimal(value) for value in registry.values}
-        ),
-        "verified_values_count": len(registry.canonical_values),
-        "verified_conditions": sorted(registry.condition_names),
+        **fabrication_state.to_dict(),
     }
-    _fabrication_info["has_real_data"] = bool(
-        registry.canonical_values
-    )
-    _fabrication_info["fabrication_suspected"] = (
-        experiment_failed and not _fabrication_info["has_real_data"]
-    )
     # --- Hard guard: block if VerifiedRegistry has zero real experiment values ---
     # Even if the LLM gives a passing score, a paper with no verified
     # experiment data must not proceed to export. This prevents the exact
     # failure in issue #165 where a 3.46s "experiment" produced a fabricated
     # paper that passed the quality gate.
-    _vr_zero_values = not registry.canonical_values
+    _vr_zero_values = not fabrication_state.has_real_data
+    quality_report_text = (
+        json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    )
+    fabrication_flags_text = (
+        json.dumps(
+            _fabrication_info,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    )
 
     try:
         current_evidence = load_canonical_experiment_evidence(run_dir)
@@ -1306,20 +1361,8 @@ def _execute_quality_gate(
             evidence=evidence,
             claim_scope=claim_scope,
         )
-        _write_text_atomic(
-            stage_dir / "quality_report.json",
-            json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
-        )
-        _write_text_atomic(
-            stage_dir / "fabrication_flags.json",
-            json.dumps(
-                _fabrication_info,
-                indent=2,
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            + "\n",
-        )
+        output.write_text_atomic("quality_report.json", quality_report_text)
+        output.write_text_atomic("fabrication_flags.json", fabrication_flags_text)
     except (
         CanonicalExperimentEvidenceError,
         Stage19InputBundleError,
@@ -1328,13 +1371,17 @@ def _execute_quality_gate(
         TypeError,
         ValueError,
     ) as exc:
-        for owned_name in ("quality_report.json", "fabrication_flags.json"):
-            (stage_dir / owned_name).unlink(missing_ok=True)
+        cleanup_suffix = _output_invalidation_suffix(
+            output, ("quality_report.json", "fabrication_flags.json")
+        )
         return StageResult(
             stage=Stage.QUALITY_GATE,
             status=StageStatus.FAILED,
             artifacts=(),
-            error=f"Stage 20 inputs changed during evaluation: {exc}",
+            error=(
+                f"Stage 20 inputs changed during evaluation: {exc}"
+                + cleanup_suffix
+            ),
             decision="retry",
         )
     if _vr_zero_values:
@@ -1372,10 +1419,40 @@ def _execute_quality_gate(
             (run_dir / "degradation_signal.json").write_text(
                 json.dumps(signal, indent=2), encoding="utf-8"
             )
+            try:
+                _publish_stage20_gate_manifest(
+                    run_dir=run_dir,
+                    output=output,
+                    outcome="degraded",
+                    evidence=evidence,
+                    stage20_inputs=stage20_inputs,
+                    canonical_config=canonical_config,
+                    claim_scope=claim_scope,
+                    quality_report_text=quality_report_text,
+                    fabrication_flags_text=fabrication_flags_text,
+                    score=score,
+                    threshold=threshold,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                cleanup_suffix = _output_invalidation_suffix(
+                    output, _STAGE20_OWNED_OUTPUTS
+                )
+                (run_dir / "degradation_signal.json").unlink(missing_ok=True)
+                return StageResult(
+                    stage=Stage.QUALITY_GATE,
+                    status=StageStatus.FAILED,
+                    artifacts=("quality_report.json", "fabrication_flags.json"),
+                    error=f"Stage 20 gate publication failed: {exc}{cleanup_suffix}",
+                    decision="retry",
+                )
             return StageResult(
                 stage=Stage.QUALITY_GATE,
                 status=StageStatus.DONE,
-                artifacts=("quality_report.json",),
+                artifacts=(
+                    "quality_report.json",
+                    "fabrication_flags.json",
+                    "quality_gate_manifest.json",
+                ),
                 evidence_refs=("stage-20/quality_report.json",),
                 decision="degraded",
             )
@@ -1396,17 +1473,133 @@ def _execute_quality_gate(
         "Quality gate PASSED: score %.1f >= threshold %.1f",
         score, threshold,
     )
+    try:
+        _publish_stage20_gate_manifest(
+            run_dir=run_dir,
+            output=output,
+            outcome="passed",
+            evidence=evidence,
+            stage20_inputs=stage20_inputs,
+            canonical_config=canonical_config,
+            claim_scope=claim_scope,
+            quality_report_text=quality_report_text,
+            fabrication_flags_text=fabrication_flags_text,
+            score=score,
+            threshold=threshold,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        cleanup_suffix = _output_invalidation_suffix(output, _STAGE20_OWNED_OUTPUTS)
+        return StageResult(
+            stage=Stage.QUALITY_GATE,
+            status=StageStatus.FAILED,
+            artifacts=("quality_report.json", "fabrication_flags.json"),
+            error=f"Stage 20 gate publication failed: {exc}{cleanup_suffix}",
+            decision="retry",
+        )
     return StageResult(
         stage=Stage.QUALITY_GATE,
         status=StageStatus.DONE,
-        artifacts=("quality_report.json", "fabrication_flags.json"),
+        artifacts=(
+            "quality_report.json",
+            "fabrication_flags.json",
+            "quality_gate_manifest.json",
+        ),
         evidence_refs=("stage-20/quality_report.json",),
     )
+
+
+def _publish_stage20_gate_manifest(
+    *,
+    run_dir: Path,
+    output: BoundOutputNamespace,
+    outcome: str,
+    evidence: CanonicalExperimentEvidence,
+    stage20_inputs: Stage20InputBundle,
+    canonical_config: RCConfig,
+    claim_scope: str,
+    quality_report_text: str,
+    fabrication_flags_text: str,
+    score: float,
+    threshold: float,
+) -> None:
+    current_evidence = load_canonical_experiment_evidence(run_dir)
+    if current_evidence != evidence:
+        raise Stage20InputBundleError(
+            "canonical experiment evidence changed before Stage 20 commit"
+        )
+    verify_stage20_input_bundle_unchanged(
+        run_dir,
+        stage20_inputs,
+        evidence=current_evidence,
+        claim_scope=claim_scope,
+    )
+    payload = {
+        "schema_version": 1,
+        "outcome": outcome,
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+        "source_paper_path": stage20_inputs.revised_paper.path,
+        "source_paper_sha256": stage20_inputs.revised_paper.sha256,
+        "stage19_publication_mode": stage20_inputs.publication_mode,
+        "stage19_publication_binding_path": stage20_inputs.publication_binding.path,
+        "stage19_publication_binding_sha256": stage20_inputs.publication_binding.sha256,
+        "quality_report_path": "stage-20/quality_report.json",
+        "quality_report_sha256": hashlib.sha256(
+            quality_report_text.encode("utf-8")
+        ).hexdigest(),
+        "fabrication_flags_path": "stage-20/fabrication_flags.json",
+        "fabrication_flags_sha256": hashlib.sha256(
+            fabrication_flags_text.encode("utf-8")
+        ).hexdigest(),
+        "quality_threshold": canonical_decimal(Decimal(str(threshold))),
+        "graceful_degradation": canonical_config.research.graceful_degradation,
+        "quality_score": canonical_decimal(Decimal(str(score))),
+        "generated": _utcnow_iso(),
+    }
+    output.write_text_atomic(
+        "quality_gate_manifest.json",
+        json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+    )
+    final_evidence = load_canonical_experiment_evidence(run_dir)
+    if final_evidence != evidence:
+        raise Stage20InputBundleError(
+            "canonical experiment evidence changed during Stage 20 commit"
+        )
+    verify_stage20_input_bundle_unchanged(
+        run_dir,
+        stage20_inputs,
+        evidence=final_evidence,
+        claim_scope=claim_scope,
+    )
+    output.assert_canonical()
+    replay_stage21_input_bundle(
+        quality_report=_bound_output_artifact(
+            output, "stage-20", "quality_report.json"
+        ),
+        fabrication_flags=_bound_output_artifact(
+            output, "stage-20", "fabrication_flags.json"
+        ),
+        quality_gate_manifest=_bound_output_artifact(
+            output, "stage-20", "quality_gate_manifest.json"
+        ),
+        stage20_inputs=stage20_inputs,
+        evidence=final_evidence,
+        canonical_config=canonical_config,
+    )
+    output.assert_canonical()
 
 
 # ---------------------------------------------------------------------------
 # Stage 21: Knowledge Archive
 # ---------------------------------------------------------------------------
+
+
+_STAGE21_OWNED_OUTPUTS = (
+    "bundle_index.json",
+    "archive.md",
+    "bundle_index.json.tmp",
+    "archive.md.tmp",
+)
 
 def _execute_knowledge_archive(
     stage_dir: Path,
@@ -1417,19 +1610,105 @@ def _execute_knowledge_archive(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
-    revised = _read_prior_artifact(run_dir, "paper_revised.md") or ""
-    analysis = _read_best_analysis(run_dir)
-    decision = _read_prior_artifact(run_dir, "decision.md") or ""
-    preamble = _build_context_preamble(config, run_dir, include_goal=True)
+    output: BoundOutputNamespace | None = None
+    try:
+        output = BoundOutputNamespace.open(run_dir, stage_dir, "stage-21")
+        output.invalidate(_STAGE21_OWNED_OUTPUTS)
+    except OSError as exc:
+        if output is not None:
+            output.close()
+        return StageResult(
+            stage=Stage.KNOWLEDGE_ARCHIVE,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Stage 21 output namespace is unsafe: {exc}",
+            decision="retry",
+        )
+    assert output is not None
+    try:
+        return _execute_knowledge_archive_bound(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=llm,
+            prompts=prompts,
+            output=output,
+        )
+    finally:
+        output.close()
+
+
+def _execute_knowledge_archive_bound(
+    stage_dir: Path,
+    run_dir: Path,
+    config: RCConfig,
+    adapters: AdapterBundle,
+    *,
+    llm: LLMClient | None,
+    prompts: PromptManager | None,
+    output: BoundOutputNamespace,
+) -> StageResult:
+    try:
+        evidence = load_canonical_experiment_evidence(run_dir)
+        canonical_config = parse_config_snapshot_text(
+            evidence.run_config_bytes.decode("utf-8"),
+            project_root=run_dir,
+            label="canonical experiment config snapshot",
+        )
+        if semantic_config_sha256(config) != semantic_config_sha256(canonical_config):
+            raise ValueError(
+                "runtime config semantic generation differs from canonical experiment evidence"
+            )
+        stage19_inputs = _load_bound_stage19_inputs(run_dir, config, evidence)
+        claim_scope = _snapshot_claim_scope(evidence)
+        stage20_inputs = load_stage20_input_bundle(
+            run_dir,
+            stage19_inputs=stage19_inputs,
+            evidence=evidence,
+            claim_scope=claim_scope,
+        )
+        stage21_inputs = load_stage21_input_bundle(
+            run_dir,
+            stage20_inputs=stage20_inputs,
+            evidence=evidence,
+            canonical_config=canonical_config,
+        )
+        revised = stage20_inputs.revised_paper.text()
+    except (
+        CanonicalExperimentEvidenceError,
+        CitationPlanContractError,
+        CitationPolicyContractError,
+        Stage19InputBundleError,
+        Stage20InputBundleError,
+        Stage21InputBundleError,
+        OSError,
+        UnicodeDecodeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return StageResult(
+            stage=Stage.KNOWLEDGE_ARCHIVE,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Stage 21 canonical input validation failed: {exc}",
+            decision="retry",
+        )
     if llm is not None:
         _pm = prompts or PromptManager()
-        _overlay = _get_evolution_overlay(run_dir, "knowledge_archive")
         sp = _pm.for_stage(
             "knowledge_archive",
-            evolution_overlay=_overlay,
-            preamble=preamble,
-            decision=decision,
-            analysis=analysis,
+            evolution_overlay=None,
+            preamble=(
+                "Research topic from the canonical runtime configuration:\n"
+                + config.research.topic
+            ),
+            decision=(
+                "PASSED (validated by the canonical Stage 20 gate)"
+                if stage21_inputs.quality_gate_outcome == "passed"
+                else "DEGRADED (explicitly authorized by the canonical Stage 20 gate)"
+            ),
+            analysis=evidence.analysis_text,
             revised=revised[:15000],
         )
         resp = _chat_with_prompt(
@@ -1456,28 +1735,184 @@ def _execute_knowledge_archive(
 
 Generated: {_utcnow_iso()}
 """
-    (stage_dir / "archive.md").write_text(archive, encoding="utf-8")
-
-    files: list[str] = []
-    for stage_subdir in sorted(run_dir.glob("stage-*")):
-        for artifact in sorted(stage_subdir.rglob("*")):
-            if artifact.is_file() and artifact != (stage_dir / "bundle_index.json"):
-                files.append(str(artifact.relative_to(run_dir)))
-    index = {
-        "run_id": run_dir.name,
-        "generated": _utcnow_iso(),
-        "artifact_count": len(files),
-        "artifacts": files,
-    }
-    (stage_dir / "bundle_index.json").write_text(
-        json.dumps(index, indent=2), encoding="utf-8"
-    )
+    try:
+        if not isinstance(archive, str) or not archive.strip():
+            raise Stage21InputBundleError("Stage 21 archive response is empty")
+        _verify_stage21_sources(
+            run_dir,
+            config=config,
+            evidence=evidence,
+            stage19_inputs=stage19_inputs,
+            stage20_inputs=stage20_inputs,
+            stage21_inputs=stage21_inputs,
+            claim_scope=claim_scope,
+            canonical_config=canonical_config,
+        )
+        archive_sha256 = hashlib.sha256(archive.encode("utf-8")).hexdigest()
+        index = _build_stage21_bundle_index(
+            run_dir,
+            evidence=evidence,
+            stage19_inputs=stage19_inputs,
+            stage20_inputs=stage20_inputs,
+            stage21_inputs=stage21_inputs,
+            archive_sha256=archive_sha256,
+        )
+        output.write_text_atomic("archive.md", archive)
+        _verify_stage21_sources(
+            run_dir,
+            config=config,
+            evidence=evidence,
+            stage19_inputs=stage19_inputs,
+            stage20_inputs=stage20_inputs,
+            stage21_inputs=stage21_inputs,
+            claim_scope=claim_scope,
+            canonical_config=canonical_config,
+        )
+        output.write_text_atomic(
+            "bundle_index.json",
+            json.dumps(index, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+        )
+        _verify_stage21_sources(
+            run_dir,
+            config=config,
+            evidence=evidence,
+            stage19_inputs=stage19_inputs,
+            stage20_inputs=stage20_inputs,
+            stage21_inputs=stage21_inputs,
+            claim_scope=claim_scope,
+            canonical_config=canonical_config,
+        )
+        output.assert_canonical()
+        verify_stage21_output_artifacts(
+            archive=_bound_output_artifact(output, "stage-21", "archive.md"),
+            index=_bound_output_artifact(output, "stage-21", "bundle_index.json"),
+            archive_text=archive,
+            expected_index=index,
+        )
+        output.assert_canonical()
+    except (
+        CanonicalExperimentEvidenceError,
+        CitationPlanContractError,
+        CitationPolicyContractError,
+        Stage19InputBundleError,
+        Stage20InputBundleError,
+        Stage21InputBundleError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        cleanup_error = None
+        try:
+            output.invalidate(_STAGE21_OWNED_OUTPUTS)
+        except OSError as cleanup_exc:
+            cleanup_error = cleanup_exc
+        return StageResult(
+            stage=Stage.KNOWLEDGE_ARCHIVE,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=(
+                f"Stage 21 inputs changed during archival: {exc}"
+                + (
+                    f"; output invalidation also failed: {cleanup_error}"
+                    if cleanup_error is not None
+                    else ""
+                )
+            ),
+            decision="retry",
+        )
     return StageResult(
         stage=Stage.KNOWLEDGE_ARCHIVE,
         status=StageStatus.DONE,
         artifacts=("archive.md", "bundle_index.json"),
         evidence_refs=("stage-21/archive.md", "stage-21/bundle_index.json"),
     )
+
+
+def _verify_stage21_sources(
+    run_dir: Path,
+    *,
+    config: RCConfig,
+    evidence: CanonicalExperimentEvidence,
+    stage19_inputs: Stage19InputBundle,
+    stage20_inputs: Stage20InputBundle,
+    stage21_inputs: Stage21InputBundle,
+    claim_scope: str,
+    canonical_config: RCConfig,
+) -> None:
+    current_evidence = load_canonical_experiment_evidence(run_dir)
+    if current_evidence != evidence:
+        raise Stage21InputBundleError(
+            "canonical experiment evidence changed during Stage 21"
+        )
+    current_stage19 = _load_bound_stage19_inputs(run_dir, config, current_evidence)
+    if current_stage19 != stage19_inputs:
+        raise Stage21InputBundleError("Stage 04-18 inputs changed during Stage 21")
+    verify_stage20_input_bundle_unchanged(
+        run_dir,
+        stage20_inputs,
+        evidence=current_evidence,
+        claim_scope=claim_scope,
+    )
+    verify_stage21_input_bundle_unchanged(
+        run_dir,
+        stage21_inputs,
+        stage20_inputs=stage20_inputs,
+        evidence=current_evidence,
+        canonical_config=canonical_config,
+    )
+
+
+def _build_stage21_bundle_index(
+    run_dir: Path,
+    *,
+    evidence: CanonicalExperimentEvidence,
+    stage19_inputs: Stage19InputBundle,
+    stage20_inputs: Stage20InputBundle,
+    stage21_inputs: Stage21InputBundle,
+    archive_sha256: str,
+) -> dict[str, Any]:
+    artifacts: dict[str, str] = {
+        evidence.manifest_path: evidence.manifest_sha256,
+        stage20_inputs.revised_paper.path: stage20_inputs.revised_paper.sha256,
+        stage20_inputs.publication_binding.path: stage20_inputs.publication_binding.sha256,
+        stage21_inputs.quality_report.path: stage21_inputs.quality_report.sha256,
+        stage21_inputs.fabrication_flags.path: stage21_inputs.fabrication_flags.sha256,
+        stage21_inputs.quality_gate_manifest.path: (
+            stage21_inputs.quality_gate_manifest.sha256
+        ),
+        "stage-21/archive.md": archive_sha256,
+    }
+    for artifact in stage19_inputs.artifacts:
+        previous = artifacts.setdefault(artifact.path, artifact.sha256)
+        if previous != artifact.sha256:
+            raise Stage21InputBundleError(
+                f"conflicting Stage 21 artifact identity: {artifact.path}"
+            )
+    artifact_entries = [
+        {"path": path, "sha256": artifacts[path]} for path in sorted(artifacts)
+    ]
+    return {
+        "schema_version": 1,
+        "run_id": run_dir.name,
+        "generated": _utcnow_iso(),
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+        "source_paper_path": stage20_inputs.revised_paper.path,
+        "source_paper_sha256": stage20_inputs.revised_paper.sha256,
+        "stage19_publication_mode": stage20_inputs.publication_mode,
+        "stage19_publication_binding_path": stage20_inputs.publication_binding.path,
+        "stage19_publication_binding_sha256": stage20_inputs.publication_binding.sha256,
+        "quality_report_path": stage21_inputs.quality_report.path,
+        "quality_report_sha256": stage21_inputs.quality_report.sha256,
+        "fabrication_flags_path": stage21_inputs.fabrication_flags.path,
+        "fabrication_flags_sha256": stage21_inputs.fabrication_flags.sha256,
+        "quality_gate_manifest_path": stage21_inputs.quality_gate_manifest.path,
+        "quality_gate_manifest_sha256": stage21_inputs.quality_gate_manifest.sha256,
+        "archive_path": "stage-21/archive.md",
+        "archive_sha256": archive_sha256,
+        "artifact_count": len(artifact_entries),
+        "artifacts": artifact_entries,
+    }
 
 
 # ---------------------------------------------------------------------------

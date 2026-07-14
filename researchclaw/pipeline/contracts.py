@@ -227,7 +227,11 @@ CONTRACTS: dict[Stage, StageContract] = {
         ),
         # fabrication_flags.json was always produced but never declared —
         # release_check depends on it, so the contract must require it.
-        output_files=("quality_report.json", "fabrication_flags.json"),
+        output_files=(
+            "quality_report.json",
+            "fabrication_flags.json",
+            "quality_gate_manifest.json",
+        ),
         dod="Quality score meets threshold and approved",
         error_code="E20_GATE_REJECT",
         max_retries=0,
