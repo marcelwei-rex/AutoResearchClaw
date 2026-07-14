@@ -103,6 +103,21 @@ def build_experiment_fact_closure_report(
     ) as exc:
         raise ExperimentFactClosureError(f"cannot load experiment contract: {exc}") from exc
 
+    return build_experiment_fact_closure_from_text(
+        paper_text=paper_text,
+        evidence=evidence,
+        contract=contract,
+    )
+
+
+def build_experiment_fact_closure_from_text(
+    *,
+    paper_text: str,
+    evidence: CanonicalExperimentEvidence,
+    contract: Any,
+) -> dict[str, Any]:
+    """Build closure from already-bound paper bytes and canonical evidence."""
+
     grounded: list[Decimal] = []
     _collect_numbers(evidence.metric_observations, grounded)
     _collect_numbers(evidence.structured_results, grounded)
@@ -151,6 +166,40 @@ def build_experiment_fact_closure_report(
     return parse_experiment_fact_closure_report(
         canonical_experiment_fact_json_text(payload)
     )
+
+
+def replay_experiment_fact_closure(
+    *,
+    paper_bytes: bytes,
+    stored_report_bytes: bytes,
+    evidence: CanonicalExperimentEvidence,
+) -> dict[str, Any]:
+    """Replay a captured closure report without reopening any run artifact."""
+
+    try:
+        paper_text = paper_bytes.decode("utf-8")
+        stored_text = stored_report_bytes.decode("utf-8")
+        contract_text = evidence.experiment_contract_bytes.decode("utf-8")
+        contract_data = yaml.safe_load(contract_text)
+        if not isinstance(contract_data, dict):
+            raise ValueError("contract root must be an object")
+        contract = validate_contract_dict(contract_data)
+        stored = parse_experiment_fact_closure_report(stored_text)
+        expected = build_experiment_fact_closure_from_text(
+            paper_text=paper_text,
+            evidence=evidence,
+            contract=contract,
+        )
+    except (
+        UnicodeDecodeError,
+        ValueError,
+        yaml.YAMLError,
+        CanonicalExperimentEvidenceError,
+    ) as exc:
+        raise ExperimentFactClosureError(f"cannot replay experiment closure: {exc}") from exc
+    if stored != expected or not stored["valid"]:
+        raise ExperimentFactClosureError("experiment fact closure replay failed")
+    return stored
 
 
 def parse_experiment_fact_closure_report(text: str) -> dict[str, Any]:
@@ -226,8 +275,8 @@ def validate_experiment_fact_closure_report(
     paper_path = run_dir / "stage-17" / "paper_draft.md"
     report_path = run_dir / "stage-17" / "experiment_fact_closure_report.json"
     try:
-        paper_text = paper_path.read_text(encoding="utf-8")
-        stored = parse_experiment_fact_closure_report(report_path.read_text(encoding="utf-8"))
+        paper_bytes = paper_path.read_bytes()
+        report_bytes = report_path.read_bytes()
     except (OSError, UnicodeDecodeError) as exc:
         raise ExperimentFactClosureError(f"cannot read experiment closure artifacts: {exc}") from exc
     if evidence is None:
@@ -237,12 +286,11 @@ def validate_experiment_fact_closure_report(
             raise ExperimentFactClosureError(
                 f"canonical experiment evidence is invalid: {exc}"
             ) from exc
-    expected = build_experiment_fact_closure_report(
-        run_dir, paper_text=paper_text, evidence=evidence
+    return replay_experiment_fact_closure(
+        paper_bytes=paper_bytes,
+        stored_report_bytes=report_bytes,
+        evidence=evidence,
     )
-    if stored != expected or not stored["valid"]:
-        raise ExperimentFactClosureError("experiment fact closure replay failed")
-    return stored
 
 
 def _collect_numbers(value: Any, output: list[Decimal]) -> None:

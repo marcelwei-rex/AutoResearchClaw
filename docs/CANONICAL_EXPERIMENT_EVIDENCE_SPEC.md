@@ -1355,7 +1355,24 @@ until C5.
   snapshot before any LLM call; the review evidence renderer receives only that
   snapshot, and `review_structure_report.json` binds its manifest path and hash.
 - C3-A: migrate both Stage 19 revision paths and the independent sectional
-  replay.
+  replay. `validation_context.json` uses its own schema v2 numeric policy:
+  `grounded_numeric_values` are unique canonical Decimal strings under
+  `stage19_decimal_v1`, never JSON numbers. The Stage 19 validator, producer,
+  and independent replay parse these tokens as finite `Decimal` values and use
+  the local exact/round-half-even/relative-tolerance matcher; they do not
+  convert canonical numeric authority through binary float. Before either
+  revision path or the independent audit accepts Stage 17 citation closure,
+  it captures and replays one immutable citation authority bundle: Stage 04
+  candidates/registry/bibliography, Stage 05 shortlist/screening report,
+  Stage 06 cards manifest plus its exact card JSON/Markdown closure and
+  allowlist, Stage 16 effective policy/final plan, and the active config
+  pointer/history/checkpoint/snapshot. The capture also binds optional-file
+  presence, the exact cards namespace, and the exact set of resumed config
+  snapshots. Plan and allowlist hashes alone are never authority. The active
+  config may use a different resume path only when its complete semantic hash
+  equals the canonical experiment-evidence config generation. A final full
+  rediscovery compares namespace, selected path, and bytes without consuming
+  any reread bytes as producer or audit input.
 - C3-B: migrate Stage 20 quality consumers.
 - C3-C: migrate Stage 21 archive consumers.
 - C3-D: migrate Stage 22 export consumers.

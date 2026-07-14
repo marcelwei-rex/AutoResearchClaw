@@ -76,7 +76,9 @@ def _stub_effective_citation_policy_for_legacy_unit_tests(
         lambda *_args, **_kwargs: {},
     )
     monkeypatch.setattr(
-        _paper_writing, "validate_citation_closure_report", lambda *_args: {}
+        _paper_writing,
+        "validate_citation_closure_report",
+        lambda *_args, **_kwargs: {},
     )
 
 
@@ -165,9 +167,19 @@ class TestPaperRevisionRecovery:
         assert retry_values == [2, 2]
         assert result.artifacts == (
             "paper_revised.md",
+            "revision_evidence_binding.json",
             "revision_notes_internal.md",
             "revision_retry_failure.json",
         )
+        binding = json.loads(
+            (stage_dir / "revision_evidence_binding.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert binding["canonical_experiment_evidence_path"] == (
+            "canonical_experiment_evidence.json"
+        )
+        assert binding["revised_paper_path"] == "stage-19/paper_revised.md"
         assert (stage_dir / "paper_revised.md").read_text(encoding="utf-8") == draft
         notes = (stage_dir / "revision_notes_internal.md").read_text(encoding="utf-8")
         assert notes.startswith("revision-0 revision-1")
@@ -292,6 +304,66 @@ class TestPaperRevisionRecovery:
         assert result.decision == "sectional"
         assert "paper_revised.md" in result.artifacts
         assert llm.calls == []
+
+    def test_sectional_input_mutation_cleans_published_outputs(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A late Stage 17/18 mutation cannot leave a reusable Stage 19 bundle."""
+        from researchclaw.pipeline.sectional_execution import (
+            SectionalExecutionResult,
+            _OWNED_DIRS,
+            _OWNED_FILES,
+        )
+        from researchclaw.pipeline.stage19_input_bundle import Stage19InputBundleError
+        from tests.test_sectional_execution import _config, _prepare_run
+
+        run_dir, stage_dir = _prepare_run(tmp_path)
+        config = replace(rc_config, paper_revision=_config())
+
+        def write_success_bundle(*, stage_dir: Path, **_kwargs: object) -> SectionalExecutionResult:
+            for name in _OWNED_FILES:
+                (stage_dir / name).write_text("published", encoding="utf-8")
+            for name in _OWNED_DIRS:
+                directory = stage_dir / name
+                directory.mkdir()
+                (directory / "published.json").write_text("{}", encoding="utf-8")
+            return SectionalExecutionResult(
+                completed=True,
+                paper_text="published",
+                error=None,
+                artifacts=tuple(_OWNED_FILES),
+            )
+
+        monkeypatch.setattr(
+            "researchclaw.pipeline.sectional_execution.execute_sectional_revision",
+            write_success_bundle,
+        )
+        monkeypatch.setattr(
+            _review_publish,
+            "verify_stage19_input_bundle_unchanged",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                Stage19InputBundleError("captured draft changed")
+            ),
+        )
+
+        result = rc_executor._execute_paper_revision(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=FakeLLMClient(),
+            sectional_provider=object(),
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert result.artifacts == ()
+        assert "inputs changed" in (result.error or "")
+        assert all(not (stage_dir / name).exists() for name in _OWNED_FILES)
+        assert all(not (stage_dir / name).exists() for name in _OWNED_DIRS)
 
     def test_sectional_flag_builds_isolated_llm_provider(
         self,
@@ -470,19 +542,26 @@ class TestPaperRevisionRecovery:
             fake_chat,
         )
 
-        with pytest.raises(RuntimeError, match="IncompleteRead"):
-            rc_executor._execute_paper_revision(
-                stage_dir,
-                run_dir,
-                strict_config,
-                adapters,
-                llm=cast(Any, FakeLLMClient()),
-                prompts=cast(Any, self._prompt_manager()),
-            )
+        result = rc_executor._execute_paper_revision(
+            stage_dir,
+            run_dir,
+            strict_config,
+            adapters,
+            llm=cast(Any, FakeLLMClient()),
+            prompts=cast(Any, self._prompt_manager()),
+        )
 
+        if invalid_contract:
+            # The canonical snapshot contract is now the sole authority. A
+            # malformed snapshot stops before any Stage 19 writer call.
+            assert calls == 0
+            assert result.status == StageStatus.FAILED
+            assert not (stage_dir / "paper_revised.md").exists()
+            return
         assert calls == 2
-        assert not (stage_dir / "paper_revised.md").exists()
-        assert not (stage_dir / "revision_retry_failure.json").exists()
+        assert result.status == StageStatus.DONE
+        assert (stage_dir / "paper_revised.md").exists()
+        assert (stage_dir / "revision_retry_failure.json").exists()
 
 
 @pytest.fixture()

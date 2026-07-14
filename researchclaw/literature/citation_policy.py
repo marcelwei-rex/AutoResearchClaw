@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -11,6 +12,7 @@ import yaml
 
 from researchclaw.config import RCConfig
 from researchclaw.literature.evidence_cards import (
+    ValidatedCardInputs,
     canonical_json_text,
     load_validated_card_inputs,
     load_validated_cards,
@@ -29,6 +31,17 @@ class CitationPolicyContractError(ValueError):
     """Raised when citation eligibility or effective policy is not replayable."""
 
 
+@dataclass(frozen=True)
+class ActiveConfigSnapshotInputs:
+    """Captured run-local config files needed for pure citation-policy replay."""
+
+    config_source_path: str
+    config_source_text: str
+    pointer_text: str | None
+    history_text: str | None
+    checkpoint_text: str | None
+
+
 def build_citation_allowlist(run_dir: Path, config: RCConfig) -> dict[str, Any]:
     """Recompute citation eligibility from canonical Stage 4-6 artifacts."""
     inputs = load_validated_card_inputs(run_dir, config)
@@ -41,14 +54,30 @@ def build_citation_allowlist(run_dir: Path, config: RCConfig) -> dict[str, Any]:
     except (OSError, UnicodeDecodeError) as exc:
         raise CitationPolicyContractError(f"cannot read citation sources: {exc}") from exc
 
+    return build_citation_allowlist_from_replayed_inputs(
+        card_inputs=inputs,
+        cards=cards,
+        cards_manifest_text=manifest_text,
+        references_text=references_text,
+    )
+
+
+def build_citation_allowlist_from_replayed_inputs(
+    *,
+    card_inputs: ValidatedCardInputs,
+    cards: tuple[dict[str, Any], ...],
+    cards_manifest_text: str,
+    references_text: str,
+) -> dict[str, Any]:
+    """Build the allowlist from validated, already captured Stage 4-6 inputs."""
     bib_keys = _bibtex_keys(references_text)
-    shortlist_keys = [str(row["cite_key"]) for row in inputs.shortlist]
+    shortlist_keys = [str(row["cite_key"]) for row in card_inputs.shortlist]
     if any(key not in bib_keys for key in shortlist_keys):
         raise CitationPolicyContractError("shortlist key is absent from canonical bibliography")
 
     eligible_keys: list[str] = []
     ineligible: list[dict[str, str]] = []
-    for row, card in zip(inputs.shortlist, cards, strict=True):
+    for row, card in zip(card_inputs.shortlist, cards, strict=True):
         cite_key = str(row["cite_key"])
         if card["source_identity"] != row["source_identity"] or card["cite_key"] != cite_key:
             raise CitationPolicyContractError("card/shortlist identity mismatch")
@@ -66,11 +95,11 @@ def build_citation_allowlist(run_dir: Path, config: RCConfig) -> dict[str, Any]:
         "schema_version": ALLOWLIST_SCHEMA_VERSION,
         "eligibility_policy_version": ELIGIBILITY_POLICY_VERSION,
         "shortlist_path": "stage-05/shortlist.jsonl",
-        "shortlist_sha256": sha256_text(inputs.shortlist_text),
+        "shortlist_sha256": sha256_text(card_inputs.shortlist_text),
         "references_path": "stage-04/references.bib",
         "references_sha256": sha256_text(references_text),
         "cards_manifest_path": "stage-06/cards_manifest.json",
-        "cards_manifest_sha256": sha256_text(manifest_text),
+        "cards_manifest_sha256": sha256_text(cards_manifest_text),
         "eligible_keys": eligible_keys,
         "ineligible": ineligible,
     }
@@ -285,10 +314,7 @@ def resolve_active_config_snapshot(
         snapshot_config = RCConfig.from_dict(raw, project_root=run_dir, check_paths=False)
     except (OSError, ValueError, yaml.YAMLError) as exc:
         raise CitationPolicyContractError(f"active config snapshot is invalid: {exc}") from exc
-    if snapshot_config.citation_policy != config.citation_policy:
-        raise CitationPolicyContractError("active citation policy differs from runtime config")
-    if snapshot_config.experiment.claim_scope != config.experiment.claim_scope:
-        raise CitationPolicyContractError("active claim_scope differs from runtime config")
+    _require_semantically_equal_config(snapshot_config, config)
     checkpoint_path = run_dir / "checkpoint.json"
     if checkpoint_path.exists():
         try:
@@ -306,6 +332,105 @@ def resolve_active_config_snapshot(
         ):
             raise CitationPolicyContractError("checkpoint config binding mismatch")
     return relative, text, digest
+
+
+def replay_active_config_snapshot(
+    inputs: ActiveConfigSnapshotInputs,
+    runtime_config: RCConfig | None,
+    *,
+    project_root: Path,
+) -> tuple[RCConfig, str, str]:
+    """Validate active-config selection entirely from captured file text."""
+    pointer_text = inputs.pointer_text
+    if pointer_text is None:
+        if inputs.history_text is not None or inputs.checkpoint_text is not None:
+            raise CitationPolicyContractError(
+                "resume state exists without active config pointer"
+            )
+        relative = "config.yaml"
+        expected_hash = ""
+        history_hash = ""
+    else:
+        pointer = _parse_object(pointer_text, "active config pointer")
+        _exact_keys(
+            pointer,
+            {
+                "schema_version",
+                "config_source_path",
+                "config_source_sha256",
+                "history_path",
+                "history_sha256",
+                "history_ordinal",
+            },
+            "active config pointer",
+        )
+        if pointer["schema_version"] != ACTIVE_CONFIG_SCHEMA_VERSION:
+            raise CitationPolicyContractError("unsupported active config schema")
+        relative = _required_string(pointer, "config_source_path")
+        expected_hash = _sha256_field(pointer, "config_source_sha256")
+        if pointer["history_path"] != "config_snapshot_history.jsonl":
+            raise CitationPolicyContractError("noncanonical config history path")
+        history_hash = _sha256_field(pointer, "history_sha256")
+        history_ordinal = _positive_int(pointer, "history_ordinal")
+        if inputs.history_text is None:
+            raise CitationPolicyContractError("config snapshot history is missing")
+        if sha256_text(inputs.history_text) != history_hash:
+            raise CitationPolicyContractError("config snapshot history hash mismatch")
+        history = _parse_config_snapshot_history(inputs.history_text)
+        if history_ordinal != len(history):
+            raise CitationPolicyContractError("active config history ordinal mismatch")
+        active_event = history[-1]
+        if (
+            active_event["config_source_path"] != relative
+            or active_event["config_source_sha256"] != expected_hash
+        ):
+            raise CitationPolicyContractError("active config/history binding mismatch")
+
+    if inputs.config_source_path != relative or not _is_config_snapshot_name(relative):
+        raise CitationPolicyContractError("noncanonical active config path")
+    digest = sha256_text(inputs.config_source_text)
+    if expected_hash and digest != expected_hash:
+        raise CitationPolicyContractError("active config snapshot hash mismatch")
+    snapshot_config = parse_config_snapshot_text(
+        inputs.config_source_text,
+        project_root=project_root,
+        label="active config snapshot",
+    )
+    if runtime_config is not None:
+        _require_semantically_equal_config(snapshot_config, runtime_config)
+    if inputs.checkpoint_text is not None:
+        checkpoint = _parse_object(inputs.checkpoint_text, "checkpoint")
+        if (
+            checkpoint.get("active_config_snapshot_path") != relative
+            or checkpoint.get("active_config_snapshot_sha256") != digest
+            or checkpoint.get("config_snapshot_history_sha256") != history_hash
+        ):
+            raise CitationPolicyContractError("checkpoint config binding mismatch")
+    return snapshot_config, relative, digest
+
+
+def parse_config_snapshot_text(
+    text: str,
+    *,
+    project_root: Path,
+    label: str = "config snapshot",
+) -> RCConfig:
+    """Strictly parse a captured run config without reopening its path."""
+
+    try:
+        raw = yaml.safe_load(text)
+        if not isinstance(raw, dict):
+            raise ValueError("config root must be a mapping")
+        return RCConfig.from_dict(raw, project_root=project_root, check_paths=False)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        raise CitationPolicyContractError(f"{label} is invalid: {exc}") from exc
+
+
+def _require_semantically_equal_config(left: RCConfig, right: RCConfig) -> None:
+    if canonical_json_text(left.to_dict()) != canonical_json_text(right.to_dict()):
+        raise CitationPolicyContractError(
+            "active config semantic generation differs from canonical config"
+        )
 
 
 def active_config_checkpoint_fields(run_dir: Path) -> dict[str, str]:
@@ -340,9 +465,28 @@ def build_effective_citation_policy(run_dir: Path, config: RCConfig) -> dict[str
     except (OSError, UnicodeDecodeError) as exc:
         raise CitationPolicyContractError(f"cannot read citation allowlist: {exc}") from exc
     allowlist = validate_citation_allowlist(run_dir, config, allowlist_text)
+    config_path, _config_text, config_hash = resolve_active_config_snapshot(run_dir, config)
+    return build_effective_citation_policy_from_replayed_inputs(
+        allowlist=allowlist,
+        allowlist_text=allowlist_text,
+        snapshot_config=config,
+        config_source_path=config_path,
+        config_source_sha256=config_hash,
+    )
+
+
+def build_effective_citation_policy_from_replayed_inputs(
+    *,
+    allowlist: Mapping[str, Any],
+    allowlist_text: str,
+    snapshot_config: RCConfig,
+    config_source_path: str,
+    config_source_sha256: str,
+) -> dict[str, Any]:
+    """Build effective policy from a replayed allowlist and active snapshot."""
     eligible_count = len(allowlist["eligible_keys"])
-    policy = config.citation_policy
-    scope = config.experiment.claim_scope
+    policy = snapshot_config.citation_policy
+    scope = snapshot_config.experiment.claim_scope
     required = (
         policy.min_unique_sources_research_release
         if scope == "research_release"
@@ -357,7 +501,6 @@ def build_effective_citation_policy(run_dir: Path, config: RCConfig) -> dict[str
         if scope == "research_release"
         else min(policy.min_unique_sources_research_release, eligible_count)
     )
-    config_path, _config_text, config_hash = resolve_active_config_snapshot(run_dir, config)
     payload = {
         "schema_version": EFFECTIVE_POLICY_SCHEMA_VERSION,
         "policy_version": EFFECTIVE_POLICY_VERSION,
@@ -369,8 +512,8 @@ def build_effective_citation_policy(run_dir: Path, config: RCConfig) -> dict[str
         ),
         "citation_allowlist_path": "stage-06/citation_allowlist.json",
         "citation_allowlist_sha256": sha256_text(allowlist_text),
-        "config_source_path": config_path,
-        "config_source_sha256": config_hash,
+        "config_source_path": config_source_path,
+        "config_source_sha256": config_source_sha256,
     }
     return parse_effective_citation_policy(canonical_json_text(payload))
 

@@ -4,23 +4,33 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from researchclaw.config import RCConfig
 from researchclaw.literature.citation_policy import (
+    ActiveConfigSnapshotInputs,
     CitationPolicyContractError,
+    build_citation_allowlist_from_replayed_inputs,
+    build_effective_citation_policy_from_replayed_inputs,
     load_effective_citation_policy,
+    parse_citation_allowlist,
+    parse_effective_citation_policy,
+    replay_active_config_snapshot,
     validate_citation_allowlist,
 )
 from researchclaw.literature.evidence_cards import (
     canonical_json_text,
     load_validated_cards,
+    validate_card_inputs_from_texts,
+    validate_cards_artifacts_from_texts,
 )
 from researchclaw.literature.experiment_fact_closure import (
     ExperimentFactClosureError,
     build_experiment_fact_closure_report,
     parse_experiment_fact_closure_report,
+    replay_experiment_fact_closure,
 )
 from researchclaw.literature.citation_identity import (
     CitationIdentityError,
@@ -45,6 +55,32 @@ CITATION_PLAN_VERSION = 2
 
 class CitationPlanContractError(ValueError):
     """Raised when a citation plan is not closed over retained evidence."""
+
+
+@dataclass(frozen=True)
+class CitationPlanReplayInputs:
+    """Complete captured source set for Stage 16 citation-plan replay."""
+
+    candidates_text: str
+    registry_text: str
+    bibliography_text: str
+    shortlist_text: str
+    screening_report_text: str
+    cards_manifest_text: str
+    card_texts: Mapping[str, str]
+    citation_allowlist_text: str
+    effective_policy_text: str
+    citation_plan_text: str
+    active_config: ActiveConfigSnapshotInputs
+
+
+@dataclass(frozen=True)
+class ReplayedCitationAuthority:
+    """Source-recomputed citation authority passed to Stage 17/19 replay."""
+
+    allowlist: Mapping[str, Any]
+    effective_policy: Mapping[str, Any]
+    plan: Mapping[str, Any]
 
 
 def _citation_section_for_config(config: RCConfig) -> str:
@@ -77,10 +113,37 @@ def build_citation_plan(
     except (CitationPolicyContractError, ValueError) as exc:
         raise CitationPlanContractError(f"invalid citation-plan source: {exc}") from exc
 
+    return build_citation_plan_from_replayed_inputs(
+        config=config,
+        plan_status=plan_status,
+        allowlist=allowlist,
+        allowlist_text=allowlist_text,
+        cards_manifest_text=manifest_text,
+        effective_policy=policy,
+        effective_policy_text=policy_text,
+        cards=cards,
+    )
+
+
+def build_citation_plan_from_replayed_inputs(
+    *,
+    config: RCConfig,
+    plan_status: str,
+    allowlist: Mapping[str, Any],
+    allowlist_text: str,
+    cards_manifest_text: str,
+    effective_policy: Mapping[str, Any],
+    effective_policy_text: str,
+    cards: tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """Build a plan solely from already replayed citation source artifacts."""
+    if plan_status not in {"preliminary", "final"}:
+        raise CitationPlanContractError("invalid citation plan status")
+
     cards_by_key = {str(card["cite_key"]): card for card in cards}
-    target = int(policy["effective_target_unique_sources"])
+    target = int(effective_policy["effective_target_unique_sources"])
     selected_keys = list(allowlist["eligible_keys"])[:target]
-    if len(selected_keys) < int(policy["effective_min_unique_sources"]):
+    if len(selected_keys) < int(effective_policy["effective_min_unique_sources"]):
         raise CitationPlanContractError("citation plan cannot meet effective minimum")
     claims: list[dict[str, Any]] = []
     citation_section = _citation_section_for_config(config)
@@ -116,12 +179,80 @@ def build_citation_plan(
         "citation_allowlist_path": "stage-06/citation_allowlist.json",
         "citation_allowlist_sha256": sha256_text(allowlist_text),
         "cards_manifest_path": "stage-06/cards_manifest.json",
-        "cards_manifest_sha256": sha256_text(manifest_text),
+        "cards_manifest_sha256": sha256_text(cards_manifest_text),
         "effective_policy_path": "stage-16/citation_policy_effective.json",
-        "effective_policy_sha256": sha256_text(policy_text),
+        "effective_policy_sha256": sha256_text(effective_policy_text),
         "claims": claims,
     }
     return parse_citation_plan(canonical_json_text(payload))
+
+
+def replay_citation_plan_provenance(
+    inputs: CitationPlanReplayInputs,
+    runtime_config: RCConfig | None,
+    *,
+    project_root: Path,
+) -> ReplayedCitationAuthority:
+    """Rebuild Stage 4-6 eligibility and Stage 16 policy/plan from captured bytes."""
+    try:
+        snapshot_config, config_path, config_sha256 = replay_active_config_snapshot(
+            inputs.active_config, runtime_config, project_root=project_root
+        )
+        card_inputs = validate_card_inputs_from_texts(
+            candidates_text=inputs.candidates_text,
+            registry_text=inputs.registry_text,
+            bibliography_text=inputs.bibliography_text,
+            shortlist_text=inputs.shortlist_text,
+            screening_report_text=inputs.screening_report_text,
+            config=snapshot_config,
+        )
+        cards = validate_cards_artifacts_from_texts(
+            manifest_text=inputs.cards_manifest_text,
+            card_texts=inputs.card_texts,
+            shortlist_text=card_inputs.shortlist_text,
+            screening_report_text=card_inputs.screening_report_text,
+            candidates_sha256=sha256_text(card_inputs.candidates_text),
+            shortlist=card_inputs.shortlist,
+        )
+        expected_allowlist = build_citation_allowlist_from_replayed_inputs(
+            card_inputs=card_inputs,
+            cards=cards,
+            cards_manifest_text=inputs.cards_manifest_text,
+            references_text=inputs.bibliography_text,
+        )
+        stored_allowlist = parse_citation_allowlist(inputs.citation_allowlist_text)
+        if stored_allowlist != expected_allowlist:
+            raise CitationPlanContractError("citation allowlist replay mismatch")
+        expected_policy = build_effective_citation_policy_from_replayed_inputs(
+            allowlist=stored_allowlist,
+            allowlist_text=inputs.citation_allowlist_text,
+            snapshot_config=snapshot_config,
+            config_source_path=config_path,
+            config_source_sha256=config_sha256,
+        )
+        stored_policy = parse_effective_citation_policy(inputs.effective_policy_text)
+        if stored_policy != expected_policy:
+            raise CitationPlanContractError("effective citation policy replay mismatch")
+        expected_plan = build_citation_plan_from_replayed_inputs(
+            config=snapshot_config,
+            plan_status="final",
+            allowlist=stored_allowlist,
+            allowlist_text=inputs.citation_allowlist_text,
+            cards_manifest_text=inputs.cards_manifest_text,
+            effective_policy=stored_policy,
+            effective_policy_text=inputs.effective_policy_text,
+            cards=cards,
+        )
+        stored_plan = parse_citation_plan(inputs.citation_plan_text)
+    except (CitationPolicyContractError, CitationIdentityError, ValueError) as exc:
+        raise CitationPlanContractError(f"citation provenance replay failed: {exc}") from exc
+    if stored_plan != expected_plan:
+        raise CitationPlanContractError("citation plan replay mismatch")
+    return ReplayedCitationAuthority(
+        allowlist=stored_allowlist,
+        effective_policy=stored_policy,
+        plan=stored_plan,
+    )
 
 
 def parse_citation_plan(text: str) -> dict[str, Any]:
@@ -387,10 +518,11 @@ def build_citation_closure_report(
     evidence: CanonicalExperimentEvidence | None = None,
 ) -> dict[str, Any]:
     plan_path = run_dir / "stage-16" / "citation_plan.json"
+    allowlist_path = run_dir / "stage-06" / "citation_allowlist.json"
     try:
         plan_text = plan_path.read_text(encoding="utf-8")
+        allowlist_text = allowlist_path.read_text(encoding="utf-8")
         plan = load_final_citation_plan(run_dir, config)
-        structure = _parse_object(structure_report_text, "paper structure report")
         experiment = parse_experiment_fact_closure_report(
             experiment_fact_report_text
         )
@@ -399,21 +531,56 @@ def build_citation_closure_report(
         )
         if experiment != expected_experiment:
             raise CitationPlanContractError("experiment fact closure replay mismatch")
+        allowlist = validate_citation_allowlist(run_dir, config, allowlist_text)
     except (
         OSError,
         UnicodeDecodeError,
         CitationPlanContractError,
+        CitationPolicyContractError,
         ExperimentFactClosureError,
     ) as exc:
         raise CitationPlanContractError(f"cannot build citation closure: {exc}") from exc
+    return build_citation_closure_from_texts(
+        paper_text=paper_text,
+        structure_report_text=structure_report_text,
+        experiment_fact_report_text=experiment_fact_report_text,
+        citation_plan_text=plan_text,
+        citation_allowlist_text=allowlist_text,
+        plan=plan,
+        allowlist=allowlist,
+    )
+
+
+def build_citation_closure_from_texts(
+    *,
+    paper_text: str,
+    structure_report_text: str,
+    experiment_fact_report_text: str,
+    citation_plan_text: str,
+    citation_allowlist_text: str,
+    plan: Mapping[str, Any] | None = None,
+    allowlist: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build closure from captured authority texts without reopening run paths."""
+
+    try:
+        plan = dict(plan) if plan is not None else parse_citation_plan(citation_plan_text)
+        allowlist = (
+            dict(allowlist)
+            if allowlist is not None
+            else parse_citation_allowlist(citation_allowlist_text)
+        )
+        structure = _parse_object(structure_report_text, "paper structure report")
+        experiment = parse_experiment_fact_closure_report(experiment_fact_report_text)
+    except (CitationPlanContractError, ExperimentFactClosureError) as exc:
+        raise CitationPlanContractError(f"cannot build citation closure: {exc}") from exc
+    if plan["citation_allowlist_sha256"] != sha256_text(citation_allowlist_text):
+        raise CitationPlanContractError("citation plan allowlist hash mismatch")
     planned = [
         citation["cite_key"]
         for claim in plan["claims"]
         for citation in claim["planned_citations"]
     ]
-    allowlist_path = run_dir / "stage-06" / "citation_allowlist.json"
-    allowlist_text = allowlist_path.read_text(encoding="utf-8")
-    allowlist = validate_citation_allowlist(run_dir, config, allowlist_text)
     cited = sorted(extract_citation_keys(paper_text))
     unknown = sorted(set(cited) - set(allowlist["eligible_keys"]))
     unplanned = sorted(set(cited) - set(planned))
@@ -454,7 +621,7 @@ def build_citation_closure_report(
         "paper_path": "stage-17/paper_draft.md",
         "paper_sha256": sha256_text(paper_text),
         "citation_plan_path": "stage-16/citation_plan.json",
-        "citation_plan_sha256": sha256_text(plan_text),
+        "citation_plan_sha256": sha256_text(citation_plan_text),
         "cited_keys": cited,
         "unknown_keys": unknown,
         "unplanned_keys": unplanned,
@@ -472,6 +639,54 @@ def build_citation_closure_report(
         ),
     }
     return parse_citation_closure_report(canonical_json_text(payload))
+
+
+def replay_citation_closure(
+    *,
+    paper_bytes: bytes,
+    structure_report_bytes: bytes,
+    experiment_fact_report_bytes: bytes,
+    citation_closure_report_bytes: bytes,
+    citation_plan_bytes: bytes,
+    citation_allowlist_bytes: bytes,
+    citation_authority: ReplayedCitationAuthority,
+    evidence: CanonicalExperimentEvidence,
+) -> dict[str, Any]:
+    """Replay captured Stage 17 closure bytes without reopening run inputs."""
+
+    try:
+        paper_text = paper_bytes.decode("utf-8")
+        structure_text = structure_report_bytes.decode("utf-8")
+        fact_text = experiment_fact_report_bytes.decode("utf-8")
+        closure_text = citation_closure_report_bytes.decode("utf-8")
+        plan_text = citation_plan_bytes.decode("utf-8")
+        allowlist_text = citation_allowlist_bytes.decode("utf-8")
+        replay_experiment_fact_closure(
+            paper_bytes=paper_bytes,
+            stored_report_bytes=experiment_fact_report_bytes,
+            evidence=evidence,
+        )
+        stored = parse_citation_closure_report(closure_text)
+        if parse_citation_plan(plan_text) != citation_authority.plan:
+            raise CitationPlanContractError("citation closure plan is not provenance-replayed")
+        if parse_citation_allowlist(allowlist_text) != citation_authority.allowlist:
+            raise CitationPlanContractError(
+                "citation closure allowlist is not provenance-replayed"
+            )
+        expected = build_citation_closure_from_texts(
+            paper_text=paper_text,
+            structure_report_text=structure_text,
+            experiment_fact_report_text=fact_text,
+            citation_plan_text=plan_text,
+            citation_allowlist_text=allowlist_text,
+            plan=citation_authority.plan,
+            allowlist=citation_authority.allowlist,
+        )
+    except (UnicodeDecodeError, CitationPlanContractError, ExperimentFactClosureError) as exc:
+        raise CitationPlanContractError(f"cannot replay citation closure: {exc}") from exc
+    if stored != expected or not stored["valid"]:
+        raise CitationPlanContractError("citation closure replay failed")
+    return stored
 
 
 def parse_citation_closure_report(text: str) -> dict[str, Any]:

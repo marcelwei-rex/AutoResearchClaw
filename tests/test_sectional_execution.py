@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +15,7 @@ from researchclaw.pipeline.sectional_execution import (
     ResolutionAssessment,
     SectionProposal,
     build_validation_context,
+    clean_sectional_outputs,
     execute_sectional_revision,
 )
 
@@ -166,7 +169,48 @@ def _prepare_run(
     contract_path = run_dir / "stage-09" / "experiment_contract.yaml"
     contract_path.parent.mkdir(parents=True, exist_ok=True)
     dump_contract(contract, contract_path)
+    (run_dir / "canonical_experiment_evidence.json").write_bytes(b"test-evidence")
+    reviews_hash = hashlib.sha256(REVIEWS.encode("utf-8")).hexdigest()
+    (run_dir / "stage-18" / "review_structure_report.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "valid": True,
+                "source_reviews_sha256": reviews_hash,
+                "canonical_experiment_evidence_path": "canonical_experiment_evidence.json",
+                "canonical_experiment_evidence_sha256": hashlib.sha256(
+                    b"test-evidence"
+                ).hexdigest(),
+                "comment_count": 1,
+                "issues": [],
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return run_dir, stage_dir
+
+
+def _execute_sectional_revision(
+    *, run_dir: Path, stage_dir: Path, **kwargs: object
+):
+    """Invoke Stage 19 with the explicit input snapshot required in production."""
+    bibliography = (run_dir / "stage-04" / "references.bib").read_text(
+        encoding="utf-8"
+    )
+    return execute_sectional_revision(
+        run_dir=run_dir,
+        stage_dir=stage_dir,
+        paper_text=(run_dir / "stage-17" / "paper_draft.md").read_text(encoding="utf-8"),
+        reviews_text=(run_dir / "stage-18" / "reviews.md").read_text(encoding="utf-8"),
+        review_structure_report_text=(
+            run_dir / "stage-18" / "review_structure_report.json"
+        ).read_text(encoding="utf-8"),
+        bibliography_text=bibliography,
+        bibliography_sha256=hashlib.sha256(bibliography.encode("utf-8")).hexdigest(),
+        **kwargs,
+    )
 
 
 def _config() -> PaperRevisionConfig:
@@ -179,33 +223,150 @@ def _config() -> PaperRevisionConfig:
     )
 
 
+def _evidence(claim_scope: str = "pipeline_validation") -> SimpleNamespace:
+    dataset_origin = "public" if claim_scope == "research_release" else "synthetic"
+    contract_bytes = (
+        "schema_version: 1\n"
+        "topic: sectional execution fixture\n"
+        f"claim_scope: {claim_scope}\n"
+        f"dataset_origin: {dataset_origin}\n"
+        "primary_metric:\n  key: detection_f1\n  direction: maximize\n"
+        "smoke_budget_sec: 60\nrun_budget_sec: 300\n"
+        "allowed_inputs: []\n"
+        "allowed_outputs:\n  - path: results.json\n    required: true\n"
+        "evaluator:\n  owner: scaffold\n  required_result_keys:\n    - dataset_origin\n    - metrics\n"
+        "safety: {}\nsealing: {}\n"
+    ).encode("utf-8")
+    return SimpleNamespace(
+        manifest_path="canonical_experiment_evidence.json",
+        manifest_sha256=hashlib.sha256(b"test-evidence").hexdigest(),
+        metric_observations={"detection_f1": (Decimal("0.475"),)},
+        structured_results={"metrics": {"detection_f1": Decimal("0.475")}},
+        summary={},
+        experiment_contract_path="stage-09/experiment_contract.yaml",
+        experiment_contract_sha256=hashlib.sha256(contract_bytes).hexdigest(),
+        experiment_contract_bytes=contract_bytes,
+    )
+
+
 def test_context_builder_binds_canonical_sources_and_excludes_stage10(
     tmp_path: Path,
 ) -> None:
     run_dir, _ = _prepare_run(tmp_path)
     from researchclaw.pipeline.manuscript_sections import parse_manuscript
 
+    bibliography = (run_dir / "stage-04" / "references.bib").read_text(
+        encoding="utf-8"
+    )
     bundle = build_validation_context(
-        run_dir=run_dir,
         document=parse_manuscript(DRAFT),
         config=_config(),
+        evidence=_evidence(),
+        bibliography_text=bibliography,
+        bibliography_sha256=hashlib.sha256(bibliography.encode("utf-8")).hexdigest(),
     )
     payload = json.loads(bundle.text)
 
     assert payload["allowed_citation_keys"] == ["smith2024"]
-    assert payload["grounded_numeric_values"] == [0.475]
+    assert payload["grounded_numeric_values"] == ["0.475"]
     assert all(not source["path"].startswith("stage-10/") for source in payload["sources"])
     assert {source["kind"] for source in payload["sources"]} == {
         "citations",
         "config",
-        "metrics",
+        "canonical_evidence",
     }
-    metric_source = next(
-        source for source in payload["sources"] if source["kind"] == "metrics"
+    assert payload["canonical_experiment_evidence_path"] == (
+        "canonical_experiment_evidence.json"
     )
-    assert metric_source["sha256"] == hashlib.sha256(
-        (run_dir / metric_source["path"]).read_bytes()
+    assert payload["canonical_experiment_evidence_sha256"] == hashlib.sha256(
+        b"test-evidence"
     ).hexdigest()
+    metric_source = next(
+        source
+        for source in payload["sources"]
+        if source["kind"] == "canonical_evidence"
+    )
+    assert metric_source == {
+        "kind": "canonical_evidence",
+        "path": "canonical_experiment_evidence.json",
+        "sha256": hashlib.sha256(b"test-evidence").hexdigest(),
+    }
+
+
+def test_context_builder_serializes_exact_decimal_authority_tokens(tmp_path: Path) -> None:
+    run_dir, _ = _prepare_run(tmp_path)
+    from researchclaw.pipeline.manuscript_sections import parse_manuscript
+
+    evidence = _evidence()
+    evidence.metric_observations = {
+        "detection_f1": (Decimal("0.1"), Decimal("0.475"), Decimal("9007199254740993"))
+    }
+    evidence.structured_results = {}
+    bibliography = (run_dir / "stage-04" / "references.bib").read_text(
+        encoding="utf-8"
+    )
+    bundle = build_validation_context(
+        document=parse_manuscript(DRAFT),
+        config=_config(),
+        evidence=evidence,
+        bibliography_text=bibliography,
+        bibliography_sha256=hashlib.sha256(bibliography.encode("utf-8")).hexdigest(),
+    )
+    payload = json.loads(bundle.text)
+
+    assert payload["schema_version"] == 2
+    assert payload["numeric_policy_version"] == "stage19_decimal_v1"
+    assert payload["grounded_numeric_values"] == ["0.1", "0.475", "9007199254740993"]
+    assert bundle.grounded_numeric_values == (
+        Decimal("0.1"),
+        Decimal("0.475"),
+        Decimal("9007199254740993"),
+    )
+
+
+def test_context_builder_rejects_binary_float_authority(tmp_path: Path) -> None:
+    run_dir, _ = _prepare_run(tmp_path)
+    from researchclaw.pipeline.manuscript_sections import parse_manuscript
+
+    evidence = _evidence()
+    evidence.metric_observations = {"detection_f1": (0.475,)}
+    bibliography = (run_dir / "stage-04" / "references.bib").read_text(
+        encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="binary-float"):
+        build_validation_context(
+            document=parse_manuscript(DRAFT),
+            config=_config(),
+            evidence=evidence,
+            bibliography_text=bibliography,
+            bibliography_sha256=hashlib.sha256(bibliography.encode("utf-8")).hexdigest(),
+        )
+
+
+def test_clean_sectional_outputs_removes_every_success_named_artifact(
+    tmp_path: Path,
+) -> None:
+    stage_dir = tmp_path / "stage-19"
+    stage_dir.mkdir()
+    for name in (
+        "paper_revised.md",
+        "revision_plan.json",
+        "review_comment_ledger.json",
+        "section_attempts.jsonl",
+        "resolution_assessments.jsonl",
+        "section_revision_manifest.json",
+        "unresolved_comments.json",
+        "validation_context.json",
+    ):
+        (stage_dir / name).write_text("owned", encoding="utf-8")
+    for name in ("sections", "section_validation"):
+        directory = stage_dir / name
+        directory.mkdir()
+        (directory / "owned.json").write_text("owned", encoding="utf-8")
+
+    clean_sectional_outputs(stage_dir)
+
+    assert not any(stage_dir.iterdir())
 
 
 def test_context_builder_fails_when_canonical_bib_omits_draft_key(
@@ -218,11 +379,16 @@ def test_context_builder_fails_when_canonical_bib_omits_draft_key(
     )
     from researchclaw.pipeline.manuscript_sections import parse_manuscript
 
+    bibliography = (run_dir / "stage-04" / "references.bib").read_text(
+        encoding="utf-8"
+    )
     with pytest.raises(RuntimeError, match="missing draft citation keys"):
         build_validation_context(
-            run_dir=run_dir,
             document=parse_manuscript(DRAFT),
             config=_config(),
+            evidence=_evidence(),
+            bibliography_text=bibliography,
+            bibliography_sha256=hashlib.sha256(bibliography.encode("utf-8")).hexdigest(),
         )
 
 
@@ -232,24 +398,26 @@ def test_provider_must_match_configured_isolated_critic(tmp_path: Path) -> None:
     provider.critic_model = provider.writer_model
 
     with pytest.raises(RuntimeError, match="distinct nonempty writer and critic"):
-        execute_sectional_revision(
+        _execute_sectional_revision(
             stage_dir=stage_dir,
             run_dir=run_dir,
             config=_config(),
             claim_scope="pipeline_validation",
             provider=provider,
+            evidence=_evidence(),
         )
 
 
 def test_pipeline_validation_writes_complete_hash_bound_artifacts(tmp_path: Path) -> None:
     run_dir, stage_dir = _prepare_run(tmp_path)
 
-    result = execute_sectional_revision(
+    result = _execute_sectional_revision(
         stage_dir=stage_dir,
         run_dir=run_dir,
         config=_config(),
         claim_scope="pipeline_validation",
         provider=_FakeProvider(),
+        evidence=_evidence(),
     )
 
     assert result.completed is True
@@ -259,12 +427,9 @@ def test_pipeline_validation_writes_complete_hash_bound_artifacts(tmp_path: Path
     )
     context_bytes = (stage_dir / "validation_context.json").read_bytes()
     attempts_bytes = (stage_dir / "section_attempts.jsonl").read_bytes()
-    contract_path = run_dir / manifest["experiment_contract_path"]
     assert manifest["completed"] is True
     assert manifest["experiment_contract_path"] == "stage-09/experiment_contract.yaml"
-    assert manifest["experiment_contract_sha256"] == hashlib.sha256(
-        contract_path.read_bytes()
-    ).hexdigest()
+    assert manifest["experiment_contract_sha256"] == _evidence().experiment_contract_sha256
     assert manifest["attempts_sha256"] == hashlib.sha256(attempts_bytes).hexdigest()
     assert manifest["writer_model"] == "writer-model"
     assert manifest["critic_model"] == "critic-model"
@@ -283,12 +448,13 @@ def test_pipeline_validation_preserves_original_when_critic_rejects(
 ) -> None:
     run_dir, stage_dir = _prepare_run(tmp_path)
 
-    result = execute_sectional_revision(
+    result = _execute_sectional_revision(
         stage_dir=stage_dir,
         run_dir=run_dir,
         config=replace(_config(), max_section_retries=0),
         claim_scope="pipeline_validation",
         provider=_FakeProvider(verdict="unresolved"),
+        evidence=_evidence(),
     )
 
     assert result.completed is True
@@ -311,12 +477,13 @@ def test_research_release_does_not_expose_paper_with_unresolved_required_comment
 ) -> None:
     run_dir, stage_dir = _prepare_run(tmp_path, claim_scope="research_release")
 
-    result = execute_sectional_revision(
+    result = _execute_sectional_revision(
         stage_dir=stage_dir,
         run_dir=run_dir,
         config=replace(_config(), max_section_retries=0),
         claim_scope="research_release",
         provider=_FakeProvider(verdict="unresolved"),
+        evidence=_evidence("research_release"),
     )
 
     assert result.completed is False
@@ -340,12 +507,13 @@ def test_transport_failures_are_bounded_and_stale_outputs_are_removed(
     stale_dir.mkdir()
     (stale_dir / "stale.md").write_text("stale", encoding="utf-8")
 
-    result = execute_sectional_revision(
+    result = _execute_sectional_revision(
         stage_dir=stage_dir,
         run_dir=run_dir,
         config=replace(_config(), max_section_retries=1),
         claim_scope="pipeline_validation",
         provider=_FakeProvider(fail_proposal=True),
+        evidence=_evidence(),
     )
 
     assert result.completed is True
@@ -373,23 +541,23 @@ def test_context_source_mutation_during_provider_execution_fails_closed(
     class MutatingProvider(_FakeProvider):
         def propose(self, **kwargs):
             result = super().propose(**kwargs)
-            (run_dir / "stage-12" / "runs" / "results.json").write_text(
-                json.dumps({"metrics": {"detection_f1": 0.999}}),
-                encoding="utf-8",
+            (run_dir / "canonical_experiment_evidence.json").write_bytes(
+                b"mutated-evidence"
             )
             return result
 
-    with pytest.raises(RuntimeError, match="validation context source changed"):
-        execute_sectional_revision(
+    with pytest.raises(RuntimeError, match="canonical experiment evidence changed"):
+        _execute_sectional_revision(
             stage_dir=stage_dir,
             run_dir=run_dir,
             config=replace(_config(), max_section_retries=0),
             claim_scope="pipeline_validation",
             provider=MutatingProvider(),
+            evidence=_evidence(),
         )
 
 
-def test_contract_mutation_during_provider_execution_fails_closed(
+def test_contract_mutation_during_provider_execution_does_not_replace_snapshot(
     tmp_path: Path,
 ) -> None:
     run_dir, stage_dir = _prepare_run(tmp_path)
@@ -404,17 +572,20 @@ def test_contract_mutation_during_provider_execution_fails_closed(
             )
             return result
 
-    with pytest.raises(RuntimeError, match="Stage 9 contract changed"):
-        execute_sectional_revision(
-            stage_dir=stage_dir,
-            run_dir=run_dir,
-            config=_config(),
-            claim_scope="pipeline_validation",
-            provider=MutatingProvider(),
-        )
+    result = _execute_sectional_revision(
+        stage_dir=stage_dir,
+        run_dir=run_dir,
+        config=_config(),
+        claim_scope="pipeline_validation",
+        provider=MutatingProvider(),
+        evidence=_evidence(),
+    )
 
-    assert not (stage_dir / "section_revision_manifest.json").exists()
-    assert not (stage_dir / "paper_revised.md").exists()
+    assert result.completed is True
+    manifest = json.loads(
+        (stage_dir / "section_revision_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["experiment_contract_sha256"] == _evidence().experiment_contract_sha256
 
 
 def test_provider_programming_error_is_not_misclassified_as_transport_failure(
@@ -428,12 +599,13 @@ def test_provider_programming_error_is_not_misclassified_as_transport_failure(
             raise KeyError("provider implementation bug")
 
     with pytest.raises(KeyError, match="provider implementation bug"):
-        execute_sectional_revision(
+        _execute_sectional_revision(
             stage_dir=stage_dir,
             run_dir=run_dir,
             config=replace(_config(), max_section_retries=0),
             claim_scope="pipeline_validation",
             provider=BrokenProvider(),
+            evidence=_evidence(),
         )
 
     assert not (stage_dir / "section_attempts.jsonl").exists()

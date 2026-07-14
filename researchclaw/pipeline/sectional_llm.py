@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from researchclaw.llm.client import LLMClient
+from researchclaw.pipeline.canonical_experiment_evidence import canonical_decimal
 from researchclaw.pipeline.manuscript_sections import ManuscriptDocument, ManuscriptSection
 from researchclaw.pipeline.sectional_execution import (
     ResolutionAssessment,
@@ -155,7 +156,9 @@ class LLMSectionalRevisionProvider:
             ],
             "attempt": attempt,
             "allowed_citation_keys": sorted(context.allowed_citation_keys),
-            "grounded_numeric_values": list(context.grounded_numeric_values),
+            "grounded_numeric_values": [
+                canonical_decimal(value) for value in context.grounded_numeric_values
+            ],
             "response_schema": {
                 "schema_version": 1,
                 "section_id": section.section_id,

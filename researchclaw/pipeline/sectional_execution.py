@@ -4,19 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
+import re
 import shutil
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
+import yaml
+
 from researchclaw.config import PaperRevisionConfig
 from researchclaw.experiment_runtime.contract import (
-    ContractValidationError,
-    find_stage09_contract,
-    load_contract,
     sha256_file,
+    validate_contract_dict,
 )
 from researchclaw.literature.verify import parse_bibtex_entries
 from researchclaw.pipeline.manuscript_sections import (
@@ -24,6 +26,10 @@ from researchclaw.pipeline.manuscript_sections import (
     ManuscriptSection,
     merge_manuscript,
     parse_manuscript,
+)
+from researchclaw.pipeline.canonical_experiment_evidence import (
+    CanonicalExperimentEvidence,
+    canonical_decimal,
 )
 from researchclaw.pipeline.sectional_revision import (
     ReviewComment,
@@ -39,6 +45,7 @@ from researchclaw.pipeline.sectional_validation import (
     ResolutionAssessmentRecord,
     SectionAttemptRecord,
     SectionManifestMetadata,
+    SectionRevisionManifest,
     SectionValidationContext,
     ValidatedSectionReplacement,
     build_section_revision_manifest,
@@ -133,7 +140,9 @@ class SectionalExecutionResult:
 @dataclass(frozen=True)
 class _ContextBundle:
     allowed_citation_keys: frozenset[str]
-    grounded_numeric_values: tuple[float, ...]
+    grounded_numeric_values: tuple[Decimal, ...]
+    canonical_experiment_evidence_path: str
+    canonical_experiment_evidence_sha256: str
     text: str
 
 
@@ -144,6 +153,12 @@ def execute_sectional_revision(
     config: PaperRevisionConfig,
     claim_scope: str,
     provider: SectionalRevisionProvider | None,
+    evidence: CanonicalExperimentEvidence,
+    paper_text: str,
+    reviews_text: str,
+    review_structure_report_text: str,
+    bibliography_text: str,
+    bibliography_sha256: str,
 ) -> SectionalExecutionResult:
     """Execute B2 using an explicitly injected provider and deterministic gates."""
 
@@ -163,41 +178,44 @@ def execute_sectional_revision(
             "sectional provider critic model does not match paper_revision.critic_model"
         )
 
-    contract_path = find_stage09_contract(run_dir)
-    if contract_path is None:
-        raise SectionalExecutionError("canonical Stage 9 experiment contract is missing")
     try:
-        contract = load_contract(contract_path)
-    except ContractValidationError as exc:
-        raise SectionalExecutionError(f"canonical Stage 9 contract is invalid: {exc}") from exc
+        contract_data = yaml.safe_load(evidence.experiment_contract_bytes.decode("utf-8"))
+        if not isinstance(contract_data, dict):
+            raise ValueError("canonical contract root is not an object")
+        contract = validate_contract_dict(contract_data)
+    except (UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
+        raise SectionalExecutionError(
+            f"canonical snapshot contract is invalid: {exc}"
+        ) from exc
     if contract.claim_scope != claim_scope:
         raise SectionalExecutionError(
             "Stage 19 claim scope does not match the canonical Stage 9 contract"
         )
-    contract_rel = contract_path.relative_to(run_dir).as_posix()
-    contract_sha = sha256_file(contract_path)
+    contract_rel = evidence.experiment_contract_path
+    contract_sha = evidence.experiment_contract_sha256
 
-    paper_path = run_dir / "stage-17" / "paper_draft.md"
-    reviews_path = run_dir / "stage-18" / "reviews.md"
-    if not paper_path.is_file() or not reviews_path.is_file():
-        raise SectionalExecutionError(
-            "sectional revision requires canonical stage-17 and stage-18 inputs"
-        )
-    paper = paper_path.read_text(encoding="utf-8")
-    reviews = reviews_path.read_text(encoding="utf-8")
-    document = parse_manuscript(paper, strict=True)
-    ledger = extract_review_ledger(reviews, source_path="stage-18/reviews.md")
+    # The Stage 19 boundary passes these only after replaying the Stage 17/18
+    # closures. This function must not create a second authority read.
+    _validate_stage18_review_binding(
+        reviews_text,
+        review_structure_report_text,
+        evidence,
+    )
+    document = parse_manuscript(paper_text, strict=True)
+    ledger = extract_review_ledger(reviews_text, source_path="stage-18/reviews.md")
     plan = validate_revision_plan(
         provider.build_plan(ledger=ledger, document=document),
         ledger,
         document,
-        reviews=reviews,
+        reviews=reviews_text,
     )
 
     context_bundle = build_validation_context(
-        run_dir=run_dir,
         document=document,
         config=config,
+        evidence=evidence,
+        bibliography_text=bibliography_text,
+        bibliography_sha256=bibliography_sha256,
     )
     _write_text_atomic(stage_dir / "validation_context.json", context_bundle.text)
     _write_json_atomic(stage_dir / "review_comment_ledger.json", ledger.to_dict())
@@ -262,6 +280,8 @@ def execute_sectional_revision(
                         writer_model=writer_model,
                         attempt=attempt,
                         source_section_sha256=section.original_sha256,
+                        canonical_experiment_evidence_path=evidence.manifest_path,
+                        canonical_experiment_evidence_sha256=evidence.manifest_sha256,
                         exc=exc,
                     )
                 )
@@ -320,6 +340,8 @@ def execute_sectional_revision(
                         attempt_id=attempt_id,
                         section_id=section_id,
                         source_section_sha256=section.original_sha256,
+                        canonical_experiment_evidence_path=evidence.manifest_path,
+                        canonical_experiment_evidence_sha256=evidence.manifest_sha256,
                         comment_ids=tuple(c.comment_id for c in assigned_comments),
                         resolution_comment_ids=proposal.resolution_comment_ids,
                         writer_model=writer_model,
@@ -347,7 +369,11 @@ def execute_sectional_revision(
                 ).to_dict()
             )
             for assessment in attempt_assessments:
-                payload = _assessment_payload(assessment)
+                payload = _assessment_payload(
+                    assessment,
+                    canonical_experiment_evidence_path=evidence.manifest_path,
+                    canonical_experiment_evidence_sha256=evidence.manifest_sha256,
+                )
                 assessments.append(payload)
                 if status == "accepted" and assessment.verdict == "resolved":
                     accepted_comment_sections.add(
@@ -380,14 +406,11 @@ def execute_sectional_revision(
 
     _verify_input_immutability(
         run_dir=run_dir,
-        paper_path=paper_path,
-        reviews_path=reviews_path,
         document=document,
         ledger=ledger,
         context_text=context_bundle.text,
         config=config,
-        contract_path=contract_path,
-        contract_sha256=contract_sha,
+        evidence=evidence,
     )
     final_ledger = _finalize_ledger(
         ledger=ledger,
@@ -395,7 +418,7 @@ def execute_sectional_revision(
         attempts_by_section=attempts_by_section,
         accepted_comment_sections=accepted_comment_sections,
     )
-    validate_review_ledger(final_ledger, reviews=reviews, require_final=True)
+    validate_review_ledger(final_ledger, reviews=reviews_text, require_final=True)
     merge_result = merge_validated_sections(document, replacements)
     assessments_text = _jsonl_text(assessments)
     attempts_text = _jsonl_text(attempts)
@@ -416,10 +439,12 @@ def execute_sectional_revision(
             merge_result=merge_result,
             ledger=final_ledger,
             plan=plan,
-            reviews=reviews,
+            reviews=reviews_text,
             claim_scope=claim_scope,
             experiment_contract_path=contract_rel,
             experiment_contract_sha256=contract_sha,
+            canonical_experiment_evidence_path=evidence.manifest_path,
+            canonical_experiment_evidence_sha256=evidence.manifest_sha256,
             writer_model=writer_model,
             critic_model=critic_model,
             source_paper_path="stage-17/paper_draft.md",
@@ -439,10 +464,12 @@ def execute_sectional_revision(
             merge_result=merge_result,
             ledger=final_ledger,
             plan=plan,
-            reviews=reviews,
+            reviews=reviews_text,
             claim_scope=claim_scope,
             experiment_contract_path=contract_rel,
             experiment_contract_sha256=contract_sha,
+            canonical_experiment_evidence_path=evidence.manifest_path,
+            canonical_experiment_evidence_sha256=evidence.manifest_sha256,
             writer_model=writer_model,
             critic_model=critic_model,
             source_paper_path="stage-17/paper_draft.md",
@@ -462,10 +489,12 @@ def execute_sectional_revision(
         merge_result=merge_result,
         ledger=final_ledger,
         plan=plan,
-        reviews=reviews,
+        reviews=reviews_text,
         claim_scope=claim_scope,
         experiment_contract_path=contract_rel,
         experiment_contract_sha256=contract_sha,
+        canonical_experiment_evidence_path=evidence.manifest_path,
+        canonical_experiment_evidence_sha256=evidence.manifest_sha256,
         writer_model=writer_model,
         critic_model=critic_model,
         source_paper_path="stage-17/paper_draft.md",
@@ -476,7 +505,6 @@ def execute_sectional_revision(
         completed=completed,
         validation_context_text=context_bundle.text,
     )
-    _write_json_atomic(stage_dir / "section_revision_manifest.json", manifest.to_dict())
     artifacts = (
         "review_comment_ledger.json",
         "revision_plan.json",
@@ -487,8 +515,36 @@ def execute_sectional_revision(
         "section_revision_manifest.json",
     )
     if not completed:
+        _write_json_atomic(stage_dir / "section_revision_manifest.json", manifest.to_dict())
         return SectionalExecutionResult(False, None, error, artifacts)
-    _write_text_atomic(stage_dir / "paper_revised.md", merge_result.merged_text)
+    try:
+        _write_text_atomic(stage_dir / "paper_revised.md", merge_result.merged_text)
+        _write_json_atomic(stage_dir / "section_revision_manifest.json", manifest.to_dict())
+        _replay_published_sectional_bundle(
+            stage_dir=stage_dir,
+            run_dir=run_dir,
+            document=document,
+            merge_result=merge_result,
+            ledger=final_ledger,
+            plan=plan,
+            reviews_text=reviews_text,
+            claim_scope=claim_scope,
+            experiment_contract_path=contract_rel,
+            experiment_contract_sha256=contract_sha,
+            canonical_experiment_evidence_path=evidence.manifest_path,
+            canonical_experiment_evidence_sha256=evidence.manifest_sha256,
+            writer_model=writer_model,
+            critic_model=critic_model,
+            source_paper_path="stage-17/paper_draft.md",
+            section_metadata=metadata,
+            attempts_text=attempts_text,
+            assessments_text=assessments_text,
+            unresolved_comments_text=unresolved_text,
+            validation_context_text=context_bundle.text,
+        )
+    except Exception:
+        clean_sectional_outputs(stage_dir)
+        raise
     return SectionalExecutionResult(
         True,
         merge_result.merged_text,
@@ -499,24 +555,33 @@ def execute_sectional_revision(
 
 def build_validation_context(
     *,
-    run_dir: Path,
     document: ManuscriptDocument,
     config: PaperRevisionConfig,
+    evidence: CanonicalExperimentEvidence,
+    bibliography_text: str,
+    bibliography_sha256: str,
 ) -> _ContextBundle:
     """Build and source-bind the B2 citation and metric validation context."""
 
     sources: list[dict[str, str]] = []
     original_citations = extract_citation_keys(merge_manuscript(document))
-    bib_path = _latest_stage_artifact(run_dir, 4, "references.bib")
     citation_keys: set[str] = set()
-    if bib_path is not None:
-        bib_text = bib_path.read_text(encoding="utf-8")
-        citation_keys.update(
-            str(entry.get("key") or "").strip()
-            for entry in parse_bibtex_entries(bib_text)
-            if str(entry.get("key") or "").strip()
-        )
-        sources.append(_source_record(run_dir, bib_path, "citations"))
+    citation_keys.update(
+        str(entry.get("key") or "").strip()
+        for entry in parse_bibtex_entries(bibliography_text)
+        if str(entry.get("key") or "").strip()
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", bibliography_sha256):
+        raise SectionalExecutionError("canonical bibliography hash is invalid")
+    if _sha256(bibliography_text) != bibliography_sha256:
+        raise SectionalExecutionError("canonical bibliography hash does not match captured bytes")
+    sources.append(
+        {
+            "kind": "citations",
+            "path": "stage-04/references.bib",
+            "sha256": bibliography_sha256,
+        }
+    )
     missing_citations = sorted(original_citations - citation_keys)
     if missing_citations:
         raise SectionalExecutionError(
@@ -524,26 +589,22 @@ def build_validation_context(
             + ", ".join(missing_citations)
         )
 
-    numeric_values: list[float] = []
-    numeric_seen: set[float] = set()
-    for path in _metric_source_paths(run_dir):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        before = len(numeric_values)
-        for key in ("primary_metric", "metrics", "key_metrics", "metrics_summary"):
-            if key in payload:
-                _collect_numbers(payload[key], numeric_values, numeric_seen)
-        per_seed = payload.get("per_seed")
-        if isinstance(per_seed, list):
-            for row in per_seed[:20]:
-                if isinstance(row, dict) and isinstance(row.get("metrics"), dict):
-                    _collect_numbers(row["metrics"], numeric_values, numeric_seen)
-        if len(numeric_values) > before:
-            sources.append(_source_record(run_dir, path, "metrics"))
+    numeric_values: list[Decimal] = []
+    numeric_seen: set[Decimal] = set()
+    for value in (
+        evidence.metric_observations,
+        evidence.structured_results,
+        evidence.summary,
+    ):
+        _collect_numbers(value, numeric_values, numeric_seen)
+    if numeric_values:
+        sources.append(
+            {
+                "kind": "canonical_evidence",
+                "path": evidence.manifest_path,
+                "sha256": evidence.manifest_sha256,
+            }
+        )
 
     config_payload = {
         "max_section_retries": config.max_section_retries,
@@ -559,17 +620,26 @@ def build_validation_context(
         }
     )
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "numeric_policy_version": "stage19_decimal_v1",
         "source_paper_sha256": document.source_sha256,
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
         "allowed_citation_keys": sorted(citation_keys),
-        "grounded_numeric_values": numeric_values,
+        "grounded_numeric_values": [canonical_decimal(value) for value in numeric_values],
         "max_section_retries": config.max_section_retries,
         "min_length_ratio": config.min_length_ratio,
         "max_length_ratio": config.max_length_ratio,
         "sources": sorted(sources, key=lambda item: (item["kind"], item["path"])),
     }
     text = _pretty_json_text(payload)
-    return _ContextBundle(frozenset(citation_keys), tuple(numeric_values), text)
+    return _ContextBundle(
+        frozenset(citation_keys),
+        tuple(numeric_values),
+        evidence.manifest_path,
+        evidence.manifest_sha256,
+        text,
+    )
 
 
 def _finalize_ledger(
@@ -622,21 +692,19 @@ def _finalize_ledger(
 def _verify_input_immutability(
     *,
     run_dir: Path,
-    paper_path: Path,
-    reviews_path: Path,
     document: ManuscriptDocument,
     ledger: ReviewLedger,
     context_text: str,
     config: PaperRevisionConfig,
-    contract_path: Path,
-    contract_sha256: str,
+    evidence: CanonicalExperimentEvidence,
 ) -> None:
-    if _sha256(paper_path.read_text(encoding="utf-8")) != document.source_sha256:
-        raise SectionalExecutionError("canonical Stage 17 paper changed during revision")
-    if _sha256(reviews_path.read_text(encoding="utf-8")) != ledger.source_reviews_sha256:
-        raise SectionalExecutionError("canonical Stage 18 reviews changed during revision")
-    if not contract_path.is_file() or sha256_file(contract_path) != contract_sha256:
-        raise SectionalExecutionError("canonical Stage 9 contract changed during revision")
+    evidence_path = run_dir / evidence.manifest_path
+    if (
+        evidence.manifest_path != "canonical_experiment_evidence.json"
+        or not evidence_path.is_file()
+        or sha256_file(evidence_path) != evidence.manifest_sha256
+    ):
+        raise SectionalExecutionError("canonical experiment evidence changed during revision")
     payload = json.loads(context_text)
     for source in payload["sources"]:
         kind = source["kind"]
@@ -647,6 +715,8 @@ def _verify_input_immutability(
                 "max_length_ratio": config.max_length_ratio,
             }
             actual = _sha256(_canonical_json_text(config_payload))
+        elif kind == "canonical_evidence":
+            actual = evidence.manifest_sha256
         else:
             path = run_dir / source["path"]
             if not path.is_file():
@@ -705,7 +775,12 @@ def _validate_assessment(
         raise SectionalExecutionError("assessment reason is required")
 
 
-def _assessment_payload(assessment: ResolutionAssessment) -> dict[str, Any]:
+def _assessment_payload(
+    assessment: ResolutionAssessment,
+    *,
+    canonical_experiment_evidence_path: str,
+    canonical_experiment_evidence_sha256: str,
+) -> dict[str, Any]:
     return ResolutionAssessmentRecord.from_dict(
         ResolutionAssessmentRecord(
             schema_version=1,
@@ -713,6 +788,8 @@ def _assessment_payload(assessment: ResolutionAssessment) -> dict[str, Any]:
             comment_id=assessment.comment_id,
             section_id=assessment.section_id,
             attempt_id=assessment.attempt_id,
+            canonical_experiment_evidence_path=canonical_experiment_evidence_path,
+            canonical_experiment_evidence_sha256=canonical_experiment_evidence_sha256,
             critic_model=assessment.critic_model,
             context_isolated=assessment.context_isolated,
             verdict=assessment.verdict,
@@ -730,6 +807,8 @@ def _transport_failure_attempt(
     writer_model: str,
     attempt: int,
     source_section_sha256: str,
+    canonical_experiment_evidence_path: str,
+    canonical_experiment_evidence_sha256: str,
     exc: Exception,
 ) -> dict[str, Any]:
     return SectionAttemptRecord.from_dict(
@@ -738,6 +817,8 @@ def _transport_failure_attempt(
             attempt_id=attempt_id,
             section_id=section_id,
             source_section_sha256=source_section_sha256,
+            canonical_experiment_evidence_path=canonical_experiment_evidence_path,
+            canonical_experiment_evidence_sha256=canonical_experiment_evidence_sha256,
             comment_ids=comment_ids,
             resolution_comment_ids=(),
             writer_model=writer_model,
@@ -767,41 +848,6 @@ def clean_sectional_outputs(stage_dir: Path) -> None:
             shutil.rmtree(path)
 
 
-def _metric_source_paths(run_dir: Path) -> tuple[Path, ...]:
-    paths: set[Path] = set()
-    paths.update(path for path in run_dir.glob("stage-12*/runs/*.json") if path.is_file())
-    paths.update(
-        path
-        for path in run_dir.glob("stage-14*/experiment_summary.json")
-        if path.is_file()
-    )
-    best = run_dir / "experiment_summary_best.json"
-    if best.is_file():
-        paths.add(best)
-    return tuple(sorted(paths, key=lambda path: path.relative_to(run_dir).as_posix()))
-
-
-def _latest_stage_artifact(run_dir: Path, stage: int, name: str) -> Path | None:
-    direct = run_dir / f"stage-{stage:02d}" / name
-    if direct.is_file():
-        return direct
-    candidates = [
-        path
-        for path in run_dir.glob(f"stage-{stage:02d}_v*/{name}")
-        if path.is_file()
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: _stage_version(path.parent.name))
-
-
-def _stage_version(name: str) -> int:
-    try:
-        return int(name.rsplit("_v", 1)[1])
-    except (IndexError, ValueError):
-        return -1
-
-
 def _source_record(run_dir: Path, path: Path, kind: str) -> dict[str, str]:
     return {
         "kind": kind,
@@ -810,16 +856,51 @@ def _source_record(run_dir: Path, path: Path, kind: str) -> dict[str, str]:
     }
 
 
-def _collect_numbers(value: Any, output: list[float], seen: set[float]) -> None:
-    if isinstance(value, dict):
+def _validate_stage18_review_binding(
+    reviews: str,
+    report_text: str,
+    evidence: CanonicalExperimentEvidence,
+) -> None:
+    try:
+        report = json.loads(report_text)
+    except json.JSONDecodeError as exc:
+        raise SectionalExecutionError(
+            f"canonical Stage 18 review structure report is invalid: {exc}"
+        ) from exc
+    if not isinstance(report, dict) or report.get("valid") is not True:
+        raise SectionalExecutionError(
+            "canonical Stage 18 review structure report is not valid"
+        )
+    if report.get("source_reviews_sha256") != _sha256(reviews):
+        raise SectionalExecutionError(
+            "canonical Stage 18 review structure report does not match reviews"
+        )
+    if (
+        report.get("canonical_experiment_evidence_path") != evidence.manifest_path
+        or report.get("canonical_experiment_evidence_sha256") != evidence.manifest_sha256
+    ):
+        raise SectionalExecutionError(
+            "canonical Stage 18 reviews bind different experiment evidence"
+        )
+
+
+def _collect_numbers(value: Any, output: list[Decimal], seen: set[Decimal]) -> None:
+    if isinstance(value, Mapping):
         for nested in value.values():
             _collect_numbers(nested, output, seen)
-    elif isinstance(value, list):
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for nested in value[:100]:
             _collect_numbers(nested, output, seen)
-    elif not isinstance(value, bool) and isinstance(value, (int, float)):
-        number = float(value)
-        if math.isfinite(number) and number not in seen:
+    elif not isinstance(value, bool) and isinstance(value, float):
+        raise SectionalExecutionError(
+            "canonical evidence must not expose binary-float numeric authority"
+        )
+    elif not isinstance(value, bool) and isinstance(value, (int, Decimal)):
+        try:
+            number = Decimal(canonical_decimal(value))
+        except Exception as exc:
+            raise SectionalExecutionError("canonical evidence numeric authority is invalid") from exc
+        if number not in seen:
             seen.add(number)
             output.append(number)
 
@@ -833,6 +914,114 @@ def _write_text_atomic(path: Path, text: str) -> None:
     temp = path.with_name(path.name + ".tmp")
     temp.write_text(text, encoding="utf-8")
     temp.replace(path)
+
+
+def _load_strict_json_object(text: str) -> dict[str, Any]:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            value[key] = item
+        return value
+
+    value = json.loads(text, object_pairs_hook=reject_duplicates)
+    if not isinstance(value, dict):
+        raise ValueError("JSON root must be an object")
+    return value
+
+
+def _replay_published_sectional_bundle(
+    *,
+    stage_dir: Path,
+    run_dir: Path,
+    document: ManuscriptDocument,
+    merge_result: Any,
+    ledger: ReviewLedger,
+    plan: RevisionPlan,
+    reviews_text: str,
+    claim_scope: str,
+    experiment_contract_path: str,
+    experiment_contract_sha256: str,
+    canonical_experiment_evidence_path: str,
+    canonical_experiment_evidence_sha256: str,
+    writer_model: str,
+    critic_model: str,
+    source_paper_path: str,
+    section_metadata: Mapping[str, SectionManifestMetadata],
+    attempts_text: str,
+    assessments_text: str,
+    unresolved_comments_text: str,
+    validation_context_text: str,
+) -> None:
+    """Reopen every published Stage 19 authority artifact before success."""
+    expected_texts = {
+        "paper_revised.md": merge_result.merged_text,
+        "review_comment_ledger.json": _pretty_json_text(ledger.to_dict()),
+        "revision_plan.json": _pretty_json_text(plan.to_dict()),
+        "validation_context.json": validation_context_text,
+        "section_attempts.jsonl": attempts_text,
+        "resolution_assessments.jsonl": assessments_text,
+        "unresolved_comments.json": unresolved_comments_text,
+    }
+    stored: dict[str, str] = {}
+    for name, expected in expected_texts.items():
+        path = stage_dir / name
+        if path.is_symlink() or not path.is_file():
+            raise SectionalExecutionError(f"published Stage 19 artifact is unsafe: {name}")
+        actual = path.read_text(encoding="utf-8")
+        if actual != expected:
+            raise SectionalExecutionError(f"published Stage 19 artifact changed: {name}")
+        stored[name] = actual
+
+    attempts = parse_section_attempts_jsonl(stored["section_attempts.jsonl"])
+    parse_resolution_assessments_jsonl(stored["resolution_assessments.jsonl"])
+    for attempt in attempts:
+        if attempt.candidate_path is None:
+            continue
+        for path_text, expected_sha256 in (
+            (attempt.candidate_path, attempt.candidate_body_sha256),
+            (attempt.validation_report_path, attempt.validation_report_sha256),
+        ):
+            if path_text is None or expected_sha256 is None:
+                raise SectionalExecutionError("published attempt artifact binding is incomplete")
+            relative = Path(path_text)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise SectionalExecutionError("published attempt artifact path is unsafe")
+            path = run_dir / relative
+            if path.is_symlink() or not path.is_file():
+                raise SectionalExecutionError("published attempt artifact is unsafe")
+            if hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha256:
+                raise SectionalExecutionError("published attempt artifact hash mismatch")
+
+    manifest_path = stage_dir / "section_revision_manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise SectionalExecutionError("published Stage 19 manifest is unsafe")
+    stored_manifest = SectionRevisionManifest.from_dict(
+        _load_strict_json_object(manifest_path.read_text(encoding="utf-8"))
+    )
+    validate_section_revision_manifest(
+        stored_manifest,
+        document=document,
+        merge_result=merge_result,
+        ledger=ledger,
+        plan=plan,
+        reviews=reviews_text,
+        claim_scope=claim_scope,
+        experiment_contract_path=experiment_contract_path,
+        experiment_contract_sha256=experiment_contract_sha256,
+        canonical_experiment_evidence_path=canonical_experiment_evidence_path,
+        canonical_experiment_evidence_sha256=canonical_experiment_evidence_sha256,
+        writer_model=writer_model,
+        critic_model=critic_model,
+        source_paper_path=source_paper_path,
+        section_metadata=section_metadata,
+        attempts_text=stored["section_attempts.jsonl"],
+        assessments_text=stored["resolution_assessments.jsonl"],
+        unresolved_comments_text=stored["unresolved_comments.json"],
+        completed=True,
+        validation_context_text=stored["validation_context.json"],
+    )
 
 
 def _canonical_json_text(value: object) -> str:

@@ -12,6 +12,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -24,7 +25,7 @@ from researchclaw.pipeline.manuscript_sections import (
     parse_manuscript,
     split_commonmark_lines_keepends,
 )
-from researchclaw.pipeline.release_artifacts import numbers_match
+from researchclaw.pipeline.canonical_experiment_evidence import canonical_decimal
 from researchclaw.pipeline.sectional_revision import (
     ContractIssue,
     ReviewLedger,
@@ -37,7 +38,7 @@ from researchclaw.pipeline.sectional_revision import (
 
 
 SCHEMA_VERSION = 1
-NUMERIC_REL_TOL = 1e-3
+NUMERIC_REL_TOL = Decimal("0.001")
 QUANTITATIVE_UNIT_LEXICON_VERSION = 1
 QUANTITATIVE_UNIT_LEXICON_V1 = frozenset(
     {
@@ -257,7 +258,7 @@ class SectionValidationContext:
     section_id: str
     attempt: int
     allowed_citation_keys: frozenset[str]
-    grounded_numeric_values: tuple[float, ...]
+    grounded_numeric_values: tuple[Decimal, ...]
     required_comment_ids: tuple[str, ...] = ()
     resolution_comment_ids: tuple[str, ...] = ()
     min_length_ratio: float = 0.80
@@ -270,6 +271,8 @@ class SectionAttemptRecord:
     attempt_id: str
     section_id: str
     source_section_sha256: str
+    canonical_experiment_evidence_path: str
+    canonical_experiment_evidence_sha256: str
     comment_ids: tuple[str, ...]
     resolution_comment_ids: tuple[str, ...]
     writer_model: str
@@ -290,6 +293,8 @@ class SectionAttemptRecord:
             "attempt_id": self.attempt_id,
             "section_id": self.section_id,
             "source_section_sha256": self.source_section_sha256,
+            "canonical_experiment_evidence_path": self.canonical_experiment_evidence_path,
+            "canonical_experiment_evidence_sha256": self.canonical_experiment_evidence_sha256,
             "comment_ids": list(self.comment_ids),
             "resolution_comment_ids": list(self.resolution_comment_ids),
             "writer_model": self.writer_model,
@@ -314,6 +319,8 @@ class SectionAttemptRecord:
                 "attempt_id",
                 "section_id",
                 "source_section_sha256",
+                "canonical_experiment_evidence_path",
+                "canonical_experiment_evidence_sha256",
                 "comment_ids",
                 "resolution_comment_ids",
                 "writer_model",
@@ -336,6 +343,14 @@ class SectionAttemptRecord:
             section_id=_required_str(data["section_id"], "section_id"),
             source_section_sha256=_required_hash(
                 data["source_section_sha256"], "source_section_sha256"
+            ),
+            canonical_experiment_evidence_path=_required_str(
+                data["canonical_experiment_evidence_path"],
+                "canonical_experiment_evidence_path",
+            ),
+            canonical_experiment_evidence_sha256=_required_hash(
+                data["canonical_experiment_evidence_sha256"],
+                "canonical_experiment_evidence_sha256",
             ),
             comment_ids=_string_tuple(data["comment_ids"], "comment_ids"),
             resolution_comment_ids=_string_tuple(
@@ -370,6 +385,8 @@ class ResolutionAssessmentRecord:
     comment_id: str
     section_id: str
     attempt_id: str
+    canonical_experiment_evidence_path: str
+    canonical_experiment_evidence_sha256: str
     critic_model: str
     context_isolated: bool
     verdict: str
@@ -383,6 +400,8 @@ class ResolutionAssessmentRecord:
             "comment_id": self.comment_id,
             "section_id": self.section_id,
             "attempt_id": self.attempt_id,
+            "canonical_experiment_evidence_path": self.canonical_experiment_evidence_path,
+            "canonical_experiment_evidence_sha256": self.canonical_experiment_evidence_sha256,
             "critic_model": self.critic_model,
             "context_isolated": self.context_isolated,
             "verdict": self.verdict,
@@ -400,6 +419,8 @@ class ResolutionAssessmentRecord:
                 "comment_id",
                 "section_id",
                 "attempt_id",
+                "canonical_experiment_evidence_path",
+                "canonical_experiment_evidence_sha256",
                 "critic_model",
                 "context_isolated",
                 "verdict",
@@ -414,6 +435,14 @@ class ResolutionAssessmentRecord:
             comment_id=_required_str(data["comment_id"], "comment_id"),
             section_id=_required_str(data["section_id"], "section_id"),
             attempt_id=_required_str(data["attempt_id"], "attempt_id"),
+            canonical_experiment_evidence_path=_required_str(
+                data["canonical_experiment_evidence_path"],
+                "canonical_experiment_evidence_path",
+            ),
+            canonical_experiment_evidence_sha256=_required_hash(
+                data["canonical_experiment_evidence_sha256"],
+                "canonical_experiment_evidence_sha256",
+            ),
             critic_model=_required_str(data["critic_model"], "critic_model"),
             context_isolated=_required_bool(
                 data["context_isolated"], "context_isolated"
@@ -550,6 +579,8 @@ class SectionRevisionManifest:
     claim_scope: str
     experiment_contract_path: str
     experiment_contract_sha256: str
+    canonical_experiment_evidence_path: str
+    canonical_experiment_evidence_sha256: str
     writer_model: str
     critic_model: str
     source_paper_path: str
@@ -575,6 +606,8 @@ class SectionRevisionManifest:
             "claim_scope": self.claim_scope,
             "experiment_contract_path": self.experiment_contract_path,
             "experiment_contract_sha256": self.experiment_contract_sha256,
+            "canonical_experiment_evidence_path": self.canonical_experiment_evidence_path,
+            "canonical_experiment_evidence_sha256": self.canonical_experiment_evidence_sha256,
             "writer_model": self.writer_model,
             "critic_model": self.critic_model,
             "source_paper_path": self.source_paper_path,
@@ -604,6 +637,8 @@ class SectionRevisionManifest:
                 "claim_scope",
                 "experiment_contract_path",
                 "experiment_contract_sha256",
+                "canonical_experiment_evidence_path",
+                "canonical_experiment_evidence_sha256",
                 "writer_model",
                 "critic_model",
                 "source_paper_path",
@@ -642,6 +677,14 @@ class SectionRevisionManifest:
             experiment_contract_sha256=_required_hash(
                 data["experiment_contract_sha256"], "experiment_contract_sha256"
             ),
+            canonical_experiment_evidence_path=_required_str(
+                data["canonical_experiment_evidence_path"],
+                "canonical_experiment_evidence_path",
+            ),
+            canonical_experiment_evidence_sha256=_required_hash(
+                data["canonical_experiment_evidence_sha256"],
+                "canonical_experiment_evidence_sha256",
+            ),
             writer_model=_required_str(data["writer_model"], "writer_model"),
             critic_model=_required_str(data["critic_model"], "critic_model"),
             source_paper_path=_required_str(data["source_paper_path"], "source_paper_path"),
@@ -679,6 +722,11 @@ class SectionRevisionManifest:
             _fail("claim_scope_invalid", "manifest claim_scope is invalid")
         if manifest.writer_model == manifest.critic_model:
             _fail("manifest_model_identity_invalid", "writer and critic must differ")
+        if manifest.canonical_experiment_evidence_path != "canonical_experiment_evidence.json":
+            _fail(
+                "canonical_evidence_path_invalid",
+                "manifest canonical evidence path is invalid",
+            )
         _validate_relative_path(
             manifest.experiment_contract_path, "experiment_contract_path"
         )
@@ -760,13 +808,8 @@ def validate_section_candidate(
         _fail("comment_id_invalid", "comment IDs must be nonempty strings")
     if any(not isinstance(key, str) or not key.strip() for key in context.allowed_citation_keys):
         _fail("citation_key_invalid", "allowed citation keys must be nonempty strings")
-    if any(
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-        for value in context.grounded_numeric_values
-    ):
-        _fail("grounded_numeric_value_invalid", "grounded values must be finite numbers")
+    if any(not isinstance(value, Decimal) or not value.is_finite() for value in context.grounded_numeric_values):
+        _fail("grounded_numeric_value_invalid", "grounded values must be finite Decimals")
 
     failures: dict[str, list[str]] = {code: [] for code in _CHECK_CODES}
     if not candidate_body.strip():
@@ -991,6 +1034,8 @@ def build_section_revision_manifest(
     claim_scope: str,
     experiment_contract_path: str,
     experiment_contract_sha256: str,
+    canonical_experiment_evidence_path: str,
+    canonical_experiment_evidence_sha256: str,
     writer_model: str,
     critic_model: str,
     source_paper_path: str,
@@ -1012,6 +1057,8 @@ def build_section_revision_manifest(
         claim_scope=claim_scope,
         experiment_contract_path=experiment_contract_path,
         experiment_contract_sha256=experiment_contract_sha256,
+        canonical_experiment_evidence_path=canonical_experiment_evidence_path,
+        canonical_experiment_evidence_sha256=canonical_experiment_evidence_sha256,
         writer_model=writer_model,
         critic_model=critic_model,
         source_paper_path=source_paper_path,
@@ -1055,6 +1102,8 @@ def validate_section_revision_manifest(
     claim_scope: str,
     experiment_contract_path: str,
     experiment_contract_sha256: str,
+    canonical_experiment_evidence_path: str,
+    canonical_experiment_evidence_sha256: str,
     writer_model: str,
     critic_model: str,
     source_paper_path: str,
@@ -1081,6 +1130,8 @@ def validate_section_revision_manifest(
         claim_scope=claim_scope,
         experiment_contract_path=experiment_contract_path,
         experiment_contract_sha256=experiment_contract_sha256,
+        canonical_experiment_evidence_path=canonical_experiment_evidence_path,
+        canonical_experiment_evidence_sha256=canonical_experiment_evidence_sha256,
         writer_model=writer_model,
         critic_model=critic_model,
         source_paper_path=source_paper_path,
@@ -1109,6 +1160,8 @@ def _construct_manifest(
     claim_scope: str,
     experiment_contract_path: str,
     experiment_contract_sha256: str,
+    canonical_experiment_evidence_path: str,
+    canonical_experiment_evidence_sha256: str,
     writer_model: str,
     critic_model: str,
     source_paper_path: str,
@@ -1123,6 +1176,15 @@ def _construct_manifest(
         _fail("claim_scope_invalid", f"invalid claim scope {claim_scope!r}")
     _validate_relative_path(experiment_contract_path, "experiment_contract_path")
     _required_hash(experiment_contract_sha256, "experiment_contract_sha256")
+    if canonical_experiment_evidence_path != "canonical_experiment_evidence.json":
+        _fail(
+            "canonical_evidence_path_invalid",
+            "canonical evidence path must be canonical_experiment_evidence.json",
+        )
+    _required_hash(
+        canonical_experiment_evidence_sha256,
+        "canonical_experiment_evidence_sha256",
+    )
     writer_model = _required_str(writer_model, "writer_model")
     critic_model = _required_str(critic_model, "critic_model")
     if writer_model == critic_model:
@@ -1369,6 +1431,8 @@ def _construct_manifest(
         claim_scope=claim_scope,
         experiment_contract_path=experiment_contract_path,
         experiment_contract_sha256=experiment_contract_sha256,
+        canonical_experiment_evidence_path=canonical_experiment_evidence_path,
+        canonical_experiment_evidence_sha256=canonical_experiment_evidence_sha256,
         writer_model=writer_model,
         critic_model=critic_model,
         source_paper_path=source_paper_path,
@@ -1399,8 +1463,11 @@ def _default_validation_context_text(document: ManuscriptDocument) -> str:
         "max_length_ratio": 1.75,
     }
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "numeric_policy_version": "stage19_decimal_v1",
         "source_paper_sha256": document.source_sha256,
+        "canonical_experiment_evidence_path": "canonical_experiment_evidence.json",
+        "canonical_experiment_evidence_sha256": "0" * 64,
         "allowed_citation_keys": [],
         "grounded_numeric_values": [],
         **config_payload,
@@ -1425,7 +1492,10 @@ def _validate_validation_context_payload(
         value,
         expected={
             "schema_version",
+            "numeric_policy_version",
             "source_paper_sha256",
+            "canonical_experiment_evidence_path",
+            "canonical_experiment_evidence_sha256",
             "allowed_citation_keys",
             "grounded_numeric_values",
             "max_section_retries",
@@ -1435,8 +1505,10 @@ def _validate_validation_context_payload(
         },
         context="validation context artifact",
     )
-    if _required_int(data["schema_version"], "schema_version") != SCHEMA_VERSION:
-        _fail("schema_version", "validation context schema_version must be 1")
+    if _required_int(data["schema_version"], "schema_version") != 2:
+        _fail("schema_version", "validation context schema_version must be 2")
+    if data["numeric_policy_version"] != "stage19_decimal_v1":
+        _fail("schema_version", "validation context numeric policy is invalid")
     if _required_hash(
         data["source_paper_sha256"], "source_paper_sha256"
     ) != document.source_sha256:
@@ -1444,6 +1516,21 @@ def _validate_validation_context_payload(
             "validation_context_source_mismatch",
             "validation context paper hash mismatches",
         )
+    if (
+        _required_str(
+            data["canonical_experiment_evidence_path"],
+            "canonical_experiment_evidence_path",
+        )
+        != "canonical_experiment_evidence.json"
+    ):
+        _fail(
+            "validation_context_canonical_evidence_invalid",
+            "validation context canonical evidence path is invalid",
+        )
+    _required_hash(
+        data["canonical_experiment_evidence_sha256"],
+        "canonical_experiment_evidence_sha256",
+    )
     citation_keys = _string_tuple(
         data["allowed_citation_keys"], "allowed_citation_keys"
     )
@@ -1452,18 +1539,14 @@ def _validate_validation_context_payload(
     values_raw = data["grounded_numeric_values"]
     if not isinstance(values_raw, list):
         _fail("invalid_type", "grounded_numeric_values must be a list")
-    numeric_values: list[float] = []
+    numeric_values: list[Decimal] = []
     for value_raw in values_raw:
-        if (
-            isinstance(value_raw, bool)
-            or not isinstance(value_raw, (int, float))
-            or not math.isfinite(float(value_raw))
-        ):
+        if not isinstance(value_raw, str):
             _fail(
                 "grounded_numeric_value_invalid",
-                "grounded numeric values must be finite numbers",
+                "grounded numeric values must be canonical decimal tokens",
             )
-        numeric_values.append(float(value_raw))
+        numeric_values.append(_parse_canonical_decimal_token(value_raw))
     if len(set(numeric_values)) != len(numeric_values):
         _fail("validation_context_duplicate", "duplicate grounded numeric values")
     retries = _required_int(data["max_section_retries"], "max_section_retries")
@@ -1487,13 +1570,21 @@ def _validate_validation_context_payload(
         kind = _required_str(source["kind"], "source.kind")
         path = _required_str(source["path"], "source.path")
         digest = _required_hash(source["sha256"], "source.sha256")
-        if kind not in {"citations", "metrics", "config"}:
+        if kind not in {"citations", "metrics", "config", "canonical_evidence"}:
             _fail("validation_context_source_invalid", f"invalid source kind {kind}")
         if kind == "config":
             if path != "config.paper_revision":
                 _fail(
                     "validation_context_source_invalid",
                     "config source path must be config.paper_revision",
+                )
+        elif kind == "canonical_evidence":
+            if path != data["canonical_experiment_evidence_path"] or digest != data[
+                "canonical_experiment_evidence_sha256"
+            ]:
+                _fail(
+                    "validation_context_source_invalid",
+                    "canonical evidence source does not match context binding",
                 )
         else:
             _validate_relative_path(path, "source.path")
@@ -1522,7 +1613,9 @@ def _validate_validation_context_payload(
         )
     if citation_keys and not any(kind == "citations" for kind, _, _ in sources):
         _fail("validation_context_source_missing", "citation source is missing")
-    if numeric_values and not any(kind == "metrics" for kind, _, _ in sources):
+    if numeric_values and not any(
+        kind in {"metrics", "canonical_evidence"} for kind, _, _ in sources
+    ):
         _fail("validation_context_source_missing", "metric source is missing")
     for metadata in section_metadata.values():
         context = metadata.validation_context
@@ -1735,7 +1828,7 @@ def extract_declared_reference_targets(text: str) -> frozenset[tuple[str, str]]:
     return frozenset(targets)
 
 
-def extract_quantitative_values(text: str) -> tuple[tuple[float, ...], tuple[str, ...]]:
+def extract_quantitative_values(text: str) -> tuple[tuple[Decimal, ...], tuple[str, ...]]:
     """Return normalized numeric values and unparsed quantitative phrases."""
 
     cleaned = _strip_quantitative_non_metrics(text)
@@ -1758,7 +1851,9 @@ def extract_quantitative_values(text: str) -> tuple[tuple[float, ...], tuple[str
         if numerator is None:
             unparsed.append(match.group(0))
         else:
-            values.append(numerator / denominators[match.group(2).casefold()])
+            with localcontext() as decimal_context:
+                decimal_context.prec = 50
+                values.append(numerator / Decimal(denominators[match.group(2).casefold()]))
         occupied.append(match.span())
 
     for match in _NUMBER_WORD_UNIT_RE.finditer(cleaned):
@@ -1770,7 +1865,7 @@ def extract_quantitative_values(text: str) -> tuple[tuple[float, ...], tuple[str
         else:
             unit = match.group(2).casefold()
             percent_units = {"%", "percent", "percentage", "percentages"}
-            values.append(parsed / 100.0 if unit in percent_units else parsed)
+            values.append(parsed / Decimal(100) if unit in percent_units else parsed)
         occupied.append(match.span())
 
     for match in _NUMBER_RE.finditer(cleaned):
@@ -1779,13 +1874,13 @@ def extract_quantitative_values(text: str) -> tuple[tuple[float, ...], tuple[str
         raw = match.group(0).strip()
         numeric = raw.rstrip("%").strip().replace(",", "")
         try:
-            value = float(numeric)
-        except ValueError:
+            value = Decimal(numeric)
+        except InvalidOperation:
             unparsed.append(raw)
             continue
         percent_word = _PERCENT_WORD_RE.match(cleaned, match.end())
         if raw.endswith("%") or percent_word is not None:
-            value /= 100.0
+            value /= Decimal(100)
         values.append(value)
     return tuple(values), tuple(unparsed)
 
@@ -1884,11 +1979,11 @@ def _strip_quantitative_non_metrics(text: str) -> str:
     return cleaned
 
 
-def _extract_math_metric_literals(text: str) -> tuple[float, ...]:
+def _extract_math_metric_literals(text: str) -> tuple[Decimal, ...]:
     math_source = re.sub(r"```.*?```|~~~.*?~~~", "", text, flags=re.DOTALL)
     math_source = _strip_inline_code(math_source)
     math_source = re.sub(r"<!--.*?-->", "", math_source, flags=re.DOTALL)
-    values: list[float] = []
+    values: list[Decimal] = []
     for math_match in _MATH_SPAN_RE.finditer(math_source):
         for number_match in _NUMBER_RE.finditer(math_match.group(0)):
             raw = number_match.group(0).strip()
@@ -1896,14 +1991,14 @@ def _extract_math_metric_literals(text: str) -> tuple[float, ...]:
             if "." not in numeric and "e" not in numeric.casefold() and not raw.endswith("%"):
                 continue
             try:
-                value = float(numeric)
-            except ValueError:
+                value = Decimal(numeric)
+            except InvalidOperation:
                 continue
-            values.append(value / 100.0 if raw.endswith("%") else value)
+            values.append(value / Decimal(100) if raw.endswith("%") else value)
     return tuple(values)
 
 
-def _parse_number_words(text: str) -> float | None:
+def _parse_number_words(text: str) -> Decimal | None:
     ones = {
         "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
         "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
@@ -1932,7 +2027,7 @@ def _parse_number_words(text: str) -> float | None:
             current = 0
         else:
             return None
-    return float(total + current)
+    return Decimal(total + current)
 
 
 def _section_by_id(document: ManuscriptDocument, section_id: str):
@@ -1976,12 +2071,52 @@ def _format_reference(reference: tuple[str, str]) -> str:
     return f"{reference[0]} {reference[1]}"
 
 
-def _matches_any(value: float, candidates: Sequence[float]) -> bool:
-    return any(numbers_match(value, candidate, rel_tol=NUMERIC_REL_TOL) for candidate in candidates)
+def _matches_any(value: Decimal, candidates: Sequence[Decimal]) -> bool:
+    return any(_decimal_numbers_match(value, candidate) for candidate in candidates)
 
 
-def _format_number(value: float) -> str:
-    return format(value, ".12g")
+def _format_number(value: Decimal) -> str:
+    return canonical_decimal(value)
+
+
+def _parse_canonical_decimal_token(token: str) -> Decimal:
+    try:
+        value = Decimal(token)
+    except InvalidOperation as exc:
+        _fail("grounded_numeric_value_invalid", "grounded numeric token is invalid")
+        raise AssertionError from exc
+    if not value.is_finite() or token != canonical_decimal(value):
+        _fail("grounded_numeric_value_invalid", "grounded numeric token is noncanonical")
+    return value
+
+
+def _decimal_numbers_match(value: Decimal, candidate: Decimal) -> bool:
+    """Match canonical Decimal observations without using process-global context."""
+    if not value.is_finite() or not candidate.is_finite():
+        return False
+    if value == candidate:
+        return True
+    # Quantization and division otherwise inherit decimal.getcontext().  Size the
+    # local context from both operands so valid canonical tokens never depend on
+    # a caller changing the process-wide precision.
+    precision = max(
+        50,
+        len(value.as_tuple().digits),
+        len(candidate.as_tuple().digits),
+        value.adjusted() + 7,
+        candidate.adjusted() + 7,
+    ) + 20
+    try:
+        with localcontext() as context:
+            context.prec = precision
+            if value.quantize(Decimal("0.000001"), rounding=ROUND_HALF_EVEN) == (
+                candidate.quantize(Decimal("0.000001"), rounding=ROUND_HALF_EVEN)
+            ):
+                return True
+            denominator = max(abs(value), abs(candidate), Decimal("1e-12"))
+            return abs(value - candidate) / denominator < NUMERIC_REL_TOL
+    except InvalidOperation:
+        return False
 
 
 def _span_overlaps(span: tuple[int, int], occupied: Sequence[tuple[int, int]]) -> bool:

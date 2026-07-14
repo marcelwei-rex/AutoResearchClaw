@@ -89,13 +89,34 @@ def load_validated_card_inputs(run_dir: Path, config: Any) -> ValidatedCardInput
     except (OSError, UnicodeDecodeError) as exc:
         raise EvidenceCardContractError(f"cannot read canonical card input: {exc}") from exc
 
+    return validate_card_inputs_from_texts(
+        candidates_text=texts["candidates"],
+        registry_text=texts["registry"],
+        bibliography_text=texts["bibliography"],
+        shortlist_text=texts["shortlist"],
+        screening_report_text=texts["screening_report"],
+        config=config,
+    )
+
+
+def validate_card_inputs_from_texts(
+    *,
+    candidates_text: str,
+    registry_text: str,
+    bibliography_text: str,
+    shortlist_text: str,
+    screening_report_text: str,
+    config: Any,
+) -> ValidatedCardInputs:
+    """Replay Stage 4/5 input bindings from already captured authority text."""
+
     try:
-        registry = parse_cite_key_registry(texts["registry"])
+        registry = parse_cite_key_registry(registry_text)
         validate_registry_artifacts(
-            registry, texts["candidates"], texts["bibliography"]
+            registry, candidates_text, bibliography_text
         )
-        candidates = parse_screening_candidates(texts["candidates"])
-        shortlist = parse_screening_candidates(texts["shortlist"])
+        candidates = parse_screening_candidates(candidates_text)
+        shortlist = parse_screening_candidates(shortlist_text)
     except (CitationIdentityError, ScreeningContractError) as exc:
         raise EvidenceCardContractError(f"invalid Stage 4/5 citation input: {exc}") from exc
 
@@ -138,12 +159,12 @@ def load_validated_card_inputs(run_dir: Path, config: Any) -> ValidatedCardInput
 
     try:
         report = parse_screening_report(
-            texts["screening_report"],
-            candidates_text_sha256=sha256_text(texts["candidates"]),
-            registry_text_sha256=sha256_text(texts["registry"]),
-            references_text_sha256=sha256_text(texts["bibliography"]),
+            screening_report_text,
+            candidates_text_sha256=sha256_text(candidates_text),
+            registry_text_sha256=sha256_text(registry_text),
+            references_text_sha256=sha256_text(bibliography_text),
             expected_screening_output_path="stage-05/shortlist.jsonl",
-            screening_output_text_sha256=sha256_text(texts["shortlist"]),
+            screening_output_text_sha256=sha256_text(shortlist_text),
             expected_minimum_quality_score=normalize_quality_threshold(
                 config.research.quality_threshold
             ),
@@ -163,9 +184,9 @@ def load_validated_card_inputs(run_dir: Path, config: Any) -> ValidatedCardInput
             "strict claim scope requires complete non-degraded screening"
         )
     return ValidatedCardInputs(
-        candidates_text=texts["candidates"],
-        shortlist_text=texts["shortlist"],
-        screening_report_text=texts["screening_report"],
+        candidates_text=candidates_text,
+        shortlist_text=shortlist_text,
+        screening_report_text=screening_report_text,
         candidates=candidates,
         shortlist=shortlist,
     )
@@ -559,8 +580,41 @@ def validate_cards_artifacts(
     shortlist: Iterable[Mapping[str, Any]],
 ) -> tuple[dict[str, Any], ...]:
     """Recompute every manifest/card/view binding from disk, default-deny."""
+    cards_dir = stage_dir / "cards"
+    if cards_dir.is_symlink() or not cards_dir.is_dir():
+        raise EvidenceCardContractError("cards directory is missing or unsafe")
+    card_texts: dict[str, str] = {}
+    actual_files = set()
+    for path in cards_dir.iterdir():
+        if path.is_symlink() or not path.is_file():
+            raise EvidenceCardContractError("cards directory must be flat files only")
+        actual_files.add(path.name)
+        try:
+            card_texts[f"stage-06/cards/{path.name}"] = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise EvidenceCardContractError(f"cannot read evidence card: {exc}") from exc
+    return validate_cards_artifacts_from_texts(
+        manifest_text=json.dumps(manifest, ensure_ascii=False),
+        card_texts=card_texts,
+        shortlist_text=shortlist_text,
+        screening_report_text=screening_report_text,
+        candidates_sha256=candidates_sha256,
+        shortlist=shortlist,
+    )
+
+
+def validate_cards_artifacts_from_texts(
+    *,
+    manifest_text: str,
+    card_texts: Mapping[str, str],
+    shortlist_text: str,
+    screening_report_text: str,
+    candidates_sha256: str,
+    shortlist: Iterable[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Recompute every manifest/card/view binding from captured card text."""
     parsed_manifest = parse_cards_manifest(
-        json.dumps(manifest, ensure_ascii=False)
+        manifest_text
     )
     if parsed_manifest["shortlist_sha256"] != sha256_text(shortlist_text):
         raise EvidenceCardContractError("cards manifest shortlist hash mismatch")
@@ -581,28 +635,18 @@ def validate_cards_artifacts(
     expected_card_ids = [f"card-{index:03d}" for index in range(1, len(shortlist_rows) + 1)]
     if [entry["card_id"] for entry in parsed_manifest["cards"]] != expected_card_ids:
         raise EvidenceCardContractError("cards manifest card-id sequence mismatch")
-    cards_dir = stage_dir / "cards"
-    if cards_dir.is_symlink() or not cards_dir.is_dir():
-        raise EvidenceCardContractError("cards directory is missing or unsafe")
-    actual_files = set()
-    for path in cards_dir.iterdir():
-        if path.is_symlink() or not path.is_file():
-            raise EvidenceCardContractError("cards directory must be flat files only")
-        actual_files.add(path.name)
     expected_files = {
-        Path(entry[key]).name
+        str(entry[key])
         for entry in parsed_manifest["cards"]
         for key in ("json_path", "markdown_path")
     }
-    if actual_files != expected_files:
+    if set(card_texts) != expected_files:
         raise EvidenceCardContractError("cards directory manifest closure mismatch")
 
     parsed_cards: list[dict[str, Any]] = []
     for entry in parsed_manifest["cards"]:
-        json_path = cards_dir / Path(entry["json_path"]).name
-        markdown_path = cards_dir / Path(entry["markdown_path"]).name
-        json_text = json_path.read_text(encoding="utf-8")
-        markdown_text = markdown_path.read_text(encoding="utf-8")
+        json_text = card_texts[str(entry["json_path"])]
+        markdown_text = card_texts[str(entry["markdown_path"])]
         if sha256_text(json_text) != entry["json_sha256"]:
             raise EvidenceCardContractError("card JSON hash mismatch")
         if sha256_text(markdown_text) != entry["markdown_sha256"]:

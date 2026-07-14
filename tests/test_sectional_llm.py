@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Callable
+from decimal import Decimal
 
 import pytest
 
@@ -57,7 +58,7 @@ def _inputs():
         section_id=method.section_id,
         attempt=1,
         allowed_citation_keys=frozenset({"smith2024"}),
-        grounded_numeric_values=(0.475,),
+        grounded_numeric_values=(Decimal("0.475"),),
         required_comment_ids=(comment.comment_id,),
     )
     return document, ledger, method, comment, context

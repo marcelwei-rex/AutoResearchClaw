@@ -4,6 +4,7 @@ import json
 import random
 import re
 from dataclasses import replace
+from decimal import Decimal, localcontext
 
 import pytest
 from markdown_it.rules_core.normalize import NEWLINES_RE
@@ -38,6 +39,7 @@ from researchclaw.pipeline.sectional_validation import (
     extract_quantitative_values,
     extract_reference_mentions,
     merge_validated_sections,
+    _decimal_numbers_match,
     parse_resolution_assessments_jsonl,
     parse_section_attempts_jsonl,
     validate_section_revision_manifest,
@@ -81,7 +83,9 @@ def _context(**overrides):
         "section_id": _method().section_id,
         "attempt": 1,
         "allowed_citation_keys": frozenset({"smith2024", "jones2023"}),
-        "grounded_numeric_values": (0.475, 0.85, 2.0, 3.0),
+        "grounded_numeric_values": (
+            Decimal("0.475"), Decimal("0.85"), Decimal("2"), Decimal("3"),
+        ),
         "required_comment_ids": ("rc-001",),
         "resolution_comment_ids": ("rc-001",),
         "min_length_ratio": 0.50,
@@ -179,10 +183,13 @@ def _manifest_inputs(*, final_status: str = "resolved", changed: bool = True):
     }
     validation_context_text = json.dumps(
         {
-            "schema_version": 1,
+            "schema_version": 2,
+            "numeric_policy_version": "stage19_decimal_v1",
             "source_paper_sha256": document.source_sha256,
+            "canonical_experiment_evidence_path": "canonical_experiment_evidence.json",
+            "canonical_experiment_evidence_sha256": "d" * 64,
             "allowed_citation_keys": ["jones2023", "smith2024"],
-            "grounded_numeric_values": [0.475, 0.85, 2.0, 3.0],
+            "grounded_numeric_values": ["0.475", "0.85", "2", "3"],
             **config_payload,
             "sources": [
                 {
@@ -191,9 +198,9 @@ def _manifest_inputs(*, final_status: str = "resolved", changed: bool = True):
                     "sha256": "a" * 64,
                 },
                 {
-                    "kind": "metrics",
-                    "path": "stage-12/runs/results.json",
-                    "sha256": "b" * 64,
+                    "kind": "canonical_evidence",
+                    "path": "canonical_experiment_evidence.json",
+                    "sha256": "d" * 64,
                 },
                 {
                     "kind": "config",
@@ -212,6 +219,8 @@ def _manifest_inputs(*, final_status: str = "resolved", changed: bool = True):
             attempt_id=attempt_id,
             section_id=section_id,
             source_section_sha256=document.sections[1].original_sha256,
+            canonical_experiment_evidence_path="canonical_experiment_evidence.json",
+            canonical_experiment_evidence_sha256="d" * 64,
             comment_ids=(final_comment.comment_id,),
             resolution_comment_ids=(final_comment.comment_id,),
             writer_model="writer-model",
@@ -240,6 +249,8 @@ def _manifest_inputs(*, final_status: str = "resolved", changed: bool = True):
                     comment_id=final_comment.comment_id,
                     section_id=section_id,
                     attempt_id=attempt_id,
+                    canonical_experiment_evidence_path="canonical_experiment_evidence.json",
+                    canonical_experiment_evidence_sha256="d" * 64,
                     critic_model="critic-model",
                     context_isolated=True,
                     verdict="resolved",
@@ -260,6 +271,8 @@ def _manifest_inputs(*, final_status: str = "resolved", changed: bool = True):
         "reviews": reviews,
         "experiment_contract_path": "stage-09/experiment_contract.yaml",
         "experiment_contract_sha256": "c" * 64,
+        "canonical_experiment_evidence_path": "canonical_experiment_evidence.json",
+        "canonical_experiment_evidence_sha256": "d" * 64,
         "writer_model": "writer-model",
         "critic_model": "critic-model",
         "source_paper_path": "stage-17/paper_draft.md",
@@ -393,6 +406,35 @@ def test_numeric_equivalent_forms_match_grounded_value(form: str) -> None:
     assert "unknown_numeric_value" not in _failed_codes(result)
 
 
+def test_decimal_numeric_values_preserve_high_precision_authority() -> None:
+    context = _context(
+        grounded_numeric_values=(
+            Decimal("0.1"),
+            Decimal("0.475"),
+            Decimal("9007199254740993"),
+        )
+    )
+    result = validate_section_candidate(
+        context,
+        _candidate("The authority values were 0.1, .475, and 9007199254740993."),
+    )
+
+    assert "unknown_numeric_value" not in _failed_codes(result)
+
+
+def test_decimal_matcher_is_independent_of_process_global_precision() -> None:
+    authority = Decimal("9007199254740993")
+    rounded_equivalent = Decimal("9007199254740993.0000001")
+
+    outcomes: list[bool] = []
+    for precision in (7, 28, 80):
+        with localcontext() as context:
+            context.prec = precision
+            outcomes.append(_decimal_numbers_match(authority, rounded_equivalent))
+
+    assert outcomes == [True, True, True]
+
+
 def test_digit_percent_word_normalizes_to_fraction() -> None:
     result = validate_section_candidate(_context(), _candidate("Recall was 85 percent."))
 
@@ -400,7 +442,7 @@ def test_digit_percent_word_normalizes_to_fraction() -> None:
 
 
 def test_material_rounding_change_is_rejected_at_fixed_tolerance() -> None:
-    assert NUMERIC_REL_TOL == 1e-3
+    assert NUMERIC_REL_TOL == Decimal("0.001")
 
     result = validate_section_candidate(_context(), _candidate("A second score was 0.48."))
 
@@ -476,7 +518,7 @@ def test_length_and_resolution_guards_fail_closed() -> None:
 def test_validation_context_rejects_nonfinite_grounded_values() -> None:
     with pytest.raises(SectionalRevisionContractError) as caught:
         validate_section_candidate(
-            _context(grounded_numeric_values=(float("nan"),)), _candidate()
+            _context(grounded_numeric_values=(Decimal("NaN"),)), _candidate()
         )
 
     assert any(
@@ -808,7 +850,7 @@ def test_manifest_rejects_noncanonical_validation_context_path() -> None:
         ),
         (
             lambda payload: payload.__setitem__(
-                "grounded_numeric_values", [0.999]
+                "grounded_numeric_values", ["0.999"]
             ),
             "validation_context_numeric_mismatch",
         ),
@@ -831,6 +873,33 @@ def test_manifest_rejects_invalid_or_unbound_validation_context(
         )
 
     assert any(issue.code == expected_code for issue in caught.value.issues)
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        ["0.475", "0.850", "2", "3"],
+        ["0.475", "0.85", "0.85", "3"],
+        ["0.475", "NaN", "2", "3"],
+        ["0.475", "Infinity", "2", "3"],
+        ["0.475", 0.85, "2", "3"],
+    ),
+)
+def test_manifest_rejects_noncanonical_decimal_context_tokens(values) -> None:
+    inputs = _manifest_inputs()
+    payload = json.loads(inputs["validation_context_text"])
+    payload["grounded_numeric_values"] = values
+    inputs["validation_context_text"] = json.dumps(
+        payload, sort_keys=True, indent=2
+    ) + "\n"
+
+    with pytest.raises(SectionalRevisionContractError) as caught:
+        build_section_revision_manifest(claim_scope="pipeline_validation", **inputs)
+
+    assert any(
+        issue.code in {"grounded_numeric_value_invalid", "validation_context_duplicate"}
+        for issue in caught.value.issues
+    )
 
 
 def test_manifest_recomputes_assessment_and_unresolved_artifact_hashes() -> None:
@@ -1034,7 +1103,7 @@ def test_extractors_ignore_code_but_scan_metric_literals_in_math() -> None:
     assert extract_citation_keys(text) == frozenset({"smith2024"})
     assert extract_reference_mentions(text) >= frozenset({("table", "2")})
     values, unparsed = extract_quantitative_values(text)
-    assert values == (0.88,)
+    assert values == (Decimal("0.88"),)
     assert unparsed == ()
 
 

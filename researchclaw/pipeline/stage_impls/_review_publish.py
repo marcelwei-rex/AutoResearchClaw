@@ -17,24 +17,26 @@ import yaml  # noqa: F401 — available for downstream use
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
 from researchclaw.experiment_runtime.contract import (
-    ContractValidationError,
-    find_stage09_contract,
-    load_contract,
+    validate_contract_dict,
 )
 from researchclaw.llm.client import LLMClient
 from researchclaw.literature.citation_policy import (
     CitationPolicyContractError,
     load_effective_citation_policy,
+    parse_config_snapshot_text,
 )
 from researchclaw.literature.citation_plan import (
     CitationPlanContractError,
     load_canonical_bibliography,
+    replay_citation_plan_provenance,
+    replay_citation_closure,
     validate_final_paper_citations,
     validate_paper_citation_minimum,
     validate_citation_closure_report,
 )
 from researchclaw.literature.experiment_fact_closure import (
     ExperimentFactClosureError,
+    replay_experiment_fact_closure,
     validate_experiment_fact_closure_report,
 )
 from researchclaw.pipeline._domain import _detect_domain  # noqa: F401
@@ -43,6 +45,14 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidenceError,
     canonical_authority_json_text,
     load_canonical_experiment_evidence,
+    semantic_config_sha256,
+)
+from researchclaw.pipeline.stage19_input_bundle import (
+    Stage19InputBundle,
+    Stage19InputBundleError,
+    load_stage19_input_bundle,
+    parse_stage18_review_structure_report,
+    verify_stage19_input_bundle_unchanged,
 )
 from researchclaw.pipeline._helpers import (
     StageResult,
@@ -89,18 +99,14 @@ def _get_review_compiled_pdf():
     return _review_compiled_pdf
 
 
-def _paper_revision_claim_scope(run_dir: Path, config: RCConfig) -> str:
-    contract_path = find_stage09_contract(run_dir)
-    if contract_path is None:
-        return str(config.experiment.claim_scope or "pipeline_validation")
+def _snapshot_claim_scope(evidence: CanonicalExperimentEvidence) -> str:
     try:
-        return load_contract(contract_path).claim_scope
-    except ContractValidationError as exc:
-        logger.warning(
-            "Stage 19: experiment contract is invalid; disabling revision fallback: %s",
-            exc,
-        )
-        return "research_release"
+        payload = yaml.safe_load(evidence.experiment_contract_bytes.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("canonical experiment contract root is not an object")
+        return validate_contract_dict(payload).claim_scope
+    except (UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
+        raise ValueError(f"canonical snapshot contract is invalid: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -140,12 +146,18 @@ def _collect_experiment_evidence(evidence: CanonicalExperimentEvidence) -> str:
 
 def _review_structure_report(
     evidence: CanonicalExperimentEvidence,
+    *,
+    stage17_binding: Mapping[str, str],
     **fields: Any,
 ) -> dict[str, Any]:
+    fields.setdefault("comment_count", 0)
+    fields.setdefault("issues", [])
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "source_reviews_path": "stage-18/reviews.md",
         "canonical_experiment_evidence_path": evidence.manifest_path,
         "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+        **stage17_binding,
         **fields,
     }
 
@@ -163,6 +175,138 @@ def _read_bound_stage17_draft(run_dir: Path) -> tuple[str, str]:
         return draft_bytes.decode("utf-8"), hashlib.sha256(draft_bytes).hexdigest()
     except UnicodeDecodeError as exc:
         raise OSError(f"Stage 17 paper draft is not UTF-8: {exc}") from exc
+
+
+def _load_bound_stage19_inputs(
+    run_dir: Path,
+    config: RCConfig,
+    evidence: CanonicalExperimentEvidence,
+) -> Stage19InputBundle:
+    """Capture and replay Stage 17/18 inputs before either Stage 19 path."""
+    bundle = load_stage19_input_bundle(run_dir)
+    try:
+        canonical_config_text = evidence.run_config_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise OSError("canonical experiment config snapshot is not UTF-8") from exc
+    canonical_config = parse_config_snapshot_text(
+        canonical_config_text,
+        project_root=run_dir,
+        label="canonical experiment config snapshot",
+    )
+    if semantic_config_sha256(config) != semantic_config_sha256(canonical_config):
+        raise OSError(
+            "runtime config semantic generation differs from canonical experiment evidence"
+        )
+    citation_authority = replay_citation_plan_provenance(
+        bundle.citation_replay_inputs(), canonical_config, project_root=run_dir
+    )
+    fact_report = replay_experiment_fact_closure(
+        paper_bytes=bundle.paper.content,
+        stored_report_bytes=bundle.experiment_fact_closure_report.content,
+        evidence=evidence,
+    )
+    citation_report = replay_citation_closure(
+        paper_bytes=bundle.paper.content,
+        structure_report_bytes=bundle.paper_structure_report.content,
+        experiment_fact_report_bytes=bundle.experiment_fact_closure_report.content,
+        citation_closure_report_bytes=bundle.citation_closure_report.content,
+        citation_plan_bytes=bundle.citation_plan.content,
+        citation_allowlist_bytes=bundle.citation_allowlist.content,
+        citation_authority=citation_authority,
+        evidence=evidence,
+    )
+    if (
+        fact_report["paper_sha256"] != bundle.paper.sha256
+        or citation_report["paper_sha256"] != bundle.paper.sha256
+        or fact_report["canonical_experiment_evidence_path"] != evidence.manifest_path
+        or fact_report["canonical_experiment_evidence_sha256"] != evidence.manifest_sha256
+    ):
+        raise OSError("Stage 17 closure reports do not bind the current draft")
+    reviews = bundle.reviews.text()
+    report = parse_stage18_review_structure_report(
+        bundle.review_structure_report.text(),
+        bundle=bundle,
+        canonical_evidence_path=evidence.manifest_path,
+        canonical_evidence_sha256=evidence.manifest_sha256,
+    )
+    if report["valid"] is not True:
+        raise OSError("Stage 18 review structure report is not valid")
+    return bundle
+
+
+_REVISION_EVIDENCE_BINDING_FIELDS = frozenset(
+    {
+        "schema_version",
+        "canonical_experiment_evidence_path",
+        "canonical_experiment_evidence_sha256",
+        "source_paper_path",
+        "source_paper_sha256",
+        "source_reviews_path",
+        "source_reviews_sha256",
+        "revised_paper_path",
+        "revised_paper_sha256",
+    }
+)
+
+
+def _parse_revision_evidence_binding(
+    text: str,
+    *,
+    evidence: CanonicalExperimentEvidence,
+    draft_sha256: str,
+    reviews_sha256: str,
+    revised_sha256: str,
+) -> dict[str, Any]:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        parsed: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise ValueError(f"duplicate revision binding key {key!r}")
+            parsed[key] = value
+        return parsed
+
+    value = json.loads(text, object_pairs_hook=reject_duplicates)
+    if not isinstance(value, dict) or set(value) != _REVISION_EVIDENCE_BINDING_FIELDS:
+        raise ValueError("revision evidence binding fields mismatch")
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        raise ValueError("revision evidence binding schema_version must be integer 1")
+    for field in (
+        "canonical_experiment_evidence_sha256",
+        "source_paper_sha256",
+        "source_reviews_sha256",
+        "revised_paper_sha256",
+    ):
+        candidate = value[field]
+        if (
+            not isinstance(candidate, str)
+            or len(candidate) != 64
+            or any(char not in "0123456789abcdef" for char in candidate)
+        ):
+            raise ValueError(f"revision evidence binding {field} is not a SHA-256")
+    expected = {
+        "schema_version": 1,
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+        "source_paper_path": "stage-17/paper_draft.md",
+        "source_paper_sha256": draft_sha256,
+        "source_reviews_path": "stage-18/reviews.md",
+        "source_reviews_sha256": reviews_sha256,
+        "revised_paper_path": "stage-19/paper_revised.md",
+        "revised_paper_sha256": revised_sha256,
+    }
+    if value != expected:
+        raise ValueError("revision evidence binding does not replay")
+    return value
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +425,26 @@ def _execute_peer_review(
             != evidence.manifest_sha256
         ):
             raise ValueError("Stage 17 draft differs from closure-bound paper")
+        citation_report_path = run_dir / "stage-17" / "citation_closure_report.json"
+        citation_report_bytes = citation_report_path.read_bytes()
+        stage17_binding = {
+            "source_paper_path": "stage-17/paper_draft.md",
+            "source_paper_sha256": draft_sha256,
+            "paper_structure_report_path": "stage-17/paper_structure_report.json",
+            "paper_structure_report_sha256": citation_closure[
+                "structure_report_sha256"
+            ],
+            "experiment_fact_closure_report_path": (
+                "stage-17/experiment_fact_closure_report.json"
+            ),
+            "experiment_fact_closure_report_sha256": citation_closure[
+                "experiment_fact_closure_report_sha256"
+            ],
+            "citation_closure_report_path": "stage-17/citation_closure_report.json",
+            "citation_closure_report_sha256": hashlib.sha256(
+                citation_report_bytes
+            ).hexdigest(),
+        }
     except (
         CitationPolicyContractError,
         CitationPlanContractError,
@@ -384,6 +548,7 @@ Statistical reporting is incomplete.
     except SectionalRevisionContractError as exc:
         report = _review_structure_report(
             evidence,
+            stage17_binding=stage17_binding,
             valid=False,
             source_reviews_sha256=hashlib.sha256(
                 reviews.encode("utf-8")
@@ -453,6 +618,7 @@ Statistical reporting is incomplete.
         except SectionalRevisionContractError as exc:
             report = _review_structure_report(
                 evidence,
+                stage17_binding=stage17_binding,
                 valid=False,
                 source_reviews_sha256=hashlib.sha256(
                     reviews.encode("utf-8")
@@ -489,6 +655,7 @@ Statistical reporting is incomplete.
     if policy_violations:
         report = _review_structure_report(
             evidence,
+            stage17_binding=stage17_binding,
             valid=False,
             source_reviews_sha256=ledger.source_reviews_sha256,
             issues=[
@@ -517,6 +684,7 @@ Statistical reporting is incomplete.
         )
     report = _review_structure_report(
         evidence,
+        stage17_binding=stage17_binding,
         valid=True,
         source_reviews_sha256=ledger.source_reviews_sha256,
         comment_count=len(ledger.comments),
@@ -551,9 +719,59 @@ def _execute_paper_revision(
     prompts: PromptManager | None = None,
     sectional_provider: object | None = None,
 ) -> StageResult:
+    from researchclaw.pipeline.sectional_execution import clean_sectional_outputs
+
+    clean_sectional_outputs(stage_dir)
+    for artifact_name in (
+        "paper_revised.md",
+        "revision_notes_internal.md",
+        "revision_retry_failure.json",
+        "revision_evidence_binding.json",
+    ):
+        (stage_dir / artifact_name).unlink(missing_ok=True)
+    try:
+        evidence = load_canonical_experiment_evidence(run_dir)
+    except (CanonicalExperimentEvidenceError, RuntimeError) as exc:
+        return StageResult(
+            stage=Stage.PAPER_REVISION,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Canonical experiment evidence is invalid or unavailable: {exc}",
+            decision="retry",
+        )
+    try:
+        claim_scope = _snapshot_claim_scope(evidence)
+    except ValueError as exc:
+        return StageResult(
+            stage=Stage.PAPER_REVISION,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Canonical experiment contract is invalid or unavailable: {exc}",
+            decision="retry",
+        )
+    try:
+        stage19_inputs = _load_bound_stage19_inputs(run_dir, config, evidence)
+        draft = stage19_inputs.paper.text()
+        reviews = stage19_inputs.reviews.text()
+        _draft_sha256 = stage19_inputs.paper.sha256
+        _reviews_sha256 = stage19_inputs.reviews.sha256
+    except (
+        CitationPlanContractError,
+        ExperimentFactClosureError,
+        Stage19InputBundleError,
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+    ) as exc:
+        return StageResult(
+            stage=Stage.PAPER_REVISION,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Stage 17/18 revision inputs are invalid: {exc}",
+            decision="retry",
+        )
     if config.paper_revision.sectional_enabled:
         from researchclaw.pipeline.sectional_execution import (
-            clean_sectional_outputs,
             execute_sectional_revision,
         )
         from researchclaw.pipeline.sectional_llm import (
@@ -561,7 +779,6 @@ def _execute_paper_revision(
         )
 
         try:
-            clean_sectional_outputs(stage_dir)
             if sectional_provider is None and llm is not None:
                 sectional_provider = LLMSectionalRevisionProvider(
                     llm=llm,
@@ -572,8 +789,14 @@ def _execute_paper_revision(
                 stage_dir=stage_dir,
                 run_dir=run_dir,
                 config=config.paper_revision,
-                claim_scope=_paper_revision_claim_scope(run_dir, config),
+                claim_scope=claim_scope,
                 provider=sectional_provider,  # type: ignore[arg-type]
+                evidence=evidence,
+                paper_text=draft,
+                reviews_text=reviews,
+                review_structure_report_text=stage19_inputs.review_structure_report.text(),
+                bibliography_text=stage19_inputs.bibliography.text(),
+                bibliography_sha256=stage19_inputs.bibliography.sha256,
             )
         except Exception as exc:  # deterministic sectional stage boundary
             logger.error("Stage 19 sectional revision failed: %s", exc)
@@ -582,6 +805,17 @@ def _execute_paper_revision(
                 status=StageStatus.FAILED,
                 artifacts=(),
                 error=f"Sectional revision failed: {exc}",
+            )
+        try:
+            verify_stage19_input_bundle_unchanged(run_dir, stage19_inputs)
+        except Stage19InputBundleError as exc:
+            clean_sectional_outputs(stage_dir)
+            return StageResult(
+                stage=Stage.PAPER_REVISION,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"Stage 17/18 revision inputs changed during Stage 19: {exc}",
+                decision="retry",
             )
         return StageResult(
             stage=Stage.PAPER_REVISION,
@@ -595,15 +829,6 @@ def _execute_paper_revision(
     # A resumed run may reuse the same stage directory. Remove outputs owned by
     # this stage before any LLM call so a failed retry cannot expose artifacts
     # from an earlier attempt as current output.
-    for artifact_name in (
-        "paper_revised.md",
-        "revision_notes_internal.md",
-        "revision_retry_failure.json",
-    ):
-        (stage_dir / artifact_name).unlink(missing_ok=True)
-
-    draft = _read_prior_artifact(run_dir, "paper_draft.md") or ""
-    reviews = _read_prior_artifact(run_dir, "reviews.md") or ""
     draft_word_count = len(draft.split())
 
     def _save_revision_notes(text: str) -> None:
@@ -620,8 +845,13 @@ def _execute_paper_revision(
 
     # R4-2: Collect real metrics for anti-fabrication guard in revision
     # BUG-47: _collect_raw_experiment_metrics returns tuple[str, bool], must unpack
-    _raw_metrics_tuple = _get_collect_raw_experiment_metrics()(run_dir)
-    raw_metrics_revision = _raw_metrics_tuple[0] if isinstance(_raw_metrics_tuple, tuple) else (_raw_metrics_tuple or "")
+    raw_metrics_revision = canonical_authority_json_text(
+        {
+            "metric_observations": evidence.metric_observations,
+            "structured_results": evidence.structured_results,
+            "summary": evidence.summary,
+        }
+    )
     data_integrity_revision = ""
     if raw_metrics_revision:
         data_integrity_revision = (
@@ -646,22 +876,6 @@ def _execute_paper_revision(
                 _rev_blocks[_bname] = _pm.block(_bname)
             except (KeyError, Exception):  # noqa: BLE001
                 _rev_blocks[_bname] = ""
-        # Load draft quality directives from Stage 17
-        _quality_prefix = ""
-        _quality_json_path = _find_prior_file(run_dir, "draft_quality.json")
-        if _quality_json_path and _quality_json_path.exists():
-            try:
-                _dq = json.loads(_quality_json_path.read_text(encoding="utf-8"))
-                _dq_directives = _dq.get("revision_directives", [])
-                if _dq_directives:
-                    _quality_prefix = (
-                        "MANDATORY QUALITY FIXES (address ALL of these):\n"
-                        + "\n".join(f"- {d}" for d in _dq_directives)
-                        + "\n\n"
-                    )
-            except Exception:  # noqa: BLE001
-                pass
-
         _overlay = _get_evolution_overlay(run_dir, "paper_revision")
         sp = _pm.for_stage(
             "paper_revision",
@@ -669,7 +883,7 @@ def _execute_paper_revision(
             topic_constraint=_pm.block("topic_constraint", topic=config.research.topic),
             writing_structure=_ws_revision,
             draft=draft,
-            reviews=_quality_prefix + reviews + data_integrity_revision,
+            reviews=reviews + data_integrity_revision,
             **_rev_blocks,
         )
 
@@ -724,7 +938,7 @@ def _execute_paper_revision(
                     retries=2,
                 )
             except RuntimeError as exc:
-                if _paper_revision_claim_scope(run_dir, config) != "pipeline_validation":
+                if claim_scope != "pipeline_validation":
                     raise
                 cause = exc.__cause__
                 logger.warning(
@@ -776,19 +990,70 @@ def _execute_paper_revision(
                     revised = draft
     else:
         revised = draft
-    (stage_dir / "paper_revised.md").write_text(revised, encoding="utf-8")
-    artifacts = ["paper_revised.md"]
+    revised_path = stage_dir / "paper_revised.md"
+    binding = {
+        "schema_version": 1,
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+        "source_paper_path": "stage-17/paper_draft.md",
+        "source_paper_sha256": _draft_sha256,
+        "source_reviews_path": "stage-18/reviews.md",
+        "source_reviews_sha256": _reviews_sha256,
+        "revised_paper_path": "stage-19/paper_revised.md",
+        "revised_paper_sha256": hashlib.sha256(revised.encode("utf-8")).hexdigest(),
+    }
+    binding_path = stage_dir / "revision_evidence_binding.json"
+    try:
+        _write_text_atomic(revised_path, revised)
+        _write_text_atomic(
+            binding_path,
+            json.dumps(binding, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
+        )
+        stored_revised_sha256 = hashlib.sha256(revised_path.read_bytes()).hexdigest()
+        _parse_revision_evidence_binding(
+            binding_path.read_text(encoding="utf-8"),
+            evidence=evidence,
+            draft_sha256=_draft_sha256,
+            reviews_sha256=_reviews_sha256,
+            revised_sha256=stored_revised_sha256,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        revised_path.unlink(missing_ok=True)
+        binding_path.unlink(missing_ok=True)
+        return StageResult(
+            stage=Stage.PAPER_REVISION,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Stage 19 revision evidence binding failed: {exc}",
+            decision="retry",
+        )
+    artifacts = ["paper_revised.md", "revision_evidence_binding.json"]
     for diagnostic_name in (
         "revision_notes_internal.md",
         "revision_retry_failure.json",
     ):
         if (stage_dir / diagnostic_name).is_file():
             artifacts.append(diagnostic_name)
+    try:
+        verify_stage19_input_bundle_unchanged(run_dir, stage19_inputs)
+    except Stage19InputBundleError as exc:
+        revised_path.unlink(missing_ok=True)
+        binding_path.unlink(missing_ok=True)
+        return StageResult(
+            stage=Stage.PAPER_REVISION,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Stage 17/18 revision inputs changed during Stage 19: {exc}",
+            decision="retry",
+        )
     return StageResult(
         stage=Stage.PAPER_REVISION,
         status=StageStatus.DONE,
         artifacts=tuple(artifacts),
-        evidence_refs=("stage-19/paper_revised.md",),
+        evidence_refs=(
+            "stage-19/paper_revised.md",
+            "stage-19/revision_evidence_binding.json",
+        ),
     )
 
 

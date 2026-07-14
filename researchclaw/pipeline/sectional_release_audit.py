@@ -10,11 +10,30 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from researchclaw.config import PaperRevisionConfig
 from researchclaw.experiment_runtime.contract import ExperimentContract, sha256_file
+from researchclaw.pipeline.canonical_experiment_evidence import (
+    CanonicalExperimentEvidence,
+    CanonicalExperimentEvidenceError,
+    load_canonical_experiment_evidence,
+)
+from researchclaw.literature.experiment_fact_closure import (
+    ExperimentFactClosureError,
+    replay_experiment_fact_closure,
+)
+from researchclaw.literature.citation_plan import (
+    CitationPlanContractError,
+    replay_citation_plan_provenance,
+    replay_citation_closure,
+)
+from researchclaw.literature.citation_policy import (
+    CitationPolicyContractError,
+    parse_config_snapshot_text,
+)
 from researchclaw.pipeline.manuscript_sections import parse_manuscript
 from researchclaw.pipeline.sectional_revision import (
     ReviewLedger,
@@ -27,6 +46,13 @@ from researchclaw.pipeline.sectional_revision import (
 from researchclaw.pipeline.sectional_execution import (
     SectionalExecutionError,
     build_validation_context,
+)
+from researchclaw.pipeline.stage19_input_bundle import (
+    Stage19InputBundle,
+    Stage19InputBundleError,
+    load_stage19_input_bundle,
+    parse_stage18_review_structure_report,
+    verify_stage19_input_bundle_unchanged,
 )
 from researchclaw.pipeline.sectional_validation import (
     ResolutionAssessmentRecord,
@@ -78,6 +104,12 @@ def audit_sectional_revision(
     """Replay a complete sectional bundle without trusting stored conclusions."""
 
     stage19 = run_dir / "stage-19"
+    if stage19.is_symlink() or not stage19.is_dir():
+        _raise(
+            "sectional_revision_artifact_missing",
+            "stage-19 must be a canonical directory",
+            "stage-19",
+        )
     manifest_path = stage19 / "section_revision_manifest.json"
     if not manifest_path.is_file():
         _raise(
@@ -115,6 +147,21 @@ def audit_sectional_revision(
             "stage-19/section_revision_manifest.json",
         )
 
+    try:
+        evidence = load_canonical_experiment_evidence(run_dir)
+    except (CanonicalExperimentEvidenceError, OSError, RuntimeError) as exc:
+        _raise(
+            "sectional_canonical_evidence_invalid",
+            f"canonical experiment evidence cannot be independently replayed: {exc}",
+            "canonical_experiment_evidence.json",
+        )
+    _verify_canonical_evidence_binding(
+        manifest.canonical_experiment_evidence_path,
+        manifest.canonical_experiment_evidence_sha256,
+        evidence,
+        "stage-19/section_revision_manifest.json",
+    )
+
     contract_rel = _relative_path(contract_path, run_dir)
     contract_sha = sha256_file(contract_path)
     if manifest.experiment_contract_path != contract_rel:
@@ -143,15 +190,68 @@ def audit_sectional_revision(
             contract_rel,
         )
 
-    paper_path = run_dir / "stage-17" / "paper_draft.md"
-    reviews_path = run_dir / "stage-18" / "reviews.md"
-    if not paper_path.is_file() or not reviews_path.is_file():
-        _raise(
-            "sectional_revision_artifact_missing",
-            "canonical Stage 17 paper and Stage 18 reviews are required",
+    try:
+        inputs = load_stage19_input_bundle(run_dir)
+        try:
+            canonical_config_text = evidence.run_config_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CitationPolicyContractError(
+                "canonical experiment config snapshot is not UTF-8"
+            ) from exc
+        canonical_config = parse_config_snapshot_text(
+            canonical_config_text,
+            project_root=run_dir,
+            label="canonical experiment config snapshot",
         )
-    paper = _read_text(paper_path, "sectional_revision_artifact_invalid")
-    reviews = _read_text(reviews_path, "sectional_revision_artifact_invalid")
+        citation_authority = replay_citation_plan_provenance(
+            inputs.citation_replay_inputs(), canonical_config, project_root=run_dir
+        )
+        paper = inputs.paper.text()
+        reviews = inputs.reviews.text()
+        fact_report = replay_experiment_fact_closure(
+            paper_bytes=inputs.paper.content,
+            stored_report_bytes=inputs.experiment_fact_closure_report.content,
+            evidence=evidence,
+        )
+        replay_citation_closure(
+            paper_bytes=inputs.paper.content,
+            structure_report_bytes=inputs.paper_structure_report.content,
+            experiment_fact_report_bytes=inputs.experiment_fact_closure_report.content,
+            citation_closure_report_bytes=inputs.citation_closure_report.content,
+            citation_plan_bytes=inputs.citation_plan.content,
+            citation_allowlist_bytes=inputs.citation_allowlist.content,
+            citation_authority=citation_authority,
+            evidence=evidence,
+        )
+    except (
+        Stage19InputBundleError,
+        ExperimentFactClosureError,
+        CitationPlanContractError,
+        CitationPolicyContractError,
+    ) as exc:
+        _raise(
+            "sectional_source_hash_mismatch",
+            f"Stage 17 closure inputs do not replay: {exc}",
+            "stage-17/experiment_fact_closure_report.json",
+        )
+    if (
+        fact_report.get("paper_sha256") != inputs.paper.sha256
+        or fact_report.get("canonical_experiment_evidence_path")
+        != evidence.manifest_path
+        or fact_report.get("canonical_experiment_evidence_sha256")
+        != evidence.manifest_sha256
+    ):
+        _raise(
+            "sectional_source_hash_mismatch",
+            "Stage 17 experiment-fact closure does not bind the current canonical paper",
+            "stage-17/experiment_fact_closure_report.json",
+        )
+    _verify_stage18_review_binding_text(
+        inputs.review_structure_report.text(),
+        reviews,
+        evidence,
+        inputs,
+    )
     try:
         document = parse_manuscript(paper, strict=True)
     except Exception as exc:  # tokenizer/structure errors are release blockers
@@ -279,10 +379,15 @@ def audit_sectional_revision(
             f"validation context is invalid: {exc}",
             "stage-19/validation_context.json",
         )
-    _verify_context_sources(run_dir, context_payload)
+    _verify_canonical_evidence_binding(
+        context_payload["canonical_experiment_evidence_path"],
+        context_payload["canonical_experiment_evidence_sha256"],
+        evidence,
+        "stage-19/validation_context.json",
+    )
+    _verify_context_sources(run_dir, context_payload, evidence)
     try:
         rebuilt_context = build_validation_context(
-            run_dir=run_dir,
             document=document,
             config=PaperRevisionConfig(
                 sectional_enabled=True,
@@ -291,6 +396,9 @@ def audit_sectional_revision(
                 max_length_ratio=float(context_payload["max_length_ratio"]),
                 critic_model=manifest.critic_model,
             ),
+            evidence=evidence,
+            bibliography_text=inputs.bibliography.text(),
+            bibliography_sha256=inputs.bibliography.sha256,
         )
         rebuilt_payload = _read_json_text(rebuilt_context.text)
     except (SectionalExecutionError, ValueError) as exc:
@@ -342,6 +450,20 @@ def audit_sectional_revision(
             "stage-19/resolution_assessments.jsonl",
         )
     _verify_model_binding(run_manifest, manifest, attempts, assessments)
+    for attempt in attempts:
+        _verify_canonical_evidence_binding(
+            attempt.canonical_experiment_evidence_path,
+            attempt.canonical_experiment_evidence_sha256,
+            evidence,
+            "stage-19/section_attempts.jsonl",
+        )
+    for assessment in assessments:
+        _verify_canonical_evidence_binding(
+            assessment.canonical_experiment_evidence_path,
+            assessment.canonical_experiment_evidence_sha256,
+            evidence,
+            "stage-19/resolution_assessments.jsonl",
+        )
 
     comments_by_id = {comment.comment_id: comment for comment in ledger.comments}
     assigned_by_section: dict[str, list[str]] = {}
@@ -476,7 +598,8 @@ def audit_sectional_revision(
                     context_payload["allowed_citation_keys"]
                 ),
                 grounded_numeric_values=tuple(
-                    float(value) for value in context_payload["grounded_numeric_values"]
+                    Decimal(value)
+                    for value in context_payload["grounded_numeric_values"]
                 ),
                 required_comment_ids=tuple(
                     comment_id
@@ -577,6 +700,8 @@ def audit_sectional_revision(
         "claim_scope": contract.claim_scope,
         "experiment_contract_path": contract_rel,
         "experiment_contract_sha256": contract_sha,
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
         "writer_model": manifest.writer_model,
         "critic_model": manifest.critic_model,
         "source_paper_path": "stage-17/paper_draft.md",
@@ -626,6 +751,14 @@ def audit_sectional_revision(
             "sectional_manifest_recompute_mismatch",
             f"section revision manifest does not recompute: {exc}",
             "stage-19/section_revision_manifest.json",
+        )
+    try:
+        verify_stage19_input_bundle_unchanged(run_dir, inputs)
+    except Stage19InputBundleError as exc:
+        _raise(
+            "sectional_source_hash_mismatch",
+            f"Stage 17/18 authority changed during release replay: {exc}",
+            "stage-17/paper_draft.md",
         )
 
 
@@ -745,9 +878,62 @@ def _verify_model_binding(
         )
 
 
-def _verify_context_sources(run_dir: Path, payload: Mapping[str, Any]) -> None:
+def _verify_canonical_evidence_binding(
+    path: object,
+    sha256: object,
+    evidence: CanonicalExperimentEvidence,
+    artifact_path: str,
+) -> None:
+    if path != evidence.manifest_path or sha256 != evidence.manifest_sha256:
+        _raise(
+            "sectional_canonical_evidence_mismatch",
+            "Stage 19 artifact does not bind the independently replayed canonical evidence",
+            artifact_path,
+        )
+
+
+def _verify_stage18_review_binding_text(
+    report_text: str,
+    reviews: str,
+    evidence: CanonicalExperimentEvidence,
+    inputs: Stage19InputBundle,
+) -> None:
+    try:
+        report = parse_stage18_review_structure_report(
+            report_text,
+            bundle=inputs,
+            canonical_evidence_path=evidence.manifest_path,
+            canonical_evidence_sha256=evidence.manifest_sha256,
+        )
+    except (ValueError, Stage19InputBundleError) as exc:
+        _raise(
+            "sectional_revision_artifact_invalid",
+            f"Stage 18 review structure report is invalid: {exc}",
+            "stage-18/review_structure_report.json",
+        )
+    if report["valid"] is not True or report["source_reviews_sha256"] != _text_sha256(reviews):
+        _raise(
+            "sectional_ledger_recompute_mismatch",
+            "Stage 18 review structure report does not bind the reviews text",
+            "stage-18/review_structure_report.json",
+        )
+
+
+def _verify_context_sources(
+    run_dir: Path,
+    payload: Mapping[str, Any],
+    evidence: CanonicalExperimentEvidence,
+) -> None:
     for source in payload["sources"]:
         if source["kind"] == "config":
+            continue
+        if source["kind"] == "canonical_evidence":
+            _verify_canonical_evidence_binding(
+                source["path"],
+                source["sha256"],
+                evidence,
+                "stage-19/validation_context.json",
+            )
             continue
         rel = source["path"]
         if rel.split("/", 1)[0].startswith("stage-10"):

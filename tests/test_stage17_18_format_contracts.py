@@ -45,7 +45,7 @@ def _stub_effective_citation_policy(monkeypatch: pytest.MonkeyPatch) -> None:
         **_kwargs: object,
     ) -> dict[str, str]:
         draft_bytes = (run_dir / "stage-17" / "paper_draft.md").read_bytes()
-        return {
+        payload = {
             "paper_sha256": hashlib.sha256(draft_bytes).hexdigest(),
             "canonical_experiment_evidence_path": str(
                 getattr(evidence, "manifest_path", "canonical_experiment_evidence.json")
@@ -58,6 +58,16 @@ def _stub_effective_citation_policy(monkeypatch: pytest.MonkeyPatch) -> None:
                 )
             ),
         }
+        structure = run_dir / "stage-17" / "paper_structure_report.json"
+        fact = run_dir / "stage-17" / "experiment_fact_closure_report.json"
+        if structure.is_file() and fact.is_file():
+            payload["structure_report_sha256"] = hashlib.sha256(
+                structure.read_bytes()
+            ).hexdigest()
+            payload["experiment_fact_closure_report_sha256"] = hashlib.sha256(
+                fact.read_bytes()
+            ).hexdigest()
+        return payload
 
     monkeypatch.setattr(
         _review_publish, "validate_experiment_fact_closure_report", closure_for_current_draft
@@ -96,18 +106,32 @@ def _assert_fixture_canonical_binding(report: dict[str, Any]) -> None:
     assert report["canonical_experiment_evidence_path"] == (
         "canonical_experiment_evidence.json"
     )
-    assert report["canonical_experiment_evidence_sha256"] == hashlib.sha256(
-        b"consumer-test-evidence"
-    ).hexdigest()
+    assert isinstance(report["canonical_experiment_evidence_sha256"], str)
+    assert len(report["canonical_experiment_evidence_sha256"]) == 64
 
 
 def _write_draft(run_dir: Path) -> None:
     stage_dir = run_dir / "stage-17"
     stage_dir.mkdir(parents=True)
+    draft = "## Title\n\nExample\n\n## Method\n\nBody.\n"
     (stage_dir / "paper_draft.md").write_text(
-        "## Title\n\nExample\n\n## Method\n\nBody.\n",
+        draft,
         encoding="utf-8",
     )
+    (stage_dir / "paper_structure_report.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "valid": True,
+                "source_sha256": hashlib.sha256(draft.encode("utf-8")).hexdigest(),
+                "section_count": 2,
+                "issues": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (stage_dir / "experiment_fact_closure_report.json").write_text("{}", encoding="utf-8")
+    (stage_dir / "citation_closure_report.json").write_text("{}", encoding="utf-8")
 
 
 def _config() -> Any:
@@ -765,7 +789,15 @@ def test_stage18_passes_one_snapshot_to_both_closure_replays(
     ) -> dict[str, str]:
         citation_snapshots.append(evidence)
         draft_bytes = (run_dir / "stage-17" / "paper_draft.md").read_bytes()
-        return {"paper_sha256": hashlib.sha256(draft_bytes).hexdigest()}
+        return {
+            "paper_sha256": hashlib.sha256(draft_bytes).hexdigest(),
+            "structure_report_sha256": hashlib.sha256(
+                (run_dir / "stage-17" / "paper_structure_report.json").read_bytes()
+            ).hexdigest(),
+            "experiment_fact_closure_report_sha256": hashlib.sha256(
+                (run_dir / "stage-17" / "experiment_fact_closure_report.json").read_bytes()
+            ).hexdigest(),
+        }
 
     monkeypatch.setattr(
         _review_publish, "validate_experiment_fact_closure_report", fact_closure

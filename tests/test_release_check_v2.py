@@ -7,25 +7,52 @@ breaks one gate at a time and asserts the corresponding failure code.
 from __future__ import annotations
 
 import builtins
+import hashlib
 import json
 import sys
+from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import release_check  # noqa: E402
 from researchclaw.pipeline import release_artifacts as ra  # noqa: E402
-from researchclaw.config import PaperRevisionConfig  # noqa: E402
+from researchclaw.config import PaperRevisionConfig, RCConfig  # noqa: E402
+from researchclaw.literature.citation_policy import (  # noqa: E402
+    build_effective_citation_policy,
+    write_active_config_binding,
+)
 from researchclaw.pipeline.sectional_execution import (  # noqa: E402
     ResolutionAssessment,
     SectionProposal,
     execute_sectional_revision,
 )
+from researchclaw.literature.experiment_fact_closure import (  # noqa: E402
+    build_experiment_fact_closure_report,
+    canonical_experiment_fact_json_text,
+)
+from researchclaw.literature.citation_plan import (  # noqa: E402
+    CitationPlanContractError,
+    build_citation_plan,
+    build_citation_closure_from_texts,
+    replay_citation_plan_provenance,
+)
+from researchclaw.pipeline.stage19_input_bundle import (  # noqa: E402
+    Stage19InputBundleError,
+    load_stage19_input_bundle,
+    verify_stage19_input_bundle_unchanged,
+)
 from researchclaw.pipeline.stages import FINAL_STAGE, Stage  # noqa: E402
-from tests.test_evidence_cards import _prepare_e9_run  # noqa: E402
+from tests.test_evidence_cards import (  # noqa: E402
+    _card_response as _base_card_response,
+    _prepare_e9_run,
+    _prepare_stage23_fixture,
+)
 
 
 PAPER = (
@@ -40,6 +67,10 @@ Release Fixture
 ## Method
 
 The detector scored 0.1234 using three seeds \\cite{smith2024deep}.
+
+## Related Work
+
+Prior work is summarized in \\cite{smith2024deep}.
 
 ## Results
 
@@ -59,9 +90,56 @@ The reporting basis is terse.
 """
 
 
+def _sectional_draft(cite_keys: tuple[str, ...]) -> str:
+    related_work = " ".join(
+        f"Prior work is summarized in \\cite{{{cite_key}}}." for cite_key in cite_keys
+    )
+    return f"""## Title
+
+Release Fixture
+
+## Method
+
+The detector scored 0.1234 using three seeds \\cite{{{cite_keys[0]}}}.
+
+## Related Work
+
+{related_work}
+
+## Results
+
+The recorded score was 0.1234.
+"""
+
+
+def _release_config_snapshot(
+    run_dir: Path,
+    *,
+    claim_scope: str = "research_release",
+    profile: str | None = None,
+) -> RCConfig:
+    raw = yaml.safe_load(
+        (REPO_ROOT / "config.deepseek.sectional-dry-run.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    raw["experiment"]["claim_scope"] = claim_scope
+    raw["experiment"]["dataset_origin"] = "public"
+    if profile is not None:
+        raw["project"]["profile"] = profile
+    snapshot = run_dir / "config.yaml"
+    snapshot.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config = RCConfig.from_dict(raw, project_root=run_dir, check_paths=False)
+    write_active_config_binding(run_dir, snapshot)
+    return config
+
+
 class _SectionalFixtureProvider:
     writer_model = "writer-model-y"
     critic_model = "section-critic-z"
+
+    def __init__(self, cite_key: str = "smith2024deep") -> None:
+        self.cite_key = cite_key
 
     def build_plan(self, *, ledger, document):
         method = next(section for section in document.sections if section.title == "Method")
@@ -88,7 +166,7 @@ class _SectionalFixtureProvider:
             section_id=section.section_id,
             revised_body=(
                 "\nThe recorded detector score was 0.1234 across three seeds "
-                "\\cite{smith2024deep}. This sentence clarifies the reporting basis.\n\n"
+                f"\\cite{{{self.cite_key}}}. This sentence clarifies the reporting basis.\n\n"
             ),
             resolution_comment_ids=tuple(comment.comment_id for comment in comments),
         )
@@ -134,6 +212,42 @@ def good_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     )
     run = tmp_path / "run"
     run.mkdir()
+    outline_evidence = SimpleNamespace(
+        manifest_path="canonical_experiment_evidence.json",
+        manifest_sha256="0" * 64,
+        analysis_text="",
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._paper_writing.load_canonical_experiment_evidence",
+        lambda _run_dir: outline_evidence,
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._paper_writing._load_bound_stage15_decision",
+        lambda _run_dir, _evidence: ("PROCEED", "0" * 64),
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._paper_writing._build_context_preamble",
+        lambda *_args, **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        "tests.test_evidence_cards._real_config_snapshot", _release_config_snapshot
+    )
+    card_batch = 0
+
+    def _release_card_response(rows: list[dict]) -> str:
+        nonlocal card_batch
+        card_batch += 1
+        response = json.loads(_base_card_response(rows))
+        response["batch_id"] = f"card-batch-{card_batch:03d}"
+        return json.dumps(response, ensure_ascii=False)
+
+    monkeypatch.setattr(
+        "tests.test_evidence_cards._card_response", _release_card_response
+    )
+    config, _unused_paper, planned_keys = _prepare_stage23_fixture(
+        run, claim_scope="research_release"
+    )
+    assert planned_keys
 
     # --- experiment evidence ---
     _write(
@@ -206,9 +320,35 @@ def good_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         run / "stage-23" / "references_verified.bib",
         "@article{smith2024deep, title={Deep}}\n@article{jones2023survey, title={Survey}}\n",
     )
-    _write(
-        run / "stage-04" / "references.bib",
-        "@article{smith2024deep, title={Deep}, year={2024}}\n",
+    canonical_evidence_text = "release-check-canonical-evidence\n"
+    _write(run / "canonical_experiment_evidence.json", canonical_evidence_text)
+    run_config_bytes = (run / "config.yaml").read_bytes()
+    evidence = SimpleNamespace(
+        manifest_path="canonical_experiment_evidence.json",
+        manifest_sha256=hashlib.sha256(
+            canonical_evidence_text.encode("utf-8")
+        ).hexdigest(),
+        selected_result_manifest_path="stage-12/experiment_result_set.json",
+        selected_result_manifest_sha256="c" * 64,
+        candidate_manifest_path=(
+            "stage-14/evidence_candidates/cand-release/experiment_evidence_candidate.json"
+        ),
+        candidate_manifest_sha256="d" * 64,
+        metric_observations={"loss": (Decimal("0.1234"),)},
+        structured_results={"metrics": {"loss": Decimal("0.1234")}},
+        summary={},
+        experiment_contract_path="stage-09/experiment_contract.yaml",
+        experiment_contract_sha256=contract_sha,
+        experiment_contract_bytes=(
+            run / "stage-09" / "experiment_contract.yaml"
+        ).read_bytes(),
+        run_config_path="config.yaml",
+        run_config_sha256=hashlib.sha256(run_config_bytes).hexdigest(),
+        run_config_bytes=run_config_bytes,
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.sectional_release_audit.load_canonical_experiment_evidence",
+        lambda _run_dir: evidence,
     )
     _write(
         run / "stage-12" / "sandbox_metadata.json",
@@ -332,8 +472,78 @@ def good_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     )
 
     # --- Stage 19 sectional bundle, generated through the real producer ---
-    _write(run / "stage-17" / "paper_draft.md", SECTIONAL_DRAFT)
+    sectional_draft = _sectional_draft(planned_keys)
+    _write(run / "stage-17" / "paper_draft.md", sectional_draft)
+    _write(
+        run / "stage-17" / "experiment_fact_closure_report.json",
+        canonical_experiment_fact_json_text(
+            build_experiment_fact_closure_report(
+                run, paper_text=sectional_draft, evidence=evidence
+            )
+        ),
+    )
+    structure_report = {
+        "schema_version": 1,
+        "valid": True,
+        "source_sha256": hashlib.sha256(sectional_draft.encode("utf-8")).hexdigest(),
+        "section_count": 4,
+        "issues": [],
+    }
+    _write(run / "stage-17" / "paper_structure_report.json", structure_report)
+    structure_text = (run / "stage-17" / "paper_structure_report.json").read_text(
+        encoding="utf-8"
+    )
+    allowlist_text = (run / "stage-06" / "citation_allowlist.json").read_text(
+        encoding="utf-8"
+    )
+    plan_text = (run / "stage-16" / "citation_plan.json").read_text(
+        encoding="utf-8"
+    )
+    fact_text = (run / "stage-17" / "experiment_fact_closure_report.json").read_text(
+        encoding="utf-8"
+    )
+    citation_closure = build_citation_closure_from_texts(
+        paper_text=sectional_draft,
+        structure_report_text=structure_text,
+        experiment_fact_report_text=fact_text,
+        citation_plan_text=plan_text,
+        citation_allowlist_text=allowlist_text,
+    )
+    _write(run / "stage-17" / "citation_closure_report.json", citation_closure)
     _write(run / "stage-18" / "reviews.md", SECTIONAL_REVIEWS)
+    _write(
+        run / "stage-18" / "review_structure_report.json",
+        {
+            "schema_version": 2,
+            "valid": True,
+            "source_reviews_path": "stage-18/reviews.md",
+            "source_reviews_sha256": hashlib.sha256(
+                SECTIONAL_REVIEWS.encode("utf-8")
+            ).hexdigest(),
+            "source_paper_path": "stage-17/paper_draft.md",
+            "source_paper_sha256": hashlib.sha256(
+                sectional_draft.encode("utf-8")
+            ).hexdigest(),
+            "paper_structure_report_path": "stage-17/paper_structure_report.json",
+            "paper_structure_report_sha256": hashlib.sha256(
+                structure_text.encode("utf-8")
+            ).hexdigest(),
+            "experiment_fact_closure_report_path": (
+                "stage-17/experiment_fact_closure_report.json"
+            ),
+            "experiment_fact_closure_report_sha256": hashlib.sha256(
+                fact_text.encode("utf-8")
+            ).hexdigest(),
+            "citation_closure_report_path": "stage-17/citation_closure_report.json",
+            "citation_closure_report_sha256": hashlib.sha256(
+                (run / "stage-17" / "citation_closure_report.json").read_bytes()
+            ).hexdigest(),
+            "canonical_experiment_evidence_path": evidence.manifest_path,
+            "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+            "comment_count": 1,
+            "issues": [],
+        },
+    )
     sectional_result = execute_sectional_revision(
         stage_dir=run / "stage-19",
         run_dir=run,
@@ -345,7 +555,19 @@ def good_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
             critic_model="section-critic-z",
         ),
         claim_scope="research_release",
-        provider=_SectionalFixtureProvider(),
+        provider=_SectionalFixtureProvider(planned_keys[0]),
+        evidence=evidence,
+        paper_text=sectional_draft,
+        reviews_text=SECTIONAL_REVIEWS,
+        review_structure_report_text=(
+            run / "stage-18" / "review_structure_report.json"
+        ).read_text(encoding="utf-8"),
+        bibliography_text=(run / "stage-04" / "references.bib").read_text(
+            encoding="utf-8"
+        ),
+        bibliography_sha256=hashlib.sha256(
+            (run / "stage-04" / "references.bib").read_bytes()
+        ).hexdigest(),
     )
     assert sectional_result.completed is True
 
@@ -412,6 +634,245 @@ def test_good_run_passes(good_run: Path) -> None:
 def test_sectional_manifest_is_required(good_run: Path) -> None:
     (good_run / "stage-19" / "section_revision_manifest.json").unlink()
     assert "sectional_revision_manifest_missing" in _codes(_check(good_run))
+
+
+def test_sectional_audit_rejects_stage17_closure_symlink(good_run: Path) -> None:
+    closure = good_run / "stage-17" / "experiment_fact_closure_report.json"
+    external = good_run.parent / "external-experiment-closure.json"
+    external.write_bytes(closure.read_bytes())
+    closure.unlink()
+    closure.symlink_to(external)
+
+    assert "sectional_source_hash_mismatch" in _codes(_check(good_run))
+
+
+@pytest.mark.parametrize(
+    "issues",
+    (
+        [{"code": "unexpected", "message": "must not be valid", "line": None}],
+        [{"code": "bad", "message": "bad line", "line": True}],
+        [{"code": "bad", "message": "missing line"}],
+    ),
+)
+def test_sectional_audit_rejects_incoherent_stage18_review_report(
+    good_run: Path, issues: list[dict]
+) -> None:
+    path = good_run / "stage-18" / "review_structure_report.json"
+    report = json.loads(path.read_text(encoding="utf-8"))
+    report["issues"] = issues
+    _write(path, report)
+
+    assert "sectional_revision_artifact_invalid" in _codes(_check(good_run))
+
+
+def test_stage19_input_bundle_detects_post_capture_mutation(good_run: Path) -> None:
+    bundle = load_stage19_input_bundle(good_run)
+    paper = good_run / "stage-17" / "paper_draft.md"
+    paper.write_text(paper.read_text(encoding="utf-8") + "\nChanged.\n", encoding="utf-8")
+
+    with pytest.raises(Stage19InputBundleError, match="changed after capture"):
+        verify_stage19_input_bundle_unchanged(good_run, bundle)
+
+
+@pytest.mark.parametrize("addition", ("checkpoint", "card-shadow", "resumed-config"))
+def test_stage19_input_bundle_detects_post_capture_namespace_addition(
+    good_run: Path, addition: str
+) -> None:
+    bundle = load_stage19_input_bundle(good_run)
+    if addition == "checkpoint":
+        _write(good_run / "checkpoint.json", {})
+    elif addition == "card-shadow":
+        _write(good_run / "stage-06" / "cards" / "shadow.json", {})
+    else:
+        (good_run / "config.resumed-20260714-010101.yaml").write_bytes(
+            (good_run / "config.yaml").read_bytes()
+        )
+
+    with pytest.raises(Stage19InputBundleError, match="changed after capture"):
+        verify_stage19_input_bundle_unchanged(good_run, bundle)
+
+
+def test_stage19_input_bundle_rejects_resumed_config_without_pointer(
+    good_run: Path,
+) -> None:
+    (good_run / "active_config_snapshot.json").unlink()
+    (good_run / "config_snapshot_history.jsonl").unlink()
+    (good_run / "checkpoint.json").unlink(missing_ok=True)
+    (good_run / "config.resumed-20260714-010101.yaml").write_bytes(
+        (good_run / "config.yaml").read_bytes()
+    )
+
+    with pytest.raises(Stage19InputBundleError, match="resume state exists"):
+        load_stage19_input_bundle(good_run)
+
+
+def test_stage19_input_bundle_rejects_unmanifested_card_file(good_run: Path) -> None:
+    (good_run / "stage-06" / "cards" / "shadow.json").write_text(
+        "{}", encoding="utf-8"
+    )
+
+    with pytest.raises(Stage19InputBundleError, match="cards manifest closure"):
+        load_stage19_input_bundle(good_run)
+
+
+def test_citation_replay_rejects_full_semantic_runtime_config_divergence(
+    good_run: Path,
+) -> None:
+    bundle = load_stage19_input_bundle(good_run)
+    raw = yaml.safe_load((good_run / "config.yaml").read_text(encoding="utf-8"))
+    raw["paper_revision"]["max_section_retries"] += 1
+    divergent = RCConfig.from_dict(raw, project_root=good_run, check_paths=False)
+
+    with pytest.raises(CitationPlanContractError, match="semantic generation"):
+        replay_citation_plan_provenance(
+            bundle.citation_replay_inputs(),
+            divergent,
+            project_root=good_run,
+        )
+
+
+def test_sectional_audit_rejects_active_config_generation_divergence(
+    good_run: Path,
+) -> None:
+    raw = yaml.safe_load((good_run / "config.yaml").read_text(encoding="utf-8"))
+    raw["paper_revision"]["max_section_retries"] += 1
+    resumed = good_run / "config.resumed-20260714-010101.yaml"
+    resumed.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    write_active_config_binding(good_run, resumed)
+
+    assert "sectional_source_hash_mismatch" in _codes(_check(good_run))
+
+
+def test_citation_replay_accepts_semantic_identical_resumed_config(
+    good_run: Path,
+) -> None:
+    raw = yaml.safe_load((good_run / "config.yaml").read_text(encoding="utf-8"))
+    config = RCConfig.from_dict(raw, project_root=good_run, check_paths=False)
+    resumed = good_run / "config.resumed-20260714-010101.yaml"
+    resumed.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    write_active_config_binding(good_run, resumed)
+
+    policy = build_effective_citation_policy(good_run, config)
+    _write(good_run / "stage-16" / "citation_policy_effective.json", policy)
+    plan = build_citation_plan(good_run, config, plan_status="final")
+    _write(good_run / "stage-16" / "citation_plan.json", plan)
+
+    bundle = load_stage19_input_bundle(good_run)
+    authority = replay_citation_plan_provenance(
+        bundle.citation_replay_inputs(),
+        config,
+        project_root=good_run,
+    )
+
+    assert authority.effective_policy["config_source_path"] == resumed.name
+
+
+def test_sectional_audit_final_fixpoint_rejects_late_namespace_addition(
+    good_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_verify = verify_stage19_input_bundle_unchanged
+
+    def add_shadow_then_verify(run_dir: Path, bundle) -> None:
+        _write(run_dir / "stage-06" / "cards" / "late-shadow.json", {})
+        real_verify(run_dir, bundle)
+
+    monkeypatch.setattr(
+        "researchclaw.pipeline.sectional_release_audit.verify_stage19_input_bundle_unchanged",
+        add_shadow_then_verify,
+    )
+
+    assert "sectional_source_hash_mismatch" in _codes(_check(good_run))
+
+
+def test_sectional_audit_rejects_self_consistent_rewritten_citation_plan(
+    good_run: Path,
+) -> None:
+    """Plan/closure/report rewrites cannot bypass the Stage 4-6 replay chain."""
+    plan_path = good_run / "stage-16" / "citation_plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["claims"][0]["claim_text"] = "Attacker-controlled background claim."
+    plan_text = json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    plan_path.write_text(plan_text, encoding="utf-8")
+
+    structure_text = (good_run / "stage-17" / "paper_structure_report.json").read_text(
+        encoding="utf-8"
+    )
+    fact_text = (
+        good_run / "stage-17" / "experiment_fact_closure_report.json"
+    ).read_text(encoding="utf-8")
+    allowlist_text = (good_run / "stage-06" / "citation_allowlist.json").read_text(
+        encoding="utf-8"
+    )
+    closure = build_citation_closure_from_texts(
+        paper_text=(good_run / "stage-17" / "paper_draft.md").read_text(
+            encoding="utf-8"
+        ),
+        structure_report_text=structure_text,
+        experiment_fact_report_text=fact_text,
+        citation_plan_text=plan_text,
+        citation_allowlist_text=allowlist_text,
+    )
+    closure_path = good_run / "stage-17" / "citation_closure_report.json"
+    _write(closure_path, closure)
+    review_report_path = good_run / "stage-18" / "review_structure_report.json"
+    review_report = json.loads(review_report_path.read_text(encoding="utf-8"))
+    review_report["citation_closure_report_sha256"] = hashlib.sha256(
+        closure_path.read_bytes()
+    ).hexdigest()
+    _write(review_report_path, review_report)
+
+    assert "sectional_source_hash_mismatch" in _codes(_check(good_run))
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "stage-04/candidates.jsonl",
+        "stage-04/cite_key_registry.json",
+        "stage-04/references.bib",
+        "stage-05/shortlist.jsonl",
+        "stage-05/screening_report.json",
+        "stage-06/cards_manifest.json",
+        "stage-06/cards/card-001.json",
+        "stage-06/cards/card-001.md",
+        "stage-06/citation_allowlist.json",
+        "stage-16/citation_policy_effective.json",
+        "config.yaml",
+        "active_config_snapshot.json",
+        "config_snapshot_history.jsonl",
+    ),
+)
+def test_sectional_audit_rejects_each_captured_citation_provenance_input(
+    good_run: Path, relative_path: str
+) -> None:
+    path = good_run / relative_path
+    if relative_path == "active_config_snapshot.json":
+        pointer = json.loads(path.read_text(encoding="utf-8"))
+        pointer["history_ordinal"] += 1
+        _write(path, pointer)
+    else:
+        path.write_text(path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+
+    assert "sectional_source_hash_mismatch" in _codes(_check(good_run))
+
+
+def test_sectional_audit_rejects_unbound_stage18_review_report(good_run: Path) -> None:
+    report_path = good_run / "stage-18" / "review_structure_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["unexpected"] = True
+    _write(report_path, report)
+
+    assert "sectional_revision_artifact_invalid" in _codes(_check(good_run))
+
+
+def test_sectional_manifest_must_bind_independently_replayed_evidence(
+    good_run: Path,
+) -> None:
+    manifest = _stage19_manifest(good_run)
+    manifest["canonical_experiment_evidence_sha256"] = "f" * 64
+    _write_stage19_manifest(good_run, manifest)
+
+    assert "sectional_canonical_evidence_mismatch" in _codes(_check(good_run))
 
 
 def test_legacy_stage19_is_not_release_eligible(good_run: Path) -> None:
@@ -488,7 +949,7 @@ def test_sectional_unresolved_artifact_cannot_hide_comment(good_run: Path) -> No
 def test_sectional_numeric_whitelist_recomputes_from_sources(good_run: Path) -> None:
     path = good_run / "stage-19" / "validation_context.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["grounded_numeric_values"].append(0.999)
+    payload["grounded_numeric_values"].append("0.999")
     text = json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
     path.write_text(text, encoding="utf-8")
     manifest = _stage19_manifest(good_run)
@@ -629,6 +1090,19 @@ def test_pipeline_validation_sectional_bundle_never_releases(good_run: Path) -> 
     sealed = json.loads(sealed_path.read_text(encoding="utf-8"))
     sealed["contract_sha256"] = ra.sha256_file(contract_path)
     _write(sealed_path, sealed)
+    canonical_text = (good_run / "canonical_experiment_evidence.json").read_text(
+        encoding="utf-8"
+    )
+    evidence = SimpleNamespace(
+        manifest_path="canonical_experiment_evidence.json",
+        manifest_sha256=hashlib.sha256(canonical_text.encode("utf-8")).hexdigest(),
+        metric_observations={"loss": (Decimal("0.1234"),)},
+        structured_results={"metrics": {"loss": Decimal("0.1234")}},
+        summary={},
+        experiment_contract_path="stage-09/experiment_contract.yaml",
+        experiment_contract_sha256=ra.sha256_file(contract_path),
+        experiment_contract_bytes=contract_path.read_bytes(),
+    )
     result = execute_sectional_revision(
         stage_dir=good_run / "stage-19",
         run_dir=good_run,
@@ -641,6 +1115,22 @@ def test_pipeline_validation_sectional_bundle_never_releases(good_run: Path) -> 
         ),
         claim_scope="pipeline_validation",
         provider=_SectionalFixtureProvider(),
+        evidence=evidence,
+        paper_text=(good_run / "stage-17" / "paper_draft.md").read_text(
+            encoding="utf-8"
+        ),
+        reviews_text=(good_run / "stage-18" / "reviews.md").read_text(
+            encoding="utf-8"
+        ),
+        review_structure_report_text=(
+            good_run / "stage-18" / "review_structure_report.json"
+        ).read_text(encoding="utf-8"),
+        bibliography_text=(good_run / "stage-04" / "references.bib").read_text(
+            encoding="utf-8"
+        ),
+        bibliography_sha256=hashlib.sha256(
+            (good_run / "stage-04" / "references.bib").read_bytes()
+        ).hexdigest(),
     )
     assert result.completed is True
 
