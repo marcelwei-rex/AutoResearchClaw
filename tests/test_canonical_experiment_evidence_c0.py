@@ -54,6 +54,7 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     canonical_authority_json_text,
     canonical_decimal,
     invocation_generation_binding_sha256,
+    load_canonical_experiment_evidence,
     parse_aggregate_results,
     parse_canonical_experiment_manifest,
     parse_execution_invocation_journal,
@@ -1157,6 +1158,120 @@ def test_stage14_publishes_deterministic_immutable_candidate_and_root(
     replayed = validate_canonical_experiment_manifest(run_dir, config)
     assert replayed["selected_candidate"]["candidate_id"] == candidate_id
     assert [path.name for path in (stage_dir / "evidence_candidates").iterdir()] == [candidate_id]
+
+
+def test_shared_accessor_returns_lock_consistent_immutable_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    _config, root = _write_canonical_bundle(run_dir)
+
+    evidence = load_canonical_experiment_evidence(run_dir)
+
+    assert evidence.manifest_sha256 == sha256_file(
+        run_dir / "canonical_experiment_evidence.json"
+    )
+    assert evidence.candidate_manifest_sha256 == root["selected_candidate"]["sha256"]
+    assert evidence.selected_result_manifest_sha256 == root["selected_result"][
+        "manifest_sha256"
+    ]
+    assert evidence.summary["metrics_summary"]["detection_f1"]["mean"] == Decimal("0.5")
+    assert evidence.analysis_text == "Analysis.\n"
+    assert {artifact.role for artifact in evidence.artifacts} == {
+        "analysis",
+        "figure_plan",
+        "results_table",
+        "summary",
+    }
+    with pytest.raises(TypeError):
+        evidence.summary["new"] = "forbidden"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        evidence.summary["metrics_summary"]["detection_f1"]["mean"] = Decimal("1")  # type: ignore[index]
+
+    summary_path = run_dir / root["selected_summary"]["source_path"]
+    summary_path.write_text("{}\n", encoding="utf-8")
+    assert evidence.summary_bytes != summary_path.read_bytes()
+    assert evidence.summary["metrics_summary"]["detection_f1"]["mean"] == Decimal("0.5")
+
+
+def test_shared_accessor_refuses_to_read_during_publication_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    _write_canonical_bundle(run_dir)
+    publisher = CanonicalAnalysisController.acquire_promotion(run_dir)
+    try:
+        with pytest.raises(RuntimeError, match="canonical_evidence_generation_locked"):
+            load_canonical_experiment_evidence(run_dir)
+    finally:
+        publisher.close()
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    [
+        "root_manifest",
+        "candidate_manifest",
+        "candidate_summary",
+        "selected_result_manifest",
+        "selected_execution",
+        "experiment_contract",
+        "run_config",
+        "summary_compatibility_copy",
+        "analysis_compatibility_copy",
+    ],
+)
+def test_shared_accessor_rejects_bundle_change_during_final_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_name: str,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    _config, root = _write_canonical_bundle(run_dir)
+    from researchclaw.pipeline import canonical_experiment_evidence as evidence_impl
+
+    targets = {
+        "root_manifest": run_dir / "canonical_experiment_evidence.json",
+        "candidate_manifest": run_dir / root["selected_candidate"]["path"],
+        "candidate_summary": run_dir / root["selected_summary"]["source_path"],
+        "selected_result_manifest": run_dir / root["selected_result"]["manifest_path"],
+        "selected_execution": run_dir / "stage-12/evidence-v1/results.json",
+        "experiment_contract": run_dir / root["experiment_contract_path"],
+        "run_config": run_dir / root["run_config_path"],
+        "summary_compatibility_copy": run_dir / root["selected_summary"]["canonical_path"],
+        "analysis_compatibility_copy": run_dir / root["selected_analysis"]["canonical_path"],
+    }
+    target = targets[target_name]
+    original = target.read_bytes()
+    real_validate = evidence_impl.validate_canonical_experiment_manifest
+    calls = 0
+
+    def mutate_before_final_replay(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            target.write_bytes(b"{}\n")
+        return real_validate(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        evidence_impl,
+        "validate_canonical_experiment_manifest",
+        mutate_before_final_replay,
+    )
+    with pytest.raises(CanonicalExperimentEvidenceError):
+        load_canonical_experiment_evidence(run_dir)
+    assert calls == 2
+
+    target.write_bytes(original)
+    recovered = load_canonical_experiment_evidence(run_dir)
+    assert recovered.manifest_sha256 == sha256_file(
+        run_dir / "canonical_experiment_evidence.json"
+    )
 
 
 def test_stage14_llm_perspectives_are_bound_into_candidate_closure(

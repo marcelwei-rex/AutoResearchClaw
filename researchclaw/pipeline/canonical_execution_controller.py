@@ -418,6 +418,15 @@ class CanonicalAnalysisController:
         )
 
     @classmethod
+    def acquire_reader(cls, run_dir: Path) -> CanonicalAnalysisController:
+        """Hold the publication lock while one consumer snapshots the bundle."""
+        return cls._acquire(
+            run_dir,
+            run_dir / "stage-14",
+            "load_canonical_experiment_evidence",
+        )
+
+    @classmethod
     def _acquire(
         cls,
         run_dir: Path,

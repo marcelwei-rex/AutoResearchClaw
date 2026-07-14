@@ -12,9 +12,11 @@ import shutil
 import tempfile
 import tokenize
 import uuid
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
 from io import BytesIO
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping
 
 import yaml
@@ -68,6 +70,44 @@ _FIGURE_AGENT_INTERMEDIATE_NAMES = frozenset(
 
 class CanonicalExperimentEvidenceError(ValueError):
     """Raised when canonical experiment evidence is not strictly replayable."""
+
+
+@dataclass(frozen=True)
+class CanonicalEvidenceArtifact:
+    """One immutable in-memory artifact from the selected Stage 14 candidate."""
+
+    role: str
+    path: str
+    sha256: str
+    content: bytes
+
+
+@dataclass(frozen=True)
+class CanonicalExperimentEvidence:
+    """A lock-consistent, replay-validated snapshot for downstream consumers."""
+
+    manifest_path: str
+    manifest_sha256: str
+    manifest: Mapping[str, Any]
+    candidate_manifest_path: str
+    candidate_manifest_sha256: str
+    candidate: Mapping[str, Any]
+    selected_result_manifest_path: str
+    selected_result_manifest_sha256: str
+    selected_result: Mapping[str, Any]
+    experiment_contract_path: str
+    experiment_contract_sha256: str
+    experiment_contract_bytes: bytes
+    run_config_path: str
+    run_config_sha256: str
+    run_config_bytes: bytes
+    summary_bytes: bytes
+    summary: Mapping[str, Any]
+    analysis_bytes: bytes
+    analysis_text: str
+    metric_observations: Mapping[str, Any]
+    structured_results: Mapping[str, Any]
+    artifacts: tuple[CanonicalEvidenceArtifact, ...]
 
 
 def sha256_text(text: str) -> str:
@@ -1512,6 +1552,155 @@ def validate_canonical_experiment_manifest(
     return payload
 
 
+def load_canonical_experiment_evidence(run_dir: Path) -> CanonicalExperimentEvidence:
+    """Replay and snapshot the complete canonical bundle under its publication lock."""
+    from researchclaw.pipeline.canonical_execution_controller import (
+        CanonicalAnalysisController,
+    )
+
+    controller = CanonicalAnalysisController.acquire_reader(run_dir)
+    try:
+        manifest_relative = "canonical_experiment_evidence.json"
+        manifest_text = _read_regular_file(
+            run_dir / manifest_relative,
+            "canonical experiment evidence manifest",
+        )
+        preview = parse_canonical_experiment_manifest(manifest_text)
+        config_relative = preview["run_config_path"]
+        config_text = _read_regular_file(
+            run_dir / config_relative,
+            "canonical producer config snapshot",
+        )
+        try:
+            config_data = yaml.safe_load(config_text)
+            if not isinstance(config_data, dict):
+                raise ValueError("config root must be a mapping")
+            config = RCConfig.from_dict(
+                config_data,
+                project_root=run_dir,
+                check_paths=False,
+            )
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            raise CanonicalExperimentEvidenceError(
+                f"canonical producer config snapshot is invalid: {exc}"
+            ) from exc
+
+        manifest = validate_canonical_experiment_manifest(run_dir, config, manifest_text)
+        selected_data = load_selected_result_for_analysis(run_dir, config)
+        selected_result_relative = manifest["selected_result"]["manifest_path"]
+        selected_result_text = _read_regular_file(
+            run_dir / selected_result_relative,
+            "canonical selected result manifest",
+        )
+        if sha256_text(selected_result_text) != manifest["selected_result"]["manifest_sha256"]:
+            raise CanonicalExperimentEvidenceError("selected result manifest changed during access")
+
+        candidate_relative = manifest["selected_candidate"]["path"]
+        candidate_manifest_path = run_dir / candidate_relative
+        candidate_root = candidate_manifest_path.parent
+        candidate_text = _read_regular_file(
+            candidate_manifest_path,
+            "selected experiment evidence candidate",
+        )
+        candidate = validate_experiment_evidence_candidate(candidate_root, candidate_text)
+        if sha256_text(candidate_text) != manifest["selected_candidate"]["sha256"]:
+            raise CanonicalExperimentEvidenceError("selected candidate changed during access")
+
+        artifact_snapshots: list[CanonicalEvidenceArtifact] = []
+        artifact_content: dict[str, bytes] = {}
+        for artifact in candidate["artifacts"]:
+            content = _read_regular_bytes(
+                candidate_root / artifact["path"],
+                f"selected candidate artifact {artifact['path']}",
+            )
+            if hashlib.sha256(content).hexdigest() != artifact["sha256"]:
+                raise CanonicalExperimentEvidenceError(
+                    f"selected candidate artifact changed during access: {artifact['path']}"
+                )
+            artifact_content[artifact["role"]] = content
+            artifact_snapshots.append(
+                CanonicalEvidenceArtifact(
+                    role=artifact["role"],
+                    path=artifact["path"],
+                    sha256=artifact["sha256"],
+                    content=content,
+                )
+            )
+
+        summary_bytes = artifact_content["summary"]
+        try:
+            summary_value = _parse_json_value(
+                summary_bytes.decode("utf-8"),
+                "canonical selected experiment summary",
+            )
+        except UnicodeDecodeError as exc:
+            raise CanonicalExperimentEvidenceError(
+                "canonical selected experiment summary is not UTF-8"
+            ) from exc
+        if not isinstance(summary_value, dict):
+            raise CanonicalExperimentEvidenceError(
+                "canonical selected experiment summary root must be an object"
+            )
+        analysis_bytes = artifact_content["analysis"]
+        try:
+            analysis_text = analysis_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CanonicalExperimentEvidenceError(
+                "canonical selected analysis is not UTF-8"
+            ) from exc
+
+        contract_relative = manifest["experiment_contract_path"]
+        contract_bytes = _read_regular_bytes(
+            run_dir / contract_relative,
+            "canonical experiment contract",
+        )
+        if hashlib.sha256(contract_bytes).hexdigest() != manifest["experiment_contract_sha256"]:
+            raise CanonicalExperimentEvidenceError("experiment contract changed during access")
+        config_bytes = config_text.encode("utf-8")
+        if hashlib.sha256(config_bytes).hexdigest() != manifest["run_config_sha256"]:
+            raise CanonicalExperimentEvidenceError("producer config changed during access")
+
+        final_manifest = validate_canonical_experiment_manifest(run_dir, config)
+        if final_manifest != manifest:
+            raise CanonicalExperimentEvidenceError("canonical bundle changed during access")
+        if _read_regular_file(
+            run_dir / manifest_relative,
+            "canonical experiment evidence manifest",
+        ) != manifest_text:
+            raise CanonicalExperimentEvidenceError("canonical manifest changed during access")
+
+        return CanonicalExperimentEvidence(
+            manifest_path=manifest_relative,
+            manifest_sha256=sha256_text(manifest_text),
+            manifest=_freeze_authority_value(manifest),
+            candidate_manifest_path=candidate_relative,
+            candidate_manifest_sha256=sha256_text(candidate_text),
+            candidate=_freeze_authority_value(candidate),
+            selected_result_manifest_path=selected_result_relative,
+            selected_result_manifest_sha256=sha256_text(selected_result_text),
+            selected_result=_freeze_authority_value(selected_data["upstream"]),
+            experiment_contract_path=contract_relative,
+            experiment_contract_sha256=manifest["experiment_contract_sha256"],
+            experiment_contract_bytes=contract_bytes,
+            run_config_path=config_relative,
+            run_config_sha256=manifest["run_config_sha256"],
+            run_config_bytes=config_bytes,
+            summary_bytes=summary_bytes,
+            summary=_freeze_authority_value(summary_value),
+            analysis_bytes=analysis_bytes,
+            analysis_text=analysis_text,
+            metric_observations=_freeze_authority_value(
+                selected_data["metric_observations"]
+            ),
+            structured_results=_freeze_authority_value(
+                selected_data["structured_results"]
+            ),
+            artifacts=tuple(artifact_snapshots),
+        )
+    finally:
+        controller.close()
+
+
 def publish_canonical_experiment_manifest(
     run_dir: Path,
     config: RCConfig,
@@ -2267,6 +2456,25 @@ def _safe_relative_path(value: object, field: str) -> str:
     if Path(path).as_posix() != path:
         raise CanonicalExperimentEvidenceError(f"{field} is not canonical")
     return path
+
+
+def _freeze_authority_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {str(key): _freeze_authority_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_authority_value(item) for item in value)
+    return value
+
+
+def _read_regular_bytes(path: Path, label: str) -> bytes:
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise CanonicalExperimentEvidenceError(f"{label} is missing or unsafe")
+        return path.read_bytes()
+    except OSError as exc:
+        raise CanonicalExperimentEvidenceError(f"cannot read {label}: {exc}") from exc
 
 
 def _read_regular_file(path: Path, label: str) -> str:
