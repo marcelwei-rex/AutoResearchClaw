@@ -489,6 +489,25 @@ def validate_paper_citation_minimum(
         raise CitationPlanContractError(
             f"cannot validate paper citation minimum: {exc}"
         ) from exc
+    return validate_paper_citation_minimum_from_authority(
+        paper_text,
+        minimum=minimum,
+        allowlist=allowlist,
+        plan=plan,
+    )
+
+
+def validate_paper_citation_minimum_from_authority(
+    paper_text: str,
+    *,
+    minimum: int,
+    allowlist: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Validate a paper using already replayed citation authority."""
+
+    if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 0:
+        raise CitationPlanContractError("citation minimum must be a nonnegative integer")
     cited = set(extract_citation_keys(paper_text))
     eligible = set(allowlist["eligible_keys"])
     planned = {

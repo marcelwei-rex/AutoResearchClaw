@@ -9,6 +9,7 @@ import re
 import hashlib
 from collections.abc import Mapping
 from collections import Counter
+from decimal import ROUND_HALF_EVEN, localcontext
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ from researchclaw.literature.citation_plan import (
     replay_citation_closure,
     validate_final_paper_citations,
     validate_paper_citation_minimum,
+    validate_paper_citation_minimum_from_authority,
     validate_citation_closure_report,
 )
 from researchclaw.literature.experiment_fact_closure import (
@@ -44,6 +46,7 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidence,
     CanonicalExperimentEvidenceError,
     canonical_authority_json_text,
+    canonical_decimal,
     load_canonical_experiment_evidence,
     semantic_config_sha256,
 )
@@ -53,6 +56,12 @@ from researchclaw.pipeline.stage19_input_bundle import (
     load_stage19_input_bundle,
     parse_stage18_review_structure_report,
     verify_stage19_input_bundle_unchanged,
+)
+from researchclaw.pipeline.stage20_input_bundle import (
+    Stage20InputBundleError,
+    load_stage20_input_bundle,
+    parse_revision_evidence_binding,
+    verify_stage20_input_bundle_unchanged,
 )
 from researchclaw.pipeline._helpers import (
     StageResult,
@@ -232,71 +241,6 @@ def _load_bound_stage19_inputs(
     if report["valid"] is not True:
         raise OSError("Stage 18 review structure report is not valid")
     return bundle
-
-
-_REVISION_EVIDENCE_BINDING_FIELDS = frozenset(
-    {
-        "schema_version",
-        "canonical_experiment_evidence_path",
-        "canonical_experiment_evidence_sha256",
-        "source_paper_path",
-        "source_paper_sha256",
-        "source_reviews_path",
-        "source_reviews_sha256",
-        "revised_paper_path",
-        "revised_paper_sha256",
-    }
-)
-
-
-def _parse_revision_evidence_binding(
-    text: str,
-    *,
-    evidence: CanonicalExperimentEvidence,
-    draft_sha256: str,
-    reviews_sha256: str,
-    revised_sha256: str,
-) -> dict[str, Any]:
-    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        parsed: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in parsed:
-                raise ValueError(f"duplicate revision binding key {key!r}")
-            parsed[key] = value
-        return parsed
-
-    value = json.loads(text, object_pairs_hook=reject_duplicates)
-    if not isinstance(value, dict) or set(value) != _REVISION_EVIDENCE_BINDING_FIELDS:
-        raise ValueError("revision evidence binding fields mismatch")
-    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
-        raise ValueError("revision evidence binding schema_version must be integer 1")
-    for field in (
-        "canonical_experiment_evidence_sha256",
-        "source_paper_sha256",
-        "source_reviews_sha256",
-        "revised_paper_sha256",
-    ):
-        candidate = value[field]
-        if (
-            not isinstance(candidate, str)
-            or len(candidate) != 64
-            or any(char not in "0123456789abcdef" for char in candidate)
-        ):
-            raise ValueError(f"revision evidence binding {field} is not a SHA-256")
-    expected = {
-        "schema_version": 1,
-        "canonical_experiment_evidence_path": evidence.manifest_path,
-        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
-        "source_paper_path": "stage-17/paper_draft.md",
-        "source_paper_sha256": draft_sha256,
-        "source_reviews_path": "stage-18/reviews.md",
-        "source_reviews_sha256": reviews_sha256,
-        "revised_paper_path": "stage-19/paper_revised.md",
-        "revised_paper_sha256": revised_sha256,
-    }
-    if value != expected:
-        raise ValueError("revision evidence binding does not replay")
-    return value
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
@@ -1010,7 +954,7 @@ def _execute_paper_revision(
             json.dumps(binding, sort_keys=True, ensure_ascii=False, indent=2) + "\n",
         )
         stored_revised_sha256 = hashlib.sha256(revised_path.read_bytes()).hexdigest()
-        _parse_revision_evidence_binding(
+        parse_revision_evidence_binding(
             binding_path.read_text(encoding="utf-8"),
             evidence=evidence,
             draft_sha256=_draft_sha256,
@@ -1061,6 +1005,94 @@ def _execute_paper_revision(
 # Stage 20: Quality Gate
 # ---------------------------------------------------------------------------
 
+
+def _thaw_authority_value(value: object) -> object:
+    """Copy a frozen accessor value without changing Decimal authority."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_authority_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_authority_value(item) for item in value]
+    return value
+
+
+def _build_stage20_registry(
+    summary: dict[str, Any], *, metric_direction: str
+):
+    """Build every derived Decimal under the fixed Stage 20 arithmetic policy."""
+
+    from researchclaw.pipeline.verified_registry import VerifiedRegistry
+
+    with localcontext() as context:
+        context.prec = 50
+        context.rounding = ROUND_HALF_EVEN
+        return VerifiedRegistry.from_experiment(
+            summary,
+            metric_direction=metric_direction,
+        )
+
+
+def _normalize_quality_score(value: object) -> float:
+    """Map malformed or nonfinite LLM scores to the fail-closed floor."""
+
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(score) or score < 0 or score > 10:
+        return 0.0
+    return score
+
+
+_QUALITY_RESPONSE_FIELDS = frozenset(
+    {"score_1_to_10", "verdict", "strengths", "weaknesses", "required_actions"}
+)
+
+
+def _parse_quality_gate_response(text: str) -> dict[str, Any]:
+    """Parse the sole supported LLM quality schema without JSON ambiguity."""
+
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate quality response key {key!r}")
+            result[key] = value
+        return result
+
+    def reject_constant(token: str) -> None:
+        raise ValueError(f"nonfinite quality response number {token}")
+
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError("quality response is not strict JSON") from exc
+    if not isinstance(value, dict) or set(value) != _QUALITY_RESPONSE_FIELDS:
+        raise ValueError("quality response fields mismatch")
+    score = value["score_1_to_10"]
+    if (
+        isinstance(score, bool)
+        or not isinstance(score, (int, float))
+        or not math.isfinite(float(score))
+        or not 0 <= score <= 10
+    ):
+        raise ValueError("quality response score must be a finite number in [0, 10]")
+    if value["verdict"] not in {"proceed", "revise", "reject"}:
+        raise ValueError("quality response verdict is invalid")
+    for field in ("strengths", "weaknesses", "required_actions"):
+        items = value[field]
+        if not isinstance(items, list) or any(
+            not isinstance(item, str) or not item.strip() for item in items
+        ):
+            raise ValueError(f"quality response {field} must be a string array")
+    return value
+
 def _execute_quality_gate(
     stage_dir: Path,
     run_dir: Path,
@@ -1072,89 +1104,68 @@ def _execute_quality_gate(
 ) -> StageResult:
     for owned_name in ("quality_report.json", "fabrication_flags.json"):
         (stage_dir / owned_name).unlink(missing_ok=True)
+    (run_dir / "degradation_signal.json").unlink(missing_ok=True)
     try:
-        effective_citation_policy = load_effective_citation_policy(run_dir, config)
-    except CitationPolicyContractError as exc:
-        return StageResult(
-            stage=Stage.QUALITY_GATE,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            error=f"Effective citation policy is invalid: {exc}",
-            decision="retry",
+        evidence = load_canonical_experiment_evidence(run_dir)
+        canonical_config_text = evidence.run_config_bytes.decode("utf-8")
+        canonical_config = parse_config_snapshot_text(
+            canonical_config_text,
+            project_root=run_dir,
+            label="canonical experiment config snapshot",
         )
-    revised = _read_prior_artifact(run_dir, "paper_revised.md") or ""
-    citation_minimum = int(
-        effective_citation_policy["effective_min_unique_sources"]
-    )
-    try:
-        validate_paper_citation_minimum(
+        if semantic_config_sha256(config) != semantic_config_sha256(canonical_config):
+            raise ValueError(
+                "runtime config semantic generation differs from canonical experiment evidence"
+            )
+        stage19_inputs = _load_bound_stage19_inputs(run_dir, config, evidence)
+        citation_authority = replay_citation_plan_provenance(
+            stage19_inputs.citation_replay_inputs(),
+            canonical_config,
+            project_root=run_dir,
+        )
+        claim_scope = _snapshot_claim_scope(evidence)
+        stage20_inputs = load_stage20_input_bundle(
             run_dir,
-            config,
+            stage19_inputs=stage19_inputs,
+            evidence=evidence,
+            claim_scope=claim_scope,
+        )
+        revised = stage20_inputs.revised_paper.text()
+        citation_minimum = int(
+            citation_authority.effective_policy["effective_min_unique_sources"]
+        )
+        validate_paper_citation_minimum_from_authority(
             revised,
             minimum=citation_minimum,
+            allowlist=citation_authority.allowlist,
+            plan=citation_authority.plan,
         )
-    except CitationPlanContractError as exc:
+        experiment_summary = _thaw_authority_value(evidence.summary)
+        if not isinstance(experiment_summary, dict):
+            raise ValueError("canonical experiment summary is not an object")
+        registry = _build_stage20_registry(
+            experiment_summary,
+            metric_direction=canonical_config.experiment.metric_direction,
+        )
+    except (
+        CanonicalExperimentEvidenceError,
+        CitationPlanContractError,
+        CitationPolicyContractError,
+        Stage19InputBundleError,
+        Stage20InputBundleError,
+        UnicodeDecodeError,
+        TypeError,
+        ValueError,
+    ) as exc:
         return StageResult(
             stage=Stage.QUALITY_GATE,
             status=StageStatus.FAILED,
             artifacts=(),
-            error=f"Paper does not satisfy the effective citation policy: {exc}",
+            error=f"Stage 20 canonical input validation failed: {exc}",
             decision="retry",
         )
     report: dict[str, Any] | None = None
-
-    # BUG-25 + BUG-180: Load the RICHEST experiment summary for cross-checking.
-    # _read_prior_artifact returns the first match in reverse-sorted order,
-    # which may be a repair stage with 0 conditions.  Instead, scan all
-    # stage-14* experiment summaries and pick the one with the most data.
-    _exp_summary: dict[str, Any] = {}
-    _exp_summary_text = ""
-    _best_richness = -1
-    for _es_path in sorted(run_dir.glob("stage-14*/experiment_summary.json")):
-        try:
-            _es_text = _es_path.read_text(encoding="utf-8")
-            _es_data = _safe_json_loads(_es_text, {})
-            if not isinstance(_es_data, dict):
-                continue
-            _richness = len(_es_data.get("condition_summaries", {}))
-            if _richness > _best_richness:
-                _best_richness = _richness
-                _exp_summary = _es_data
-                _exp_summary_text = _es_text
-        except OSError:
-            continue
-    # Also check experiment_summary_best.json at run root
-    _root_best = run_dir / "experiment_summary_best.json"
-    if _root_best.is_file():
-        try:
-            _rb_text = _root_best.read_text(encoding="utf-8")
-            _rb_data = _safe_json_loads(_rb_text, {})
-            if isinstance(_rb_data, dict):
-                _rb_rich = len(_rb_data.get("condition_summaries", {}))
-                if _rb_rich > _best_richness:
-                    _exp_summary = _rb_data
-                    _exp_summary_text = _rb_text
-        except OSError:
-            pass
-    # Fallback to _read_prior_artifact if nothing found above
-    if not _exp_summary:
-        _exp_summary_text = _read_prior_artifact(run_dir, "experiment_summary.json") or ""
-        _exp_summary = _safe_json_loads(_exp_summary_text, {}) if _exp_summary_text else {}
-
-    _exp_failed = False
-    if isinstance(_exp_summary, dict):
-        _best_run = _exp_summary.get("best_run", {})
-        if isinstance(_best_run, dict):
-            _exp_failed = (
-                _best_run.get("status") == "failed"
-                and not _best_run.get("metrics")
-            )
-        # Also check if metrics_summary is empty
-        if not _exp_summary.get("metrics_summary"):
-            _exp_failed = True
-        # BUG-180: If we found real condition data, don't mark as failed
-        if _best_richness > 0:
-            _exp_failed = False
+    experiment_failed = not bool(registry.canonical_values)
 
     if llm is not None:
         _pm = prompts or PromptManager()
@@ -1164,19 +1175,18 @@ def _execute_quality_gate(
 
         # BUG-25: Inject experiment status into quality gate prompt
         _exp_context = ""
-        if _exp_summary and isinstance(_exp_summary, dict):
+        if experiment_summary:
             _exp_status_keys = {
-                k: _exp_summary.get(k) for k in (
+                k: experiment_summary.get(k) for k in (
                     "total_conditions", "total_metric_keys",
                     "metrics_summary",
-                ) if _exp_summary.get(k) is not None
+                ) if experiment_summary.get(k) is not None
             }
-            # BUG-180: Include condition count from condition_summaries
-            _cond_summ = _exp_summary.get("condition_summaries", {})
+            _cond_summ = experiment_summary.get("condition_summaries", {})
             if isinstance(_cond_summ, dict) and _cond_summ:
                 _exp_status_keys["completed_conditions"] = len(_cond_summ)
                 _exp_status_keys["condition_names"] = list(_cond_summ.keys())[:20]
-            if _best_run := _exp_summary.get("best_run"):
+            if _best_run := experiment_summary.get("best_run"):
                 _exp_status_keys["best_run_status"] = (
                     _best_run.get("status") if isinstance(_best_run, dict) else str(_best_run)
                 )
@@ -1188,18 +1198,17 @@ def _execute_quality_gate(
                 "fabrication. Penalize severely.\n"
             )
 
-        _overlay = _get_evolution_overlay(run_dir, "quality_gate")
         sp = _pm.for_stage(
             "quality_gate",
-            evolution_overlay=_overlay,
+            evolution_overlay=None,
             quality_threshold=str(config.research.quality_threshold),
             revised=(
                 paper_for_eval
                 + _exp_context
                 + "\n\nCitation policy: require at least "
-                + str(effective_citation_policy["effective_min_unique_sources"])
+                + str(citation_authority.effective_policy["effective_min_unique_sources"])
                 + " unique eligible sources and target "
-                + str(effective_citation_policy["effective_target_unique_sources"])
+                + str(citation_authority.effective_policy["effective_target_unique_sources"])
                 + ". Do not penalize the paper for not exceeding that target.\n"
             ),
         )
@@ -1210,11 +1219,18 @@ def _execute_quality_gate(
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
         )
-        parsed = _safe_json_loads(resp.content, {})
-        if isinstance(parsed, dict):
-            report = parsed
+        try:
+            report = _parse_quality_gate_response(resp.content)
+        except ValueError as exc:
+            return StageResult(
+                stage=Stage.QUALITY_GATE,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"Stage 20 quality response is invalid: {exc}",
+                decision="retry",
+            )
     # BUG-25: If experiment failed with no metrics, cap the quality score
-    if report is not None and _exp_failed:
+    if report is not None and experiment_failed:
         _orig_score = report.get("score_1_to_10", 5)
         if isinstance(_orig_score, (int, float)) and _orig_score > 3:
             report["score_1_to_10"] = min(_orig_score, 3.0)
@@ -1228,77 +1244,99 @@ def _execute_quality_gate(
             )
     if report is None:
         report = _default_quality_report(config.research.quality_threshold)
-    report.setdefault("generated", _utcnow_iso())
-    (stage_dir / "quality_report.json").write_text(
-        json.dumps(report, indent=2), encoding="utf-8"
+    report["generated"] = report.get("generated") or _utcnow_iso()
+    report["canonical_experiment_evidence_path"] = evidence.manifest_path
+    report["canonical_experiment_evidence_sha256"] = evidence.manifest_sha256
+    report["source_paper_path"] = stage20_inputs.revised_paper.path
+    report["source_paper_sha256"] = stage20_inputs.revised_paper.sha256
+    report["stage19_publication_mode"] = stage20_inputs.publication_mode
+    report["stage19_publication_binding_path"] = (
+        stage20_inputs.publication_binding.path
+    )
+    report["stage19_publication_binding_sha256"] = (
+        stage20_inputs.publication_binding.sha256
     )
 
     # T2.1: Enforce quality gate — fail if score below threshold
-    score = report.get("score_1_to_10", 0)
-    # BUG-R5-01: score can be string from LLM JSON — coerce to float
-    if not isinstance(score, (int, float)):
-        try:
-            score = float(score)
-        except (TypeError, ValueError):
-            score = 0
+    score = _normalize_quality_score(report.get("score_1_to_10", 0))
+    report["score_1_to_10"] = score
     verdict = report.get("verdict", "proceed")
     threshold = config.research.quality_threshold or 5.0
 
     # --- Fabrication flag: collect real metrics for Stage 22 sanitization ---
     _fabrication_info: dict[str, Any] = {
-        "experiment_failed": _exp_failed,
+        "schema_version": 2,
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+        "source_paper_path": stage20_inputs.revised_paper.path,
+        "source_paper_sha256": stage20_inputs.revised_paper.sha256,
+        "stage19_publication_mode": stage20_inputs.publication_mode,
+        "stage19_publication_binding_path": stage20_inputs.publication_binding.path,
+        "stage19_publication_binding_sha256": stage20_inputs.publication_binding.sha256,
+        "experiment_failed": experiment_failed,
         "quality_score": score,
-        "real_metric_values": [],
+        "real_metric_values": sorted(
+            {canonical_decimal(value) for value in registry.values}
+        ),
+        "verified_values_count": len(registry.canonical_values),
+        "verified_conditions": sorted(registry.condition_names),
     }
-    if isinstance(_exp_summary, dict):
-        # Collect ALL real numeric values from experiment_summary.json
-        _cond_summaries = _exp_summary.get("condition_summaries", {})
-        if isinstance(_cond_summaries, dict):
-            for cond_name, cond_data in _cond_summaries.items():
-                if not isinstance(cond_data, dict):
-                    continue
-                cond_status = cond_data.get("status", "")
-                if cond_status == "failed":
-                    continue  # skip failed conditions
-                for k, v in cond_data.items():
-                    if isinstance(v, (int, float)) and k not in (
-                        "seed_count", "total_steps", "training_steps",
-                    ):
-                        _fabrication_info["real_metric_values"].append(
-                            round(float(v), 4)
-                        )
-        _ms = _exp_summary.get("metrics_summary", {})
-        if isinstance(_ms, dict):
-            for _mk, _mv in _ms.items():
-                if isinstance(_mv, dict):
-                    for _stat in ("mean", "min", "max"):
-                        _sv = _mv.get(_stat)
-                        if isinstance(_sv, (int, float)):
-                            _fabrication_info["real_metric_values"].append(
-                                round(float(_sv), 4)
-                            )
     _fabrication_info["has_real_data"] = bool(
-        _fabrication_info["real_metric_values"]
+        registry.canonical_values
     )
     _fabrication_info["fabrication_suspected"] = (
-        _exp_failed and not _fabrication_info["has_real_data"]
+        experiment_failed and not _fabrication_info["has_real_data"]
     )
     # --- Hard guard: block if VerifiedRegistry has zero real experiment values ---
     # Even if the LLM gives a passing score, a paper with no verified
     # experiment data must not proceed to export. This prevents the exact
     # failure in issue #165 where a 3.46s "experiment" produced a fabricated
     # paper that passed the quality gate.
-    _vr_zero_values = False
+    _vr_zero_values = not registry.canonical_values
+
     try:
-        from researchclaw.pipeline.verified_registry import VerifiedRegistry as _VR20
-        _vr20 = _VR20.from_run_dir(run_dir, metric_direction=config.experiment.metric_direction, best_only=True) if isinstance(_exp_summary, dict) else None
-        if _vr20:
-            _fabrication_info["verified_values_count"] = len(_vr20.values)
-            _fabrication_info["verified_conditions"] = sorted(_vr20.condition_names)
-            if len(_vr20.values) == 0 and _exp_failed:
-                _vr_zero_values = True
-    except Exception:
-        pass
+        current_evidence = load_canonical_experiment_evidence(run_dir)
+        if current_evidence != evidence:
+            raise Stage20InputBundleError(
+                "canonical experiment evidence changed during Stage 20"
+            )
+        verify_stage20_input_bundle_unchanged(
+            run_dir,
+            stage20_inputs,
+            evidence=evidence,
+            claim_scope=claim_scope,
+        )
+        _write_text_atomic(
+            stage_dir / "quality_report.json",
+            json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+        )
+        _write_text_atomic(
+            stage_dir / "fabrication_flags.json",
+            json.dumps(
+                _fabrication_info,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n",
+        )
+    except (
+        CanonicalExperimentEvidenceError,
+        Stage19InputBundleError,
+        Stage20InputBundleError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        for owned_name in ("quality_report.json", "fabrication_flags.json"):
+            (stage_dir / owned_name).unlink(missing_ok=True)
+        return StageResult(
+            stage=Stage.QUALITY_GATE,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Stage 20 inputs changed during evaluation: {exc}",
+            decision="retry",
+        )
     if _vr_zero_values:
         logger.error(
             "Stage 20 BLOCKED: VerifiedRegistry has zero real experiment values "
@@ -1316,10 +1354,6 @@ def _execute_quality_gate(
                 "Pipeline must not proceed to export."
             ),
         )
-    (stage_dir / "fabrication_flags.json").write_text(
-        json.dumps(_fabrication_info, indent=2), encoding="utf-8"
-    )
-
     if isinstance(score, (int, float)) and score < threshold:
         if config.research.graceful_degradation:
             logger.warning(

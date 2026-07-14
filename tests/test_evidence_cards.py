@@ -1346,7 +1346,7 @@ def test_stage17_uses_final_plan_only_and_writes_replayable_closure(
         stage20, run_dir, config, AdapterBundle(), llm=None
     )
     assert quality.status is StageStatus.FAILED
-    assert "effective citation policy" in (quality.error or "").lower()
+    assert "citation minimum" in (quality.error or "").lower()
     assert "minimum=1" in (quality.error or "")
     closure["paper_sha256"] = "0" * 64
     (stage17 / "citation_closure_report.json").write_text(
@@ -2395,4 +2395,4 @@ def test_paper_consumers_reject_tampered_effective_policy(
     stage_dir.mkdir(parents=True, exist_ok=True)
     result = executor(stage_dir, run_dir, config, AdapterBundle(), llm=None)
     assert result.status is StageStatus.FAILED
-    assert "Effective citation policy is invalid" in (result.error or "")
+    assert "citation policy" in (result.error or "").lower()

@@ -94,6 +94,8 @@ def consumer_evidence_fixture(monkeypatch: pytest.MonkeyPatch):
             manifest_path.write_bytes(manifest_bytes)
         manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
         contract_hash = hashlib.sha256(contract_bytes).hexdigest()
+        config_path = run_dir / "config.yaml"
+        run_config_bytes = config_path.read_bytes() if config_path.is_file() else b""
         decision_dir = run_dir / "stage-15"
         decision_dir.mkdir(parents=True, exist_ok=True)
         decision_path = decision_dir / "decision.md"
@@ -187,8 +189,8 @@ def consumer_evidence_fixture(monkeypatch: pytest.MonkeyPatch):
             experiment_contract_sha256=contract_hash,
             experiment_contract_bytes=contract_bytes,
             run_config_path="config.yaml",
-            run_config_sha256="d" * 64,
-            run_config_bytes=b"",
+            run_config_sha256=hashlib.sha256(run_config_bytes).hexdigest(),
+            run_config_bytes=run_config_bytes,
             summary_bytes=summary_bytes,
             summary=MappingProxyType(summary),
             analysis_bytes=b"Analysis.\n",
@@ -219,13 +221,16 @@ def consumer_evidence_fixture(monkeypatch: pytest.MonkeyPatch):
         draft_path = run_dir / "stage-17" / "paper_draft.md"
         reviews_path = run_dir / "stage-18" / "reviews.md"
         bibliography_path = run_dir / "stage-04" / "references.bib"
-        draft = draft_path.read_text(encoding="utf-8")
-        reviews = reviews_path.read_text(encoding="utf-8")
-        bibliography = (
-            bibliography_path.read_text(encoding="utf-8")
-            if bibliography_path.is_file()
+        revised_path = run_dir / "stage-19/paper_revised.md"
+        draft = (
+            draft_path.read_text(encoding="utf-8")
+            if draft_path.is_file()
+            else revised_path.read_text(encoding="utf-8")
+            if revised_path.is_file()
             else ""
         )
+        reviews = reviews_path.read_text(encoding="utf-8") if reviews_path.is_file() else ""
+        bibliography = bibliography_path.read_text(encoding="utf-8") if bibliography_path.is_file() else ""
         def bound(path: str, text: str) -> BoundArtifact:
             content = text.encode("utf-8")
             return BoundArtifact(path, hashlib.sha256(content).hexdigest(), content)
@@ -243,31 +248,47 @@ def consumer_evidence_fixture(monkeypatch: pytest.MonkeyPatch):
             sort_keys=True,
         )
 
+        def from_run(path: str, fallback: str = "{}") -> BoundArtifact:
+            target = run_dir / path
+            return bound(
+                path,
+                target.read_text(encoding="utf-8") if target.is_file() else fallback,
+            )
+
+        cards_manifest = from_run("stage-06/cards_manifest.json")
+        cards_dir = run_dir / "stage-06/cards"
+        card_artifacts = (
+            tuple(
+                from_run(str(path.relative_to(run_dir)))
+                for path in sorted(cards_dir.iterdir())
+                if path.is_file()
+            )
+            if cards_dir.is_dir()
+            else ()
+        )
         return Stage19InputBundle(
             paper=bound("stage-17/paper_draft.md", draft),
-            paper_structure_report=bound("stage-17/paper_structure_report.json", "{}"),
-            experiment_fact_closure_report=bound(
-                "stage-17/experiment_fact_closure_report.json", "{}"
-            ),
-            citation_closure_report=bound("stage-17/citation_closure_report.json", "{}"),
+            paper_structure_report=from_run("stage-17/paper_structure_report.json"),
+            experiment_fact_closure_report=from_run("stage-17/experiment_fact_closure_report.json"),
+            citation_closure_report=from_run("stage-17/citation_closure_report.json"),
             reviews=bound("stage-18/reviews.md", reviews),
             review_structure_report=bound(
                 "stage-18/review_structure_report.json", review_report
             ),
-            citation_plan=bound("stage-16/citation_plan.json", "{}"),
-            effective_policy=bound("stage-16/citation_policy_effective.json", "{}"),
-            citation_allowlist=bound("stage-06/citation_allowlist.json", "{}"),
-            candidates=bound("stage-04/candidates.jsonl", ""),
-            registry=bound("stage-04/cite_key_registry.json", "{}"),
+            citation_plan=from_run("stage-16/citation_plan.json"),
+            effective_policy=from_run("stage-16/citation_policy_effective.json"),
+            citation_allowlist=from_run("stage-06/citation_allowlist.json"),
+            candidates=from_run("stage-04/candidates.jsonl", ""),
+            registry=from_run("stage-04/cite_key_registry.json"),
             bibliography=bound("stage-04/references.bib", bibliography),
-            shortlist=bound("stage-05/shortlist.jsonl", ""),
-            screening_report=bound("stage-05/screening_report.json", "{}"),
-            cards_manifest=bound("stage-06/cards_manifest.json", "{}"),
-            card_artifacts=(),
+            shortlist=from_run("stage-05/shortlist.jsonl", ""),
+            screening_report=from_run("stage-05/screening_report.json"),
+            cards_manifest=cards_manifest,
+            card_artifacts=card_artifacts,
             active_config_pointer=None,
             config_snapshot_history=None,
             resumed_config_snapshots=(),
-            active_config_snapshot=bound("config.yaml", "{}"),
+            active_config_snapshot=from_run("config.yaml"),
             checkpoint=None,
         )
 
@@ -277,6 +298,43 @@ def consumer_evidence_fixture(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr(
         "researchclaw.pipeline.stage_impls._review_publish.verify_stage19_input_bundle_unchanged",
+        lambda *_args, **_kwargs: None,
+    )
+    def _stage20_inputs(run_dir: Path, *, stage19_inputs, evidence, claim_scope):
+        from researchclaw.pipeline.stage20_input_bundle import Stage20InputBundle
+
+        revised_path = run_dir / "stage-19" / "paper_revised.md"
+        revised = revised_path.read_text(encoding="utf-8")
+
+        def bound(path: str, text: str):
+            from researchclaw.pipeline.stage19_input_bundle import BoundArtifact
+
+            content = text.encode("utf-8")
+            return BoundArtifact(path, hashlib.sha256(content).hexdigest(), content)
+
+        return Stage20InputBundle(
+            stage19_inputs=stage19_inputs,
+            revised_paper=bound("stage-19/paper_revised.md", revised),
+            publication_binding=bound(
+                "stage-19/revision_evidence_binding.json",
+                json.dumps(
+                    {
+                        "canonical_experiment_evidence_path": evidence.manifest_path,
+                        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+                        "claim_scope": claim_scope,
+                    },
+                    sort_keys=True,
+                ),
+            ),
+            publication_mode="legacy",
+        )
+
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._review_publish.load_stage20_input_bundle",
+        _stage20_inputs,
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._review_publish.verify_stage20_input_bundle_unchanged",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(

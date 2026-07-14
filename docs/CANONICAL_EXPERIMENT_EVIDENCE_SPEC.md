@@ -1373,7 +1373,22 @@ until C5.
   equals the canonical experiment-evidence config generation. A final full
   rediscovery compares namespace, selected path, and bytes without consuming
   any reread bytes as producer or audit input.
-- C3-B: migrate Stage 20 quality consumers.
+- C3-B: migrate Stage 20 quality consumers. Stage 20 captures the exact
+  `stage-19/paper_revised.md` plus exactly one legacy or sectional publication
+  binding, and rejects shadow/versioned papers or ambiguous bindings. Citation
+  minimums are evaluated from the source-replayed Stage 04-06/16 authority;
+  experiment context, `VerifiedRegistry`, and fabrication values are derived
+  only from one immutable canonical experiment snapshot. Stage 14 glob scans,
+  root `experiment_summary_best.json`, and `VerifiedRegistry.from_run_dir()`
+  are not authority. `quality_report.json` and `fabrication_flags.json` bind
+  the canonical manifest, revised-paper hash, and Stage 19 publication binding;
+  metric values are canonical Decimal strings derived under a local
+  precision-50, round-half-even context. An empty canonical registry is always
+  fatal, regardless of stored condition names. LLM quality output uses one
+  exact JSON schema that rejects duplicate keys and nonfinite values; malformed
+  output cannot enter graceful degradation. One final Stage 04-19 rediscovery
+  plus canonical-snapshot fixpoint runs before either success-named output is
+  published.
 - C3-C: migrate Stage 21 archive consumers.
 - C3-D: migrate Stage 22 export consumers.
 - C3-E: add the complete call-site and forbidden-scan guard, then set
