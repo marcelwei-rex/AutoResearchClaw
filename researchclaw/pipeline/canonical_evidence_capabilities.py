@@ -30,6 +30,9 @@ CANONICAL_EVIDENCE_CAPABILITIES: dict[str, int] = {
     "stage14_candidate_and_promotion": CAPABILITY_SCHEMA_VERSION,
     "shared_accessor": CAPABILITY_SCHEMA_VERSION,
     "stage15_17_consumers": CAPABILITY_SCHEMA_VERSION,
+    # This component covers the remaining manuscript path: Stage 18 peer
+    # review through Stage 22 export/publish. It activates only after all five
+    # stages use the accessor and pass the repository guard.
     "stage19_22_consumers": 0,
     "stage24_release_consumers": 0,
     "external_and_persistent_consumers": 0,

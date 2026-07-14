@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -37,11 +38,32 @@ def _stub_effective_citation_policy(monkeypatch: pytest.MonkeyPatch) -> None:
             "effective_target_unique_sources": 15,
         },
     )
+    def closure_for_current_draft(
+        run_dir: Path,
+        *_args: object,
+        evidence: object | None = None,
+        **_kwargs: object,
+    ) -> dict[str, str]:
+        draft_bytes = (run_dir / "stage-17" / "paper_draft.md").read_bytes()
+        return {
+            "paper_sha256": hashlib.sha256(draft_bytes).hexdigest(),
+            "canonical_experiment_evidence_path": str(
+                getattr(evidence, "manifest_path", "canonical_experiment_evidence.json")
+            ),
+            "canonical_experiment_evidence_sha256": str(
+                getattr(
+                    evidence,
+                    "manifest_sha256",
+                    hashlib.sha256(b"consumer-test-evidence").hexdigest(),
+                )
+            ),
+        }
+
     monkeypatch.setattr(
-        _review_publish, "validate_experiment_fact_closure_report", lambda *_args: {}
+        _review_publish, "validate_experiment_fact_closure_report", closure_for_current_draft
     )
     monkeypatch.setattr(
-        _review_publish, "validate_citation_closure_report", lambda *_args: {}
+        _review_publish, "validate_citation_closure_report", closure_for_current_draft
     )
 
 
@@ -68,6 +90,15 @@ class _SequentialLLM:
         self.calls.append(messages)
         self.systems.append(str(kwargs.get("system", "")))
         return SimpleNamespace(content=self.responses.pop(0))
+
+
+def _assert_fixture_canonical_binding(report: dict[str, Any]) -> None:
+    assert report["canonical_experiment_evidence_path"] == (
+        "canonical_experiment_evidence.json"
+    )
+    assert report["canonical_experiment_evidence_sha256"] == hashlib.sha256(
+        b"consumer-test-evidence"
+    ).hexdigest()
 
 
 def _write_draft(run_dir: Path) -> None:
@@ -419,6 +450,427 @@ Limited evidence.
     )
     assert report["valid"] is True
     assert report["comment_count"] == 1
+    _assert_fixture_canonical_binding(report)
+
+
+def test_stage18_uses_one_canonical_snapshot_and_binds_review_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-18"
+    stage_dir.mkdir(parents=True)
+    _write_draft(run_dir)
+    shadow_draft = run_dir / "stage-17_v99"
+    shadow_draft.mkdir()
+    (shadow_draft / "paper_draft.md").write_text(
+        "POISON SHADOW DRAFT", encoding="utf-8"
+    )
+    (shadow_draft / "draft_quality.json").write_text(
+        '{"overall_warnings":["Canonical detection_f1 is 0.99"]}',
+        encoding="utf-8",
+    )
+    poison_dir = run_dir / "stage-12" / "runs"
+    poison_dir.mkdir(parents=True)
+    (poison_dir / "poison.json").write_text(
+        '{"metrics":{"poison_metric":999}}', encoding="utf-8"
+    )
+    evidence = SimpleNamespace(
+        manifest_path="canonical_experiment_evidence.json",
+        manifest_sha256="a" * 64,
+        selected_result={"result_set_type": "stage12_baseline"},
+        metric_observations={"safe_metric": ("0.5",)},
+        structured_results={"metrics": {"safe_metric": "0.5"}},
+        summary=MappingProxyType(
+            {
+                "metrics_summary": MappingProxyType(
+                    {"safe_metric": MappingProxyType({"mean": "0.5"})}
+                )
+            }
+        ),
+        analysis_text="Canonical analysis.\n",
+    )
+    calls = 0
+
+    def load_once(_run_dir: Path) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        return evidence
+
+    class CapturingPrompts(_PromptManagerStub):
+        experiment_evidence = ""
+        draft = ""
+
+        def for_stage(self, *_args: object, **kwargs: object) -> SimpleNamespace:
+            self.experiment_evidence = str(kwargs["experiment_evidence"])
+            self.draft = str(kwargs["draft"])
+            return super().for_stage(*_args, **kwargs)
+
+    monkeypatch.setattr(_review_publish, "load_canonical_experiment_evidence", load_once)
+    prompts = CapturingPrompts()
+    llm = _SequentialLLM(
+        [
+            "## Reviewer A\n\n### Strengths\nClear scope.\n\n"
+            "### Weaknesses\nLimited evidence.\n\n"
+            "### Actionable Revisions\n1. Add uncertainty estimates.\n"
+        ]
+    )
+
+    result = _execute_peer_review(
+        stage_dir,
+        run_dir,
+        cast(Any, _config()),
+        cast(Any, None),
+        llm=cast(Any, llm),
+        prompts=cast(Any, prompts),
+    )
+
+    assert result.status is StageStatus.DONE
+    assert calls == 1
+    assert "safe_metric" in prompts.experiment_evidence
+    assert "poison_metric" not in prompts.experiment_evidence
+    assert "POISON SHADOW DRAFT" not in prompts.draft
+    assert all("detection_f1 is 0.99" not in message["content"] for message in llm.calls[0])
+    report = json.loads(
+        (stage_dir / "review_structure_report.json").read_text(encoding="utf-8")
+    )
+    assert report["canonical_experiment_evidence_path"] == evidence.manifest_path
+    assert report["canonical_experiment_evidence_sha256"] == evidence.manifest_sha256
+
+
+def test_stage18_invalid_canonical_evidence_cleans_outputs_before_llm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-18"
+    stage_dir.mkdir(parents=True)
+    _write_draft(run_dir)
+    for name in ("reviews.md", "review_structure_report.json"):
+        (stage_dir / name).write_text("stale\n", encoding="utf-8")
+
+    def invalid_evidence(_run_dir: Path) -> None:
+        raise _review_publish.CanonicalExperimentEvidenceError("invalid snapshot")
+
+    monkeypatch.setattr(
+        _review_publish, "load_canonical_experiment_evidence", invalid_evidence
+    )
+    llm = _SequentialLLM(["unexpected"])
+
+    result = _execute_peer_review(
+        stage_dir,
+        run_dir,
+        cast(Any, _config()),
+        cast(Any, None),
+        llm=cast(Any, llm),
+        prompts=cast(Any, _PromptManagerStub()),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert llm.calls == []
+    assert not (stage_dir / "reviews.md").exists()
+    assert not (stage_dir / "review_structure_report.json").exists()
+
+
+def test_stage18_rejects_symlinked_stage17_directory_before_llm(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-18"
+    stage_dir.mkdir(parents=True)
+    external_stage17 = tmp_path / "external-stage-17"
+    external_stage17.mkdir()
+    (external_stage17 / "paper_draft.md").write_text(
+        "## Title\n\nExternal draft.\n", encoding="utf-8"
+    )
+    (run_dir / "stage-17").symlink_to(external_stage17, target_is_directory=True)
+    llm = _SequentialLLM(["unexpected"])
+
+    result = _execute_peer_review(
+        stage_dir,
+        run_dir,
+        cast(Any, _config()),
+        cast(Any, None),
+        llm=cast(Any, llm),
+        prompts=cast(Any, _PromptManagerStub()),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert llm.calls == []
+
+
+def test_stage18_rejects_symlinked_stage17_draft_before_llm(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-18"
+    stage_dir.mkdir(parents=True)
+    _write_draft(run_dir)
+    external_draft = tmp_path / "external-draft.md"
+    external_draft.write_text("## Title\n\nExternal draft.\n", encoding="utf-8")
+    draft_path = run_dir / "stage-17" / "paper_draft.md"
+    draft_path.unlink()
+    draft_path.symlink_to(external_draft)
+    llm = _SequentialLLM(["unexpected"])
+
+    result = _execute_peer_review(
+        stage_dir,
+        run_dir,
+        cast(Any, _config()),
+        cast(Any, None),
+        llm=cast(Any, llm),
+        prompts=cast(Any, _PromptManagerStub()),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert llm.calls == []
+
+
+def test_stage18_rejects_non_utf8_stage17_draft_before_llm(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-18"
+    stage_dir.mkdir(parents=True)
+    _write_draft(run_dir)
+    (run_dir / "stage-17" / "paper_draft.md").write_bytes(b"\xff\xfe")
+    llm = _SequentialLLM(["unexpected"])
+
+    result = _execute_peer_review(
+        stage_dir,
+        run_dir,
+        cast(Any, _config()),
+        cast(Any, None),
+        llm=cast(Any, llm),
+        prompts=cast(Any, _PromptManagerStub()),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert llm.calls == []
+
+
+def test_stage18_rejects_closure_for_different_draft_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-18"
+    stage_dir.mkdir(parents=True)
+    _write_draft(run_dir)
+    changed = "## Title\n\nChanged after the draft snapshot.\n"
+
+    def mutate_then_report(_run_dir: Path, *_args: object, **_kwargs: object) -> dict[str, str]:
+        draft_path = run_dir / "stage-17" / "paper_draft.md"
+        draft_path.write_text(changed, encoding="utf-8")
+        return {"paper_sha256": hashlib.sha256(changed.encode("utf-8")).hexdigest()}
+
+    monkeypatch.setattr(
+        _review_publish,
+        "validate_experiment_fact_closure_report",
+        mutate_then_report,
+    )
+    monkeypatch.setattr(
+        _review_publish,
+        "validate_citation_closure_report",
+        mutate_then_report,
+    )
+    llm = _SequentialLLM(["unexpected"])
+
+    result = _execute_peer_review(
+        stage_dir,
+        run_dir,
+        cast(Any, _config()),
+        cast(Any, None),
+        llm=cast(Any, llm),
+        prompts=cast(Any, _PromptManagerStub()),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert llm.calls == []
+    assert "differs from closure-bound paper" in (result.error or "")
+
+
+def test_stage18_accessor_lock_error_returns_failed_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-18"
+    stage_dir.mkdir(parents=True)
+    _write_draft(run_dir)
+    monkeypatch.setattr(
+        _review_publish,
+        "load_canonical_experiment_evidence",
+        lambda _run_dir: (_ for _ in ()).throw(
+            RuntimeError("canonical_evidence_generation_locked")
+        ),
+    )
+    llm = _SequentialLLM(["unexpected"])
+
+    result = _execute_peer_review(
+        stage_dir,
+        run_dir,
+        cast(Any, _config()),
+        cast(Any, None),
+        llm=cast(Any, llm),
+        prompts=cast(Any, _PromptManagerStub()),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert llm.calls == []
+    assert "canonical_evidence_generation_locked" in (result.error or "")
+
+
+def test_stage18_passes_one_snapshot_to_both_closure_replays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-18"
+    stage_dir.mkdir(parents=True)
+    _write_draft(run_dir)
+    evidence = SimpleNamespace(
+        manifest_path="canonical_experiment_evidence.json",
+        manifest_sha256="e" * 64,
+        selected_result={},
+        metric_observations={},
+        structured_results={},
+        summary={},
+        analysis_text="",
+    )
+    fact_snapshots: list[object] = []
+    citation_snapshots: list[object] = []
+
+    monkeypatch.setattr(
+        _review_publish, "load_canonical_experiment_evidence", lambda _run_dir: evidence
+    )
+
+    def fact_closure(
+        _run_dir: Path, *, evidence: object | None = None
+    ) -> dict[str, str]:
+        fact_snapshots.append(evidence)
+        draft_bytes = (run_dir / "stage-17" / "paper_draft.md").read_bytes()
+        return {
+            "paper_sha256": hashlib.sha256(draft_bytes).hexdigest(),
+            "canonical_experiment_evidence_path": "canonical_experiment_evidence.json",
+            "canonical_experiment_evidence_sha256": "e" * 64,
+        }
+
+    def citation_closure(
+        _run_dir: Path, _config: object, *, evidence: object | None = None
+    ) -> dict[str, str]:
+        citation_snapshots.append(evidence)
+        draft_bytes = (run_dir / "stage-17" / "paper_draft.md").read_bytes()
+        return {"paper_sha256": hashlib.sha256(draft_bytes).hexdigest()}
+
+    monkeypatch.setattr(
+        _review_publish, "validate_experiment_fact_closure_report", fact_closure
+    )
+    monkeypatch.setattr(
+        _review_publish, "validate_citation_closure_report", citation_closure
+    )
+    llm = _SequentialLLM(
+        [
+            "## Reviewer A\n\n### Strengths\nClear scope.\n\n"
+            "### Weaknesses\nLimited evidence.\n\n"
+            "### Actionable Revisions\n1. Add uncertainty estimates.\n"
+        ]
+    )
+
+    result = _execute_peer_review(
+        stage_dir,
+        run_dir,
+        cast(Any, _config()),
+        cast(Any, None),
+        llm=cast(Any, llm),
+        prompts=cast(Any, _PromptManagerStub()),
+    )
+
+    assert result.status is StageStatus.DONE
+    assert fact_snapshots == [evidence]
+    assert citation_snapshots == [evidence]
+
+
+def test_stage18_repair_transport_failure_cleans_unbound_artifacts(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-18"
+    stage_dir.mkdir(parents=True)
+    _write_draft(run_dir)
+    excessive = """## Reviewer A
+
+### Strengths
+Clear scope.
+
+### Weaknesses
+Limited evidence.
+
+### Actionable Revisions
+1. Ensure at least 20 relevant references.
+"""
+
+    class RepairTransportFailure:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, _messages: object, **_kwargs: object) -> SimpleNamespace:
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("transport unavailable")
+            return SimpleNamespace(content=excessive)
+
+    llm = RepairTransportFailure()
+    result = _execute_peer_review(
+        stage_dir,
+        run_dir,
+        cast(Any, _config()),
+        cast(Any, None),
+        llm=cast(Any, llm),
+        prompts=cast(Any, _PromptManagerStub()),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert llm.calls == 2
+    assert not (stage_dir / "reviews.md").exists()
+    assert not (stage_dir / "review_structure_report.json").exists()
+
+
+def test_stage18_evidence_renderer_has_no_legacy_source_selection() -> None:
+    source = inspect.getsource(_review_publish._collect_experiment_evidence)
+    for forbidden in (
+        "run_dir",
+        "_read_prior_artifact",
+        "refinement_log",
+        "stage-*/runs",
+        ".glob(",
+    ):
+        assert forbidden not in source
+
+    stage_source = inspect.getsource(_review_publish._execute_peer_review)
+    for forbidden in (
+        "_find_prior_file",
+        "draft_quality.json",
+        "_get_evolution_overlay",
+        "_read_prior_artifact",
+    ):
+        assert forbidden not in stage_source
+
+    draft_source = inspect.getsource(_review_publish._read_bound_stage17_draft)
+    for forbidden in (
+        "_find_prior_file",
+        "_read_prior_artifact",
+        ".glob(",
+        ".rglob(",
+        ".iterdir(",
+        "os.walk",
+    ):
+        assert forbidden not in draft_source
 
 
 def test_stage18_unknown_subsection_fixture_fails_closed(tmp_path: Path) -> None:
@@ -446,6 +898,7 @@ def test_stage18_unknown_subsection_fixture_fails_closed(tmp_path: Path) -> None
     assert report["source_reviews_sha256"] == hashlib.sha256(
         fixture.read_text(encoding="utf-8").encode("utf-8")
     ).hexdigest()
+    _assert_fixture_canonical_binding(report)
     assert "unknown_review_subsection" in {
         issue["code"] for issue in report["issues"]
     }
@@ -470,6 +923,7 @@ def test_stage18_no_llm_fallback_obeys_the_contract(tmp_path: Path) -> None:
     )
     assert report["valid"] is True
     assert report["comment_count"] == 4
+    _assert_fixture_canonical_binding(report)
 
 
 def test_stage18_repairs_citation_requirement_above_effective_target(
@@ -503,6 +957,8 @@ Limited evidence.
     assert result.status == StageStatus.DONE
     assert len(llm.calls) == 2
     assert "effective target of 15" in llm.calls[1][0]["content"]
+    report = json.loads((stage_dir / "review_structure_report.json").read_text())
+    _assert_fixture_canonical_binding(report)
 
 
 def test_stage18_fails_when_citation_requirement_remains_above_target(
@@ -535,6 +991,54 @@ Limited evidence.
     assert result.status == StageStatus.FAILED
     report = json.loads((stage_dir / "review_structure_report.json").read_text())
     assert report["issues"][0]["code"] == "citation_count_policy_exceeded"
+    _assert_fixture_canonical_binding(report)
+
+
+def test_stage18_repair_structure_failure_binds_canonical_report(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-18"
+    stage_dir.mkdir(parents=True)
+    _write_draft(run_dir)
+    excessive = """## Reviewer A
+
+### Strengths
+Clear scope.
+
+### Weaknesses
+Limited evidence.
+
+### Actionable Revisions
+1. Ensure at least 20 relevant references.
+"""
+    malformed_repair = """## Reviewer A
+
+### Strengths
+Clear scope.
+
+### Required Revisions
+1. Add uncertainty estimates.
+"""
+    llm = _SequentialLLM([excessive, malformed_repair])
+
+    result = _execute_peer_review(
+        stage_dir,
+        run_dir,
+        cast(Any, _config()),
+        cast(Any, None),
+        llm=cast(Any, llm),
+        prompts=cast(Any, _PromptManagerStub()),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert len(llm.calls) == 2
+    report = json.loads((stage_dir / "review_structure_report.json").read_text())
+    assert report["valid"] is False
+    _assert_fixture_canonical_binding(report)
+    assert "unknown_review_subsection" in {
+        issue["code"] for issue in report["issues"]
+    }
 
 
 @pytest.mark.parametrize(

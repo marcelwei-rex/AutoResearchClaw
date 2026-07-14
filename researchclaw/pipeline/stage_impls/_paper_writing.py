@@ -2799,13 +2799,14 @@ Generated: {_utcnow_iso()}
                 encoding="utf-8"
             ),
             experiment_fact_report_text=experiment_report_text,
+            evidence=evidence,
         )
         (stage_dir / "citation_closure_report.json").write_text(
             canonical_json_text(citation_report), encoding="utf-8"
         )
         draft_path.write_text(final_draft, encoding="utf-8")
         validate_experiment_fact_closure_report(run_dir, evidence=evidence)
-        validate_citation_closure_report(run_dir, config)
+        validate_citation_closure_report(run_dir, config, evidence=evidence)
     except (
         CitationPlanContractError,
         ExperimentFactClosureError,

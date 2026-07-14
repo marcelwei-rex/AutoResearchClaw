@@ -34,6 +34,9 @@ from researchclaw.pipeline.manuscript_sections import (
     parse_manuscript,
 )
 from researchclaw.pipeline._domain import _prompt_bank_domain_from_config
+from researchclaw.pipeline.canonical_experiment_evidence import (
+    CanonicalExperimentEvidence,
+)
 
 
 CITATION_PLAN_SCHEMA_VERSION = 1
@@ -381,6 +384,7 @@ def build_citation_closure_report(
     paper_text: str,
     structure_report_text: str,
     experiment_fact_report_text: str,
+    evidence: CanonicalExperimentEvidence | None = None,
 ) -> dict[str, Any]:
     plan_path = run_dir / "stage-16" / "citation_plan.json"
     try:
@@ -391,7 +395,7 @@ def build_citation_closure_report(
             experiment_fact_report_text
         )
         expected_experiment = build_experiment_fact_closure_report(
-            run_dir, paper_text=paper_text
+            run_dir, paper_text=paper_text, evidence=evidence
         )
         if experiment != expected_experiment:
             raise CitationPlanContractError("experiment fact closure replay mismatch")
@@ -530,7 +534,12 @@ def parse_citation_closure_report(text: str) -> dict[str, Any]:
     return payload
 
 
-def validate_citation_closure_report(run_dir: Path, config: RCConfig) -> dict[str, Any]:
+def validate_citation_closure_report(
+    run_dir: Path,
+    config: RCConfig,
+    *,
+    evidence: CanonicalExperimentEvidence | None = None,
+) -> dict[str, Any]:
     paper_path = run_dir / "stage-17" / "paper_draft.md"
     structure_path = run_dir / "stage-17" / "paper_structure_report.json"
     experiment_path = run_dir / "stage-17" / "experiment_fact_closure_report.json"
@@ -548,6 +557,7 @@ def validate_citation_closure_report(run_dir: Path, config: RCConfig) -> dict[st
         paper_text=paper_text,
         structure_report_text=structure_text,
         experiment_fact_report_text=experiment_text,
+        evidence=evidence,
     )
     if stored != expected or not stored["valid"]:
         raise CitationPlanContractError("citation closure replay failed")

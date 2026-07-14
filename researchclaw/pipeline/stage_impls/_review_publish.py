@@ -7,6 +7,7 @@ import logging
 import math
 import re
 import hashlib
+from collections.abc import Mapping
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,12 @@ from researchclaw.literature.experiment_fact_closure import (
     validate_experiment_fact_closure_report,
 )
 from researchclaw.pipeline._domain import _detect_domain  # noqa: F401
+from researchclaw.pipeline.canonical_experiment_evidence import (
+    CanonicalExperimentEvidence,
+    CanonicalExperimentEvidenceError,
+    canonical_authority_json_text,
+    load_canonical_experiment_evidence,
+)
 from researchclaw.pipeline._helpers import (
     StageResult,
     _build_context_preamble,
@@ -44,7 +51,6 @@ from researchclaw.pipeline._helpers import (
     _collect_experiment_results,  # noqa: F401
     _default_quality_report,
     _extract_paper_title,
-    _find_prior_file,
     _generate_framework_diagram_prompt,
     _generate_neurips_checklist,
     _get_evolution_overlay,
@@ -101,74 +107,62 @@ def _paper_revision_claim_scope(run_dir: Path, config: RCConfig) -> str:
 # _collect_experiment_evidence
 # ---------------------------------------------------------------------------
 
-def _collect_experiment_evidence(run_dir: Path) -> str:
-    """Collect actual experiment parameters and results for peer review."""
-    evidence_parts: list[str] = []
-
-    # 1. Read experiment code to find actual trial count, methods used
-    exp_dir = _read_prior_artifact(run_dir, "experiment/")
-    if exp_dir and Path(exp_dir).is_dir():
-        main_py = Path(exp_dir) / "main.py"
-        if main_py.exists():
-            code = main_py.read_text(encoding="utf-8")
-            evidence_parts.append(f"### Actual Experiment Code (main.py)\n```python\n{code[:3000]}\n```")
-
-    # 2. Read sandbox run results (actual metrics, runtime, stderr)
-    runs_text = _read_prior_artifact(run_dir, "runs/")
-    if runs_text and Path(runs_text).is_dir():
-        for run_file in sorted(Path(runs_text).glob("*.json"))[:5]:
-            payload = _safe_json_loads(run_file.read_text(encoding="utf-8"), {})
-            if isinstance(payload, dict):
-                summary = {
-                    "metrics": payload.get("metrics"),
-                    "elapsed_sec": payload.get("elapsed_sec"),
-                    "timed_out": payload.get("timed_out"),
-                }
-                stderr = payload.get("stderr", "")
-                if stderr:
-                    summary["stderr_excerpt"] = stderr[:500]
-                evidence_parts.append(
-                    f"### Run Result: {run_file.name}\n```json\n{json.dumps(summary, indent=2)}\n```"
-                )
-
-    # 3. Read refinement log for actual iteration count
-    refine_log_text = _read_prior_artifact(run_dir, "refinement_log.json")
-    if refine_log_text:
-        try:
-            rlog = json.loads(refine_log_text)
-            summary = {
-                "iterations_executed": len(rlog.get("iterations", [])),
-                "converged": rlog.get("converged"),
-                "stop_reason": rlog.get("stop_reason"),
-                "best_metric": rlog.get("best_metric"),
-            }
-            evidence_parts.append(
-                f"### Refinement Summary\n```json\n{json.dumps(summary, indent=2)}\n```"
-            )
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    # 4. Count actual number of experiment runs
-    actual_run_count = 0
-    for stage_subdir in sorted(run_dir.glob("stage-*/runs")):
-        for rf in stage_subdir.glob("*.json"):
-            if rf.name != "results.json":
-                actual_run_count += 1
-    if actual_run_count > 0:
-        evidence_parts.append(
-            f"### Actual Trial Count\n"
-            f"**The experiment was executed {actual_run_count} time(s).** "
-            f"If the paper claims a different number of trials, this is a CRITICAL discrepancy."
+def _collect_experiment_evidence(evidence: CanonicalExperimentEvidence) -> str:
+    """Render only the accessor-selected immutable experiment snapshot."""
+    metrics_summary = evidence.summary.get("metrics_summary")
+    parts = [
+        "## Actual Experiment Evidence",
+        "Use only the accessor-selected evidence below to verify methodology and "
+        "quantitative claims. Do not infer results beyond these records.",
+        "### Canonical Evidence Identity\n"
+        f"- Manifest path: `{evidence.manifest_path}`\n"
+        f"- Manifest SHA-256: `{evidence.manifest_sha256}`",
+        "### Selected Result\n```json\n"
+        + canonical_authority_json_text(evidence.selected_result).rstrip()
+        + "\n```",
+        "### Metric Observations\n```json\n"
+        + canonical_authority_json_text(evidence.metric_observations).rstrip()
+        + "\n```",
+        "### Structured Results\n```json\n"
+        + canonical_authority_json_text(evidence.structured_results).rstrip()
+        + "\n```",
+    ]
+    if isinstance(metrics_summary, Mapping):
+        parts.append(
+            "### Summary Metrics\n```json\n"
+            + canonical_authority_json_text(metrics_summary).rstrip()
+            + "\n```"
         )
+    if evidence.analysis_text.strip():
+        parts.append("### Canonical Analysis\n" + evidence.analysis_text)
+    return "\n\n" + "\n\n".join(parts)
 
-    if not evidence_parts:
-        return ""
 
-    return (
-        "\n\n## Actual Experiment Evidence\n"
-        "Use the evidence below to verify the paper's methodology claims.\n\n"
-        + "\n\n".join(evidence_parts)
-    )
+def _review_structure_report(
+    evidence: CanonicalExperimentEvidence,
+    **fields: Any,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+        **fields,
+    }
+
+
+def _read_bound_stage17_draft(run_dir: Path) -> tuple[str, str]:
+    """Read one regular Stage 17 draft whose bytes will be closure-bound."""
+    stage17_dir = run_dir / "stage-17"
+    if stage17_dir.is_symlink() or not stage17_dir.is_dir():
+        raise OSError("Stage 17 directory is missing, unsafe, or not a directory")
+    draft_path = stage17_dir / "paper_draft.md"
+    if draft_path.is_symlink() or not draft_path.is_file():
+        raise OSError("Stage 17 paper draft is missing or not a regular file")
+    draft_bytes = draft_path.read_bytes()
+    try:
+        return draft_bytes.decode("utf-8"), hashlib.sha256(draft_bytes).hexdigest()
+    except UnicodeDecodeError as exc:
+        raise OSError(f"Stage 17 paper draft is not UTF-8: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -260,46 +254,60 @@ def _execute_peer_review(
     for owned_name in ("reviews.md", "review_structure_report.json"):
         (stage_dir / owned_name).unlink(missing_ok=True)
     try:
+        evidence = load_canonical_experiment_evidence(run_dir)
+    except (CanonicalExperimentEvidenceError, RuntimeError) as exc:
+        return StageResult(
+            stage=Stage.PEER_REVIEW,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Canonical experiment evidence is invalid or unavailable: {exc}",
+            decision="retry",
+        )
+    try:
+        draft, draft_sha256 = _read_bound_stage17_draft(run_dir)
         effective_citation_policy = load_effective_citation_policy(run_dir, config)
-        validate_experiment_fact_closure_report(run_dir)
-        validate_citation_closure_report(run_dir, config)
+        experiment_closure = validate_experiment_fact_closure_report(
+            run_dir, evidence=evidence
+        )
+        citation_closure = validate_citation_closure_report(
+            run_dir, config, evidence=evidence
+        )
+        if (
+            experiment_closure["paper_sha256"] != draft_sha256
+            or citation_closure["paper_sha256"] != draft_sha256
+            or experiment_closure["canonical_experiment_evidence_path"]
+            != evidence.manifest_path
+            or experiment_closure["canonical_experiment_evidence_sha256"]
+            != evidence.manifest_sha256
+        ):
+            raise ValueError("Stage 17 draft differs from closure-bound paper")
     except (
         CitationPolicyContractError,
         CitationPlanContractError,
         ExperimentFactClosureError,
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
     ) as exc:
         return StageResult(
             stage=Stage.PEER_REVIEW,
             status=StageStatus.FAILED,
             artifacts=(),
-            error=f"Effective citation policy is invalid or Stage 17 evidence closure failed: {exc}",
+            error=(
+                "Effective citation policy is invalid or Stage 17 evidence "
+                f"closure failed: {exc}"
+            ),
             decision="retry",
         )
-    draft = _read_prior_artifact(run_dir, "paper_draft.md") or ""
-    experiment_evidence = _collect_experiment_evidence(run_dir)
-
-    # Load draft quality warnings from Stage 17 (if available)
-    _quality_suffix = ""
-    _quality_json_path = _find_prior_file(run_dir, "draft_quality.json")
-    if _quality_json_path and _quality_json_path.exists():
-        try:
-            _dq = json.loads(_quality_json_path.read_text(encoding="utf-8"))
-            _dq_warnings = _dq.get("overall_warnings", [])
-            if _dq_warnings:
-                _quality_suffix = (
-                    "\n\nAUTOMATED QUALITY ISSUES (flag these in your review):\n"
-                    + "\n".join(f"- {w}" for w in _dq_warnings)
-                    + "\n"
-                )
-        except Exception:  # noqa: BLE001
-            pass
+    experiment_evidence = _collect_experiment_evidence(evidence)
 
     if llm is not None:
         _pm = prompts or PromptManager()
-        _overlay = _get_evolution_overlay(run_dir, "peer_review")
         sp = _pm.for_stage(
             "peer_review",
-            evolution_overlay=_overlay,
+            # Persistent experiment lessons migrate separately. Stage 18 v1
+            # receives experiment context only from the accessor snapshot.
+            evolution_overlay="",
             topic=config.research.topic,
             draft=draft,
             experiment_evidence=experiment_evidence,
@@ -319,7 +327,6 @@ def _execute_peer_review(
         )
         _review_user = (
             sp.user
-            + _quality_suffix
             + _citation_policy_suffix
             + _STAGE18_REVIEW_FORMAT_CONTRACT
         )
@@ -375,13 +382,13 @@ Statistical reporting is incomplete.
             source_path="stage-18/reviews.md",
         )
     except SectionalRevisionContractError as exc:
-        report = {
-            "schema_version": 1,
-            "valid": False,
-            "source_reviews_sha256": hashlib.sha256(
+        report = _review_structure_report(
+            evidence,
+            valid=False,
+            source_reviews_sha256=hashlib.sha256(
                 reviews.encode("utf-8")
             ).hexdigest(),
-            "issues": [
+            issues=[
                 {
                     "code": issue.code,
                     "message": issue.message,
@@ -389,7 +396,7 @@ Statistical reporting is incomplete.
                 }
                 for issue in exc.issues
             ],
-        }
+        )
         (stage_dir / "review_structure_report.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False),
             encoding="utf-8",
@@ -420,26 +427,37 @@ Statistical reporting is incomplete.
             + "review once, preserving the exact heading contract and lowering any "
             + "citation-count requirement to the effective target or below."
         )
-        repaired = _chat_with_prompt(
-            llm,
-            _review_system,
-            repair_prompt,
-            json_mode=sp.json_mode,
-            max_tokens=sp.max_tokens,
-            retries=0,
-        )
+        try:
+            repaired = _chat_with_prompt(
+                llm,
+                _review_system,
+                repair_prompt,
+                json_mode=sp.json_mode,
+                max_tokens=sp.max_tokens,
+                retries=0,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve no-artifact failure state.
+            for owned_name in ("reviews.md", "review_structure_report.json"):
+                (stage_dir / owned_name).unlink(missing_ok=True)
+            return StageResult(
+                stage=Stage.PEER_REVIEW,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"Citation-policy review repair failed: {exc}",
+                decision="retry",
+            )
         reviews = repaired.content
         (stage_dir / "reviews.md").write_text(reviews, encoding="utf-8")
         try:
             ledger = extract_review_ledger(reviews, source_path="stage-18/reviews.md")
         except SectionalRevisionContractError as exc:
-            report = {
-                "schema_version": 1,
-                "valid": False,
-                "source_reviews_sha256": hashlib.sha256(
+            report = _review_structure_report(
+                evidence,
+                valid=False,
+                source_reviews_sha256=hashlib.sha256(
                     reviews.encode("utf-8")
                 ).hexdigest(),
-                "issues": [
+                issues=[
                     {
                         "code": issue.code,
                         "message": issue.message,
@@ -447,7 +465,7 @@ Statistical reporting is incomplete.
                     }
                     for issue in exc.issues
                 ],
-            }
+            )
             (stage_dir / "review_structure_report.json").write_text(
                 json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
             )
@@ -469,11 +487,11 @@ Statistical reporting is incomplete.
             ledger, citation_target
         )
     if policy_violations:
-        report = {
-            "schema_version": 1,
-            "valid": False,
-            "source_reviews_sha256": ledger.source_reviews_sha256,
-            "issues": [
+        report = _review_structure_report(
+            evidence,
+            valid=False,
+            source_reviews_sha256=ledger.source_reviews_sha256,
+            issues=[
                 {
                     "code": "citation_count_policy_exceeded",
                     "message": (
@@ -483,7 +501,7 @@ Statistical reporting is incomplete.
                     "line": None,
                 }
             ],
-        }
+        )
         (stage_dir / "review_structure_report.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
         )
@@ -497,13 +515,13 @@ Statistical reporting is incomplete.
                 "stage-18/review_structure_report.json",
             ),
         )
-    report = {
-        "schema_version": 1,
-        "valid": True,
-        "source_reviews_sha256": ledger.source_reviews_sha256,
-        "comment_count": len(ledger.comments),
-        "issues": [],
-    }
+    report = _review_structure_report(
+        evidence,
+        valid=True,
+        source_reviews_sha256=ledger.source_reviews_sha256,
+        comment_count=len(ledger.comments),
+        issues=[],
+    )
     (stage_dir / "review_structure_report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False),
         encoding="utf-8",

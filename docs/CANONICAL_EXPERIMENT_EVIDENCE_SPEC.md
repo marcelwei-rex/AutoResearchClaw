@@ -1349,11 +1349,20 @@ until C5.
 - add repository guard tests for direct and indirect source selection;
 - keep the runtime capability gate blocked.
 
-### C3: revision, quality, and export consumers
+### C3: peer review, revision, quality, archive, and export consumers
 
-- migrate Stage 19 sectional context;
-- migrate Stage 20 and Stage 22 consumers;
-- ensure manifests/closure reports record the canonical-evidence manifest hash;
+- C3-A0: migrate Stage 18 peer-review context. It loads one immutable accessor
+  snapshot before any LLM call; the review evidence renderer receives only that
+  snapshot, and `review_structure_report.json` binds its manifest path and hash.
+- C3-A: migrate both Stage 19 revision paths and the independent sectional
+  replay.
+- C3-B: migrate Stage 20 quality consumers.
+- C3-C: migrate Stage 21 archive consumers.
+- C3-D: migrate Stage 22 export consumers.
+- C3-E: add the complete call-site and forbidden-scan guard, then set
+  `stage19_22_consumers` to v1 only after Stage 18 through Stage 22 pass it.
+- ensure each migrated manifest or closure report records the canonical-evidence
+  manifest hash;
 - keep the runtime capability gate blocked.
 
 ### C4: Stage 24 and release replay

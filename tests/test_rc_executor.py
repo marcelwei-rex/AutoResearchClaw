@@ -2206,70 +2206,46 @@ class TestCollectRawExperimentMetrics:
 
 
 class TestCollectExperimentEvidence:
-    """Tests for _collect_experiment_evidence() helper."""
+    """Tests for the snapshot-only peer-review evidence renderer."""
 
-    def test_returns_empty_when_no_artifacts(self, tmp_path: Path) -> None:
-        run_dir = tmp_path / "run"
-        run_dir.mkdir()
-        assert rc_executor._collect_experiment_evidence(run_dir) == ""
-
-    def test_includes_main_py_code(self, run_dir: Path) -> None:
-        exp_dir = run_dir / "stage-10" / "experiment"
-        exp_dir.mkdir(parents=True, exist_ok=True)
-        (exp_dir / "main.py").write_text("print('hello')", encoding="utf-8")
-        result = rc_executor._collect_experiment_evidence(run_dir)
-        assert "main.py" in result
-        assert "hello" in result
-
-    def test_includes_run_metrics(self, run_dir: Path) -> None:
-        runs_dir = run_dir / "stage-12" / "runs"
-        runs_dir.mkdir(parents=True, exist_ok=True)
-        (runs_dir / "run-1.json").write_text(
-            json.dumps({"metrics": {"loss": 0.5}, "elapsed_sec": 3.2}),
-            encoding="utf-8",
+    def test_renders_only_selected_snapshot(self) -> None:
+        evidence = SimpleNamespace(
+            manifest_path="canonical_experiment_evidence.json",
+            manifest_sha256="a" * 64,
+            selected_result={"result_set_type": "stage12_baseline"},
+            metric_observations={"detection_f1": (Decimal("0.5"),)},
+            structured_results={"metrics": {"detection_f1": Decimal("0.5")}},
+            summary={"metrics_summary": {"detection_f1": {"mean": Decimal("0.5")}}},
+            analysis_text="Canonical analysis only.\n",
         )
-        result = rc_executor._collect_experiment_evidence(run_dir)
-        assert "loss" in result
-        assert "0.5" in result
 
-    def test_includes_stderr_excerpt(self, run_dir: Path) -> None:
-        runs_dir = run_dir / "stage-12" / "runs"
-        runs_dir.mkdir(parents=True, exist_ok=True)
-        (runs_dir / "run-1.json").write_text(
-            json.dumps({
-                "metrics": {"loss": 0.5},
-                "stderr": "RuntimeWarning: divide by zero",
-            }),
-            encoding="utf-8",
-        )
-        result = rc_executor._collect_experiment_evidence(run_dir)
-        assert "divide by zero" in result
+        result = rc_executor._collect_experiment_evidence(evidence)
 
-    def test_includes_refinement_summary(self, run_dir: Path) -> None:
-        refine_dir = run_dir / "stage-13"
-        refine_dir.mkdir(parents=True, exist_ok=True)
-        (refine_dir / "refinement_log.json").write_text(
-            json.dumps({
-                "iterations": [{"iteration": 1}, {"iteration": 2}],
-                "converged": True,
-                "stop_reason": "no_improvement_for_2_iterations",
-                "best_metric": 0.3,
-            }),
-            encoding="utf-8",
-        )
-        result = rc_executor._collect_experiment_evidence(run_dir)
-        assert "iterations_executed" in result
-        assert "2" in result
+        assert "Canonical Evidence Identity" in result
+        assert "detection_f1" in result
+        assert "Canonical analysis only." in result
+        assert "stage12_baseline" in result
 
-    def test_includes_actual_trial_count(self, run_dir: Path) -> None:
-        runs_dir = run_dir / "stage-12" / "runs"
-        runs_dir.mkdir(parents=True, exist_ok=True)
-        (runs_dir / "run-1.json").write_text(
-            json.dumps({"metrics": {"loss": 0.5}}), encoding="utf-8"
+    def test_does_not_read_legacy_artifact_tree(self, tmp_path: Path) -> None:
+        legacy = tmp_path / "stage-12" / "runs"
+        legacy.mkdir(parents=True)
+        (legacy / "poison.json").write_text(
+            '{"metrics":{"poison_metric":999}}', encoding="utf-8"
         )
-        result = rc_executor._collect_experiment_evidence(run_dir)
-        assert "1 time(s)" in result
-        assert "CRITICAL" in result
+        evidence = SimpleNamespace(
+            manifest_path="canonical_experiment_evidence.json",
+            manifest_sha256="b" * 64,
+            selected_result={"result_set_type": "stage13_refinement"},
+            metric_observations={"safe_metric": (Decimal("0.5"),)},
+            structured_results={"metrics": {"safe_metric": Decimal("0.5")}},
+            summary={},
+            analysis_text="",
+        )
+
+        result = rc_executor._collect_experiment_evidence(evidence)
+
+        assert "safe_metric" in result
+        assert "poison_metric" not in result
 
 
 class TestWritePaperSections:

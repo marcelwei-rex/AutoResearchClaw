@@ -165,6 +165,10 @@ def consumer_evidence_fixture(monkeypatch: pytest.MonkeyPatch):
         _load,
     )
     monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._review_publish.load_canonical_experiment_evidence",
+        _load,
+    )
+    monkeypatch.setattr(
         "researchclaw.literature.experiment_fact_closure.load_canonical_experiment_evidence",
         _load,
     )
