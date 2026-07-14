@@ -493,9 +493,9 @@ Every iteration record binds:
 - exact refined project file paths and hashes;
 - code-validation report path/hash;
 - initial sandbox result path/hash;
-- optional runtime-repair project and rerun result path/hash;
-- accepted/rejected status derived from deterministic runtime checks;
-- the exact finite primary-metric observation parsed from the accepted final
+- a null runtime-repair field reserved for a future policy version;
+- accepted status derived from deterministic runtime checks;
+- the exact finite primary-metric observation parsed from the accepted initial
   execution result;
 - no files outside the iteration namespace.
 
@@ -503,7 +503,7 @@ Stage 13 preserves the Stage 10 owner closure. Its project contains the same
 flat logical filenames as the Stage 10 seal. Model-owned files may change;
 scaffold-owned files retain their Stage 10 hashes and exact bytes. Under
 `hpc_anomaly_detection_v1`, `main.py` must remain scaffold-owned and must still
-equal `render_main_py(contract)` for initial and repair projects. A scope without
+equal `render_main_py(contract)` for the initial project. A scope without
 an equivalent sealed scaffold evaluator is not eligible for this evaluator
 schema and fails closed.
 
@@ -511,10 +511,9 @@ The initial project roles use exact paths under
 `stage-13/evidence-v1/iterations/<iteration-id>/`: project files are a
 canonically path-sorted, nonempty set under `project/` containing
 `project/main.py`; the report is exactly `validation_report.json`; and the
-execution result is exactly `initial_execution.json`. A runtime repair, when
-present, uses the corresponding exact paths under `runtime_repair/`:
-`project/`, `validation_report.json`, and `execution_result.json`. No path may
-serve more than one role within an iteration.
+execution result is exactly `initial_execution.json`. Refinement policy v1
+permits no `runtime_repair/` paths. No path may serve more than one role within
+an iteration.
 
 Each validation report has this exact replayable shape:
 
@@ -532,20 +531,25 @@ validation policy v1, every Python file is decoded according to its Python
 encoding declaration and compiled in `exec` mode. The report is not an
 acceptance oracle: acceptance is independently derived from the recomputed
 syntax check plus one finite observation under the exact primary metric key in
-the final execution result. Deterministic rejection codes are
-`python_syntax_invalid` and `primary_metric_missing_or_nonsingular`, in that
-order when both apply. Stored `accepted`, `rejection_codes`, and metric fields
-must exactly match that derivation. The initial attempt is always replayed. A
-runtime repair is legal only when that initial attempt is deterministically
-rejected; its project, report, and execution are then replayed as a second
-attempt. A producer cannot add an unnecessary repair to replace an already
-accepted metric.
+the final execution result. The deterministic rejection codes
+`python_syntax_invalid` and `primary_metric_missing_or_nonsingular` are reserved
+for a future refinement policy version that retains rejected attempts. Under
+refinement policy v1, stored `accepted`, `rejection_codes`, and metric fields
+must be exactly `true`, `[]`, and the independently derived finite observation.
+The manifest field `runtime_repair` is likewise reserved for a future policy
+version, but the policy-v1 strict loader requires it to be exactly `null`.
+Invalid model-response syntax, execution failure or timeout, a missing evaluator
+result, or a missing/non-singular primary metric fails the entire Stage 13
+generation; the producer publishes no refinement manifest or evidence
+namespace. Support for retained rejected attempts or runtime repair requires a
+policy-version bump plus an immutable attempt-publication grammar. A future
+producer cannot add an unnecessary repair to replace an already accepted metric.
 
 Stage 13 publishes `stage-13/refinement_result_set.json` with:
 
 - baseline Stage 12 manifest path/hash and full replay;
 - Stage 9 contract, Stage 10 sealed input, and config semantic bindings;
-- complete ordered iteration records, including rejected attempts;
+- complete ordered accepted iteration records under refinement policy v1;
 - `refinement_log.json` path/hash as a diagnostic cross-check, not a selection
   oracle;
 - deterministic selected result: either `stage12_baseline` or exactly one
@@ -603,8 +607,11 @@ Its exact top-level shape is:
 }
 ```
 
-`runtime_repair` is exactly null or an exact object containing repaired project
-files, execution result path/hash, and deterministic runtime-validation report.
+Under refinement policy v1, `runtime_repair` is exactly null, `accepted` is
+exactly true, `rejection_codes` is exactly an empty array, and
+`primary_metric_observation` is a finite JSON number. A repaired-project object
+is reserved for a future refinement policy version and is rejected by the v1
+loader.
 `selected_result.type` is exactly `baseline` or `iteration`; baseline requires a
 null iteration ID and iteration requires one accepted canonical ID. Stored
 accepted/status/metric fields are independently recomputed rather than trusted.

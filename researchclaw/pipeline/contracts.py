@@ -129,11 +129,17 @@ CONTRACTS: dict[Stage, StageContract] = {
     ),
     Stage.ITERATIVE_REFINE: StageContract(
         stage=Stage.ITERATIVE_REFINE,
-        input_files=("runs/",),
-        output_files=("refinement_log.json", "experiment_final/"),
-        dod="Edit-run-eval loop converged or max iterations reached",
+        # The producer must invalidate stale authority before reading Stage 12.
+        input_files=(),
+        output_files=(
+            "refinement_result_set.json",
+            "refinement_log.json",
+            "evidence-v1/",
+            "experiment_final/",
+        ),
+        dod="Canonical refinement provenance published and replayed",
         error_code="E13_REFINE_FAIL",
-        max_retries=2,
+        max_retries=0,
     ),
     # Phase F: Analysis & Decision
     Stage.RESULT_ANALYSIS: StageContract(

@@ -287,9 +287,8 @@ def test_estimate_stage12_footprint_bytes_sums_all_versions(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_stage13_collider_branch_promotes_merged_stage12_results(tmp_path):
-    """Stage 13 in collider mode is a passthrough; the merged Stage-12 output
-    must appear bit-identical at stage-13/experiment_final/results.json."""
+def test_stage13_collider_mode_cannot_publish_canonical_refinement(tmp_path):
+    """An unsupported agent mode cannot create compatibility evidence."""
     from researchclaw.adapters import AdapterBundle
     from researchclaw.pipeline.stage_impls._execution import _execute_iterative_refine
 
@@ -311,16 +310,17 @@ def test_stage13_collider_branch_promotes_merged_stage12_results(tmp_path):
 
     cfg = _make_rc_config(tmp_path, profile="hep_ph", mode="collider_agent")
 
-    _ = _execute_iterative_refine(
+    result = _execute_iterative_refine(
         stage_dir=s13,
         run_dir=run_dir,
         config=cfg,
         adapters=AdapterBundle(),
     )
 
-    promoted = s13 / "experiment_final" / "results.json"
-    assert promoted.is_file()
-    assert promoted.read_text(encoding="utf-8") == merged_payload
+    assert result.status.value == "failed"
+    assert "does not support experiment mode" in (result.error or "")
+    assert not (s13 / "experiment_final").exists()
+    assert not (s13 / "refinement_result_set.json").exists()
 
 
 # ---------------------------------------------------------------------------

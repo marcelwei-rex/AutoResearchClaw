@@ -225,6 +225,73 @@ def build_stage12_evidence_texts(
     return invocation_text, aggregate_text
 
 
+def build_refinement_execution_text(
+    structured_results_text: str,
+    *,
+    contract: ExperimentContract,
+    evaluator_schema: str,
+) -> str:
+    """Normalize one Stage 13 evaluator result with the Stage 12 authority grammar."""
+    invocation_text, _aggregate_text = build_stage12_evidence_texts(
+        structured_results_text,
+        contract=contract,
+        evaluator_schema=evaluator_schema,
+    )
+    return invocation_text
+
+
+def build_refinement_validation_report(
+    project_root: Path,
+    project_files: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the replayable Stage 13 syntax report from staged project bytes."""
+    canonical_refs = sorted(project_files, key=lambda item: item["path"])
+    if project_files != canonical_refs:
+        raise CanonicalExperimentEvidenceError(
+            "Stage 13 project files are not canonically sorted"
+        )
+    syntax_valid = True
+    for ref in canonical_refs:
+        path = ref.get("path")
+        digest = ref.get("sha256")
+        if not isinstance(path, str) or "/project/" not in path:
+            raise CanonicalExperimentEvidenceError("noncanonical Stage 13 project path")
+        logical_name = path.rsplit("/project/", 1)[1]
+        if not logical_name or "/" in logical_name or "\\" in logical_name:
+            raise CanonicalExperimentEvidenceError(
+                "Stage 13 project must preserve flat sealed filenames"
+            )
+        source_path = project_root / logical_name
+        if source_path.is_symlink() or not source_path.is_file():
+            raise CanonicalExperimentEvidenceError("Stage 13 staged project file is unsafe")
+        if sha256_file(source_path) != digest:
+            raise CanonicalExperimentEvidenceError("Stage 13 staged project hash mismatch")
+        if not logical_name.endswith(".py"):
+            continue
+        raw = source_path.read_bytes()
+        try:
+            encoding, _ = tokenize.detect_encoding(BytesIO(raw).readline)
+            source = raw.decode(encoding)
+            compile(source, path, "exec")
+        except (LookupError, SyntaxError, UnicodeDecodeError, ValueError):
+            syntax_valid = False
+    return {
+        "schema_version": REFINEMENT_VALIDATION_SCHEMA_VERSION,
+        "validation_policy_version": 1,
+        "project_files_sha256": sha256_text(canonical_json_text(canonical_refs)),
+        "checks": {"python_syntax_valid": syntax_valid},
+    }
+
+
+def stage12_primary_metric(
+    run_dir: Path,
+    baseline: Mapping[str, Any],
+    metric_key: str,
+) -> Decimal:
+    """Return the independently replayed Stage 12 primary metric."""
+    return _stage12_primary_metric(run_dir, baseline, metric_key)
+
+
 def canonical_authority_json_text(value: object) -> str:
     """Serialize strict authority JSON without a Decimal-to-float conversion."""
     return _authority_json_value(value) + "\n"
@@ -721,16 +788,31 @@ def validate_refinement_result_set(
     baseline = validate_experiment_result_set(run_dir, config, baseline_text)
     seal, contract = _validate_common_run_bindings(run_dir, config, payload)
     _require_common_binding_equality(payload, baseline, "Stage 12/13")
+    contract_metric_key = _required_string(
+        contract.primary_metric.get("key"), "contract primary metric key"
+    )
+    contract_direction = contract.primary_metric.get("direction")
+    if (
+        payload["primary_metric_key"] != contract_metric_key
+        or config.experiment.metric_key != contract_metric_key
+    ):
+        raise CanonicalExperimentEvidenceError(
+            "Stage 13 primary metric differs from contract/config"
+        )
+    if (
+        contract_direction not in {"maximize", "minimize"}
+        or payload["optimization_direction"] != contract_direction
+        or config.experiment.metric_direction != contract_direction
+    ):
+        raise CanonicalExperimentEvidenceError(
+            "Stage 13 optimization direction differs from contract/config"
+        )
 
     expected_evidence: set[str] = set()
     accepted_values: dict[str, Decimal] = {}
     for item in payload["iterations"]:
         prefix = f"stage-13/evidence-v1/iterations/{item['iteration_id']}/"
         refs = list(item["project_files"]) + [item["validation_report"], item["initial_execution"]]
-        if item["runtime_repair"] is not None:
-            repair = item["runtime_repair"]
-            refs.extend(repair["project_files"])
-            refs.extend([repair["execution_result"], repair["validation_report"]])
         relative_paths = [ref["path"] for ref in refs]
         if len(relative_paths) != len(set(relative_paths)):
             raise CanonicalExperimentEvidenceError("Stage 13 cross-role path alias")
@@ -752,32 +834,17 @@ def validate_refinement_result_set(
             seal=seal,
             contract=contract,
         )
-        final_outcome = initial_outcome
-        if item["runtime_repair"] is not None:
-            if initial_outcome[0]:
-                raise CanonicalExperimentEvidenceError("unnecessary Stage 13 runtime repair")
-            repair = item["runtime_repair"]
-            final_outcome = _replay_refinement_attempt(
-                run_dir,
-                project_files=repair["project_files"],
-                validation_ref=repair["validation_report"],
-                execution_ref=repair["execution_result"],
-                evaluator_schema=payload["evaluator_schema"],
-                primary_metric_key=payload["primary_metric_key"],
-                seal=seal,
-                contract=contract,
+        accepted, rejection_codes, observed = initial_outcome
+        if not accepted or rejection_codes or observed is None:
+            raise CanonicalExperimentEvidenceError(
+                "Stage 13 policy v1 iteration did not replay as accepted"
             )
-        accepted, rejection_codes, observed = final_outcome
-        if item["accepted"] is not accepted or item["rejection_codes"] != rejection_codes:
-            raise CanonicalExperimentEvidenceError("Stage 13 accepted/status replay mismatch")
-        if accepted:
-            assert observed is not None
-            stored = Decimal(canonical_decimal(item["primary_metric_observation"]))
-            if observed != stored:
-                raise CanonicalExperimentEvidenceError("accepted iteration metric mismatch")
-            accepted_values[item["iteration_id"]] = observed
-        elif item["primary_metric_observation"] is not None:
-            raise CanonicalExperimentEvidenceError("rejected iteration has metric authority")
+        stored = _finite_json_number(
+            item["primary_metric_observation"], "primary_metric_observation"
+        )
+        if observed != stored:
+            raise CanonicalExperimentEvidenceError("accepted iteration metric mismatch")
+        accepted_values[item["iteration_id"]] = observed
     _validate_exact_namespace(
         run_dir,
         run_dir / "stage-13/evidence-v1",
@@ -798,7 +865,60 @@ def validate_refinement_result_set(
             best_type, best_id, best_value = "iteration", iteration_id, value
     if payload["selected_result"] != {"type": best_type, "iteration_id": best_id}:
         raise CanonicalExperimentEvidenceError("Stage 13 selected result replay mismatch")
+    _validate_refinement_compatibility_copies(run_dir, payload, seal)
     return payload
+
+
+def _validate_refinement_compatibility_copies(
+    run_dir: Path,
+    refinement: Mapping[str, Any],
+    seal: Mapping[str, Any],
+) -> None:
+    selected = refinement["selected_result"]
+    selected_sources: dict[str, Path] = {}
+    if selected["type"] == "baseline":
+        for name in sorted(seal["files"]):
+            selected_sources[name] = run_dir / "stage-10/selected_candidate" / name
+    else:
+        item = next(
+            candidate
+            for candidate in refinement["iterations"]
+            if candidate["iteration_id"] == selected["iteration_id"]
+        )
+        for ref in item["project_files"]:
+            name = ref["path"].rsplit("/project/", 1)[1]
+            selected_sources[name] = run_dir / ref["path"]
+
+    final_root = run_dir / "stage-13/experiment_final"
+    expected = {
+        f"stage-13/experiment_final/{name}" for name in selected_sources
+    }
+    _validate_exact_namespace(
+        run_dir,
+        final_root,
+        expected,
+        "Stage 13 compatibility project",
+    )
+    for name, source_path in selected_sources.items():
+        source = _require_regular_path(source_path, "Stage 13 selected project file")
+        final = _require_regular_path(
+            final_root / name, "Stage 13 compatibility project file"
+        )
+        if source.read_bytes() != final.read_bytes():
+            raise CanonicalExperimentEvidenceError(
+                f"Stage 13 compatibility copy mismatch: {name}"
+            )
+    selected_main = _require_regular_path(
+        selected_sources["main.py"], "Stage 13 selected main.py"
+    )
+    final_main = _require_regular_path(
+        run_dir / "stage-13/experiment_final.py",
+        "Stage 13 compatibility main.py",
+    )
+    if selected_main.read_bytes() != final_main.read_bytes():
+        raise CanonicalExperimentEvidenceError(
+            "Stage 13 compatibility copy mismatch: experiment_final.py"
+        )
 
 
 def parse_experiment_evidence_candidate(text: str) -> dict[str, Any]:
@@ -1499,48 +1619,22 @@ def _parse_refinement_iteration(item: object, index: int, iteration_ids: set[str
         raise CanonicalExperimentEvidenceError("noncanonical Stage 13 initial execution path")
     all_refs = list(project_files) + [validation_report, initial_execution]
     if item["runtime_repair"] is not None:
-        repair = item["runtime_repair"]
-        if not isinstance(repair, dict):
-            raise CanonicalExperimentEvidenceError("runtime_repair must be null or object")
-        _exact_keys(repair, {"project_files", "execution_result", "validation_report"}, "runtime_repair")
-        repair_files = _file_ref_list(
-            repair["project_files"], "runtime_repair.project_files", nonempty=True
+        raise CanonicalExperimentEvidenceError(
+            "runtime_repair must be null under refinement policy v1"
         )
-        repair_paths = [ref["path"] for ref in repair_files]
-        repair_prefix = prefix + "runtime_repair/"
-        repair_project_prefix = repair_prefix + "project/"
-        if repair_paths != sorted(repair_paths):
-            raise CanonicalExperimentEvidenceError("runtime repair project files are not canonically sorted")
-        if any(not path.startswith(repair_project_prefix) for path in repair_paths):
-            raise CanonicalExperimentEvidenceError("noncanonical runtime repair project path")
-        if repair_project_prefix + "main.py" not in repair_paths:
-            raise CanonicalExperimentEvidenceError("runtime repair project is missing main.py")
-        repair_execution = _file_ref(repair["execution_result"], "runtime_repair.execution_result")
-        repair_validation = _file_ref(
-            repair["validation_report"], "runtime_repair.validation_report"
-        )
-        if repair_execution["path"] != repair_prefix + "execution_result.json":
-            raise CanonicalExperimentEvidenceError("noncanonical runtime repair execution path")
-        if repair_validation["path"] != repair_prefix + "validation_report.json":
-            raise CanonicalExperimentEvidenceError("noncanonical runtime repair validation path")
-        all_refs.extend(repair_files)
-        all_refs.extend([repair_execution, repair_validation])
     all_paths = [ref["path"] for ref in all_refs]
     if len(all_paths) != len(set(all_paths)):
         raise CanonicalExperimentEvidenceError("Stage 13 cross-role path alias")
-    if not isinstance(item["accepted"], bool):
-        raise CanonicalExperimentEvidenceError("accepted must be bool")
+    if item["accepted"] is not True:
+        raise CanonicalExperimentEvidenceError(
+            "accepted must be true under refinement policy v1"
+        )
     rejection_codes = item["rejection_codes"]
-    if not isinstance(rejection_codes, list) or any(not isinstance(x, str) or not x for x in rejection_codes):
-        raise CanonicalExperimentEvidenceError("invalid rejection_codes")
-    if len(rejection_codes) != len(set(rejection_codes)):
-        raise CanonicalExperimentEvidenceError("duplicate rejection code")
-    if item["accepted"]:
-        if rejection_codes:
-            raise CanonicalExperimentEvidenceError("accepted iteration has rejection codes")
-        canonical_decimal(item["primary_metric_observation"])
-    elif item["primary_metric_observation"] is not None or not rejection_codes:
-        raise CanonicalExperimentEvidenceError("rejected iteration has invalid metric/status")
+    if rejection_codes != []:
+        raise CanonicalExperimentEvidenceError(
+            "rejection_codes must be empty under refinement policy v1"
+        )
+    _finite_json_number(item["primary_metric_observation"], "primary_metric_observation")
 
 
 def _parse_candidate_identity(value: object) -> dict[str, Any]:

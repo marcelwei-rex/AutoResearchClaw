@@ -282,3 +282,82 @@ def require_controller_lease(lease: object) -> InvocationLease:
     if lease.ordinal != 1:
         raise PermissionError("canonical_stage12_invocation_ordinal_invalid")
     return lease
+
+
+class CanonicalRefinementController:
+    """Own the Stage 13 generation lock, rollover, and authority invalidation."""
+
+    def __init__(self, stage_dir: Path, lock_descriptor: int) -> None:
+        self.stage_dir = stage_dir
+        self._lock_descriptor: int | None = lock_descriptor
+
+    @classmethod
+    def prepare_generation(
+        cls,
+        run_dir: Path,
+        stage_dir: Path,
+    ) -> CanonicalRefinementController:
+        require_canonical_evidence_capabilities("CanonicalRefinementController.prepare")
+        if stage_dir != run_dir / "stage-13":
+            raise RuntimeError("canonical_stage13_directory_mismatch")
+        lock_path = run_dir / ".canonical_experiment_evidence.lock"
+        if lock_path.is_symlink():
+            raise RuntimeError("canonical_evidence_lock_unsafe")
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise RuntimeError("canonical_evidence_lock_unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise RuntimeError("canonical_evidence_generation_locked") from exc
+
+        controller = cls(stage_dir, descriptor)
+        try:
+            if stage_dir.is_symlink():
+                raise RuntimeError("canonical_stage13_directory_unsafe")
+            if stage_dir.exists() and not stage_dir.is_dir():
+                raise RuntimeError("canonical_stage13_directory_unsafe")
+            invalidation_unsafe = False
+            for path in (
+                run_dir / "canonical_experiment_evidence.json",
+                run_dir / "experiment_summary_best.json",
+                run_dir / "analysis_best.md",
+                run_dir / "stage-13/refinement_result_set.json",
+            ):
+                if path.is_symlink():
+                    path.unlink()
+                elif path.exists():
+                    if not path.is_file():
+                        invalidation_unsafe = True
+                    else:
+                        path.unlink()
+            if invalidation_unsafe:
+                raise RuntimeError("canonical_evidence_invalidation_unsafe")
+            if stage_dir.exists() and any(stage_dir.iterdir()):
+                versions: list[int] = []
+                for path in run_dir.iterdir():
+                    match = re.fullmatch(r"stage-13_v([1-9]\d*)", path.name)
+                    if match:
+                        if path.is_symlink() or not path.is_dir():
+                            raise RuntimeError("canonical_stage13_history_unsafe")
+                        versions.append(int(match.group(1)))
+                archive = run_dir / f"stage-13_v{max(versions, default=0) + 1}"
+                os.replace(stage_dir, archive)
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            return controller
+        except Exception:
+            controller.close()
+            raise
+
+    def close(self) -> None:
+        if self._lock_descriptor is None:
+            return
+        fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
+        os.close(self._lock_descriptor)
+        self._lock_descriptor = None

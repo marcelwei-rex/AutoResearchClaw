@@ -8,6 +8,7 @@ import subprocess
 import sys
 from decimal import Decimal, ROUND_HALF_EVEN, getcontext, localcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -37,6 +38,7 @@ from researchclaw.pipeline.canonical_evidence_capabilities import (
 )
 from researchclaw.pipeline.canonical_execution_controller import (
     CanonicalExecutionController,
+    CanonicalRefinementController,
     require_controller_lease,
 )
 from researchclaw.pipeline.experiment_repair import (
@@ -69,7 +71,7 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
 from researchclaw.pipeline.runner import execute_pipeline
 from researchclaw.pipeline import runner as pipeline_runner
 from researchclaw.pipeline.runner import _metaclaw_post_pipeline
-from researchclaw.pipeline.executor import StageResult
+from researchclaw.pipeline.executor import StageResult, execute_stage
 from researchclaw.pipeline.stage_impls._code_generation import _seal_selected_candidate
 from researchclaw.pipeline.stage_impls._execution import (
     _execute_experiment_run,
@@ -254,6 +256,14 @@ def _write_canonical_bundle(run_dir: Path) -> tuple[RCConfig, dict[str, object]]
 
     stage13 = run_dir / "stage-13"
     (stage13 / "evidence-v1").mkdir(parents=True)
+    final13 = stage13 / "experiment_final"
+    final13.mkdir()
+    for name in ("detector_plugin.py", "main.py"):
+        payload = (run_dir / "stage-10/selected_candidate" / name).read_bytes()
+        (final13 / name).write_bytes(payload)
+    (stage13 / "experiment_final.py").write_bytes(
+        (run_dir / "stage-10/selected_candidate/main.py").read_bytes()
+    )
     refinement_log_text = "{}\n"
     (stage13 / "refinement_log.json").write_text(refinement_log_text, encoding="utf-8")
     refinement = {
@@ -748,6 +758,337 @@ def test_run_level_replay_closes_stage12_stage13_and_root_bundle(tmp_path: Path)
         validate_experiment_result_set(run_dir, config)
 
 
+def test_stage13_producer_publishes_replayable_baseline_without_llm(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+
+    result = _execute_iterative_refine(
+        run_dir / "stage-13",
+        run_dir,
+        config,
+        AdapterBundle(),
+        llm=None,
+    )
+
+    assert result.status is StageStatus.DONE
+    manifest = validate_refinement_result_set(run_dir, config)
+    assert manifest["iterations"] == []
+    assert manifest["selected_result"] == {"type": "baseline", "iteration_id": None}
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
+    assert (run_dir / "stage-13_v1").is_dir()
+    assert not (run_dir / "stage-13_v1/refinement_result_set.json").exists()
+    assert (run_dir / "stage-13/experiment_final/main.py").read_bytes() == (
+        run_dir / "stage-10/selected_candidate/main.py"
+    ).read_bytes()
+
+
+def test_stage13_producer_selects_replayed_improving_iteration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+
+    class SequenceLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, *args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            self.calls += 1
+            return SimpleNamespace(content=(
+                "```filename:detector_plugin.py\n"
+                "class DetectorPlugin:\n"
+                "    def fit(self, X, y):\n"
+                "        return self\n"
+                "    def predict(self, X):\n"
+                f"        # iteration {self.calls}\n"
+                f"        return [{self.calls % 2}] * len(X)\n"
+                "```"
+            ))
+
+    metrics = iter((0.8, 0.7, 0.6))
+
+    class FakeSandbox:
+        backend_kind = "subprocess"
+
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+        def run_project(self, project_dir: Path, *, timeout_sec: int) -> SimpleNamespace:
+            del project_dir, timeout_sec
+            output = self.root / "run-output"
+            output.mkdir()
+            (output / "results.json").write_text(
+                canonical_json_text(_hpc_structured_result(next(metrics))),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(
+                returncode=0,
+                timed_out=False,
+                output_dir=output,
+            )
+
+    from researchclaw.experiment import factory
+
+    monkeypatch.setattr(
+        factory,
+        "create_sandbox",
+        lambda _config, root, metadata_dir=None: FakeSandbox(root),
+    )
+    result = _execute_iterative_refine(
+        run_dir / "stage-13",
+        run_dir,
+        config,
+        AdapterBundle(),
+        llm=SequenceLLM(),
+    )
+
+    assert result.status is StageStatus.DONE
+    manifest = validate_refinement_result_set(run_dir, config)
+    assert [item["iteration_id"] for item in manifest["iterations"]] == [
+        "iter-1", "iter-2", "iter-3"
+    ]
+    assert manifest["selected_result"] == {
+        "type": "iteration",
+        "iteration_id": "iter-1",
+    }
+    assert manifest["iterations"][0]["primary_metric_observation"] == Decimal("0.8")
+    assert (run_dir / "stage-13/experiment_final/detector_plugin.py").read_text(
+        encoding="utf-8"
+    ).endswith("return [1] * len(X)")
+
+
+def test_stage13_rejects_model_attempt_to_replace_scaffold_evaluator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+
+    class MainReplacingLLM:
+        def chat(self, *args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(content="```filename:main.py\nprint('replacement')\n```")
+
+    from researchclaw.experiment import factory
+
+    def forbidden_sandbox(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("sandbox must not run for an ownership violation")
+
+    monkeypatch.setattr(factory, "create_sandbox", forbidden_sandbox)
+    result = _execute_iterative_refine(
+        run_dir / "stage-13",
+        run_dir,
+        config,
+        AdapterBundle(),
+        llm=MainReplacingLLM(),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "scaffold-owned" in (result.error or "")
+    assert not (run_dir / "stage-13/refinement_result_set.json").exists()
+    assert not (run_dir / "stage-13/evidence-v1").exists()
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
+
+
+def test_stage13_prepublication_replay_failure_leaves_no_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+    from researchclaw.pipeline.stage_impls import _execution as execution_impl
+
+    monkeypatch.setattr(
+        execution_impl,
+        "validate_refinement_result_set",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            CanonicalExperimentEvidenceError("forced replay failure")
+        ),
+    )
+    result = _execute_iterative_refine(
+        run_dir / "stage-13",
+        run_dir,
+        config,
+        AdapterBundle(),
+        llm=None,
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "forced replay failure" in (result.error or "")
+    assert not (run_dir / "stage-13/refinement_result_set.json").exists()
+    assert not (run_dir / "stage-13/evidence-v1").exists()
+    assert not (run_dir / "stage-13/experiment_final").exists()
+
+
+def test_stage13_invalidates_old_authority_before_baseline_preflight(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+    (run_dir / "stage-12/experiment_result_set.json").unlink()
+
+    result = _execute_iterative_refine(
+        run_dir / "stage-13",
+        run_dir,
+        config,
+        AdapterBundle(),
+        llm=None,
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
+    assert not (run_dir / "experiment_summary_best.json").exists()
+    assert not (run_dir / "analysis_best.md").exists()
+    assert not (run_dir / "stage-13/refinement_result_set.json").exists()
+
+
+def test_stage13_generation_uses_shared_experiment_evidence_lock(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    stage13 = run_dir / "stage-13"
+    first = CanonicalRefinementController.prepare_generation(run_dir, stage13)
+    try:
+        with pytest.raises(RuntimeError, match="generation_locked"):
+            CanonicalRefinementController.prepare_generation(run_dir, stage13)
+    finally:
+        first.close()
+
+
+def test_stage13_execute_stage_invalidates_before_missing_baseline_preflight(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+    (run_dir / "stage-12/experiment_result_set.json").unlink()
+
+    result = execute_stage(
+        Stage.ITERATIVE_REFINE,
+        run_dir=run_dir,
+        run_id="stage13-missing-baseline",
+        config=config,
+        adapters=AdapterBundle(),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "preflight failed" in (result.error or "")
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
+    assert not (run_dir / "stage-13/refinement_result_set.json").exists()
+
+
+def test_stage13_generation_rejects_symlink_without_touching_target(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    victim = external / "refinement_result_set.json"
+    victim.write_text("victim\n", encoding="utf-8")
+    (run_dir / "stage-13").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="stage13_directory_unsafe"):
+        CanonicalRefinementController.prepare_generation(
+            run_dir, run_dir / "stage-13"
+        )
+
+    assert victim.read_text(encoding="utf-8") == "victim\n"
+
+
+def test_stage13_replay_rejects_forged_direction_and_winner(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+    _add_refinement_iteration(
+        run_dir,
+        metric=0.9,
+        accepted=True,
+        rejection_codes=[],
+        primary_metric_observation=0.9,
+    )
+    manifest_path = run_dir / "stage-13/refinement_result_set.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["optimization_direction"] = "minimize"
+    manifest["selected_result"] = {"type": "baseline", "iteration_id": None}
+    manifest_path.write_text(canonical_json_text(manifest), encoding="utf-8")
+
+    with pytest.raises(CanonicalExperimentEvidenceError, match="direction differs"):
+        validate_refinement_result_set(run_dir, config)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "```python\nclass DetectorPlugin:\n    pass\n```",
+        "class DetectorPlugin:\n    pass\n",
+        (
+            "```python\nclass DetectorPlugin:\n    pass\n```\n"
+            "```python\nprint('second')\n```"
+        ),
+        (
+            "PROSE OUTSIDE FENCE\n"
+            "```filename:detector_plugin.py\nclass DetectorPlugin:\n    pass\n```"
+        ),
+    ],
+)
+def test_stage13_rejects_noncanonical_model_response_grammar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+    response: str,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+
+    class InvalidLLM:
+        def chat(self, *args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(content=response)
+
+    from researchclaw.experiment import factory
+
+    def forbidden_sandbox(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("invalid response must not reach sandbox")
+
+    monkeypatch.setattr(factory, "create_sandbox", forbidden_sandbox)
+    result = _execute_iterative_refine(
+        run_dir / "stage-13",
+        run_dir,
+        config,
+        AdapterBundle(),
+        llm=InvalidLLM(),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert not (run_dir / "stage-13/refinement_result_set.json").exists()
+    assert not (run_dir / "stage-13/evidence-v1").exists()
+
+
+def test_stage13_replay_rejects_tampered_compatibility_copy(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+    (run_dir / "stage-13/experiment_final/main.py").write_text(
+        "print('tampered')\n", encoding="utf-8"
+    )
+
+    with pytest.raises(CanonicalExperimentEvidenceError, match="compatibility copy mismatch"):
+        validate_refinement_result_set(run_dir, config)
+
+
 def test_run_level_replay_rejects_stage13_and_root_copy_tampering(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     config, _root = _write_canonical_bundle(run_dir)
@@ -762,7 +1103,7 @@ def test_run_level_replay_rejects_stage13_and_root_copy_tampering(tmp_path: Path
         validate_canonical_experiment_manifest(run_dir, config)
 
 
-def test_stage13_recomputes_rejected_superior_iteration_from_bound_evidence(
+def test_stage13_policy_v1_parser_rejects_rejected_iteration(
     tmp_path: Path,
 ) -> None:
     run_dir = tmp_path / "run"
@@ -775,8 +1116,50 @@ def test_stage13_recomputes_rejected_superior_iteration_from_bound_evidence(
         primary_metric_observation=None,
     )
 
-    with pytest.raises(CanonicalExperimentEvidenceError, match="accepted/status replay mismatch"):
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="accepted must be true under refinement policy v1",
+    ):
         validate_refinement_result_set(run_dir, config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        (
+            "rejection_codes",
+            ["producer_says_no"],
+            "rejection_codes must be empty under refinement policy v1",
+        ),
+        (
+            "primary_metric_observation",
+            "0.9",
+            "primary_metric_observation must be a JSON number",
+        ),
+    ],
+)
+def test_stage13_policy_v1_parser_rejects_noncanonical_accepted_state(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    run_dir = tmp_path / field
+    _config, _root = _write_canonical_bundle(run_dir)
+    _add_refinement_iteration(
+        run_dir,
+        metric=0.9,
+        accepted=True,
+        rejection_codes=[],
+        primary_metric_observation=0.9,
+    )
+    manifest = json.loads(
+        (run_dir / "stage-13/refinement_result_set.json").read_text(encoding="utf-8")
+    )
+    manifest["iterations"][0][field] = value
+
+    with pytest.raises(CanonicalExperimentEvidenceError, match=message):
+        parse_refinement_result_set(canonical_json_text(manifest))
 
 
 def test_stage13_rejects_replacement_of_scaffold_owned_evaluator(tmp_path: Path) -> None:
@@ -1065,7 +1448,7 @@ def test_stage13_validation_report_is_strict_and_cross_role_alias_is_rejected(
         parse_refinement_result_set(canonical_json_text(manifest))
 
 
-def test_stage13_rejects_runtime_repair_after_valid_initial_attempt(tmp_path: Path) -> None:
+def test_stage13_policy_v1_parser_rejects_runtime_repair(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     config, _root = _write_canonical_bundle(run_dir)
     _add_refinement_iteration(
@@ -1117,8 +1500,17 @@ def test_stage13_rejects_runtime_repair_after_valid_initial_attempt(tmp_path: Pa
     }
     manifest_path.write_text(canonical_json_text(manifest), encoding="utf-8")
 
-    with pytest.raises(CanonicalExperimentEvidenceError, match="unnecessary.*runtime repair"):
-        validate_refinement_result_set(run_dir, config)
+    manifest_text = canonical_json_text(manifest)
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="runtime_repair must be null under refinement policy v1",
+    ):
+        parse_refinement_result_set(manifest_text)
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="runtime_repair must be null under refinement policy v1",
+    ):
+        validate_refinement_result_set(run_dir, config, manifest_text)
 
 
 def test_root_replay_rejects_stored_candidate_that_is_not_tie_break_winner(
