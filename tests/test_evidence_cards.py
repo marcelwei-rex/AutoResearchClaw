@@ -1468,7 +1468,9 @@ def test_stage20_22_and_23_reject_bibliography_key_outside_allowlist(
         stage22, run_dir, config, AdapterBundle(), llm=None
     )
     assert exported.status is StageStatus.FAILED
-    assert "Evidence-bound" in (exported.error or "")
+    assert "canonical experiment evidence" in (exported.error or "")
+    assert not (stage22 / "paper_final.md").exists()
+    assert not (stage22 / "stage22_export_manifest.json").exists()
 
     (stage22 / "paper_final.md").write_text(final_text, encoding="utf-8")
     stage23 = run_dir / "stage-23"
@@ -2286,7 +2288,7 @@ def test_e9_rejects_stage24_cross_artifact_tampering(
     assert exc_info.value.code == "citation_support_replay_failed"
 
 
-def test_stage22_rejects_multi_key_markers_when_canonical_bib_is_missing(
+def test_stage22_rejects_legacy_paper_when_canonical_bundle_is_missing(
     tmp_path: Path,
 ) -> None:
     run_dir = tmp_path / "run"
@@ -2303,7 +2305,9 @@ def test_stage22_rejects_multi_key_markers_when_canonical_bib_is_missing(
         stage22, run_dir, config, AdapterBundle(), llm=None
     )
     assert result.status is StageStatus.FAILED
-    assert "Canonical bibliography" in (result.error or "")
+    assert "canonical experiment evidence" in (result.error or "")
+    assert not (stage22 / "paper_final.md").exists()
+    assert not (stage22 / "stage22_export_manifest.json").exists()
 
 
 def test_resumed_config_without_active_pointer_fails_closed(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -422,6 +423,31 @@ def _write_canonical_bundle(run_dir: Path) -> tuple[RCConfig, dict[str, object]]
     return config, root
 
 
+def test_accessor_snapshots_selected_project_bytes_under_canonical_lock(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _config, _manifest = _write_canonical_bundle(run_dir)
+
+    evidence = load_canonical_experiment_evidence(run_dir)
+
+    assert [item.logical_name for item in evidence.project_artifacts] == [
+        "detector_plugin.py",
+        "main.py",
+    ]
+    for item in evidence.project_artifacts:
+        assert hashlib.sha256(item.content).hexdigest() == item.sha256
+        assert item.source_path.startswith("stage-10/selected_candidate/")
+    captured = evidence.project_artifacts[0].content
+    source = run_dir / evidence.project_artifacts[0].source_path
+    source.write_text("tampered after snapshot\n", encoding="utf-8")
+    assert evidence.project_artifacts[0].content == captured
+    with pytest.raises(CanonicalExperimentEvidenceError):
+        load_canonical_experiment_evidence(run_dir)
+
+
 def _prepare_stage14_upstream(run_dir: Path) -> RCConfig:
     config, _root = _write_canonical_bundle(run_dir)
     shutil.rmtree(run_dir / "stage-14")
@@ -573,7 +599,10 @@ def test_stage10_loader_rejects_semantically_different_active_config(tmp_path: P
     changed["experiment"]["time_budget_sec"] += 1
     changed_config = RCConfig.from_dict(changed, project_root=run_dir, check_paths=False)
 
-    with pytest.raises(CanonicalExperimentEvidenceError, match="active config differs"):
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="active config semantic generation differs",
+    ):
         validate_selected_candidate_manifest(run_dir, changed_config)
     assert semantic_config_sha256(changed_config) != semantic_config_sha256(config)
 

@@ -1413,7 +1413,32 @@ until C5.
   unlink is relative to that same directory fd. Final publication also requires
   the live run/stage paths to retain the captured device/inode identities, so a
   parent replacement cannot redirect cleanup or authorize detached outputs.
-- C3-D: migrate Stage 22 export consumers.
+- C3-D: migrate Stage 22 export consumers. The shared accessor captures the
+  replay-selected flat Stage 10/13 project files as immutable bytes while the
+  canonical publication lock is held. Stage 22 consumes the exact Stage 19
+  publication and Stage 20 quality-gate commit point, replays Stage 4-18
+  citation/fact provenance, and packages code only from those captured project
+  bytes. It must not reopen `experiment_final*`, scan `stage-14*`, read the
+  root degradation signal, use an evolution overlay, or call an LLM to rewrite
+  the final paper. Candidate policy v1 has an empty figure plan, so Stage 22 v1
+  publishes no experiment charts and deterministically removes references to
+  unavailable `charts/*` files. Direct files and the flat `code/` directory
+  are built under directory-fd-bound staging. Production and disk replay share
+  one pure semantic reconstruction from the captured bundle: the transformed
+  Markdown, final LaTeX, bibliography, verification and sanitization reports,
+  canonical-source binding, template bytes, and code package must match that
+  reconstruction exactly. The paper verifier evaluates the final LaTeX bytes,
+  not the pre-render Markdown. A strict `stage22_export_manifest.json` binds
+  every mandatory output plus the canonical evidence, selected-result, Stage
+  19, Stage 20, bibliography, template-source, and project-source hashes.
+  The complete Stage 04-20 input graph is replayed immediately before that
+  manifest is written last. Any failure removes the manifest and all
+  success-named Stage 22 outputs. A missing LaTeX toolchain is represented by a
+  strict bound `compile_status.json`, never inferred as success. Compile success
+  requires a nonempty PDF with a PDF header; failed or unavailable compilation
+  forbids a PDF. A paper-verifier `REJECT` fails Stage 22 rather than
+  heuristically rewriting numeric claims. The legacy Stage 22 producer is a
+  mechanically disabled entrypoint and cannot be invoked as alternate authority.
 - C3-E: add the complete call-site and forbidden-scan guard, then set
   `stage19_22_consumers` to v1 only after Stage 18 through Stage 22 pass it.
 - ensure each migrated manifest or closure report records the canonical-evidence

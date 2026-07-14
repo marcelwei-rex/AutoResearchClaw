@@ -64,7 +64,13 @@ def test_topic_init_contract_has_expected_input_output_files():
 def test_export_publish_contract_has_expected_outputs():
     contract = CONTRACTS[Stage.EXPORT_PUBLISH]
 
-    assert contract.output_files == ("paper_final.md", "code/")
+    assert contract.input_files == ()
+    assert contract.output_files == (
+        "paper_final.md",
+        "code/",
+        "stage22_export_manifest.json",
+    )
+    assert contract.max_retries == 0
 
 
 @pytest.mark.parametrize("contract", tuple(CONTRACTS.values()))

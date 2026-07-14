@@ -1302,14 +1302,13 @@ class TestExportPublishCodePackage:
         stage_dir = tmp_path / "run" / "stage-22"
         stage_dir.mkdir(parents=True, exist_ok=True)
 
-        rc_executor._execute_export_publish(
+        result = rc_executor._execute_export_publish(
             stage_dir, run_dir, rc_config, adapters, llm=None
         )
 
-        assert (stage_dir / "code" / "experiment.py").exists()
-        assert (stage_dir / "code" / "README.md").exists()
-        req_text = (stage_dir / "code" / "requirements.txt").read_text(encoding="utf-8")
-        assert "numpy" in req_text
+        assert result.status is StageStatus.FAILED
+        assert not (stage_dir / "code").exists()
+        assert not (stage_dir / "stage22_export_manifest.json").exists()
 
     def test_export_falls_back_to_experiment_py(
         self,
@@ -1330,12 +1329,12 @@ class TestExportPublishCodePackage:
         stage_dir = tmp_path / "run" / "stage-22"
         stage_dir.mkdir(parents=True, exist_ok=True)
 
-        rc_executor._execute_export_publish(
+        result = rc_executor._execute_export_publish(
             stage_dir, run_dir, rc_config, adapters, llm=None
         )
 
-        code_text = (stage_dir / "code" / "experiment.py").read_text(encoding="utf-8")
-        assert "val_loss: 0.1" in code_text
+        assert result.status is StageStatus.FAILED
+        assert not (stage_dir / "code").exists()
 
     def test_export_no_experiment_skips_code_dir(
         self,
@@ -1360,6 +1359,7 @@ class TestExportPublishCodePackage:
 
         assert not (stage_dir / "code").exists()
         assert "code/" not in result.artifacts
+        assert result.status is StageStatus.FAILED
 
     def test_export_detects_multiple_dependencies(
         self,
@@ -1385,16 +1385,12 @@ class TestExportPublishCodePackage:
         stage_dir = tmp_path / "run" / "stage-22"
         stage_dir.mkdir(parents=True, exist_ok=True)
 
-        rc_executor._execute_export_publish(
+        result = rc_executor._execute_export_publish(
             stage_dir, run_dir, rc_config, adapters, llm=None
         )
 
-        requirements = (stage_dir / "code" / "requirements.txt").read_text(
-            encoding="utf-8"
-        )
-        assert "numpy" in requirements
-        assert "torch" in requirements
-        assert "scikit-learn" in requirements
+        assert result.status is StageStatus.FAILED
+        assert not (stage_dir / "code").exists()
 
     def test_export_code_readme_contains_title(
         self,
@@ -1415,12 +1411,12 @@ class TestExportPublishCodePackage:
         stage_dir = tmp_path / "run" / "stage-22"
         stage_dir.mkdir(parents=True, exist_ok=True)
 
-        rc_executor._execute_export_publish(
+        result = rc_executor._execute_export_publish(
             stage_dir, run_dir, rc_config, adapters, llm=None
         )
 
-        readme = (stage_dir / "code" / "README.md").read_text(encoding="utf-8")
-        assert "My Great Paper" in readme
+        assert result.status is StageStatus.FAILED
+        assert not (stage_dir / "code").exists()
 
     def test_export_writes_canonical_source_metadata(
         self,
@@ -1442,17 +1438,9 @@ class TestExportPublishCodePackage:
             stage_dir, run_dir, rc_config, adapters, llm=None
         )
 
-        assert "canonical_source.json" in result.artifacts
-        metadata = json.loads((stage_dir / "canonical_source.json").read_text())
-        assert metadata["source_id"]
-        assert metadata["markdown_source_id"] == metadata["source_id"]
-        assert metadata["latex_source_id"] == metadata["source_id"]
-        assert metadata["markdown_path"] == "stage-22/paper_final.md"
-        assert metadata["latex_path"] == "stage-22/paper.tex"
-        from researchclaw.pipeline import release_artifacts as _ra
-
-        assert metadata["markdown_sha256"] == _ra.sha256_file(stage_dir / "paper_final.md")
-        assert metadata["latex_sha256"] == _ra.sha256_file(stage_dir / "paper.tex")
+        assert result.status is StageStatus.FAILED
+        assert not (stage_dir / "canonical_source.json").exists()
+        assert not (stage_dir / "stage22_export_manifest.json").exists()
 
 
 def test_contracts_stage13_includes_experiment_final() -> None:
@@ -1464,7 +1452,11 @@ def test_contracts_stage13_includes_experiment_final() -> None:
 
 
 def test_contracts_stage22_includes_code_dir() -> None:
-    assert "code/" in CONTRACTS[Stage.EXPORT_PUBLISH].output_files
+    contract = CONTRACTS[Stage.EXPORT_PUBLISH]
+    assert contract.input_files == ()
+    assert "code/" in contract.output_files
+    assert "stage22_export_manifest.json" in contract.output_files
+    assert contract.max_retries == 0
 
 
 # ── P1-1: Topic keyword extraction tests ──

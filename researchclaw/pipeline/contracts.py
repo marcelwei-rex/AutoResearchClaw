@@ -245,10 +245,15 @@ CONTRACTS: dict[Stage, StageContract] = {
     ),
     Stage.EXPORT_PUBLISH: StageContract(
         stage=Stage.EXPORT_PUBLISH,
-        input_files=("paper_revised.md",),
-        output_files=("paper_final.md", "code/"),
+        input_files=(),
+        output_files=(
+            "paper_final.md",
+            "code/",
+            "stage22_export_manifest.json",
+        ),
         dod="Final paper exported in target format",
         error_code="E22_EXPORT_FAIL",
+        max_retries=0,
     ),
     Stage.CITATION_VERIFY: StageContract(
         stage=Stage.CITATION_VERIFY,

@@ -83,6 +83,16 @@ class CanonicalEvidenceArtifact:
 
 
 @dataclass(frozen=True)
+class CanonicalProjectArtifact:
+    """One immutable selected Stage 10/13 project file."""
+
+    logical_name: str
+    source_path: str
+    sha256: str
+    content: bytes
+
+
+@dataclass(frozen=True)
 class CanonicalExperimentEvidence:
     """A lock-consistent, replay-validated snapshot for downstream consumers."""
 
@@ -108,6 +118,7 @@ class CanonicalExperimentEvidence:
     metric_observations: Mapping[str, Any]
     structured_results: Mapping[str, Any]
     artifacts: tuple[CanonicalEvidenceArtifact, ...]
+    project_artifacts: tuple[CanonicalProjectArtifact, ...]
 
 
 def sha256_text(text: str) -> str:
@@ -1587,6 +1598,11 @@ def load_canonical_experiment_evidence(run_dir: Path) -> CanonicalExperimentEvid
 
         manifest = validate_canonical_experiment_manifest(run_dir, config, manifest_text)
         selected_data = load_selected_result_for_analysis(run_dir, config)
+        project_artifacts = _snapshot_selected_project(
+            run_dir,
+            config,
+            selected_data["upstream"],
+        )
         selected_result_relative = manifest["selected_result"]["manifest_path"]
         selected_result_text = _read_regular_file(
             run_dir / selected_result_relative,
@@ -1696,9 +1712,101 @@ def load_canonical_experiment_evidence(run_dir: Path) -> CanonicalExperimentEvid
                 selected_data["structured_results"]
             ),
             artifacts=tuple(artifact_snapshots),
+            project_artifacts=project_artifacts,
         )
     finally:
         controller.close()
+
+
+def _snapshot_selected_project(
+    run_dir: Path,
+    config: RCConfig,
+    upstream: Mapping[str, Any],
+) -> tuple[CanonicalProjectArtifact, ...]:
+    """Capture the replay-selected flat project while the publication lock is held."""
+
+    seal_text = _read_regular_file(
+        run_dir / "stage-10/selected_candidate_manifest.json",
+        "selected candidate manifest",
+    )
+    seal = validate_selected_candidate_manifest(run_dir, config, seal_text)
+    expected_seal_sha = upstream.get("sealed_candidate_manifest_sha256")
+    if sha256_text(seal_text) != expected_seal_sha:
+        raise CanonicalExperimentEvidenceError(
+            "selected project seal differs from selected result"
+        )
+
+    selected_sources: dict[str, tuple[str, str]] = {}
+    if upstream.get("result_set_type") == "stage12_baseline":
+        for logical_name, metadata in seal["files"].items():
+            selected_sources[logical_name] = (
+                f"stage-10/selected_candidate/{logical_name}",
+                metadata["sha256"],
+            )
+    elif upstream.get("result_set_type") == "stage13_refinement":
+        selected = upstream.get("selected_result")
+        if selected == {"type": "baseline", "iteration_id": None}:
+            for logical_name, metadata in seal["files"].items():
+                selected_sources[logical_name] = (
+                    f"stage-10/selected_candidate/{logical_name}",
+                    metadata["sha256"],
+                )
+        elif isinstance(selected, Mapping) and selected.get("type") == "iteration":
+            iteration_id = selected.get("iteration_id")
+            iteration = next(
+                (
+                    item
+                    for item in upstream.get("iterations", ())
+                    if isinstance(item, Mapping)
+                    and item.get("iteration_id") == iteration_id
+                ),
+                None,
+            )
+            if iteration is None:
+                raise CanonicalExperimentEvidenceError(
+                    "selected refinement project is missing"
+                )
+            for ref in iteration["project_files"]:
+                source_path = ref["path"]
+                marker = "/project/"
+                if marker not in source_path:
+                    raise CanonicalExperimentEvidenceError(
+                        "selected refinement project path is invalid"
+                    )
+                logical_name = source_path.rsplit(marker, 1)[1]
+                selected_sources[logical_name] = (source_path, ref["sha256"])
+        else:
+            raise CanonicalExperimentEvidenceError(
+                "selected refinement project identity is invalid"
+            )
+    else:
+        raise CanonicalExperimentEvidenceError("selected result type is invalid")
+
+    if set(selected_sources) != set(seal["files"]):
+        raise CanonicalExperimentEvidenceError(
+            "selected project file closure differs from Stage 10 seal"
+        )
+    snapshots: list[CanonicalProjectArtifact] = []
+    for logical_name in sorted(selected_sources):
+        source_path, expected_sha = selected_sources[logical_name]
+        content = _read_regular_bytes(
+            run_dir / source_path,
+            f"selected project file {logical_name}",
+        )
+        actual_sha = hashlib.sha256(content).hexdigest()
+        if actual_sha != expected_sha:
+            raise CanonicalExperimentEvidenceError(
+                f"selected project file changed during access: {logical_name}"
+            )
+        snapshots.append(
+            CanonicalProjectArtifact(
+                logical_name=logical_name,
+                source_path=source_path,
+                sha256=actual_sha,
+                content=content,
+            )
+        )
+    return tuple(snapshots)
 
 
 def publish_canonical_experiment_manifest(
