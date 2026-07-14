@@ -1672,121 +1672,19 @@ def _consecutive_empty_metrics(run_dir: Path, pivot_count: int) -> bool:
 
 
 def _promote_best_stage14(run_dir: Path, config: RCConfig) -> None:
-    """BUG-205: After forced PROCEED, promote the best stage-14 experiment.
+    """Replay immutable candidates and publish the deterministic winner under lock."""
+    from researchclaw.pipeline.canonical_execution_controller import (
+        CanonicalAnalysisController,
+    )
+    from researchclaw.pipeline.canonical_experiment_evidence import (
+        publish_canonical_experiment_manifest,
+    )
 
-    Scans all ``stage-14*`` directories, scores them by primary metric,
-    and copies the best experiment_summary.json into ``stage-14/`` if the
-    current ``stage-14/`` is not already the best.
-    """
-    import shutil
-
-    metric_key = config.experiment.metric_key or "primary_metric"
-    metric_dir = config.experiment.metric_direction or "maximize"
-
-    candidates: list[tuple[float, Path]] = []
-    for d in sorted(run_dir.glob("stage-14*")):
-        summary_path = d / "experiment_summary.json"
-        if not summary_path.exists():
-            continue
-        try:
-            data = json.loads(summary_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            continue
-        ms = data.get("metrics_summary", {})
-        pm_val: float | None = None
-        # BUG-DA8-03: Exact match first, then substring fallback
-        # (avoids "accuracy" matching "balanced_accuracy")
-        if metric_key in ms:
-            _v = ms[metric_key]
-            try:
-                pm_val = float(_v["mean"] if isinstance(_v, dict) else _v)
-            except (TypeError, ValueError, KeyError):
-                pass
-        if pm_val is None:
-            for k, v in ms.items():
-                if metric_key in k:
-                    try:
-                        pm_val = float(v["mean"] if isinstance(v, dict) else v)
-                    except (TypeError, ValueError, KeyError):
-                        pass
-                    break
-        if pm_val is not None:
-            if math.isnan(pm_val):
-                continue
-            candidates.append((pm_val, d))
-
-    if not candidates:
-        return  # nothing to promote
-
-    current_dir = run_dir / "stage-14"
-
-    # Sort: best first
-    candidates.sort(key=lambda x: x[0], reverse=(metric_dir == "maximize"))
-
-    # BUG-226: Detect degenerate near-zero metrics (broken normalization or
-    # collapsed training).  When minimising, a value >1000x smaller than the
-    # second-best almost certainly comes from a degenerate iteration.
-    if metric_dir == "minimize" and len(candidates) > 1:
-        _bv, _bd = candidates[0]
-        _sv = candidates[1][0]
-        if 0 < _bv < _sv * 1e-3:
-            logger.warning(
-                "BUG-226: Degenerate best value %.6g is >1000× smaller than "
-                "second-best %.6g — skipping degenerate iteration %s",
-                _bv, _sv, _bd.name,
-            )
-            candidates.pop(0)
-
-    best_val, best_dir = candidates[0]
-
-    # BUG-223: Always write canonical best summary at run root BEFORE any
-    # early return, so downstream consumers (Stage 17, Stage 20, Stage 22,
-    # VerifiedRegistry) always find experiment_summary_best.json.
-    _best_src = best_dir / "experiment_summary.json"
-    if _best_src.exists():
-        shutil.copy2(_best_src, run_dir / "experiment_summary_best.json")
-        logger.info(
-            "BUG-223: Wrote experiment_summary_best.json from %s (%.4f)",
-            best_dir.name, best_val,
-        )
-        # BUG-225: Also copy analysis.md from the best iteration so Stage 17
-        # doesn't read stale analysis from a degenerate non-versioned stage-14.
-        _best_analysis = best_dir / "analysis.md"
-        if _best_analysis.exists():
-            shutil.copy2(_best_analysis, run_dir / "analysis_best.md")
-
-    if best_dir == current_dir:
-        logger.info("BUG-205: stage-14/ already has the best result (%.4f)", best_val)
-        return
-
-    # Promote: copy best summary into stage-14/
-    current_summary = current_dir / "experiment_summary.json"
-    best_summary = best_dir / "experiment_summary.json"
-    # BUG-213: Also promote when stage-14/ is missing or empty
-    if best_summary.exists():
-        current_dir.mkdir(parents=True, exist_ok=True)
-        logger.warning(
-            "BUG-205: Promoting %s (%.4f) over stage-14/",
-            best_dir.name, best_val,
-        )
-        shutil.copy2(best_summary, current_summary)
-        # Also copy charts, analysis, and figure plans if they exist
-        for fname in [
-            "analysis.md",
-            "results_table.tex",
-            "figure_plan.json",           # BUG-213: must travel with metrics
-            "figure_plan_final.json",     # BUG-213: ditto
-        ]:
-            src = best_dir / fname
-            if src.exists():
-                shutil.copy2(src, current_dir / fname)
-        # Copy charts directory
-        best_charts = best_dir / "charts"
-        current_charts = current_dir / "charts"
-        if best_charts.is_dir():
-            if current_charts.is_dir():
-                shutil.rmtree(current_charts)
-            shutil.copytree(best_charts, current_charts)
+    controller = CanonicalAnalysisController.acquire_promotion(run_dir)
+    try:
+        publish_canonical_experiment_manifest(run_dir, config)
+    finally:
+        controller.close()
 
 
 def _check_experiment_quality(

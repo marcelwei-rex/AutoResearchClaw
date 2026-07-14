@@ -27,7 +27,7 @@ CANONICAL_EVIDENCE_CAPABILITIES: dict[str, int] = {
     "stage10_sealed_input": CAPABILITY_SCHEMA_VERSION,
     "stage12_result_set": CAPABILITY_SCHEMA_VERSION,
     "stage13_refinement_set": CAPABILITY_SCHEMA_VERSION,
-    "stage14_candidate_and_promotion": 0,
+    "stage14_candidate_and_promotion": CAPABILITY_SCHEMA_VERSION,
     "shared_accessor": 0,
     "stage15_17_consumers": 0,
     "stage19_22_consumers": 0,

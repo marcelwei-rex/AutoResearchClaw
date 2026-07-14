@@ -367,20 +367,20 @@ def test_rcconfig_from_dict_parses_partial_run_and_q1_gate_controls(
     tmp_path: Path,
 ):
     data = _valid_config_data()
-    data["runtime"]["skip_stages"] = [9, 13]
+    data["runtime"]["skip_stages"] = [9, 11]
     data["runtime"]["inject_artifacts"] = {"stage-14/analysis.md": "existing"}
     data["security"]["q1_spine_hard_gate"] = True
     data["security"]["q1_spine_max_rollbacks"] = 2
 
     config = RCConfig.from_dict(data, project_root=tmp_path, check_paths=False)
 
-    assert config.runtime.skip_stages == (9, 13)
+    assert config.runtime.skip_stages == (9, 11)
     assert config.runtime.inject_artifacts == {"stage-14/analysis.md": "existing"}
     assert config.security.q1_spine_hard_gate is True
     assert config.security.q1_spine_max_rollbacks == 2
 
 
-@pytest.mark.parametrize("stage", [4, 5, 6, 16])
+@pytest.mark.parametrize("stage", [4, 5, 6, 12, 13, 14, 16])
 def test_validate_config_rejects_skipping_evidence_authority_stages(
     tmp_path: Path, stage: int
 ) -> None:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import importlib.util
 import inspect
 import json
+import os
+import shutil
 import subprocess
 import sys
 from decimal import Decimal, ROUND_HALF_EVEN, getcontext, localcontext
@@ -37,6 +40,7 @@ from researchclaw.pipeline.canonical_evidence_capabilities import (
     incomplete_canonical_evidence_capabilities,
 )
 from researchclaw.pipeline.canonical_execution_controller import (
+    CanonicalAnalysisController,
     CanonicalExecutionController,
     CanonicalRefinementController,
     require_controller_lease,
@@ -47,6 +51,7 @@ from researchclaw.pipeline.experiment_repair import (
 )
 from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidenceError,
+    canonical_authority_json_text,
     canonical_decimal,
     invocation_generation_binding_sha256,
     parse_aggregate_results,
@@ -66,6 +71,7 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     validate_experiment_result_set,
     validate_refinement_result_set,
     validate_single_invocation_aggregate,
+    publish_canonical_experiment_manifest,
     _stage12_primary_metric,
 )
 from researchclaw.pipeline.runner import execute_pipeline
@@ -77,11 +83,29 @@ from researchclaw.pipeline.stage_impls._execution import (
     _execute_experiment_run,
     _execute_iterative_refine,
 )
+from researchclaw.pipeline.stage_impls._analysis import _execute_result_analysis
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.report import generate_report
 
 
 SHA = "1" * 64
+EMPTY_FIGURE_PLAN_TEXT = canonical_authority_json_text(
+    {
+        "schema_version": 1,
+        "generator": "canonical_stage14_v1",
+        "figures": [],
+    }
+)
+
+
+def _enable_complete_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
+    from researchclaw.pipeline import canonical_evidence_capabilities as capabilities
+
+    monkeypatch.setattr(
+        capabilities,
+        "CANONICAL_EVIDENCE_CAPABILITIES",
+        {name: CAPABILITY_SCHEMA_VERSION for name in REQUIRED_CAPABILITIES},
+    )
 
 
 def _config(run_dir: Path) -> RCConfig:
@@ -290,7 +314,7 @@ def _write_canonical_bundle(run_dir: Path) -> tuple[RCConfig, dict[str, object]]
     stage14 = run_dir / "stage-14/evidence_candidates"
     artifacts = {
         "analysis.md": "Analysis.\n",
-        "figure_plan.json": "{}\n",
+        "figure_plan.json": EMPTY_FIGURE_PLAN_TEXT,
         "results_table.tex": "table\n",
         "experiment_summary.json": json.dumps(
             {"metrics_summary": {"detection_f1": {"mean": 0.5}}}, sort_keys=True
@@ -379,6 +403,19 @@ def _write_canonical_bundle(run_dir: Path) -> tuple[RCConfig, dict[str, object]]
         canonical_json_text(root), encoding="utf-8"
     )
     return config, root
+
+
+def _prepare_stage14_upstream(run_dir: Path) -> RCConfig:
+    config, _root = _write_canonical_bundle(run_dir)
+    shutil.rmtree(run_dir / "stage-14")
+    for name in (
+        "canonical_experiment_evidence.json",
+        "experiment_summary_best.json",
+        "analysis_best.md",
+    ):
+        (run_dir / name).unlink()
+    (run_dir / "stage-14").mkdir()
+    return config
 
 
 def _add_refinement_iteration(
@@ -1089,6 +1126,404 @@ def test_stage13_replay_rejects_tampered_compatibility_copy(tmp_path: Path) -> N
         validate_refinement_result_set(run_dir, config)
 
 
+def test_stage14_publishes_deterministic_immutable_candidate_and_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    config = _prepare_stage14_upstream(run_dir)
+    stage_dir = run_dir / "stage-14"
+
+    first = _execute_result_analysis(
+        stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
+    )
+
+    assert first.status is StageStatus.DONE
+    root = validate_canonical_experiment_manifest(run_dir, config)
+    candidate_id = root["selected_candidate"]["candidate_id"]
+    candidate_root = stage_dir / "evidence_candidates" / candidate_id
+    assert validate_experiment_evidence_candidate(candidate_root)["candidate_id"] == candidate_id
+    assert not (stage_dir / "analysis.md").exists()
+    assert not (stage_dir / "experiment_summary.json").exists()
+    assert (candidate_root / "figure_plan.json").is_file()
+    assert not list(stage_dir.glob(".candidate-staging-*"))
+
+    second = _execute_result_analysis(
+        stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
+    )
+
+    assert second.status is StageStatus.DONE
+    replayed = validate_canonical_experiment_manifest(run_dir, config)
+    assert replayed["selected_candidate"]["candidate_id"] == candidate_id
+    assert [path.name for path in (stage_dir / "evidence_candidates").iterdir()] == [candidate_id]
+
+
+def test_stage14_llm_perspectives_are_bound_into_candidate_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    config = _prepare_stage14_upstream(run_dir)
+    object.__setattr__(config.experiment.figure_agent, "enabled", True)
+    stage_dir = run_dir / "stage-14"
+
+    class AnalysisLLM:
+        def chat(self, *args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            return SimpleNamespace(content="# Bound analysis\nCanonical result discussion.\n")
+
+    result = _execute_result_analysis(
+        stage_dir,
+        run_dir,
+        config,
+        None,  # type: ignore[arg-type]
+        llm=AnalysisLLM(),  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.DONE
+    root = validate_canonical_experiment_manifest(run_dir, config)
+    candidate_root = run_dir / Path(root["selected_candidate"]["path"]).parent
+    candidate = validate_experiment_evidence_candidate(candidate_root)
+    perspective_paths = {
+        item["path"]
+        for item in candidate["artifacts"]
+        if item["path"].startswith("perspectives/")
+    }
+    assert perspective_paths == {
+        "perspectives/methodologist.md",
+        "perspectives/optimist.md",
+        "perspectives/skeptic.md",
+    }
+    assert all(
+        item["role"] == "auxiliary"
+        for item in candidate["artifacts"]
+        if item["path"] in perspective_paths
+    )
+    assert not (stage_dir / "perspectives").exists()
+    assert not (candidate_root / "charts").exists()
+    assert (candidate_root / "figure_plan.json").read_text(
+        encoding="utf-8"
+    ) == EMPTY_FIGURE_PLAN_TEXT
+
+
+def test_stage14_rejects_partial_chart_output_instead_of_sealing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    config = _prepare_stage14_upstream(run_dir)
+    stage_dir = run_dir / "stage-14"
+    from researchclaw.pipeline.stage_impls import _analysis as analysis_impl
+
+    def partial_renderer(
+        staging: Path,
+        *_args: object,
+        **_kwargs: object,
+    ) -> StageResult:
+        (staging / "analysis.md").write_text("analysis\n", encoding="utf-8")
+        (staging / "experiment_summary.json").write_text("{}\n", encoding="utf-8")
+        (staging / "results_table.tex").write_text("table\n", encoding="utf-8")
+        charts = staging / "charts"
+        charts.mkdir()
+        (charts / "unreviewed.png").write_bytes(b"partial")
+        return StageResult(
+            stage=Stage.RESULT_ANALYSIS,
+            status=StageStatus.DONE,
+            artifacts=(),
+        )
+
+    monkeypatch.setattr(
+        analysis_impl,
+        "_render_result_analysis_candidate",
+        partial_renderer,
+    )
+    result = analysis_impl._execute_result_analysis(
+        stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "forbids producer-supplied charts" in (result.error or "")
+    assert not list((stage_dir / "evidence_candidates").iterdir())
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
+
+
+def test_stage14_invalidates_old_root_before_missing_upstream_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-14"
+    stage_dir.mkdir(parents=True)
+    for name in (
+        "canonical_experiment_evidence.json",
+        "experiment_summary_best.json",
+        "analysis_best.md",
+    ):
+        (run_dir / name).write_text("stale\n", encoding="utf-8")
+
+    result = _execute_result_analysis(
+        stage_dir, run_dir, _config(run_dir), None, llm=None  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "Stage 12 result set is missing" in (result.error or "")
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
+    assert not (run_dir / "experiment_summary_best.json").exists()
+    assert not (run_dir / "analysis_best.md").exists()
+
+
+def test_stage14_promotion_rejects_tampered_candidate_without_root_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    config = _prepare_stage14_upstream(run_dir)
+    stage_dir = run_dir / "stage-14"
+    result = _execute_result_analysis(
+        stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
+    )
+    assert result.status is StageStatus.DONE
+    root = validate_canonical_experiment_manifest(run_dir, config)
+    candidate_root = run_dir / Path(root["selected_candidate"]["path"]).parent
+    (candidate_root / "analysis.md").write_text("tampered\n", encoding="utf-8")
+    (run_dir / "canonical_experiment_evidence.json").unlink()
+
+    controller = CanonicalAnalysisController.acquire_promotion(run_dir)
+    try:
+        with pytest.raises(CanonicalExperimentEvidenceError, match="artifact hash mismatch"):
+            publish_canonical_experiment_manifest(run_dir, config)
+    finally:
+        controller.close()
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
+
+
+def test_runner_stage14_promotion_reconstructs_root_from_canonical_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    config = _prepare_stage14_upstream(run_dir)
+    result = _execute_result_analysis(
+        run_dir / "stage-14",
+        run_dir,
+        config,
+        None,
+        llm=None,  # type: ignore[arg-type]
+    )
+    assert result.status is StageStatus.DONE
+    expected = validate_canonical_experiment_manifest(run_dir, config)
+    for name in (
+        "canonical_experiment_evidence.json",
+        "experiment_summary_best.json",
+        "analysis_best.md",
+    ):
+        (run_dir / name).unlink()
+
+    pipeline_runner._promote_best_stage14(run_dir, config)
+
+    assert validate_canonical_experiment_manifest(run_dir, config) == expected
+
+
+def test_stage14_candidate_publication_rejects_cross_device_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    config = _prepare_stage14_upstream(run_dir)
+    stage_dir = run_dir / "stage-14"
+    real_replace = os.replace
+
+    def cross_device_replace(source: object, destination: object) -> None:
+        source_path = Path(source)  # type: ignore[arg-type]
+        destination_path = Path(destination)  # type: ignore[arg-type]
+        if (
+            source_path.name.startswith(".candidate-staging-")
+            and destination_path.parent == stage_dir / "evidence_candidates"
+        ):
+            raise OSError(errno.EXDEV, "forced cross-device publication")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", cross_device_replace)
+    result = _execute_result_analysis(
+        stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "cross-device Stage 14 candidate publication is forbidden" in (
+        result.error or ""
+    )
+    assert not list((stage_dir / "evidence_candidates").iterdir())
+    assert not list(stage_dir.glob(".candidate-staging-*"))
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
+
+
+def test_stage14_root_publication_interruption_leaves_no_manifest_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    config = _prepare_stage14_upstream(run_dir)
+    stage_dir = run_dir / "stage-14"
+    real_replace = os.replace
+
+    def interrupt_analysis_copy(source: object, destination: object) -> None:
+        destination_path = Path(destination)  # type: ignore[arg-type]
+        if destination_path == run_dir / "analysis_best.md":
+            raise OSError("forced compatibility-copy interruption")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", interrupt_analysis_copy)
+    result = _execute_result_analysis(
+        stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
+    assert len(list((stage_dir / "evidence_candidates").iterdir())) == 1
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="canonical experiment evidence manifest is missing",
+    ):
+        validate_canonical_experiment_manifest(run_dir, config)
+
+
+def test_stage14_candidate_post_rename_replay_reads_disk_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    config = _prepare_stage14_upstream(run_dir)
+    stage_dir = run_dir / "stage-14"
+    real_replace = os.replace
+    corrupt_once = True
+
+    def corrupt_published_candidate(source: object, destination: object) -> None:
+        nonlocal corrupt_once
+        destination_path = Path(destination)  # type: ignore[arg-type]
+        real_replace(source, destination)
+        if corrupt_once and destination_path.parent == stage_dir / "evidence_candidates":
+            corrupt_once = False
+            (destination_path / "experiment_evidence_candidate.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+
+    monkeypatch.setattr(os, "replace", corrupt_published_candidate)
+    result = _execute_result_analysis(
+        stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "Stage 14 evidence candidate fields mismatch" in (result.error or "")
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
+    assert not list((stage_dir / "evidence_candidates").iterdir())
+
+    recovered = _execute_result_analysis(
+        stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
+    )
+
+    assert recovered.status is StageStatus.DONE
+    assert len(list((stage_dir / "evidence_candidates").iterdir())) == 1
+    validate_canonical_experiment_manifest(run_dir, config)
+
+
+def test_stage14_candidate_pre_rename_replay_reads_disk_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    config = _prepare_stage14_upstream(run_dir)
+    stage_dir = run_dir / "stage-14"
+    real_write_text = Path.write_text
+
+    def corrupt_staged_manifest(
+        path: Path,
+        data: str,
+        *args: object,
+        **kwargs: object,
+    ) -> int:
+        written = real_write_text(path, data, *args, **kwargs)  # type: ignore[arg-type]
+        if (
+            path.name == "experiment_evidence_candidate.json"
+            and path.parent.name.startswith(".candidate-staging-")
+        ):
+            real_write_text(path, "{}\n", encoding="utf-8")
+        return written
+
+    monkeypatch.setattr(Path, "write_text", corrupt_staged_manifest)
+    result = _execute_result_analysis(
+        stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "Stage 14 evidence candidate fields mismatch" in (result.error or "")
+    assert not list((stage_dir / "evidence_candidates").iterdir())
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
+
+
+def test_stage14_root_post_replace_replay_reads_disk_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    config = _prepare_stage14_upstream(run_dir)
+    stage_dir = run_dir / "stage-14"
+    real_replace = os.replace
+
+    def corrupt_published_root(source: object, destination: object) -> None:
+        destination_path = Path(destination)  # type: ignore[arg-type]
+        real_replace(source, destination)
+        if destination_path == run_dir / "canonical_experiment_evidence.json":
+            destination_path.write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(os, "replace", corrupt_published_root)
+    result = _execute_result_analysis(
+        stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "canonical experiment evidence manifest fields mismatch" in (
+        result.error or ""
+    )
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
+
+
+def test_stage14_symlinked_generation_does_not_touch_external_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    external = tmp_path / "external-stage14"
+    external.mkdir()
+    marker = external / "keep.txt"
+    marker.write_text("external\n", encoding="utf-8")
+    (run_dir / "stage-14").symlink_to(external, target_is_directory=True)
+
+    result = _execute_result_analysis(
+        run_dir / "stage-14",
+        run_dir,
+        _config(run_dir),
+        None,
+        llm=None,  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "canonical_stage14_directory_unsafe" in (result.error or "")
+    assert marker.read_text(encoding="utf-8") == "external\n"
+
+
 def test_run_level_replay_rejects_stage13_and_root_copy_tampering(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     config, _root = _write_canonical_bundle(run_dir)
@@ -1641,6 +2076,86 @@ def test_candidate_rejects_missing_role_and_same_path_for_different_roles(
         parse_experiment_evidence_candidate(canonical_json_text(duplicate))
 
 
+@pytest.mark.parametrize(
+    ("role", "path"),
+    [
+        ("chart", "charts/shadow.png"),
+        ("auxiliary", "figure_plan_final.json"),
+        ("auxiliary", "intermediate/figure_plan.json"),
+        ("auxiliary", "intermediate/charts/shadow.png"),
+    ],
+)
+def test_candidate_policy_v1_loader_rejects_figure_agent_artifacts(
+    tmp_path: Path,
+    role: str,
+    path: str,
+) -> None:
+    run_dir = tmp_path / "run"
+    _config, root = _write_canonical_bundle(run_dir)
+    candidate_path = run_dir / root["selected_candidate"]["path"]
+    payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+    artifact_sha = "a" * 64
+    payload["identity_payload"]["artifacts"].append(
+        {"role": role, "logical_name": path, "sha256": artifact_sha}
+    )
+    payload["identity_payload"]["artifacts"].sort(
+        key=lambda item: (item["role"], item["logical_name"])
+    )
+    payload["artifacts"].append({"role": role, "path": path, "sha256": artifact_sha})
+    payload["artifacts"].sort(key=lambda item: (item["role"], item["path"]))
+
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="invalid candidate auxiliary role/path",
+    ):
+        parse_experiment_evidence_candidate(canonical_json_text(payload))
+
+
+def test_stage14_promotion_rejects_manifest_bound_chart_under_policy_v1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_complete_capabilities(monkeypatch)
+    run_dir = tmp_path / "run"
+    config, root = _write_canonical_bundle(run_dir)
+    manifest_path = run_dir / root["selected_candidate"]["path"]
+    candidate_root = manifest_path.parent
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    charts = candidate_root / "charts"
+    charts.mkdir()
+    chart = charts / "shadow.png"
+    chart.write_bytes(b"shadow chart")
+    chart_sha = sha256_file(chart)
+    payload["identity_payload"]["artifacts"].append(
+        {"role": "chart", "logical_name": "charts/shadow.png", "sha256": chart_sha}
+    )
+    payload["identity_payload"]["artifacts"].sort(
+        key=lambda item: (item["role"], item["logical_name"])
+    )
+    payload["artifacts"].append(
+        {"role": "chart", "path": "charts/shadow.png", "sha256": chart_sha}
+    )
+    payload["artifacts"].sort(key=lambda item: (item["role"], item["path"]))
+    identity_sha = sha256_text(canonical_json_text(payload["identity_payload"]))
+    payload["identity_payload_sha256"] = identity_sha
+    payload["candidate_id"] = "cand-" + identity_sha
+    manifest_path.write_text(canonical_json_text(payload), encoding="utf-8")
+    renamed_root = candidate_root.with_name(payload["candidate_id"])
+    candidate_root.rename(renamed_root)
+    (run_dir / "canonical_experiment_evidence.json").unlink()
+
+    controller = CanonicalAnalysisController.acquire_promotion(run_dir)
+    try:
+        with pytest.raises(
+            CanonicalExperimentEvidenceError,
+            match="invalid candidate auxiliary role/path",
+        ):
+            publish_canonical_experiment_manifest(run_dir, config)
+    finally:
+        controller.close()
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
+
+
 @pytest.mark.parametrize("bad", [True, False, 1.0, "1"])
 def test_integer_schema_fields_reject_bool_float_and_string(bad: object) -> None:
     aggregate = {
@@ -1662,8 +2177,11 @@ def test_candidate_file_closure_and_identity_tokens_are_default_deny(tmp_path: P
     artifact.write_text("{}\n", encoding="utf-8")
     artifact_sha = sha256_text("{}\n")
     (root / "analysis.md").write_text("{}\n", encoding="utf-8")
-    (root / "figure_plan.json").write_text("{}\n", encoding="utf-8")
+    (root / "figure_plan.json").write_text(
+        EMPTY_FIGURE_PLAN_TEXT, encoding="utf-8"
+    )
     (root / "results_table.tex").write_text("{}\n", encoding="utf-8")
+    figure_plan_sha = sha256_text(EMPTY_FIGURE_PLAN_TEXT)
     identity = {
         "candidate_identity_policy_version": 1,
         "selected_result_type": "stage12_baseline",
@@ -1674,7 +2192,7 @@ def test_candidate_file_closure_and_identity_tokens_are_default_deny(tmp_path: P
         "optimization_direction": "maximize",
         "artifacts": [
             {"role": "analysis", "logical_name": "analysis.md", "sha256": artifact_sha},
-            {"role": "figure_plan", "logical_name": "figure_plan.json", "sha256": artifact_sha},
+            {"role": "figure_plan", "logical_name": "figure_plan.json", "sha256": figure_plan_sha},
             {"role": "results_table", "logical_name": "results_table.tex", "sha256": artifact_sha},
             {"role": "summary", "logical_name": "experiment_summary.json", "sha256": artifact_sha},
         ],
@@ -1707,7 +2225,7 @@ def test_candidate_file_closure_and_identity_tokens_are_default_deny(tmp_path: P
         "primary_metric_value": "0.5",
         "artifacts": [
             {"role": "analysis", "path": "analysis.md", "sha256": artifact_sha},
-            {"role": "figure_plan", "path": "figure_plan.json", "sha256": artifact_sha},
+            {"role": "figure_plan", "path": "figure_plan.json", "sha256": figure_plan_sha},
             {"role": "results_table", "path": "results_table.tex", "sha256": artifact_sha},
             {"role": "summary", "path": "experiment_summary.json", "sha256": artifact_sha},
         ],
@@ -1732,19 +2250,24 @@ def test_candidate_file_closure_and_identity_tokens_are_default_deny(tmp_path: P
     (root / "experiment_evidence_candidate.json").write_text(
         canonical_json_text(payload), encoding="utf-8"
     )
-    with pytest.raises(CanonicalExperimentEvidenceError, match="structured artifact"):
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="deterministic empty figure plan",
+    ):
         validate_experiment_evidence_candidate(root)
 
-    (root / "figure_plan.json").write_text("{}\n", encoding="utf-8")
+    (root / "figure_plan.json").write_text(
+        EMPTY_FIGURE_PLAN_TEXT, encoding="utf-8"
+    )
     for item in identity["artifacts"]:
         if item["role"] == "figure_plan":
-            item["sha256"] = artifact_sha
+            item["sha256"] = figure_plan_sha
     identity_sha = sha256_text(canonical_json_text(identity))
     payload["candidate_id"] = "cand-" + identity_sha
     payload["identity_payload_sha256"] = identity_sha
     for item in payload["artifacts"]:
         if item["role"] == "figure_plan":
-            item["sha256"] = artifact_sha
+            item["sha256"] = figure_plan_sha
     (root / "experiment_evidence_candidate.json").write_text(
         canonical_json_text(payload), encoding="utf-8"
     )

@@ -144,10 +144,12 @@ CONTRACTS: dict[Stage, StageContract] = {
     # Phase F: Analysis & Decision
     Stage.RESULT_ANALYSIS: StageContract(
         stage=Stage.RESULT_ANALYSIS,
-        input_files=("runs/",),
-        output_files=("analysis.md",),
-        dod="Metrics analyzed with statistical tests and conclusions",
+        # The producer must invalidate stale root authority before reading Stage 12/13.
+        input_files=(),
+        output_files=("evidence_candidates/",),
+        dod="Immutable Stage 14 candidate and deterministic root selection replay successfully",
         error_code="E14_ANALYSIS_ERR",
+        max_retries=0,
     ),
     Stage.RESEARCH_DECISION: StageContract(
         stage=Stage.RESEARCH_DECISION,

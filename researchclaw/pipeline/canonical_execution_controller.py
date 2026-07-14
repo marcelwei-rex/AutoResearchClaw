@@ -7,7 +7,9 @@ import fcntl
 import os
 import re
 import secrets
+import shutil
 import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -354,6 +356,122 @@ class CanonicalRefinementController:
         except Exception:
             controller.close()
             raise
+
+    def close(self) -> None:
+        if self._lock_descriptor is None:
+            return
+        fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
+        os.close(self._lock_descriptor)
+        self._lock_descriptor = None
+
+
+class CanonicalAnalysisController:
+    """Own Stage 14 invalidation, candidate staging, and promotion locking."""
+
+    def __init__(self, run_dir: Path, stage_dir: Path, lock_descriptor: int) -> None:
+        self.run_dir = run_dir
+        self.stage_dir = stage_dir
+        self._lock_descriptor: int | None = lock_descriptor
+
+    @classmethod
+    def prepare_generation(
+        cls,
+        run_dir: Path,
+        stage_dir: Path,
+    ) -> CanonicalAnalysisController:
+        controller = cls._acquire(run_dir, stage_dir, "CanonicalAnalysisController.prepare")
+        try:
+            if stage_dir != run_dir / "stage-14":
+                raise RuntimeError("canonical_stage14_directory_mismatch")
+            if stage_dir.is_symlink() or (stage_dir.exists() and not stage_dir.is_dir()):
+                raise RuntimeError("canonical_stage14_directory_unsafe")
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            controller._invalidate_root_authority()
+            for name in (
+                "analysis.md",
+                "experiment_summary.json",
+                "results_table.tex",
+                "figure_plan.json",
+                "figure_plan_final.json",
+                "charts",
+                "perspectives",
+            ):
+                controller._remove_owned_path(stage_dir / name)
+            for path in stage_dir.iterdir():
+                if path.name.startswith((".candidate-staging-", ".candidate-rejected-")):
+                    controller._remove_owned_path(path)
+            candidates = stage_dir / "evidence_candidates"
+            if candidates.is_symlink() or (candidates.exists() and not candidates.is_dir()):
+                raise RuntimeError("canonical_stage14_candidate_collection_unsafe")
+            candidates.mkdir(exist_ok=True)
+            return controller
+        except Exception:
+            controller.close()
+            raise
+
+    @classmethod
+    def acquire_promotion(cls, run_dir: Path) -> CanonicalAnalysisController:
+        return cls._acquire(
+            run_dir,
+            run_dir / "stage-14",
+            "CanonicalAnalysisController.promote",
+        )
+
+    @classmethod
+    def _acquire(
+        cls,
+        run_dir: Path,
+        stage_dir: Path,
+        entrypoint: str,
+    ) -> CanonicalAnalysisController:
+        require_canonical_evidence_capabilities(entrypoint)
+        lock_path = run_dir / ".canonical_experiment_evidence.lock"
+        if lock_path.is_symlink():
+            raise RuntimeError("canonical_evidence_lock_unsafe")
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise RuntimeError("canonical_evidence_lock_unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise RuntimeError("canonical_evidence_generation_locked") from exc
+        return cls(run_dir, stage_dir, descriptor)
+
+    def create_candidate_staging(self) -> Path:
+        if self._lock_descriptor is None:
+            raise RuntimeError("canonical_stage14_controller_closed")
+        raw = tempfile.mkdtemp(prefix=".candidate-staging-", dir=self.stage_dir)
+        staging = Path(raw)
+        if staging.parent != self.stage_dir or staging.is_symlink() or not staging.is_dir():
+            raise RuntimeError("canonical_stage14_staging_unsafe")
+        return staging
+
+    def _invalidate_root_authority(self) -> None:
+        for path in (
+            self.run_dir / "canonical_experiment_evidence.json",
+            self.run_dir / "experiment_summary_best.json",
+            self.run_dir / "analysis_best.md",
+        ):
+            self._remove_owned_path(path, files_only=True)
+
+    @staticmethod
+    def _remove_owned_path(path: Path, *, files_only: bool = False) -> None:
+        if path.is_symlink():
+            path.unlink()
+        elif not path.exists():
+            return
+        elif path.is_file():
+            path.unlink()
+        elif path.is_dir() and not files_only:
+            shutil.rmtree(path)
+        else:
+            raise RuntimeError("canonical_evidence_invalidation_unsafe")
 
     def close(self) -> None:
         if self._lock_descriptor is None:

@@ -272,7 +272,10 @@ class TestNoncriticalStageSkip:
                 stage=stage, status=StageStatus.DONE, artifacts=("ok.md",)
             )
 
-        with patch.object(rc_runner, "execute_stage", side_effect=mock_execute_stage):
+        with (
+            patch.object(rc_runner, "execute_stage", side_effect=mock_execute_stage),
+            patch.object(rc_runner, "_promote_best_stage14", return_value=None),
+        ):
             results = rc_runner.execute_pipeline(
                 run_dir=run_dir,
                 run_id="run-skip-noncritical",
@@ -312,7 +315,10 @@ class TestNoncriticalStageSkip:
                 stage=stage, status=StageStatus.DONE, artifacts=("ok.md",)
             )
 
-        with patch.object(rc_runner, "execute_stage", side_effect=mock_execute_stage):
+        with (
+            patch.object(rc_runner, "execute_stage", side_effect=mock_execute_stage),
+            patch.object(rc_runner, "_promote_best_stage14", return_value=None),
+        ):
             results = rc_runner.execute_pipeline(
                 run_dir=run_dir,
                 run_id="run-fail-critical",

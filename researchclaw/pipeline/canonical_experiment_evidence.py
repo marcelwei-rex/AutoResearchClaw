@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import math
+import os
 import re
+import shutil
+import tempfile
 import tokenize
+import uuid
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
 from io import BytesIO
 from pathlib import Path
@@ -51,6 +56,14 @@ _MANDATORY_CANDIDATE_ROLES = {
     "results_table": "results_table.tex",
     "summary": "experiment_summary.json",
 }
+_FIGURE_AGENT_INTERMEDIATE_NAMES = frozenset(
+    {
+        "figure_decisions.json",
+        "figure_plan_code.json",
+        "figure_plan_final.json",
+        "nano_banana_results.json",
+    }
+)
 
 
 class CanonicalExperimentEvidenceError(ValueError):
@@ -1020,9 +1033,210 @@ def validate_experiment_evidence_candidate(
             raise CanonicalExperimentEvidenceError("candidate artifact contains forbidden identity data")
         if path.suffix.lower() == ".json":
             structured = _parse_json_value(raw.decode("utf-8"), artifact["path"])
+            if artifact["role"] == "figure_plan" and structured != {
+                "schema_version": 1,
+                "generator": "canonical_stage14_v1",
+                "figures": [],
+            }:
+                raise CanonicalExperimentEvidenceError(
+                    "candidate policy v1 requires the deterministic empty figure plan"
+                )
             decoded_forbidden = tuple(token.decode("ascii") for token in forbidden)
             _reject_decoded_identity_strings(structured, decoded_forbidden)
     return payload
+
+
+def load_selected_result_for_analysis(
+    run_dir: Path,
+    config: RCConfig,
+) -> dict[str, Any]:
+    """Replay the selected Stage 12/13 result and expose its bounded analysis input."""
+    selected, upstream, metric_key, direction, metric_value = _derive_selected_result(
+        run_dir, config
+    )
+    if selected["result_set_type"] == "stage12_baseline":
+        execution = parse_aggregate_results(
+            _read_regular_file(
+                run_dir / "stage-12/evidence-v1/results.json",
+                "Stage 12 aggregate results",
+            )
+        )
+    else:
+        chosen = upstream["selected_result"]
+        if chosen["type"] == "baseline":
+            execution = parse_aggregate_results(
+                _read_regular_file(
+                    run_dir / "stage-12/evidence-v1/results.json",
+                    "Stage 12 aggregate results",
+                )
+            )
+        else:
+            iteration = next(
+                item
+                for item in upstream["iterations"]
+                if item["iteration_id"] == chosen["iteration_id"]
+            )
+            execution = parse_invocation_result(
+                _read_regular_file(
+                    run_dir / iteration["initial_execution"]["path"],
+                    "selected Stage 13 execution result",
+                )
+            )
+    if execution["evaluator_schema"] != upstream["evaluator_schema"]:
+        raise CanonicalExperimentEvidenceError("selected analysis evaluator mismatch")
+    observations = execution["metric_observations"].get(metric_key)
+    if not isinstance(observations, list) or not observations:
+        raise CanonicalExperimentEvidenceError("selected analysis metric is missing")
+    if _decimal_mean(observations) != metric_value:
+        raise CanonicalExperimentEvidenceError("selected analysis metric replay mismatch")
+    return {
+        "selected_result": selected,
+        "upstream": upstream,
+        "primary_metric_key": metric_key,
+        "optimization_direction": direction,
+        "primary_metric_value": metric_value,
+        "metric_observations": execution["metric_observations"],
+        "structured_results": execution["structured_results"],
+    }
+
+
+def publish_experiment_evidence_candidate(
+    run_dir: Path,
+    stage_dir: Path,
+    staging_root: Path,
+    config: RCConfig,
+) -> tuple[Path, str, dict[str, Any]]:
+    """Seal, replay, and atomically publish one complete Stage 14 candidate."""
+    if stage_dir != run_dir / "stage-14":
+        raise CanonicalExperimentEvidenceError("canonical Stage 14 directory mismatch")
+    if staging_root.parent != stage_dir or not staging_root.name.startswith(".candidate-staging-"):
+        raise CanonicalExperimentEvidenceError("noncanonical Stage 14 staging directory")
+    if staging_root.is_symlink() or not staging_root.is_dir():
+        raise CanonicalExperimentEvidenceError("Stage 14 staging directory is unsafe")
+
+    selected_data = load_selected_result_for_analysis(run_dir, config)
+    selected = selected_data["selected_result"]
+    upstream = selected_data["upstream"]
+    metric_key = selected_data["primary_metric_key"]
+    direction = selected_data["optimization_direction"]
+    metric_value = selected_data["primary_metric_value"]
+
+    artifacts: list[dict[str, str]] = []
+    mandatory_by_path = {
+        logical_name: role for role, logical_name in _MANDATORY_CANDIDATE_ROLES.items()
+    }
+    for path in sorted(staging_root.rglob("*"), key=lambda item: item.relative_to(staging_root).as_posix()):
+        if path.is_symlink():
+            raise CanonicalExperimentEvidenceError("Stage 14 staging contains a symlink")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise CanonicalExperimentEvidenceError("Stage 14 staging contains a non-regular entry")
+        relative = path.relative_to(staging_root).as_posix()
+        if relative == "experiment_evidence_candidate.json":
+            raise CanonicalExperimentEvidenceError("Stage 14 staging contains a premature manifest")
+        if relative in mandatory_by_path:
+            role = mandatory_by_path[relative]
+        elif relative.startswith("charts/"):
+            role = "chart"
+        else:
+            role = "auxiliary"
+        artifacts.append({"role": role, "path": relative, "sha256": sha256_file(path)})
+    artifacts.sort(key=lambda item: (item["role"], item["path"]))
+    _artifact_list(artifacts, "candidate artifacts", path_field="path")
+
+    identity_artifacts = [
+        {"role": item["role"], "logical_name": item["path"], "sha256": item["sha256"]}
+        for item in artifacts
+    ]
+    identity = {
+        "candidate_identity_policy_version": 1,
+        "selected_result_type": selected["result_set_type"],
+        "selected_result_manifest_sha256": selected["manifest_sha256"],
+        "experiment_contract_sha256": upstream["experiment_contract_sha256"],
+        "config_semantic_sha256": upstream["config_semantic_sha256"],
+        "primary_metric_key": metric_key,
+        "optimization_direction": direction,
+        "artifacts": identity_artifacts,
+    }
+    identity_sha = sha256_text(canonical_json_text(identity))
+    candidate_id = "cand-" + identity_sha
+    payload = {
+        "schema_version": CANDIDATE_SCHEMA_VERSION,
+        "candidate_policy_version": 1,
+        "candidate_id": candidate_id,
+        "identity_payload": identity,
+        "identity_payload_sha256": identity_sha,
+        "selected_result": selected,
+        "experiment_contract_path": upstream["experiment_contract_path"],
+        "experiment_contract_sha256": upstream["experiment_contract_sha256"],
+        "sealed_candidate_manifest_path": upstream["sealed_candidate_manifest_path"],
+        "sealed_candidate_manifest_sha256": upstream["sealed_candidate_manifest_sha256"],
+        "run_config_path": upstream["run_config_path"],
+        "run_config_sha256": upstream["run_config_sha256"],
+        "config_semantic_policy_version": upstream["config_semantic_policy_version"],
+        "config_semantic_sha256": upstream["config_semantic_sha256"],
+        "claim_scope": upstream["claim_scope"],
+        "dataset_origin": upstream["dataset_origin"],
+        "evaluator_schema": upstream["evaluator_schema"],
+        "primary_metric_key": metric_key,
+        "optimization_direction": direction,
+        "primary_metric_value": canonical_decimal(metric_value),
+        "artifacts": artifacts,
+    }
+    candidate_text = canonical_json_text(payload)
+    (staging_root / "experiment_evidence_candidate.json").write_text(
+        candidate_text, encoding="utf-8"
+    )
+    validate_experiment_evidence_candidate(staging_root)
+    if _candidate_summary_metric(staging_root, payload, metric_key) != metric_value:
+        raise CanonicalExperimentEvidenceError("candidate summary primary metric mismatch")
+
+    candidates_root = stage_dir / "evidence_candidates"
+    if candidates_root.is_symlink() or not candidates_root.is_dir():
+        raise CanonicalExperimentEvidenceError("candidate collection is unsafe")
+    destination = candidates_root / candidate_id
+    if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or not destination.is_dir():
+            raise CanonicalExperimentEvidenceError("candidate destination is unsafe")
+        existing_text = _read_regular_file(
+            destination / "experiment_evidence_candidate.json",
+            "existing experiment evidence candidate",
+        )
+        validate_experiment_evidence_candidate(destination)
+        if (
+            existing_text != candidate_text
+            or _candidate_directory_digest(destination) != _candidate_directory_digest(staging_root)
+        ):
+            raise CanonicalExperimentEvidenceError("candidate ID collision during publication")
+        shutil.rmtree(staging_root)
+        return destination, existing_text, payload
+    try:
+        os.replace(staging_root, destination)
+    except OSError as exc:
+        if exc.errno == errno.EXDEV:
+            raise CanonicalExperimentEvidenceError(
+                "cross-device Stage 14 candidate publication is forbidden"
+            ) from exc
+        raise
+    try:
+        published = validate_experiment_evidence_candidate(destination)
+    except Exception:
+        quarantine = stage_dir / f".candidate-rejected-{uuid.uuid4().hex}"
+        try:
+            os.replace(destination, quarantine)
+        except OSError as cleanup_error:
+            raise CanonicalExperimentEvidenceError(
+                "failed to quarantine invalid published Stage 14 candidate"
+            ) from cleanup_error
+        try:
+            shutil.rmtree(quarantine)
+        except OSError:
+            # The atomic move already removed the candidate from the authoritative
+            # collection. A later generation cleans non-authoritative quarantine.
+            pass
+        raise
+    return destination, candidate_text, published
 
 
 def _derive_selected_result(
@@ -1296,6 +1510,129 @@ def validate_canonical_experiment_manifest(
         if source.read_bytes() != canonical.read_bytes() or sha256_file(canonical) != ref["canonical_sha256"]:
             raise CanonicalExperimentEvidenceError(f"{field} compatibility copy mismatch")
     return payload
+
+
+def publish_canonical_experiment_manifest(
+    run_dir: Path,
+    config: RCConfig,
+) -> dict[str, Any]:
+    """Deterministically select Stage 14 evidence and publish the root pointer last."""
+    selected, upstream, metric_key, direction, metric_value = _derive_selected_result(
+        run_dir, config
+    )
+    winner_path, candidate_text, candidate = _select_canonical_candidate(
+        run_dir,
+        selected_result=selected,
+        upstream=upstream,
+        primary_metric_key=metric_key,
+        optimization_direction=direction,
+        metric_value=metric_value,
+    )
+    artifact_map = {item["role"]: item for item in candidate["artifacts"]}
+    summary_source = _require_regular_path(
+        winner_path.parent / artifact_map["summary"]["path"],
+        "selected candidate summary",
+    )
+    analysis_source = _require_regular_path(
+        winner_path.parent / artifact_map["analysis"]["path"],
+        "selected candidate analysis",
+    )
+    winner_relative = winner_path.relative_to(run_dir).as_posix()
+    summary_relative = summary_source.relative_to(run_dir).as_posix()
+    analysis_relative = analysis_source.relative_to(run_dir).as_posix()
+    payload = {
+        "schema_version": CANONICAL_MANIFEST_SCHEMA_VERSION,
+        "selection_policy_version": 1,
+        "selected_result": selected,
+        "experiment_contract_path": upstream["experiment_contract_path"],
+        "experiment_contract_sha256": upstream["experiment_contract_sha256"],
+        "sealed_candidate_manifest_path": upstream["sealed_candidate_manifest_path"],
+        "sealed_candidate_manifest_sha256": upstream["sealed_candidate_manifest_sha256"],
+        "run_config_path": upstream["run_config_path"],
+        "run_config_sha256": upstream["run_config_sha256"],
+        "config_semantic_policy_version": upstream["config_semantic_policy_version"],
+        "config_semantic_sha256": upstream["config_semantic_sha256"],
+        "claim_scope": upstream["claim_scope"],
+        "dataset_origin": upstream["dataset_origin"],
+        "evaluator_schema": upstream["evaluator_schema"],
+        "primary_metric": metric_key,
+        "optimization_direction": direction,
+        "selected_candidate": {
+            "candidate_id": candidate["candidate_id"],
+            "path": winner_relative,
+            "sha256": sha256_text(candidate_text),
+        },
+        "selected_summary": {
+            "source_path": summary_relative,
+            "source_sha256": artifact_map["summary"]["sha256"],
+            "canonical_path": "experiment_summary_best.json",
+            "canonical_sha256": artifact_map["summary"]["sha256"],
+        },
+        "selected_analysis": {
+            "source_path": analysis_relative,
+            "source_sha256": artifact_map["analysis"]["sha256"],
+            "canonical_path": "analysis_best.md",
+            "canonical_sha256": artifact_map["analysis"]["sha256"],
+        },
+    }
+    manifest_text = canonical_json_text(payload)
+    parse_canonical_experiment_manifest(manifest_text)
+
+    destinations = {
+        "summary": run_dir / "experiment_summary_best.json",
+        "analysis": run_dir / "analysis_best.md",
+        "manifest": run_dir / "canonical_experiment_evidence.json",
+    }
+    for path in destinations.values():
+        if path.exists() and not path.is_symlink() and not path.is_file():
+            raise CanonicalExperimentEvidenceError("canonical publication destination is unsafe")
+    temporary: dict[str, Path] = {}
+    try:
+        temporary["summary"] = _write_publication_temp(
+            run_dir, ".experiment-summary-", summary_source.read_bytes()
+        )
+        temporary["analysis"] = _write_publication_temp(
+            run_dir, ".analysis-", analysis_source.read_bytes()
+        )
+        temporary["manifest"] = _write_publication_temp(
+            run_dir, ".canonical-manifest-", manifest_text.encode("utf-8")
+        )
+        root_manifest = destinations["manifest"]
+        if root_manifest.exists() or root_manifest.is_symlink():
+            root_manifest.unlink()
+        os.replace(temporary.pop("summary"), destinations["summary"])
+        os.replace(temporary.pop("analysis"), destinations["analysis"])
+        os.replace(temporary.pop("manifest"), root_manifest)
+        try:
+            return validate_canonical_experiment_manifest(run_dir, config)
+        except Exception:
+            if root_manifest.exists() or root_manifest.is_symlink():
+                root_manifest.unlink()
+            raise
+    finally:
+        for path in temporary.values():
+            if path.exists() or path.is_symlink():
+                path.unlink()
+
+
+def _write_publication_temp(run_dir: Path, prefix: str, payload: bytes) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=run_dir)
+    path = Path(raw_path)
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("canonical publication write made no progress")
+            offset += written
+        os.fsync(descriptor)
+    except Exception:
+        os.close(descriptor)
+        if path.exists():
+            path.unlink()
+        raise
+    os.close(descriptor)
+    return path
 
 
 def _resolve_full_config_identity(run_dir: Path, config: RCConfig) -> tuple[str, str, str]:
@@ -1729,12 +2066,25 @@ def _artifact_list(value: object, label: str, *, path_field: str) -> list[dict[s
             path = item[path_field]
             if role in _MANDATORY_CANDIDATE_ROLES:
                 continue
-            if role == "chart" and path.startswith("charts/"):
-                continue
-            if role == "auxiliary" and not path.startswith("charts/"):
+            if role == "auxiliary" and not _candidate_policy_v1_forbids_artifact(path):
                 continue
             raise CanonicalExperimentEvidenceError("invalid candidate auxiliary role/path")
     return result
+
+
+def _candidate_policy_v1_forbids_artifact(path: str) -> bool:
+    """Reject FigureAgent output outside the sole canonical empty figure plan."""
+    if "charts" in Path(path).parts:
+        return True
+    name = Path(path).name
+    if name in _FIGURE_AGENT_INTERMEDIATE_NAMES:
+        return True
+    if name.startswith("figure_plan") and path != "figure_plan.json":
+        return True
+    return (
+        name.endswith(".json")
+        and (name.startswith("scripts_") or name.startswith("reviews_"))
+    )
 
 
 def _metric_observations(value: object) -> dict[str, list[int | float | Decimal]]:

@@ -1808,204 +1808,38 @@ class TestHypothesisGenDebate:
 
 
 class TestResultAnalysisDebate:
-    def test_result_analysis_with_llm_creates_perspectives(
-        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
+    def test_result_analysis_rejects_legacy_run_inputs(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        run_dir = tmp_path / "run"
-        run_dir.mkdir()
-        stage_dir = run_dir / "stage-14"
-        stage_dir.mkdir(parents=True)
-        _write_prior_artifact(run_dir, 1, "goal.md", "# Goal\nTest")
-        _write_prior_artifact(run_dir, 8, "hypotheses.md", "# H1\nTest")
-        fake_llm = FakeLLMClient("## Analysis\nResults look good.")
-        result = rc_executor._execute_result_analysis(
-            stage_dir, run_dir, rc_config, adapters, llm=fake_llm
-        )
-        assert result.status == StageStatus.DONE
-        assert "analysis.md" in result.artifacts
-        perspectives_dir = stage_dir / "perspectives"
-        assert perspectives_dir.exists()
-        # Should have 3 perspective files (optimist, skeptic, methodologist)
-        perspective_files = list(perspectives_dir.glob("*.md"))
-        assert len(perspective_files) == 3
+        from researchclaw.pipeline import canonical_evidence_capabilities as capabilities
 
-    def test_result_analysis_without_llm_no_perspectives(
-        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
-    ) -> None:
-        run_dir = tmp_path / "run"
-        run_dir.mkdir()
-        stage_dir = run_dir / "stage-14"
-        stage_dir.mkdir(parents=True)
-        result = rc_executor._execute_result_analysis(
-            stage_dir, run_dir, rc_config, adapters, llm=None
+        monkeypatch.setattr(
+            capabilities,
+            "CANONICAL_EVIDENCE_CAPABILITIES",
+            {name: 1 for name in capabilities.REQUIRED_CAPABILITIES},
         )
-        assert result.status == StageStatus.DONE
-        assert "analysis.md" in result.artifacts
-        assert not (stage_dir / "perspectives").exists()
-
-    def test_result_analysis_ignores_rejected_refinement_metrics(
-        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
-    ) -> None:
         run_dir = tmp_path / "run"
-        run_dir.mkdir()
-        stage12_runs = run_dir / "stage-12" / "runs"
-        stage12_runs.mkdir(parents=True)
-        (stage12_runs / "run-1.json").write_text(
-            json.dumps(
-                {
-                    "run_id": "run-1",
-                    "status": "completed",
-                    "metrics": {"detection_f1": 0.5},
-                }
-            ),
-            encoding="utf-8",
-        )
-        refine_dir = run_dir / "stage-13"
-        refine_dir.mkdir(parents=True)
-        (refine_dir / "refinement_log.json").write_text(
-            json.dumps(
-                {
-                    "best_version": "experiment/",
-                    "best_metric": 0.5,
-                    "iterations": [
-                        {
-                            "iteration": 1,
-                            "version_dir": "experiment_v1/",
-                            "metric": None,
-                            "sandbox": {
-                                "returncode": 0,
-                                "metrics": {"detection_f1": 0.99},
-                            },
-                            "sandbox_after_fix": {
-                                "returncode": 1,
-                                "metrics": {},
-                            },
-                        }
-                    ],
-                }
-            ),
+        legacy_runs = run_dir / "stage-12/runs"
+        legacy_runs.mkdir(parents=True)
+        (legacy_runs / "run-1.json").write_text(
+            json.dumps({"status": "completed", "metrics": {"detection_f1": 0.99}}),
             encoding="utf-8",
         )
         stage_dir = run_dir / "stage-14"
-        stage_dir.mkdir(parents=True)
+        stage_dir.mkdir()
 
         result = rc_executor._execute_result_analysis(
             stage_dir, run_dir, rc_config, adapters, llm=None
         )
 
-        assert result.status == StageStatus.DONE
-        summary = json.loads((stage_dir / "experiment_summary.json").read_text())
-        assert summary["metrics_summary"]["detection_f1"]["mean"] == 0.5
-        assert summary["best_run"]["run_id"] == "run-1"
+        assert result.status == StageStatus.FAILED
+        assert "Stage 12 result set is missing" in (result.error or "")
+        assert not (run_dir / "canonical_experiment_evidence.json").exists()
 
-    def test_result_analysis_rejects_runtime_issue_without_fix_metrics(
-        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
-    ) -> None:
-        run_dir = tmp_path / "run"
-        run_dir.mkdir()
-        stage12_runs = run_dir / "stage-12" / "runs"
-        stage12_runs.mkdir(parents=True)
-        (stage12_runs / "run-1.json").write_text(
-            json.dumps(
-                {
-                    "run_id": "run-1",
-                    "status": "completed",
-                    "metrics": {"detection_f1": 0.5},
-                }
-            ),
-            encoding="utf-8",
-        )
-        refine_dir = run_dir / "stage-13"
-        refine_dir.mkdir(parents=True)
-        (refine_dir / "refinement_log.json").write_text(
-            json.dumps(
-                {
-                    "best_version": "experiment_v1/",
-                    "best_metric": 0.99,
-                    "iterations": [
-                        {
-                            "iteration": 1,
-                            "version_dir": "experiment_v1/",
-                            "metric": 0.99,
-                            "runtime_issues": "DUMMY metric values detected",
-                            "sandbox": {
-                                "returncode": 0,
-                                "metrics": {"detection_f1": 0.99},
-                            },
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-        stage_dir = run_dir / "stage-14"
-        stage_dir.mkdir(parents=True)
-
-        result = rc_executor._execute_result_analysis(
-            stage_dir, run_dir, rc_config, adapters, llm=None
-        )
-
-        assert result.status == StageStatus.DONE
-        summary = json.loads((stage_dir / "experiment_summary.json").read_text())
-        assert summary["metrics_summary"]["detection_f1"]["mean"] == 0.5
-        assert summary["best_run"]["run_id"] == "run-1"
-
-    def test_result_analysis_accepts_successfully_repaired_metrics(
-        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
-    ) -> None:
-        run_dir = tmp_path / "run"
-        run_dir.mkdir()
-        stage12_runs = run_dir / "stage-12" / "runs"
-        stage12_runs.mkdir(parents=True)
-        (stage12_runs / "run-1.json").write_text(
-            json.dumps(
-                {
-                    "run_id": "run-1",
-                    "status": "completed",
-                    "metrics": {"detection_f1": 0.5},
-                }
-            ),
-            encoding="utf-8",
-        )
-        refine_dir = run_dir / "stage-13"
-        refine_dir.mkdir(parents=True)
-        (refine_dir / "refinement_log.json").write_text(
-            json.dumps(
-                {
-                    "best_version": "experiment_v1/",
-                    "best_metric": 0.75,
-                    "iterations": [
-                        {
-                            "iteration": 1,
-                            "version_dir": "experiment_v1/",
-                            "metric": 0.75,
-                            "runtime_issues": "DUMMY metric values detected",
-                            "runtime_unresolved": False,
-                            "sandbox": {
-                                "returncode": 0,
-                                "metrics": {"detection_f1": 0.99},
-                            },
-                            "sandbox_after_fix": {
-                                "returncode": 0,
-                                "metrics": {"detection_f1": 0.75},
-                            },
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-        stage_dir = run_dir / "stage-14"
-        stage_dir.mkdir(parents=True)
-
-        result = rc_executor._execute_result_analysis(
-            stage_dir, run_dir, rc_config, adapters, llm=None
-        )
-
-        assert result.status == StageStatus.DONE
-        summary = json.loads((stage_dir / "experiment_summary.json").read_text())
-        assert summary["metrics_summary"]["detection_f1"]["mean"] == 0.75
-        assert summary["best_run"]["run_id"] == "iterative-refine-best"
 
     def test_release_audit_json_repair_handles_markdown_fence(self) -> None:
         data = release_audit._loads_json_repaired(

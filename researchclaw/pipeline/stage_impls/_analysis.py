@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -14,16 +16,21 @@ from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._domain import _detect_domain, _is_ml_domain
 from researchclaw.pipeline._helpers import (
     StageResult,
-    _build_context_preamble,
     _chat_with_prompt,
-    _collect_experiment_results,
-    _collect_json_context,
     _get_pipeline_evolution_overlay,
     _multi_perspective_generate,
     _read_prior_artifact,
     _safe_json_loads,
     _synthesize_perspectives,
     _utcnow_iso,
+)
+from researchclaw.pipeline.canonical_execution_controller import CanonicalAnalysisController
+from researchclaw.pipeline.canonical_experiment_evidence import (
+    canonical_authority_json_text,
+    canonical_decimal,
+    load_selected_result_for_analysis,
+    publish_canonical_experiment_manifest,
+    publish_experiment_evidence_candidate,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
@@ -40,213 +47,137 @@ def _execute_result_analysis(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
-    # --- Collect experiment data ---
-    exp_data = _collect_experiment_results(
-        run_dir,
-        metric_key=config.experiment.metric_key,
-        metric_direction=config.experiment.metric_direction,
-    )
-    runs_dir = _read_prior_artifact(run_dir, "runs/") or ""
-    context = ""
-    if runs_dir:
-        context = _collect_json_context(Path(runs_dir), max_files=30)
+    controller: CanonicalAnalysisController | None = None
+    staging: Path | None = None
+    try:
+        controller = CanonicalAnalysisController.prepare_generation(run_dir, stage_dir)
+        staging = controller.create_candidate_staging()
+        rendered = _render_result_analysis_candidate(
+            staging,
+            run_dir,
+            config,
+            adapters,
+            llm=llm,
+            prompts=prompts,
+        )
+        if rendered.status is not StageStatus.DONE:
+            return rendered
+        _ensure_candidate_support_artifacts(staging)
+        _remove_empty_candidate_directories(staging)
+        candidate_root, _candidate_text, candidate = publish_experiment_evidence_candidate(
+            run_dir, stage_dir, staging, config
+        )
+        staging = None
+        publish_canonical_experiment_manifest(run_dir, config)
+        candidate_manifest = (
+            candidate_root / "experiment_evidence_candidate.json"
+        ).relative_to(stage_dir).as_posix()
+        return StageResult(
+            stage=Stage.RESULT_ANALYSIS,
+            status=StageStatus.DONE,
+            artifacts=(candidate_manifest,),
+            evidence_refs=(
+                (candidate_root / "experiment_evidence_candidate.json")
+                .relative_to(run_dir)
+                .as_posix(),
+                "canonical_experiment_evidence.json",
+            ),
+            decision=f"canonical_candidate:{candidate['candidate_id']}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return StageResult(
+            stage=Stage.RESULT_ANALYSIS,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Canonical Stage 14 publication failed: {exc}",
+        )
+    finally:
+        if staging is not None and (staging.exists() or staging.is_symlink()):
+            if staging.is_symlink():
+                staging.unlink()
+            elif staging.is_dir():
+                shutil.rmtree(staging)
+        if controller is not None:
+            controller.close()
 
-    # --- R13-1: Merge Stage 13 (ITERATIVE_REFINE) results if available ---
-    # Stage 13 stores richer per-condition metrics in refinement_log.json
-    # that _collect_experiment_results() misses (it only scans runs/ dirs).
-    _refine_log_text = _read_prior_artifact(run_dir, "refinement_log.json")
-    if _refine_log_text:
-        try:
-            _refine_data = json.loads(_refine_log_text)
-            _best_iter = None
-            _best_ver = _refine_data.get("best_version", "")
 
-            def _get_valid_sandbox(it: dict) -> dict:
-                """Return the sandbox metrics only if Stage 13 accepted them.
+def _canonical_analysis_inputs(
+    run_dir: Path,
+    config: RCConfig,
+) -> tuple[dict[str, Any], str]:
+    selected = load_selected_result_for_analysis(run_dir, config)
+    structured = selected["structured_results"]
+    metrics = structured.get("metrics")
+    if not isinstance(metrics, dict) or not metrics:
+        raise ValueError("selected evaluator result has no metrics")
+    primary_key = selected["primary_metric_key"]
+    primary_value = selected["primary_metric_value"]
+    metrics_summary: dict[str, dict[str, object]] = {}
+    per_seed = structured.get("per_seed")
+    for key in sorted(metrics):
+        value = Decimal(canonical_decimal(metrics[key]))
+        observations: list[Decimal] = []
+        if isinstance(per_seed, list):
+            for record in per_seed:
+                record_metrics = record.get("metrics") if isinstance(record, dict) else None
+                if isinstance(record_metrics, dict) and key in record_metrics:
+                    observations.append(Decimal(canonical_decimal(record_metrics[key])))
+        if not observations:
+            observations = [value]
+        mean = primary_value if key == primary_key else value
+        metrics_summary[key] = {
+            "min": min(observations),
+            "max": max(observations),
+            "mean": mean,
+            "count": len(observations),
+        }
+    best_run = {
+        "run_id": selected["selected_result"]["result_set_type"],
+        "task_id": "canonical-evaluator",
+        "status": "completed",
+        "metrics": metrics,
+        "elapsed_sec": structured.get("runtime_sec", 0),
+        "timed_out": False,
+    }
+    table = [
+        r"\begin{table}[h]",
+        r"\centering",
+        r"\caption{Canonical Experiment Results}",
+        r"\begin{tabular}{lrrrr}",
+        r"\hline",
+        r"Metric & Min & Max & Mean & N \\",
+        r"\hline",
+    ]
+    for key, summary in metrics_summary.items():
+        table.append(
+            f"{key} & {canonical_decimal(summary['min'])} & "
+            f"{canonical_decimal(summary['max'])} & "
+            f"{canonical_decimal(summary['mean'])} & {summary['count']} \\\\"
+        )
+    table.extend([r"\hline", r"\end{tabular}", r"\end{table}"])
+    exp_data = {
+        "metrics_summary": metrics_summary,
+        "runs": [best_run],
+        "best_run": best_run,
+        "latex_table": "\n".join(table),
+        "paired_comparisons": [],
+        "structured_results": structured,
+    }
+    return exp_data, canonical_authority_json_text(structured)
 
-                Stage 13 can log metrics from an initial run and then reject the
-                same candidate after runtime repair fails. Stage 14 must not
-                resurrect those rejected metrics as the canonical summary.
-                """
-                if it.get("metric") is None:
-                    return {}
-                has_runtime_issues = bool(it.get("runtime_issues"))
-                if it.get("runtime_unresolved") is True:
-                    return {}
-                sbx_fix_raw = it.get("sandbox_after_fix")
-                if has_runtime_issues:
-                    if not isinstance(sbx_fix_raw, dict) or sbx_fix_raw.get("returncode") != 0:
-                        return {}
-                    sandbox_keys = ("sandbox_after_fix",)
-                else:
-                    if isinstance(sbx_fix_raw, dict) and sbx_fix_raw.get("returncode") != 0:
-                        return {}
-                    sandbox_keys = ("sandbox_after_fix", "sandbox")
-                for key in sandbox_keys:
-                    sbx = it.get(key, {})
-                    if (
-                        isinstance(sbx, dict)
-                        and sbx.get("returncode") == 0
-                        and isinstance(sbx.get("metrics"), dict)
-                        and sbx.get("metrics")
-                    ):
-                        return sbx
-                return {}
 
-            # If Stage 13 fell back to the baseline experiment/, keep Stage 12
-            # as the canonical source. Only merge a refinement version that was
-            # explicitly selected by Stage 13 and has accepted runtime metrics.
-            if _best_ver and _best_ver != "experiment/":
-                for _it in _refine_data.get("iterations", []):
-                    _sbx = _get_valid_sandbox(_it)
-                    _it_metrics = _sbx.get("metrics", {})
-                    if _it.get("version_dir", "") == _best_ver and _it_metrics:
-                        _best_iter = _it
-                        break
-            if _best_iter is not None:
-                _sbx = _get_valid_sandbox(_best_iter)
-                _refine_metrics = _sbx.get("metrics", {})
-                # BUG-165 fix: Prefer Stage 13 refinement data when it is
-                # actually better.  The old `or True` unconditionally
-                # replaced existing data, causing catastrophic regressions
-                # (BUG-205: v1=78.93% destroyed by v3=8.65%).
-                _refine_is_better = not exp_data["metrics_summary"]
-                if not _refine_is_better and _refine_metrics:
-                    # Compare primary_metric values to decide
-                    _mkey = config.experiment.metric_key or "primary_metric"
-                    _mdir = config.experiment.metric_direction or "maximize"
-                    _existing_pm: float | None = None
-                    _refine_pm: float | None = None
-                    # BUG-214: Use exact match first, then substring fallback
-                    # to avoid "accuracy" matching "balanced_accuracy".
-                    _ms_items = list((exp_data.get("metrics_summary") or {}).items())
-                    for _k, _v in _ms_items:
-                        if _k == _mkey:
-                            try:
-                                _existing_pm = float(_v["mean"] if isinstance(_v, dict) else _v)
-                            except (TypeError, ValueError, KeyError):
-                                pass
-                            break
-                    else:
-                        for _k, _v in _ms_items:
-                            if _mkey in _k:
-                                try:
-                                    _existing_pm = float(_v["mean"] if isinstance(_v, dict) else _v)
-                                except (TypeError, ValueError, KeyError):
-                                    pass
-                                break
-                    _refine_items = list(_refine_metrics.items())
-                    for _k, _v in _refine_items:
-                        if _k == _mkey:
-                            try:
-                                _refine_pm = float(_v)
-                            except (TypeError, ValueError):
-                                pass
-                            break
-                    else:
-                        for _k, _v in _refine_items:
-                            if _mkey in _k:
-                                try:
-                                    _refine_pm = float(_v)
-                                except (TypeError, ValueError):
-                                    pass
-                                break
-                    if _existing_pm is None:
-                        _refine_is_better = True  # no existing data
-                    elif _refine_pm is not None:
-                        if _mdir == "maximize":
-                            _refine_is_better = _refine_pm > _existing_pm
-                        else:
-                            _refine_is_better = _refine_pm < _existing_pm
-                    logger.info(
-                        "Stage 14: Refine metric comparison: existing=%s, refine=%s, "
-                        "direction=%s → refine_is_better=%s",
-                        _existing_pm, _refine_pm, _mdir, _refine_is_better,
-                    )
-                if _refine_metrics and _refine_is_better:
-                    # Refinement has richer data — rebuild metrics_summary from it
-                    _new_summary: dict[str, dict[str, float | None]] = {}
-                    for _mk, _mv in _refine_metrics.items():
-                        try:
-                            _fv = float(_mv)
-                            _new_summary[_mk] = {
-                                "min": round(_fv, 6),
-                                "max": round(_fv, 6),
-                                "mean": round(_fv, 6),
-                                "count": 1,
-                            }
-                        except (ValueError, TypeError):
-                            pass
-                    if _new_summary:
-                        exp_data["metrics_summary"] = _new_summary
-                        # Also update best_run with refinement data
-                        exp_data["best_run"] = {
-                            "run_id": "iterative-refine-best",
-                            "task_id": "sandbox-main",
-                            "status": "completed",
-                            "metrics": {
-                                k: v for k, v in _refine_metrics.items()
-                            },
-                            "elapsed_sec": _sbx.get("elapsed_sec", 0),
-                            "stdout": "",  # omit for brevity
-                            "stderr": _sbx.get("stderr", ""),
-                            "timed_out": _sbx.get("timed_out", False),
-                        }
-                        # Rebuild latex table
-                        _ltx = [
-                            r"\begin{table}[h]", r"\centering",
-                            r"\caption{Experiment Results (Best Refinement Iteration)}",
-                            r"\begin{tabular}{lrrrr}", r"\hline",
-                            r"Metric & Min & Max & Mean & N \\", r"\hline",
-                        ]
-                        for _col in sorted(_new_summary.keys()):
-                            _s = _new_summary[_col]
-                            _ltx.append(
-                                f"{_col} & {_s['min']:.4f} & {_s['max']:.4f} "
-                                f"& {_s['mean']:.4f} & {_s['count']} \\\\"
-                            )
-                        _ltx.extend([r"\hline", r"\end{tabular}", r"\end{table}"])
-                        exp_data["latex_table"] = "\n".join(_ltx)
-                        # Count unique conditions (keys without 'seed' and not ending in _mean/_std)
-                        _conditions = {
-                            k for k in _refine_metrics
-                            if "seed" not in k and not k.endswith("_std")
-                        }
-                        exp_data["runs"] = [exp_data["best_run"]]
-                        # Store condition count for accurate reporting
-                        exp_data["best_run"]["condition_count"] = len(_conditions)
-                        if not context:
-                            context = json.dumps(
-                                {"refinement_best_metrics": _refine_metrics},
-                                indent=2, default=str,
-                            )
-                        _bm_val = _refine_data.get("best_metric")
-                        logger.info(
-                            "R13-1: Merged %d metrics from refinement_log (best_metric=%.4f)",
-                            len(_refine_metrics),
-                            float(_bm_val) if isinstance(_bm_val, (int, float)) else 0.0,
-                        )
-        except (json.JSONDecodeError, OSError, KeyError):
-            logger.warning("R13-1: Failed to parse refinement_log.json, using Stage 12 data")
-
-    # --- R19-2: Extract PAIRED comparisons from refinement stdout ---
-    from researchclaw.experiment.sandbox import extract_paired_comparisons as _extract_paired
-
+def _render_result_analysis_candidate(
+    stage_dir: Path,
+    run_dir: Path,
+    config: RCConfig,
+    adapters: AdapterBundle,
+    *,
+    llm: LLMClient | None = None,
+    prompts: PromptManager | None = None,
+) -> StageResult:
+    exp_data, context = _canonical_analysis_inputs(run_dir, config)
+    _refine_log_text = ""
     _all_paired: list[dict[str, object]] = []
-    # First: from _collect_experiment_results (Stage 12 runs/)
-    if exp_data.get("paired_comparisons"):
-        _all_paired.extend(exp_data["paired_comparisons"])
-    # Second: from refinement_log iterations (Stage 13)
-    if _refine_log_text:
-        try:
-            _rl = json.loads(_refine_log_text)
-            for _it in _rl.get("iterations", []):
-                for _sbx_key in ("sandbox", "sandbox_after_fix"):
-                    _sbx_stdout = (_it.get(_sbx_key) or {}).get("stdout", "")
-                    if _sbx_stdout:
-                        _all_paired.extend(_extract_paired(_sbx_stdout))
-        except (json.JSONDecodeError, OSError):
-            pass
 
     # --- R19-3: Build structured condition_summaries from metrics ---
     _condition_summaries: dict[str, dict[str, Any]] = {}
@@ -527,7 +458,6 @@ def _execute_result_analysis(
         "total_runs": len(exp_data["runs"]),
         "best_run": exp_data["best_run"],
         "latex_table": exp_data["latex_table"],
-        "generated": _utcnow_iso(),
     }
     if _seed_insufficiency_warnings:
         summary_payload["seed_insufficiency_warnings"] = _seed_insufficiency_warnings
@@ -569,7 +499,8 @@ def _execute_result_analysis(
     if _total_metrics:
         summary_payload["total_metric_keys"] = _total_metrics
     (stage_dir / "experiment_summary.json").write_text(
-        json.dumps(summary_payload, indent=2, default=str), encoding="utf-8"
+        canonical_authority_json_text(_authority_ready(summary_payload)),
+        encoding="utf-8",
     )
     if exp_data["latex_table"]:
         (stage_dir / "results_table.tex").write_text(
@@ -577,9 +508,7 @@ def _execute_result_analysis(
         )
 
     # --- Build data-augmented prompt ---
-    preamble = _build_context_preamble(
-        config, run_dir, include_goal=True, include_hypotheses=True
-    )
+    preamble = f"Research topic: {config.research.topic}"
     data_context = ""
     if exp_data["metrics_summary"]:
         lines = ["\n## Quantitative Results"]
@@ -663,8 +592,6 @@ def _execute_result_analysis(
 
 ## Conclusion
 - Proceed to decision stage with moderate confidence.
-
-Generated: {_utcnow_iso()}
 """
     (stage_dir / "analysis.md").write_text(analysis, encoding="utf-8")
 
@@ -672,101 +599,9 @@ Generated: {_utcnow_iso()}
     if (stage_dir / "results_table.tex").exists():
         artifacts.append("results_table.tex")
 
-    # IMP-6 + FA: Generate charts early (Stage 14) so paper draft can reference them
-    # Try FigureAgent first (multi-agent intelligent charts), fall back to visualize.py
-    _figure_plan_saved = False
-    if config.experiment.figure_agent.enabled and llm is not None:
-        try:
-            from researchclaw.agents.figure_agent import FigureOrchestrator
-            from researchclaw.agents.figure_agent.orchestrator import FigureAgentConfig as _FACfg
-
-            _fa_cfg = _FACfg(
-                enabled=True,
-                min_figures=config.experiment.figure_agent.min_figures,
-                max_figures=config.experiment.figure_agent.max_figures,
-                max_iterations=config.experiment.figure_agent.max_iterations,
-                render_timeout_sec=config.experiment.figure_agent.render_timeout_sec,
-                use_docker=config.experiment.figure_agent.use_docker,
-                docker_image=config.experiment.figure_agent.docker_image,
-                output_format=config.experiment.figure_agent.output_format,
-                gemini_api_key=config.experiment.figure_agent.gemini_api_key,
-                gemini_model=config.experiment.figure_agent.gemini_model,
-                nano_banana_enabled=config.experiment.figure_agent.nano_banana_enabled,
-                strict_mode=config.experiment.figure_agent.strict_mode,
-                dpi=config.experiment.figure_agent.dpi,
-            )
-            _fa = FigureOrchestrator(llm, _fa_cfg, stage_dir=stage_dir)
-
-            # Build conditions list from condition_summaries
-            _fa_conditions = list(_condition_summaries.keys()) if _condition_summaries else []
-
-            # BUG-09 fix: pass best_run metrics as fallback data if
-            # structured_results is empty, so Planner has some data to chart
-            _fa_exp_results = exp_data.get("structured_results", {})
-            if not _fa_exp_results and _best_metrics:
-                _fa_exp_results = {"best_run_metrics": _best_metrics}
-
-            # Read paper draft for Decision Agent analysis
-            _paper_draft = (
-                _read_prior_artifact(run_dir, "paper_draft.md")
-                or _read_prior_artifact(run_dir, "outline.md")
-                or ""
-            )
-
-            _fa_plan = _fa.orchestrate({
-                "experiment_results": _fa_exp_results,
-                "condition_summaries": _condition_summaries,
-                "metrics_summary": exp_data.get("metrics_summary", {}),
-                "metric_key": config.experiment.metric_key,
-                "conditions": _fa_conditions,
-                "topic": _read_prior_artifact(run_dir, "topic.md") or config.research.topic,
-                "hypothesis": _read_prior_artifact(run_dir, "hypotheses.md") or "",
-                "paper_draft": _paper_draft,
-                "output_dir": str(stage_dir / "charts"),
-            })
-
-            if _fa_plan.figure_count > 0:
-                # Save figure plan for Stage 17 to read
-                (stage_dir / "figure_plan.json").write_text(
-                    json.dumps(_fa_plan.to_dict(), indent=2, default=str),
-                    encoding="utf-8",
-                )
-                _figure_plan_saved = True
-                for _cf_name in _fa_plan.get_chart_files():
-                    artifacts.append(f"charts/{_cf_name}")
-                logger.info(
-                    "Stage 14: FigureAgent generated %d charts (%d passed review, %.1fs)",
-                    _fa_plan.figure_count,
-                    _fa_plan.passed_count,
-                    _fa_plan.elapsed_sec,
-                )
-            else:
-                logger.warning("Stage 14: FigureAgent produced no charts, falling back")
-        except Exception as _fa_exc:
-            logger.warning("Stage 14: FigureAgent failed (%s), falling back to visualize.py", _fa_exc)
-
-    # Fallback: legacy visualize.py chart generation
-    if not _figure_plan_saved:
-        try:
-            from researchclaw.experiment.visualize import (
-                generate_all_charts as _gen_charts_early,
-            )
-
-            _charts_dir = stage_dir / "charts"
-            _early_charts = _gen_charts_early(
-                run_dir,
-                _charts_dir,
-                metric_key=config.experiment.metric_key,
-            )
-            if _early_charts:
-                for _cp in _early_charts:
-                    artifacts.append(f"charts/{_cp.name}")
-                logger.info(
-                    "Stage 14: Generated %d early charts (legacy) for paper embedding",
-                    len(_early_charts),
-                )
-        except Exception as _chart_exc:
-            logger.warning("Stage 14: Early chart generation failed: %s", _chart_exc)
+    # Candidate policy v1 deliberately disables FigureAgent. Its current renderer can
+    # execute untrusted code locally and its manifests contain staging paths and timing.
+    # A deterministic empty plan is the only authoritative figure state in C1.
 
     return StageResult(
         stage=Stage.RESULT_ANALYSIS,
@@ -774,6 +609,50 @@ Generated: {_utcnow_iso()}
         artifacts=tuple(artifacts),
         evidence_refs=tuple(f"stage-14/{a}" for a in artifacts),
     )
+
+
+def _authority_ready(value: object) -> object:
+    """Convert derived binary floats to deterministic JSON Decimal values."""
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {str(key): _authority_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_authority_ready(item) for item in value]
+    return value
+
+
+def _ensure_candidate_support_artifacts(staging: Path) -> None:
+    for name in ("analysis.md", "experiment_summary.json", "results_table.tex"):
+        path = staging / name
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"Stage 14 candidate is missing mandatory artifact: {name}")
+    figure_plan = staging / "figure_plan.json"
+    if figure_plan.exists() or figure_plan.is_symlink():
+        raise RuntimeError("Stage 14 policy v1 forbids producer-supplied figure plans")
+    charts_root = staging / "charts"
+    if charts_root.is_symlink() or (
+        charts_root.exists()
+        and (not charts_root.is_dir() or any(charts_root.iterdir()))
+    ):
+        raise RuntimeError("Stage 14 policy v1 forbids producer-supplied charts")
+    plan = {
+        "schema_version": 1,
+        "generator": "canonical_stage14_v1",
+        "figures": [],
+    }
+    figure_plan.write_text(canonical_authority_json_text(plan), encoding="utf-8")
+
+
+def _remove_empty_candidate_directories(staging: Path) -> None:
+    directories = sorted(
+        (path for path in staging.rglob("*") if path.is_dir() and not path.is_symlink()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for path in directories:
+        if not any(path.iterdir()):
+            path.rmdir()
 
 
 def _parse_decision(text: str) -> str | None:

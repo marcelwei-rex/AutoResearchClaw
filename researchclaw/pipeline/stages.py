@@ -135,6 +135,9 @@ SKIP_FORBIDDEN_STAGES: frozenset[Stage] = frozenset(
         Stage.LITERATURE_COLLECT,
         Stage.LITERATURE_SCREEN,
         Stage.KNOWLEDGE_EXTRACT,
+        Stage.EXPERIMENT_RUN,
+        Stage.ITERATIVE_REFINE,
+        Stage.RESULT_ANALYSIS,
         Stage.PAPER_OUTLINE,
     }
 )
