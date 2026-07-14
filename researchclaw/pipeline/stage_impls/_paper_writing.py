@@ -7,6 +7,8 @@ import json
 import logging
 import math
 import re
+from collections.abc import Mapping
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,7 @@ from researchclaw.literature.evidence_cards import canonical_json_text
 from researchclaw.literature.experiment_fact_closure import (
     ExperimentFactClosureError,
     build_experiment_fact_closure_report,
+    canonical_experiment_fact_json_text,
     remove_unsupported_experiment_fact_blocks,
     validate_experiment_fact_closure_report,
 )
@@ -41,14 +44,10 @@ from researchclaw.pipeline._helpers import (
     StageResult,
     _build_context_preamble,
     _chat_with_prompt,
-    _collect_experiment_results,
     _default_paper_outline,
     _extract_paper_title,
     _generate_framework_diagram_prompt,
     _generate_neurips_checklist,
-    _get_pipeline_evolution_overlay,
-    _read_best_analysis,
-    _read_prior_artifact,
     _safe_json_loads,
     _topic_constraint_block,
     _utcnow_iso,
@@ -56,6 +55,12 @@ from researchclaw.pipeline._helpers import (
 from researchclaw.pipeline.manuscript_sections import (
     ManuscriptStructureError,
     parse_manuscript,
+)
+from researchclaw.pipeline.canonical_experiment_evidence import (
+    CanonicalExperimentEvidence,
+    CanonicalExperimentEvidenceError,
+    canonical_decimal,
+    load_canonical_experiment_evidence,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
@@ -81,6 +86,34 @@ The caller will reject every response whose CommonMark heading sequence is not e
 _SECTION_GENERATION_SCHEMA_VERSION = 1
 _SECTION_OWNERSHIP_CONTRACT_VERSION = 1
 _EXPERIMENT_FACT_INVALID_SCHEMA_VERSION = 1
+_OUTLINE_BINDING_SCHEMA_VERSION = 1
+_STAGE15_STANDARD_DECISION_FIELDS = frozenset(
+    {
+        "decision",
+        "raw_text_excerpt",
+        "quality_warnings",
+        "generated",
+        "canonical_experiment_evidence_path",
+        "canonical_experiment_evidence_sha256",
+        "decision_path",
+        "decision_sha256",
+    }
+)
+_STAGE15_AGENT_DECISION_FIELDS = frozenset(
+    {
+        "decision",
+        "verdict",
+        "retry_count",
+        "rerun_triggered",
+        "max_retries",
+        "generated",
+        "source",
+        "canonical_experiment_evidence_path",
+        "canonical_experiment_evidence_sha256",
+        "decision_path",
+        "decision_sha256",
+    }
+)
 _RESERVED_MAJOR_SECTION_NAMES = frozenset(
     {
         "abstract",
@@ -97,6 +130,151 @@ _RESERVED_MAJOR_SECTION_NAMES = frozenset(
         "phenomenology / computational setup",
     }
 )
+
+
+def _read_regular_utf8(path: Path, label: str) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} is missing or not a regular file")
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"cannot read {label}: {exc}") from exc
+
+
+def _strict_json_object(text: str, label: str) -> dict[str, Any]:
+    def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, child in pairs:
+            if key in value:
+                raise ValueError(f"duplicate {label} key: {key}")
+            value[key] = child
+        return value
+
+    try:
+        value = json.loads(text, object_pairs_hook=_reject_duplicates)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid {label} JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} root must be an object")
+    return value
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _load_bound_stage15_decision(
+    run_dir: Path,
+    evidence: CanonicalExperimentEvidence,
+) -> tuple[str, str]:
+    decision_path = run_dir / "stage-15/decision.md"
+    binding_path = run_dir / "stage-15/decision_structured.json"
+    decision_text = _read_regular_utf8(decision_path, "Stage 15 decision")
+    binding = _strict_json_object(
+        _read_regular_utf8(binding_path, "Stage 15 decision binding"),
+        "Stage 15 decision binding",
+    )
+    binding_fields = frozenset(binding)
+    if binding_fields == _STAGE15_STANDARD_DECISION_FIELDS:
+        if (
+            not isinstance(binding["raw_text_excerpt"], str)
+            or binding["raw_text_excerpt"] != decision_text[:500]
+            or not isinstance(binding["quality_warnings"], list)
+            or not all(isinstance(item, str) for item in binding["quality_warnings"])
+            or not isinstance(binding["generated"], str)
+            or not binding["generated"].strip()
+        ):
+            raise ValueError("Stage 15 standard decision binding is invalid")
+    elif binding_fields == _STAGE15_AGENT_DECISION_FIELDS:
+        raise ValueError(
+            "Stage 15 agent requirements decisions are not authorized for "
+            "Stage 16 in canonical evidence migration v1"
+        )
+    else:
+        raise ValueError("Stage 15 decision binding fields mismatch")
+    expected = {
+        "decision_path": "stage-15/decision.md",
+        "decision_sha256": _sha256_text(decision_text),
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+    }
+    for field, value in expected.items():
+        if binding.get(field) != value:
+            raise ValueError(f"Stage 15 decision binding mismatch: {field}")
+    from researchclaw.pipeline.stage_impls._analysis import _parse_decision
+
+    parsed_decision = _parse_decision(decision_text)
+    if binding.get("decision") != "proceed" or parsed_decision != "proceed":
+        raise ValueError("Stage 15 decision does not authorize paper writing")
+    return decision_text, expected["decision_sha256"]
+
+
+def _write_outline_binding(
+    stage_dir: Path,
+    *,
+    outline: str,
+    decision_sha256: str,
+    evidence: CanonicalExperimentEvidence,
+) -> str:
+    payload = {
+        "schema_version": _OUTLINE_BINDING_SCHEMA_VERSION,
+        "outline_path": "stage-16/outline.md",
+        "outline_sha256": _sha256_text(outline),
+        "decision_path": "stage-15/decision.md",
+        "decision_sha256": decision_sha256,
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+    }
+    text = canonical_json_text(payload)
+    (stage_dir / "outline_binding.json").write_text(text, encoding="utf-8")
+    return text
+
+
+def _load_bound_stage16_outline(
+    run_dir: Path,
+    evidence: CanonicalExperimentEvidence,
+) -> str:
+    outline_path = run_dir / "stage-16/outline.md"
+    binding_path = run_dir / "stage-16/outline_binding.json"
+    outline = _read_regular_utf8(outline_path, "Stage 16 outline")
+    binding = _strict_json_object(
+        _read_regular_utf8(binding_path, "Stage 16 outline binding"),
+        "Stage 16 outline binding",
+    )
+    expected_fields = {
+        "schema_version",
+        "outline_path",
+        "outline_sha256",
+        "decision_path",
+        "decision_sha256",
+        "canonical_experiment_evidence_path",
+        "canonical_experiment_evidence_sha256",
+    }
+    if set(binding) != expected_fields:
+        raise ValueError("Stage 16 outline binding fields mismatch")
+    expected = {
+        "schema_version": _OUTLINE_BINDING_SCHEMA_VERSION,
+        "outline_path": "stage-16/outline.md",
+        "outline_sha256": _sha256_text(outline),
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+    }
+    for field, value in expected.items():
+        if binding.get(field) != value:
+            raise ValueError(f"Stage 16 outline binding mismatch: {field}")
+    if binding.get("decision_path") != "stage-15/decision.md":
+        raise ValueError("Stage 16 outline binding mismatch: decision_path")
+    decision_sha256 = binding.get("decision_sha256")
+    if not isinstance(decision_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", decision_sha256
+    ) is None:
+        raise ValueError("Stage 16 outline binding mismatch: decision_sha256")
+    _decision, current_decision_sha256 = _load_bound_stage15_decision(
+        run_dir, evidence
+    )
+    if decision_sha256 != current_decision_sha256:
+        raise ValueError("Stage 16 outline binding mismatch: decision_sha256")
+    return outline
 
 
 class PaperSectionContractError(ValueError):
@@ -182,6 +360,12 @@ def _write_experiment_fact_invalid(
         "paper_sha256": report["paper_sha256"],
         "experiment_contract_path": report["experiment_contract_path"],
         "experiment_contract_sha256": report["experiment_contract_sha256"],
+        "canonical_experiment_evidence_path": report[
+            "canonical_experiment_evidence_path"
+        ],
+        "canonical_experiment_evidence_sha256": report[
+            "canonical_experiment_evidence_sha256"
+        ],
         "dataset_origin": report["dataset_origin"],
         "grounded_numeric_values": report["grounded_numeric_values"],
         "manuscript_numeric_values": report["manuscript_numeric_values"],
@@ -189,7 +373,7 @@ def _write_experiment_fact_invalid(
         "dataset_claim_violations": report["dataset_claim_violations"],
     }
     (stage_dir / "experiment_fact_closure_invalid.json").write_text(
-        canonical_json_text(payload), encoding="utf-8"
+        canonical_experiment_fact_json_text(payload), encoding="utf-8"
     )
 
 
@@ -197,12 +381,11 @@ def _fact_repair_added_numeric_authority(
     before: dict[str, Any], after: dict[str, Any]
 ) -> bool:
     """Return True unless the deterministic repair only removes numeric occurrences."""
-    before_values = list(float(value) for value in before["manuscript_numeric_values"])
+    before_values = list(before["manuscript_numeric_values"])
     for value in after["manuscript_numeric_values"]:
-        numeric = float(value)
-        if numeric not in before_values:
+        if value not in before_values:
             return True
-        before_values.remove(numeric)
+        before_values.remove(value)
     return False
 
 
@@ -390,16 +573,26 @@ def _execute_paper_outline(
     preliminary_plan_path = stage_dir / "citation_plan.preliminary.json"
     final_plan_path = stage_dir / "citation_plan.json"
     outline_path = stage_dir / "outline.md"
+    outline_binding_path = stage_dir / "outline_binding.json"
     try:
         policy_path.unlink(missing_ok=True)
         preliminary_plan_path.unlink(missing_ok=True)
         final_plan_path.unlink(missing_ok=True)
         outline_path.unlink(missing_ok=True)
+        outline_binding_path.unlink(missing_ok=True)
+        evidence = load_canonical_experiment_evidence(run_dir)
+        decision, decision_sha256 = _load_bound_stage15_decision(run_dir, evidence)
         effective_policy = build_effective_citation_policy(run_dir, config)
         policy_path.write_text(
             canonical_json_text(effective_policy), encoding="utf-8"
         )
-    except (CitationPolicyContractError, OSError, UnicodeDecodeError) as exc:
+    except (
+        CanonicalExperimentEvidenceError,
+        CitationPolicyContractError,
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+    ) as exc:
         return StageResult(
             stage=Stage.PAPER_OUTLINE,
             status=StageStatus.FAILED,
@@ -407,11 +600,12 @@ def _execute_paper_outline(
             error=f"Citation policy could not be closed: {exc}",
             decision="retry",
         )
-    analysis = _read_best_analysis(run_dir)
-    decision = _read_prior_artifact(run_dir, "decision.md") or ""
+    analysis = evidence.analysis_text
     preamble = _build_context_preamble(
         config,
         run_dir,
+        canonical_evidence=evidence,
+        bound_decision=decision,
         include_analysis=True,
         include_decision=True,
         include_experiment_data=True,
@@ -447,10 +641,9 @@ def _execute_paper_outline(
             _asg = _pm.block("academic_style_guide")
         except (KeyError, Exception):
             _asg = ""
-        _overlay = _get_pipeline_evolution_overlay(run_dir, "paper_outline")
         sp = _pm.for_stage(
             "paper_outline",
-            evolution_overlay=_overlay,
+            evolution_overlay="",
             preamble=preamble,
             topic_constraint=_pm.block("topic_constraint", topic=config.research.topic),
             feedback=feedback,
@@ -502,6 +695,7 @@ def _execute_paper_outline(
         preliminary_plan_path.unlink(missing_ok=True)
         final_plan_path.unlink(missing_ok=True)
         outline_path.unlink(missing_ok=True)
+        outline_binding_path.unlink(missing_ok=True)
         return StageResult(
             stage=Stage.PAPER_OUTLINE,
             status=StageStatus.FAILED,
@@ -510,18 +704,37 @@ def _execute_paper_outline(
             decision="retry",
             evidence_refs=("stage-16/citation_policy_effective.json",),
         )
-    outline_path.write_text(outline, encoding="utf-8")
+    try:
+        outline_path.write_text(outline, encoding="utf-8")
+        _write_outline_binding(
+            stage_dir,
+            outline=outline,
+            decision_sha256=decision_sha256,
+            evidence=evidence,
+        )
+    except OSError as exc:
+        outline_path.unlink(missing_ok=True)
+        outline_binding_path.unlink(missing_ok=True)
+        return StageResult(
+            stage=Stage.PAPER_OUTLINE,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Outline binding could not be published: {exc}",
+            decision="retry",
+        )
     return StageResult(
         stage=Stage.PAPER_OUTLINE,
         status=StageStatus.DONE,
         artifacts=(
             "outline.md",
+            "outline_binding.json",
             "citation_policy_effective.json",
             "citation_plan.preliminary.json",
             "citation_plan.json",
         ),
         evidence_refs=(
             "stage-16/outline.md",
+            "stage-16/outline_binding.json",
             "stage-16/citation_policy_effective.json",
             "stage-16/citation_plan.preliminary.json",
             "stage-16/citation_plan.json",
@@ -529,247 +742,98 @@ def _execute_paper_outline(
     )
 
 
-def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
-    """Collect raw experiment metric lines from stdout for paper writing.
+def _iter_authority_numbers(prefix: str, value: Any) -> list[tuple[str, Decimal]]:
+    entries: list[tuple[str, Decimal]] = []
+    if isinstance(value, bool):
+        return entries
+    if isinstance(value, (int, float, Decimal)):
+        entries.append((prefix, Decimal(str(value))))
+    elif isinstance(value, Mapping):
+        for key, child in value.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            entries.extend(_iter_authority_numbers(child_prefix, child))
+    elif isinstance(value, (tuple, list)):
+        for index, child in enumerate(value):
+            entries.extend(_iter_authority_numbers(f"{prefix}[{index}]", child))
+    return entries
 
-    Returns a tuple of (formatted block, has_parsed_metrics).
-    ``has_parsed_metrics`` is True when at least one run had a non-empty
-    ``metrics`` dict in its JSON payload — a reliable signal of real data.
-    """
-    metric_lines: list[str] = []
-    run_count = 0
-    has_parsed_metrics = False
 
-    for stage_subdir in sorted(run_dir.glob("stage-*/runs")):
-        for run_file in sorted(stage_subdir.glob("*.json")):
-            if run_file.name == "results.json":
-                continue
-            try:
-                payload = json.loads(run_file.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                continue
-            if not isinstance(payload, dict):
-                continue
+def _plain_evidence_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _plain_evidence_value(child) for key, child in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_plain_evidence_value(child) for child in value]
+    return value
 
-            # R10: Skip simulated data — only collect real experiment results
-            if payload.get("status") == "simulated":
-                continue
 
-            run_count += 1
+def _authority_decimal(value: Any) -> Decimal | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else None
+    if isinstance(value, int):
+        return Decimal(value)
+    return None
 
-            # Extract from parsed metrics (check both 'metrics' and 'key_metrics')
-            metrics = payload.get("metrics", {}) or payload.get("key_metrics", {})
-            if isinstance(metrics, dict) and metrics:
-                has_parsed_metrics = True
-                for k, v in metrics.items():
-                    metric_lines.append(f"  {k}: {v}")
 
-            # Also extract from stdout for full detail
-            # BUG-23: Filter out infrastructure lines that are NOT experiment results
-            _INFRA_KEYS = {
-                "SEED_COUNT", "TIME_ESTIMATE", "TRAINING_STEPS",
-                "REGISTERED_CONDITIONS", "METRIC_DEF", "GPU_MEMORY",
-                "BATCH_SIZE", "NUM_WORKERS", "TOTAL_PARAMS",
-                "time_budget_sec", "max_epochs", "num_seeds",
-            }
-            stdout = payload.get("stdout", "")
-            if stdout:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if ":" in line:
-                        parts = line.rsplit(":", 1)
-                        try:
-                            float(parts[1].strip())
-                            key_part = parts[0].strip().split("/")[-1]  # last segment
-                            if key_part in _INFRA_KEYS:
-                                continue  # skip infrastructure lines
-                            metric_lines.append(f"  {line}")
-                        except (ValueError, TypeError, IndexError):
-                            pass
+def _authority_number_text(value: Any) -> str:
+    numeric = _authority_decimal(value)
+    return canonical_decimal(numeric) if numeric is not None else str(value)
 
-    # R19-4 + R23-1: Collect metrics from refinement_log.json (Stage 13).
-    # If refinement has richer data than Stage 12 runs/, REPLACE Stage 12 data
-    # to avoid confusing the paper writer with conflicting sources.
-    _refine_lines: list[str] = []
-    _refine_run_count = 0
-    # Scan ALL refinement logs across versions, pick by quality (primary
-    # metric) then richness (metric count).  BUG-207: Previous logic picked
-    # the sandbox entry with the most metric keys regardless of whether it
-    # represented a regression (e.g. sandbox_after_fix with 1.29% accuracy
-    # winning over sandbox with 78.93% because it had 6 more keys).
-    _best_refine_metrics: dict[str, Any] = {}
-    _best_refine_stdout = ""
-    _best_refine_primary: float | None = None
-    for _rl_path in sorted(run_dir.glob("stage-13*/refinement_log.json")):
-        try:
-            _rlog = json.loads(_rl_path.read_text(encoding="utf-8"))
-            for _it in _rlog.get("iterations", []):
-                for _sbx_key in ("sandbox", "sandbox_after_fix"):
-                    _sbx = _it.get(_sbx_key, {})
-                    if not isinstance(_sbx, dict):
-                        continue
-                    _sbx_metrics = _sbx.get("metrics", {})
-                    if not isinstance(_sbx_metrics, dict) or not _sbx_metrics:
-                        continue
-                    # Extract primary metric value for quality comparison
-                    _sbx_primary: float | None = None
-                    for _pm_key in ("primary_metric", "best_metric"):
-                        if _pm_key in _sbx_metrics:
-                            try:
-                                _sbx_primary = float(_sbx_metrics[_pm_key])
-                            except (ValueError, TypeError):
-                                pass
-                            break
-                    # Prefer higher primary metric; fall back to count
-                    _dominated = False
-                    if _best_refine_primary is not None and _sbx_primary is not None:
-                        if _sbx_primary > _best_refine_primary:
-                            _dominated = True  # new is better
-                        elif _sbx_primary < _best_refine_primary * 0.5:
-                            continue  # skip: regression (>50% worse)
-                    # Accept if quality-dominant or richer-with-no-regression
-                    if _dominated or len(_sbx_metrics) > len(_best_refine_metrics):
-                        _best_refine_metrics = _sbx_metrics
-                        _best_refine_stdout = _sbx.get("stdout", "")
-                        _best_refine_primary = _sbx_primary
-        except (json.JSONDecodeError, OSError):
-            pass
 
-    if _best_refine_metrics and len(_best_refine_metrics) > len(metric_lines) // 2:
-        # Refinement has richer data — REPLACE Stage 12 data to avoid conflicts
-        metric_lines = []
-        run_count = 1
-        for k, v in _best_refine_metrics.items():
-            metric_lines.append(f"  {k}: {v}")
-        # Also extract PAIRED and metric lines from stdout
-        if _best_refine_stdout:
-            for _line in _best_refine_stdout.splitlines():
-                _line = _line.strip()
-                if _line.startswith("PAIRED:"):
-                    metric_lines.append(f"  {_line}")
-                elif ":" in _line:
-                    parts = _line.rsplit(":", 1)
-                    try:
-                        float(parts[1].strip())
-                        metric_lines.append(f"  {_line}")
-                    except (ValueError, TypeError, IndexError):
-                        pass
-    elif _best_refine_metrics:
-        # Refinement has some data but not richer — append to existing
-        run_count += 1
-        for k, v in _best_refine_metrics.items():
-            metric_lines.append(f"  {k}: {v}")
-        if _best_refine_stdout:
-            for _line in _best_refine_stdout.splitlines():
-                _line = _line.strip()
-                if _line.startswith("PAIRED:"):
-                    metric_lines.append(f"  {_line}")
-
-    if not metric_lines:
-        return "", has_parsed_metrics
-
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    unique: list[str] = []
-    for line in metric_lines:
-        if line not in seen:
-            seen.add(line)
-            unique.append(line)
-
-    # BUG-29: Reformat raw metric lines into human-readable condition summaries
-    # to prevent LLM from pasting raw path-style lines into the paper
-    _grouped: dict[str, list[str]] = {}
-    _ungrouped: list[str] = []
-    for line in unique[:200]:
-        stripped = line.strip()
-        # Match pattern: condition/env/step/metric: value
-        parts = stripped.split("/")
-        if len(parts) >= 3 and ":" in parts[-1]:
-            cond = parts[0]
-            detail = "/".join(parts[1:])
-            _grouped.setdefault(cond, []).append(f"  - {detail}")
-        else:
-            _ungrouped.append(stripped)
-
-    formatted_lines: list[str] = []
-    if _grouped:
-        for cond, details in sorted(_grouped.items()):
-            formatted_lines.append(f"## Condition: {cond}")
-            formatted_lines.extend(details[:30])
-    if _ungrouped:
-        formatted_lines.extend(_ungrouped)
-
+def _collect_raw_experiment_metrics(
+    evidence: CanonicalExperimentEvidence | Path,
+) -> tuple[str, bool]:
+    """Render only accessor-selected observations for the paper writer."""
+    if isinstance(evidence, Path):
+        evidence = load_canonical_experiment_evidence(evidence)
+    entries = _iter_authority_numbers("metric_observations", evidence.metric_observations)
+    if not entries:
+        return "", False
+    lines = [f"  {key}: {value}" for key, value in entries[:200]]
     return (
-        f"\n\nACTUAL EXPERIMENT DATA (from {run_count} run(s) — use ONLY these numbers):\n"
-        "```\n"
-        + "\n".join(formatted_lines[:200])
-        + "\n```\n"
-        "CRITICAL: Every number in the Results table MUST come from the data above. "
-        "Do NOT round excessively, do NOT invent numbers, do NOT change values. "
-        f"The experiment ran {run_count} time(s) — state this accurately in the methodology.\n"
-        "NEVER paste raw metric paths (like 'condition/env/step/metric: value') "
-        "into the paper. Always convert to formatted LaTeX tables or inline prose.\n"
-    ), has_parsed_metrics
+        "\n\nCANONICAL EXPERIMENT DATA (use ONLY these selected observations):\n"
+        "```\n" + "\n".join(lines) + "\n```\n"
+        f"Evidence manifest: {evidence.manifest_path} ({evidence.manifest_sha256}).\n"
+        "Do not invent, interpolate, or source values from diagnostic workspaces.\n"
+    ), True
 
 
-def _collect_grounded_metric_whitelist(run_dir: Path) -> str:
-    """Build a compact allowlist of metric numbers the paper may report.
-
-    Stage 12's scaffold-owned evaluator writes the authoritative result to
-    ``stage-12/runs/results.json``. Older raw-log collection skipped files
-    named ``results.json``, which meant the writer could miss the only
-    grounded metric source and invent headline numbers. This block gives the
-    LLM a source-specific allowlist rather than another vague warning.
-    """
-    entries: list[tuple[str, str, float]] = []
-    seen: set[tuple[str, str, float]] = set()
+def _collect_grounded_metric_whitelist(
+    evidence: CanonicalExperimentEvidence | Path,
+) -> str:
+    """Build the writer allowlist from the selected result set only."""
+    if isinstance(evidence, Path):
+        evidence = load_canonical_experiment_evidence(evidence)
+    entries: list[tuple[str, str, Decimal]] = []
+    seen: set[tuple[str, str]] = set()
 
     def _add(source: str, key: str, value: Any) -> None:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
             return
-        fval = float(value)
-        item = (source, key, round(fval, 8))
+        decimal_value = Decimal(str(value))
+        item = (key, str(decimal_value))
         if item in seen:
             return
         seen.add(item)
-        entries.append((source, key, fval))
+        entries.append((source, key, decimal_value))
 
     def _walk_metrics(source: str, prefix: str, obj: Any) -> None:
-        if isinstance(obj, dict):
+        if isinstance(obj, Mapping):
             for key, value in obj.items():
                 next_prefix = f"{prefix}.{key}" if prefix else str(key)
                 _walk_metrics(source, next_prefix, value)
-        elif isinstance(obj, list):
+        elif isinstance(obj, (tuple, list)):
             for idx, value in enumerate(obj[:20]):
                 _walk_metrics(source, f"{prefix}[{idx}]", value)
         else:
             _add(source, prefix, obj)
 
-    candidates: list[Path] = []
-    candidates.extend(sorted((run_dir / "stage-12" / "runs").glob("*.json")))
-    candidates.extend(sorted(run_dir.glob("stage-12*/runs/*.json")))
-    candidates.append(run_dir / "experiment_summary_best.json")
-    candidates.extend(sorted(run_dir.glob("stage-14*/experiment_summary.json")))
-
-    for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        rel = path.relative_to(run_dir).as_posix()
-        for key in ("primary_metric", "metrics", "key_metrics", "metrics_summary"):
-            if key in data:
-                _walk_metrics(rel, key, data[key])
-        per_seed = data.get("per_seed")
-        if isinstance(per_seed, list):
-            for idx, row in enumerate(per_seed[:20]):
-                if isinstance(row, dict) and isinstance(row.get("metrics"), dict):
-                    seed = row.get("seed", idx)
-                    _walk_metrics(rel, f"per_seed[{seed}].metrics", row["metrics"])
+    source = evidence.selected_result_manifest_path
+    _walk_metrics(source, "metric_observations", evidence.metric_observations)
+    _walk_metrics(source, "structured_results", evidence.structured_results)
 
     if not entries:
         return ""
@@ -782,7 +846,7 @@ def _collect_grounded_metric_whitelist(run_dir: Path) -> str:
         "If a desired number is not listed, write an em dash (---) or omit the numeric claim.",
     ]
     for source, key, value in entries[:160]:
-        literal = json.dumps(value, allow_nan=False, separators=(",", ":"))
+        literal = str(value)
         lines.append(f"- {source} :: {key} = {literal}")
     return "\n".join(lines) + "\n"
 
@@ -842,10 +906,9 @@ def _write_paper_sections(
     except (KeyError, Exception):  # noqa: BLE001
         _writing_structure = ""
 
-    _overlay = _get_pipeline_evolution_overlay(run_dir, "paper_draft")
     system = pm.for_stage(
         "paper_draft",
-        evolution_overlay=_overlay,
+        evolution_overlay="",
         preamble=preamble,
         topic_constraint=topic_constraint,
         exp_metrics_instruction=exp_metrics_instruction,
@@ -1729,7 +1792,8 @@ def _check_ablation_effectiveness(
 
     # Find baseline/control condition
     baseline_name = None
-    baseline_mean = None
+    baseline_mean: Decimal | None = None
+    decimal_threshold = Decimal(str(threshold))
     for name, data in cond_summaries.items():
         if not isinstance(data, dict):
             continue
@@ -1742,13 +1806,15 @@ def _check_ablation_effectiveness(
             for mk, mv in metrics.items():
                 if mk.endswith("_mean"):
                     baseline_name = name
-                    baseline_mean = float(mv)
+                    baseline_mean = _authority_decimal(mv)
                     break
             if baseline_mean is None:
                 for mk, mv in metrics.items():
                     try:
                         baseline_name = name
-                        baseline_mean = float(mv)
+                        baseline_mean = _authority_decimal(mv)
+                        if baseline_mean is None:
+                            continue
                         break
                     except (TypeError, ValueError):
                         continue
@@ -1773,9 +1839,8 @@ def _check_ablation_effectiveness(
         for mk, mv in metrics.items():
             if not mk.endswith("_mean"):
                 continue
-            try:
-                abl_val = float(mv)
-            except (TypeError, ValueError):
+            abl_val = _authority_decimal(mv)
+            if abl_val is None:
                 continue
             if baseline_mean != 0:
                 rel_diff = abs(abl_val - baseline_mean) / abs(baseline_mean)
@@ -1784,14 +1849,14 @@ def _check_ablation_effectiveness(
             abs_diff = abs(abl_val - baseline_mean)
             # Improvement C: Tighter check — both relative < threshold
             # AND absolute < 1pp → TRIVIAL
-            if rel_diff < threshold and abs_diff < 1.0:
+            if rel_diff < decimal_threshold and abs_diff < Decimal(1):
                 warnings.append(
                     f"TRIVIAL: Ablation '{name}' {mk}={abl_val:.4f} is within "
                     f"{rel_diff:.1%} (abs {abs_diff:.4f}pp) of baseline "
                     f"'{baseline_name}' {mk}={baseline_mean:.4f} — "
                     f"ablation is ineffective"
                 )
-            elif rel_diff < threshold:
+            elif rel_diff < decimal_threshold:
                 warnings.append(
                     f"Ablation '{name}' {mk}={abl_val:.4f} is within "
                     f"{rel_diff:.1%} of baseline '{baseline_name}' "
@@ -1825,17 +1890,16 @@ def _detect_result_contradictions(
         return advisories
 
     # Collect primary metric means per condition
-    means: dict[str, float] = {}
+    means: dict[str, Decimal] = {}
     for name, data in cond_summaries.items():
         if not isinstance(data, dict):
             continue
         metrics = data.get("metrics", {})
         for mk, mv in metrics.items():
             if mk.endswith("_mean"):
-                try:
-                    means[name] = float(mv)
-                except (TypeError, ValueError):
-                    pass
+                numeric = _authority_decimal(mv)
+                if numeric is not None:
+                    means[name] = numeric
                 break
 
     if len(means) < 2:
@@ -1844,8 +1908,8 @@ def _detect_result_contradictions(
     # Check 1: All methods within noise margin (2% relative spread)
     vals = list(means.values())
     val_range = max(vals) - min(vals)
-    val_mean = sum(vals) / len(vals)
-    if val_mean != 0 and (val_range / abs(val_mean)) < 0.02:
+    val_mean = sum(vals, Decimal(0)) / Decimal(len(vals))
+    if val_mean != 0 and (val_range / abs(val_mean)) < Decimal("0.02"):
         advisories.append(
             "NULL RESULT: All methods produce nearly identical primary metric values "
             f"(range={val_range:.4f}, mean={val_mean:.4f}). Frame this as a null result — "
@@ -1952,12 +2016,22 @@ def _execute_paper_draft(
         "experiment_fact_closure_after.json",
         "experiment_fact_repair_log.json",
         "draft_quality.json",
+        "paper_meta.json",
+        "quality_warnings.json",
         "references_preverified.bib",
     ):
         (stage_dir / owned_name).unlink(missing_ok=True)
     try:
+        evidence = load_canonical_experiment_evidence(run_dir)
+        outline = _load_bound_stage16_outline(run_dir, evidence)
         effective_citation_policy = load_effective_citation_policy(run_dir, config)
-    except CitationPolicyContractError as exc:
+    except (
+        CanonicalExperimentEvidenceError,
+        CitationPolicyContractError,
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+    ) as exc:
         return StageResult(
             stage=Stage.PAPER_DRAFT,
             status=StageStatus.FAILED,
@@ -1968,103 +2042,34 @@ def _execute_paper_draft(
     citation_target = int(
         effective_citation_policy["effective_target_unique_sources"]
     )
-    outline = _read_prior_artifact(run_dir, "outline.md") or ""
     preamble = _build_context_preamble(
         config,
         run_dir,
+        canonical_evidence=evidence,
         include_goal=True,
         include_hypotheses=True,
         include_analysis=True,
         include_experiment_data=True,  # WS-5.1: inject real experiment data
     )
 
-    # BUG-222: Read PROMOTED BEST experiment_summary for the paper prompt.
-    # Previous code (R21-1) picked the "richest" experiment_summary across
-    # all stage-14* dirs.  After REFINE regression, a later iteration with
-    # more conditions but worse quality could win, feeding the LLM regressed
-    # data.  Now: prefer experiment_summary_best.json (written by
-    # _promote_best_stage14()), fall back to richest stage-14* for
-    # non-REFINE runs.
-    exp_summary_text = None
-    _best_path = run_dir / "experiment_summary_best.json"
-    if _best_path.is_file():
-        try:
-            _text = _best_path.read_text(encoding="utf-8")
-            _parsed = _safe_json_loads(_text, {})
-            if isinstance(_parsed, dict) and (
-                _parsed.get("condition_summaries") or _parsed.get("metrics_summary")
-            ):
-                exp_summary_text = _text
-                logger.info("BUG-222: Using promoted experiment_summary_best.json")
-        except OSError:
-            pass
-    if exp_summary_text is None:
-        # Fallback: pick richest stage-14* (pre-BUG-222 behavior)
-        _best_metric_count = 0
-        for _s14_dir in sorted(run_dir.glob("stage-14*")):
-            _candidate = _s14_dir / "experiment_summary.json"
-            if _candidate.is_file():
-                _text = _candidate.read_text(encoding="utf-8")
-                _parsed = _safe_json_loads(_text, {})
-                if isinstance(_parsed, dict):
-                    _mcount = _parsed.get("total_metric_keys", 0) or len(
-                        _parsed.get("metrics_summary", {})
-                    )
-                    _paired_count = len(_parsed.get("paired_comparisons", []))
-                    _cond_count = len(_parsed.get("condition_summaries", {}))
-                    _score = _mcount + _paired_count * 10 + _cond_count * 5
-                    if _score > _best_metric_count:
-                        _best_metric_count = _score
-                        exp_summary_text = _text
-                        logger.info(
-                            "R21-1 fallback: Selected %s (score=%d)",
-                            _s14_dir.name, _score,
-                        )
-        if exp_summary_text is None:
-            exp_summary_text = _read_prior_artifact(run_dir, "experiment_summary.json")
+    exp_summary_text = evidence.summary_bytes.decode("utf-8")
+    exp_summary = _plain_evidence_value(evidence.summary)
     exp_metrics_instruction = ""
     has_real_metrics = False
-    _verified_registry = None  # Phase 1: anti-fabrication verified data registry
-    # BUG-108: Load refinement_log so VerifiedRegistry has per-iteration metrics
-    _refinement_log_for_vr: dict | None = None
-    _rl_candidates = sorted(run_dir.glob("stage-13*/refinement_log.json"), reverse=True)
-    _rl_path = _rl_candidates[0] if _rl_candidates else None
-    if _rl_path and _rl_path.is_file():
-        try:
-            _refinement_log_for_vr = json.loads(_rl_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-    if exp_summary_text:
-        exp_summary = _safe_json_loads(exp_summary_text, {})
-        # Phase 1: Build VerifiedRegistry from experiment data
-        if isinstance(exp_summary, dict):
-            try:
-                from researchclaw.pipeline.verified_registry import VerifiedRegistry
-                # BUG-222: Use best_only=True to ensure paper tables reflect
-                # only the promoted best iteration, not regressed data
-                _verified_registry = VerifiedRegistry.from_run_dir(
-                    run_dir,
-                    metric_direction=config.experiment.metric_direction,
-                    best_only=True,
-                )
-                logger.info(
-                    "Stage 17: VerifiedRegistry — %d verified values, %d conditions",
-                    len(_verified_registry.values),
-                    len(_verified_registry.condition_names),
-                )
-            except Exception as _vr_exc:
-                logger.warning("Stage 17: Failed to build VerifiedRegistry: %s", _vr_exc)
-        if isinstance(exp_summary, dict) and exp_summary.get("metrics_summary"):
-            has_real_metrics = True
-            exp_metrics_instruction = (
-                "\n\nIMPORTANT: Use the ACTUAL experiment results provided in the context. "
-                "All numbers in the Results and Experiments sections MUST reference real data. "
-                "Do NOT write 'no quantitative results yet' or use placeholder numbers. "
-                "Cite specific metrics with their actual values.\n"
-            )
+    from researchclaw.pipeline.verified_registry import VerifiedRegistry
+    _verified_registry = VerifiedRegistry.from_experiment(
+        exp_summary,
+        metric_direction=config.experiment.metric_direction,
+    )
+    if exp_summary.get("metrics_summary"):
+        has_real_metrics = True
+        exp_metrics_instruction = (
+            "\n\nIMPORTANT: Use only the accessor-selected experiment results. "
+            "All experiment numbers must be present in the canonical evidence bundle.\n"
+        )
 
     # Collect raw experiment stdout metrics as hard constraint for the paper
-    raw_metrics_block, _has_parsed_metrics = _collect_raw_experiment_metrics(run_dir)
+    raw_metrics_block, _has_parsed_metrics = _collect_raw_experiment_metrics(evidence)
     if raw_metrics_block:
         # BUG-23: Raw stdout alone is not sufficient — require either
         # metrics_summary data, parsed metrics from run JSONs,
@@ -2076,14 +2081,14 @@ def _execute_paper_draft(
             has_real_metrics = True
         exp_metrics_instruction += raw_metrics_block
 
-    grounded_metric_whitelist = _collect_grounded_metric_whitelist(run_dir)
+    grounded_metric_whitelist = _collect_grounded_metric_whitelist(evidence)
     if grounded_metric_whitelist:
         has_real_metrics = True
         exp_metrics_instruction += grounded_metric_whitelist
 
     # R18-1 + R19-6: Inject paired statistical comparisons AND condition summaries
-    if exp_summary_text:
-        exp_summary_parsed = _safe_json_loads(exp_summary_text, {})
+    if exp_summary:
+        exp_summary_parsed = exp_summary
         if isinstance(exp_summary_parsed, dict):
             # R19-6: Inject experiment scale header so LLM knows the data richness
             _total_conds = exp_summary_parsed.get("total_conditions")
@@ -2124,27 +2129,24 @@ def _execute_paper_draft(
                         continue
                     sr = cdata.get("success_rate")
                     if sr is not None:
-                        try:
-                            cond_block += f"- Success rate: {float(sr):.1%}\n"
-                        except (ValueError, TypeError):
-                            cond_block += f"- Success rate: {sr}\n"
+                        cond_block += (
+                            f"- Success rate: {_authority_number_text(sr)}\n"
+                        )
                     ns = cdata.get("n_seeds") or cdata.get("n_seed_metrics")
                     if ns:
                         cond_block += f"- Seeds: {ns}\n"
                     ci_lo = cdata.get("ci95_low")
                     ci_hi = cdata.get("ci95_high")
                     if ci_lo is not None and ci_hi is not None:
-                        try:
-                            cond_block += f"- Bootstrap 95% CI: [{float(ci_lo):.4f}, {float(ci_hi):.4f}]\n"
-                        except (ValueError, TypeError):
-                            cond_block += f"- Bootstrap 95% CI: [{ci_lo}, {ci_hi}]\n"
+                        cond_block += (
+                            "- Bootstrap 95% CI: "
+                            f"[{_authority_number_text(ci_lo)}, "
+                            f"{_authority_number_text(ci_hi)}]\n"
+                        )
                     cm = cdata.get("metrics") or {}
                     if isinstance(cm, dict) and cm:
                         for mk, mv in sorted(cm.items()):
-                            if isinstance(mv, (int, float)):
-                                cond_block += f"- {mk}: {mv:.4f}\n"
-                            else:
-                                cond_block += f"- {mk}: {mv}\n"
+                            cond_block += f"- {mk}: {_authority_number_text(mv)}\n"
                 exp_metrics_instruction += cond_block
 
             # R18-1: Inject paired statistical comparisons
@@ -2166,10 +2168,11 @@ def _execute_paper_draft(
                     ci_hi = pc.get("ci95_high")
                     ci_str = ""
                     if ci_lo is not None and ci_hi is not None:
-                        try:
-                            ci_str = f", 95% CI [{float(ci_lo):.3f}, {float(ci_hi):.3f}]"
-                        except (ValueError, TypeError):
-                            ci_str = f", 95% CI [{ci_lo}, {ci_hi}]"
+                        ci_str = (
+                            ", 95% CI "
+                            f"[{_authority_number_text(ci_lo)}, "
+                            f"{_authority_number_text(ci_hi)}]"
+                        )
                     paired_block += (
                         f"- {method} vs {baseline} (regime={regime}): "
                         f"mean_diff={md}, std_diff={sd}, "
@@ -2255,8 +2258,8 @@ def _execute_paper_draft(
                 )
 
     # BUG-003: Inject actual evaluated datasets as a hard constraint
-    if exp_summary_text:
-        _ds_parsed = _safe_json_loads(exp_summary_text, {})
+    if exp_summary:
+        _ds_parsed = exp_summary
         if isinstance(_ds_parsed, dict):
             _datasets: set[str] = set()
             # Extract from condition names (often contain dataset info)
@@ -2283,8 +2286,8 @@ def _execute_paper_draft(
                 )
 
     # P7: Ablation effectiveness check
-    if exp_summary_text:
-        _exp_parsed_p7 = _safe_json_loads(exp_summary_text, {})
+    if exp_summary:
+        _exp_parsed_p7 = exp_summary
         if isinstance(_exp_parsed_p7, dict):
             _abl_warnings = _check_ablation_effectiveness(_exp_parsed_p7)
             if _abl_warnings:
@@ -2300,8 +2303,8 @@ def _execute_paper_draft(
                 logger.warning("P7: Ablation effectiveness warnings: %s", _abl_warnings)
 
     # P10: Contradiction detection
-    if exp_summary_text:
-        _exp_parsed_p10 = _safe_json_loads(exp_summary_text, {})
+    if exp_summary:
+        _exp_parsed_p10 = exp_summary
         if isinstance(_exp_parsed_p10, dict):
             _contradictions = _detect_result_contradictions(
                 _exp_parsed_p10, metric_direction=config.experiment.metric_direction
@@ -2315,90 +2318,7 @@ def _execute_paper_draft(
                 exp_metrics_instruction += _contra_block
                 logger.warning("P10: Contradiction advisories: %s", _contradictions)
 
-    # R10: HARD BLOCK — refuse to write paper when all data is simulated
-    # (skipped for literature-first / survey topics)
     _is_lit_first = _topic_is_literature_first(config)
-    all_simulated = True
-    for stage_subdir in sorted(run_dir.glob("stage-*/runs")):
-        for run_file in sorted(stage_subdir.glob("*.json")):
-            try:
-                _payload = json.loads(run_file.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                continue
-            if not isinstance(_payload, dict):
-                continue
-            # Scaffold-owned pipeline_validation results are synthetic by
-            # contract, but they are not the old formulaic "simulated mode"
-            # payloads this guard was built to block. They are valid for
-            # dry-run writing and remain non-release via release_check.
-            if (
-                run_file.name == "results.json"
-                and _payload.get("evaluator_owner") == "scaffold"
-                and isinstance(_payload.get("metrics"), dict)
-                and _payload.get("metrics")
-            ):
-                all_simulated = False
-                break
-            if run_file.name == "results.json":
-                continue
-            if _payload.get("status") != "simulated":
-                all_simulated = False
-                break
-        if not all_simulated:
-            break
-
-    if all_simulated and not _is_lit_first:
-        logger.error(
-            "BLOCKED: All experiment data is simulated (mode='simulated'). "
-            "Cannot write a paper based on formulaic fake data. "
-            "Switch to experiment.mode='sandbox' and re-run."
-        )
-        (stage_dir / "paper_draft.md").write_text(
-            "# Paper Draft Blocked\n\n"
-            "**Reason**: All experiment results are from simulated mode "
-            "(formulaic data: `0.3 + idx * 0.03`). "
-            "These are not real experimental results.\n\n"
-            "**Action Required**: Set `experiment.mode: 'sandbox'` in "
-            "config.arc.yaml and re-run the pipeline.",
-            encoding="utf-8",
-        )
-        (stage_dir / "paper_meta.json").write_text(
-            json.dumps(
-                {
-                    "outcome": "blocked_simulated_data",
-                    "detected_by": (
-                        "stage-*/runs/*.json status field — every entry "
-                        "reports status: 'simulated'"
-                    ),
-                    "is_literature_first_topic": False,
-                    "note": (
-                        "Paper drafting refuses formulaic simulated metrics "
-                        "by design. Switch experiment.mode to 'sandbox' "
-                        "(or 'docker' / 'ssh_remote' / etc.) and re-run."
-                    ),
-                    "action_required": (
-                        "Set experiment.mode: 'sandbox' in config.yaml and "
-                        "re-run from --from-stage EXPERIMENT_RUN."
-                    ),
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        return StageResult(
-            stage=Stage.PAPER_DRAFT,
-            status=StageStatus.PAUSED,
-            artifacts=("paper_draft.md", "paper_meta.json"),
-            error=(
-                "Paper draft blocked: all experiment data is simulated. "
-                "Re-run with experiment.mode='sandbox'."
-            ),
-            evidence_refs=(
-                "stage-17/paper_draft.md",
-                "stage-17/paper_meta.json",
-            ),
-            decision="blocked_simulated_data",
-        )
 
     # R4-2: HARD BLOCK — refuse to write paper with no real data (ML/empirical domains)
     # For non-empirical domains (math proofs, theoretical economics), allow proceeding
@@ -2486,7 +2406,7 @@ def _execute_paper_draft(
 
     # R11-5: Experiment quality minimum threshold before paper writing
     # Parse analysis.md for quality rating and condition completeness
-    analysis_text = _read_best_analysis(run_dir)
+    analysis_text = evidence.analysis_text
     _quality_warnings: list[str] = []
 
     # Check 1: Was the analysis quality rating very low?
@@ -2608,139 +2528,16 @@ def _execute_paper_draft(
     )
 
     # IMP-6 + FA: Inject chart references into paper draft prompt
-    # Prefer FigureAgent's figure_plan.json (rich descriptions) over raw file scan
-    # BUG-FIX: figure_plan.json may be a list (from FigureAgent planner) or a dict
-    # (from executor overwrite).  The orchestrator writes a list at planning time;
-    # the executor overwrites with a dict only when figure_count > 0.  If the
-    # FigureAgent renders 0 charts the list persists, and calling .get() on it
-    # raises AttributeError.
-    _fa_descriptions = ""
-    # BUG-178: Iterate in reverse order so we read the LATEST stage-14
-    # iteration's figure plan, matching Stage 22 which copies charts
-    # from the newest iteration.
-    for _s14_dir in sorted(run_dir.glob("stage-14*"), reverse=True):
-        # Prefer the final plan (dict with figure_descriptions) if it exists
-        for _fp_name in ("figure_plan_final.json", "figure_plan.json"):
-            _fp_path = _s14_dir / _fp_name
-            if not _fp_path.exists():
-                continue
-            try:
-                _fp_data = json.loads(_fp_path.read_text(encoding="utf-8"))
-                if isinstance(_fp_data, dict):
-                    _fa_descriptions = _fp_data.get("figure_descriptions", "")
-                elif isinstance(_fp_data, list) and _fp_data:
-                    # List format from FigureAgent planner — synthesize descriptions
-                    _desc_parts = ["## PLANNED FIGURES (from figure plan)\n"]
-                    for _fig in _fp_data:
-                        if isinstance(_fig, dict):
-                            _fid = _fig.get("figure_id", "unnamed")
-                            _ftitle = _fig.get("title", "")
-                            _fcap = _fig.get("caption", "")
-                            _fsec = _fig.get("section", "results")
-                            _desc_parts.append(
-                                f"- **{_fid}** ({_fsec}): {_ftitle}\n  {_fcap}"
-                            )
-                    if len(_desc_parts) > 1:
-                        _fa_descriptions = "\n".join(_desc_parts)
-            except (json.JSONDecodeError, OSError):
-                pass
-            if _fa_descriptions:
-                break
-        if _fa_descriptions:
-            break
-
-    if _fa_descriptions:
-        exp_metrics_instruction += "\n\n" + _fa_descriptions
-        logger.info("Stage 17: Injected FigureAgent figure descriptions into paper draft prompt")
-    else:
-        # Fallback: scan for chart files from the LATEST stage-14 iteration
-        # BUG-178: Must use reverse order to match Stage 22 chart copy behavior
-        _chart_files: list[str] = []
-        for _s14_dir in sorted(run_dir.glob("stage-14*"), reverse=True):
-            _charts_path = _s14_dir / "charts"
-            if _charts_path.is_dir():
-                _found = sorted(_charts_path.glob("*.png"))
-                if _found:
-                    _chart_files = [f.name for f in _found]
-                    break  # Use only the latest iteration's charts
-        if _chart_files:
-            _chart_block = (
-                "\n\n## AVAILABLE FIGURES (embed in the paper)\n"
-                "The following figures were generated from actual experiment data. "
-                "You MUST reference at least 1-2 of these in the Results section "
-                "using markdown image syntax: `![Caption](charts/filename.png)`\n\n"
-            )
-            for _cf_name in _chart_files:
-                _label = _cf_name.replace("_", " ").replace(".png", "").title()
-                _chart_block += f"- `charts/{_cf_name}` \u2014 {_label}\n"
-            _chart_block += (
-                "\nFor each figure referenced, write a descriptive caption and "
-                "discuss what the figure shows in 2-3 sentences.\n"
-            )
-            exp_metrics_instruction += _chart_block
-            logger.info(
-                "Stage 17: Injected %d chart references into paper draft prompt",
-                len(_chart_files),
-            )
-
-    # WS-5.5: Framework diagram placeholder instruction
-    exp_metrics_instruction += (
-        "\n\n## FRAMEWORK DIAGRAM PLACEHOLDER\n"
-        "In the Method/Approach section, include a placeholder for the methodology "
-        "framework overview figure. Insert this exactly:\n\n"
-        "```\n"
-        "![Framework Overview](charts/framework_diagram.png)\n"
-        "**Figure N.** Overview of the proposed methodology. "
-        "[A detailed framework diagram will be generated separately and inserted here.]\n"
-        "```\n\n"
-        "This figure should be referenced in the text as 'Figure N' and discussed briefly "
-        "(1-2 sentences describing the overall pipeline/architecture flow). "
-        "The actual image will be generated post-hoc using a text-to-image model.\n"
-    )
-
-    # P5: Extract hyperparameters from results.json for paper Method section
+    # Candidate policy v1 authorizes a deterministic empty figure state. No
+    # chart context is inferred from diagnostic or versioned directories.
     _hp_table = ""
-    for _s14_dir in sorted(run_dir.glob("stage-14*")):
-        for _run_file in sorted(_s14_dir.glob("runs/*.json")):
-            try:
-                _run_data = json.loads(_run_file.read_text(encoding="utf-8"))
-                if isinstance(_run_data, dict) and _run_data.get("hyperparameters"):
-                    _hp = _run_data["hyperparameters"]
-                    if isinstance(_hp, dict) and _hp:
-                        _hp_table = "\n\n## HYPERPARAMETERS (include as a table in the Method section)\n"
-                        _hp_table += "| Hyperparameter | Value |\n|---|---|\n"
-                        for _hk, _hv in sorted(_hp.items()):
-                            _hp_table += f"| {_hk} | {_hv} |\n"
-                        _hp_table += (
-                            "\nThis table MUST appear in the Method/Experiments section. "
-                            "Include ALL hyperparameters used, with justification for key choices.\n"
-                        )
-                        break
-            except (json.JSONDecodeError, OSError):
-                continue
-        if _hp_table:
-            break
-    # Also check staging dirs for results.json
-    if not _hp_table:
-        for _staging_dir in sorted(run_dir.glob("stage-*/runs/_docker_*")):
-            _rjson = _staging_dir / "results.json"
-            if _rjson.is_file():
-                try:
-                    _rdata = json.loads(_rjson.read_text(encoding="utf-8"))
-                    if isinstance(_rdata, dict) and _rdata.get("hyperparameters"):
-                        _hp = _rdata["hyperparameters"]
-                        if isinstance(_hp, dict) and _hp:
-                            _hp_table = "\n\n## HYPERPARAMETERS (include as a table in the Method section)\n"
-                            _hp_table += "| Hyperparameter | Value |\n|---|---|\n"
-                            for _hk, _hv in sorted(_hp.items()):
-                                _hp_table += f"| {_hk} | {_hv} |\n"
-                            _hp_table += (
-                                "\nThis table MUST appear in the Method/Experiments section. "
-                                "Include ALL hyperparameters used, with justification for key choices.\n"
-                            )
-                            break
-                except (json.JSONDecodeError, OSError):
-                    continue
+    _hp = evidence.structured_results.get("hyperparameters")
+    if isinstance(_hp, Mapping) and _hp:
+        _hp_table = "\n\n## HYPERPARAMETERS (include as a table in the Method section)\n"
+        _hp_table += "| Hyperparameter | Value |\n|---|---|\n"
+        for _hk, _hv in sorted(_hp.items()):
+            _hp_table += f"| {_hk} | {_hv} |\n"
+        _hp_table += "\nInclude only these accessor-selected hyperparameters.\n"
     if _hp_table:
         exp_metrics_instruction += _hp_table
 
@@ -2824,8 +2621,7 @@ def _execute_paper_draft(
     else:
         # Build template with real data if available
         results_section = "Template results summary."
-        if exp_summary_text:
-            exp_summary = _safe_json_loads(exp_summary_text, {})
+        if exp_summary:
             if isinstance(exp_summary, dict) and exp_summary.get("metrics_summary"):
                 lines = ["Experiment results:"]
                 for mk, mv in exp_summary["metrics_summary"].items():
@@ -2936,13 +2732,14 @@ Generated: {_utcnow_iso()}
 
     try:
         experiment_report = build_experiment_fact_closure_report(
-            run_dir, paper_text=final_draft
+            run_dir, paper_text=final_draft, evidence=evidence
         )
         if not experiment_report["valid"]:
             initial_experiment_report = experiment_report
             _write_experiment_fact_invalid(stage_dir, experiment_report)
             (stage_dir / "experiment_fact_closure_initial.json").write_text(
-                canonical_json_text(initial_experiment_report), encoding="utf-8"
+                canonical_experiment_fact_json_text(initial_experiment_report),
+                encoding="utf-8",
             )
             try:
                 final_draft, repair_log = remove_unsupported_experiment_fact_blocks(
@@ -2957,7 +2754,7 @@ Generated: {_utcnow_iso()}
                     f"deterministic experiment-fact repair failed: {exc}"
                 ) from exc
             (stage_dir / "experiment_fact_repair_log.json").write_text(
-                canonical_json_text(repair_log), encoding="utf-8"
+                canonical_experiment_fact_json_text(repair_log), encoding="utf-8"
             )
             structure_report = _validate_stage17_manuscript_structure(
                 final_draft, stage_dir=stage_dir
@@ -2967,10 +2764,11 @@ Generated: {_utcnow_iso()}
                     "deterministic experiment-fact repair broke manuscript structure"
                 )
             experiment_report = build_experiment_fact_closure_report(
-                run_dir, paper_text=final_draft
+                run_dir, paper_text=final_draft, evidence=evidence
             )
             (stage_dir / "experiment_fact_closure_after.json").write_text(
-                canonical_json_text(experiment_report), encoding="utf-8"
+                canonical_experiment_fact_json_text(experiment_report),
+                encoding="utf-8",
             )
             if _fact_repair_added_numeric_authority(
                 initial_experiment_report, experiment_report
@@ -2987,7 +2785,9 @@ Generated: {_utcnow_iso()}
             (stage_dir / "experiment_fact_closure_invalid.json").unlink(
                 missing_ok=True
             )
-        experiment_report_text = canonical_json_text(experiment_report)
+        experiment_report_text = canonical_experiment_fact_json_text(
+            experiment_report
+        )
         (stage_dir / "experiment_fact_closure_report.json").write_text(
             experiment_report_text, encoding="utf-8"
         )
@@ -3004,7 +2804,7 @@ Generated: {_utcnow_iso()}
             canonical_json_text(citation_report), encoding="utf-8"
         )
         draft_path.write_text(final_draft, encoding="utf-8")
-        validate_experiment_fact_closure_report(run_dir)
+        validate_experiment_fact_closure_report(run_dir, evidence=evidence)
         validate_citation_closure_report(run_dir, config)
     except (
         CitationPlanContractError,

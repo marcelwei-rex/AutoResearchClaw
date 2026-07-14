@@ -12,6 +12,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any
 
@@ -40,47 +41,60 @@ class ConditionResult:
     """Aggregated results for one experimental condition."""
 
     name: str
-    per_seed_values: dict[int, float] = field(default_factory=dict)
-    mean: float | None = None
-    std: float | None = None
+    per_seed_values: dict[int, Decimal] = field(default_factory=dict)
+    mean: Decimal | None = None
+    std: Decimal | None = None
     n_seeds: int = 0
-    aggregate_metric: float | None = None  # The condition-level metric
+    aggregate_metric: Decimal | None = None  # The condition-level metric
 
     def compute_stats(self) -> None:
         """Compute mean and std from per-seed values."""
-        vals = [v for v in self.per_seed_values.values() if _is_finite(v)]
+        vals = [
+            numeric
+            for value in self.per_seed_values.values()
+            if (numeric := _as_decimal(value)) is not None
+        ]
         self.n_seeds = len(vals)
         if not vals:
             return
-        self.mean = sum(vals) / len(vals)
+        self.mean = sum(vals, Decimal(0)) / Decimal(len(vals))
         if len(vals) >= 2:
-            variance = sum((v - self.mean) ** 2 for v in vals) / (len(vals) - 1)
-            self.std = math.sqrt(variance)
+            variance = sum(
+                ((v - self.mean) ** 2 for v in vals), Decimal(0)
+            ) / Decimal(len(vals) - 1)
+            with localcontext() as context:
+                context.prec = 50
+                self.std = variance.sqrt()
         else:
-            self.std = 0.0
+            self.std = Decimal(0)
 
 
 @dataclass
 class VerifiedRegistry:
     """Registry of all numbers grounded in experiment data."""
 
-    values: dict[float, str] = field(default_factory=dict)
+    # ``values`` includes deterministic display aliases. Only this mapping may
+    # satisfy exact equality; relative tolerance is restricted to raw evidence.
+    values: dict[Decimal, str] = field(default_factory=dict)
+    canonical_values: dict[Decimal, str] = field(default_factory=dict)
     condition_names: set[str] = field(default_factory=set)
     conditions: dict[str, ConditionResult] = field(default_factory=dict)
-    primary_metric: float | None = None
-    primary_metric_std: float | None = None
+    primary_metric: Decimal | None = None
+    primary_metric_std: Decimal | None = None
     metric_direction: str = "maximize"  # "maximize" or "minimize"
     training_config: dict[str, Any] = field(default_factory=dict)
 
-    def add_value(self, value: float, source: str) -> None:
+    def add_value(self, value: int | float | Decimal, source: str) -> None:
         """Register a verified numeric value with its provenance."""
-        if not _is_finite(value):
+        numeric = _as_decimal(value)
+        if numeric is None:
             return
-        self.values[value] = source
+        self.values[numeric] = source
+        self.canonical_values[numeric] = source
         # Also register common transformations
-        self._add_variants(value, source)
+        self._add_variants(numeric, source)
 
-    def _add_variants(self, value: float, source: str) -> None:
+    def _add_variants(self, value: Decimal, source: str) -> None:
         """Register rounding variants and percentage conversions."""
         # Rounded variants (2, 3, 4 decimal places)
         for dp in (1, 2, 3, 4):
@@ -89,8 +103,8 @@ class VerifiedRegistry:
                 self.values[rounded] = f"{source} (rounded to {dp}dp)"
 
         # Percentage conversion: if value is in [0, 1], also register value*100
-        if 0.0 < abs(value) <= 1.0:
-            pct = value * 100.0
+        if Decimal(0) < abs(value) <= Decimal(1):
+            pct = value * Decimal(100)
             if pct not in self.values:
                 self.values[pct] = f"{source} (×100)"
                 for dp in (1, 2, 3, 4):
@@ -99,32 +113,46 @@ class VerifiedRegistry:
                         self.values[pct_r] = f"{source} (×100, {dp}dp)"
 
         # If value > 1 and could be a percentage, also register value/100
-        if abs(value) > 1.0:
-            frac = value / 100.0
+        if abs(value) > Decimal(1):
+            frac = value / Decimal(100)
             if frac not in self.values:
                 self.values[frac] = f"{source} (÷100)"
 
-    def is_verified(self, number: float, tolerance: float = 0.01) -> bool:
+    def is_verified(
+        self, number: int | float | Decimal, tolerance: int | float | Decimal = 0.01
+    ) -> bool:
         """Check if *number* matches any verified value within relative tolerance."""
-        if not _is_finite(number):
+        numeric = _as_decimal(number)
+        decimal_tolerance = _normalize_tolerance(tolerance)
+        if numeric is None or decimal_tolerance is None:
             return False
-        for v in self.values:
-            if v == 0.0:
-                if abs(number) < 1e-6:
-                    return True
-            elif abs(number - v) / max(abs(v), 1e-9) <= tolerance:
+        if numeric in self.values:
+            return True
+        if decimal_tolerance == 0:
+            return False
+        for v in self.canonical_values:
+            if v != 0 and abs(numeric - v) / max(
+                abs(v), Decimal("1e-9")
+            ) < decimal_tolerance:
                 return True
         return False
 
-    def lookup(self, number: float, tolerance: float = 0.01) -> str | None:
+    def lookup(
+        self, number: int | float | Decimal, tolerance: int | float | Decimal = 0.01
+    ) -> str | None:
         """Return the source description if *number* is verified, else None."""
-        if not _is_finite(number):
+        numeric = _as_decimal(number)
+        decimal_tolerance = _normalize_tolerance(tolerance)
+        if numeric is None or decimal_tolerance is None:
             return None
-        for v, src in self.values.items():
-            if v == 0.0:
-                if abs(number) < 1e-6:
-                    return src
-            elif abs(number - v) / max(abs(v), 1e-9) <= tolerance:
+        if numeric in self.values:
+            return self.values[numeric]
+        if decimal_tolerance == 0:
+            return None
+        for v, src in self.canonical_values.items():
+            if v != 0 and abs(numeric - v) / max(
+                abs(v), Decimal("1e-9")
+            ) < decimal_tolerance:
                 return src
         return None
 
@@ -159,13 +187,15 @@ class VerifiedRegistry:
 
         # Parse per-seed structure: "CondName/seed/metric_key" → value
         for key, value in metrics.items():
-            if not isinstance(value, (int, float)) or not _is_finite(value):
+            if not _is_finite(value):
                 continue
+            numeric = _as_decimal(value)
+            assert numeric is not None
             if key in _INFRA_KEYS:
-                reg.training_config[key] = value
+                reg.training_config[key] = numeric
                 continue
 
-            reg.add_value(value, f"best_run.metrics.{key}")
+            reg.add_value(numeric, f"best_run.metrics.{key}")
 
             m = _PER_SEED_PATTERN.match(key)
             if m:
@@ -173,7 +203,7 @@ class VerifiedRegistry:
                 seed_idx = int(seed_str)
                 if cond_name not in reg.conditions:
                     reg.conditions[cond_name] = ConditionResult(name=cond_name)
-                reg.conditions[cond_name].per_seed_values[seed_idx] = value
+                reg.conditions[cond_name].per_seed_values[seed_idx] = numeric
                 reg.condition_names.add(cond_name)
 
         # --- 2. Extract condition_summaries ---
@@ -183,9 +213,11 @@ class VerifiedRegistry:
                 reg.conditions[cond_name] = ConditionResult(name=cond_name)
             cond_metrics = cond_data.get("metrics", {})
             for mk, mv in cond_metrics.items():
-                if isinstance(mv, (int, float)) and _is_finite(mv):
-                    reg.add_value(mv, f"condition_summaries.{cond_name}.{mk}")
-                    reg.conditions[cond_name].aggregate_metric = mv
+                if _is_finite(mv):
+                    numeric = _as_decimal(mv)
+                    assert numeric is not None
+                    reg.add_value(numeric, f"condition_summaries.{cond_name}.{mk}")
+                    reg.conditions[cond_name].aggregate_metric = numeric
 
         # --- 3. Extract metrics_summary (min/max/mean per key) ---
         for key, stats in experiment_summary.get("metrics_summary", {}).items():
@@ -193,7 +225,7 @@ class VerifiedRegistry:
                 continue
             for stat_name in ("min", "max", "mean"):
                 v = stats.get(stat_name)
-                if isinstance(v, (int, float)) and _is_finite(v):
+                if _is_finite(v):
                     reg.add_value(v, f"metrics_summary.{key}.{stat_name}")
 
         # --- 4. Extract primary_metric ---
@@ -202,9 +234,11 @@ class VerifiedRegistry:
             reg.primary_metric = pm
             reg.add_value(pm, "primary_metric")
         pm_std = metrics.get("primary_metric_std")
-        if isinstance(pm_std, (int, float)) and _is_finite(pm_std):
-            reg.primary_metric_std = pm_std
-            reg.add_value(pm_std, "primary_metric_std")
+        if _is_finite(pm_std):
+            numeric_std = _as_decimal(pm_std)
+            assert numeric_std is not None
+            reg.primary_metric_std = numeric_std
+            reg.add_value(numeric_std, "primary_metric_std")
 
         # --- 5. Compute per-condition stats ---
         for cond in reg.conditions.values():
@@ -223,8 +257,8 @@ class VerifiedRegistry:
                     reg.add_value(diff, f"diff({c1.name}-{c2.name})")
                     reg.add_value(abs(diff), f"|diff({c1.name},{c2.name})|")
                 # Relative improvement
-                if c2.mean and abs(c2.mean) > 1e-9:  # type: ignore[operator]
-                    rel = (c1.mean - c2.mean) / abs(c2.mean) * 100.0  # type: ignore[operator]
+                if c2.mean and abs(c2.mean) > Decimal("1e-9"):  # type: ignore[operator]
+                    rel = (c1.mean - c2.mean) / abs(c2.mean) * Decimal(100)  # type: ignore[operator]
                     if _is_finite(rel):
                         reg.add_value(rel, f"rel_improve({c1.name} vs {c2.name})")
                         reg.add_value(abs(rel), f"|rel_improve({c1.name},{c2.name})|")
@@ -369,6 +403,9 @@ def _merge_into(target: VerifiedRegistry, source: VerifiedRegistry) -> None:
     for v, desc in source.values.items():
         if v not in target.values:
             target.values[v] = desc
+    for v, desc in source.canonical_values.items():
+        if v not in target.canonical_values:
+            target.canonical_values[v] = desc
     target.condition_names |= source.condition_names
     for cname, cresult in source.conditions.items():
         if cname not in target.conditions:
@@ -396,7 +433,7 @@ def _merge_into(target: VerifiedRegistry, source: VerifiedRegistry) -> None:
 def _enrich_from_refinement_log(reg: VerifiedRegistry, refinement_log: dict) -> None:
     """Add values from the best refinement iteration."""
     best_metric = refinement_log.get("best_metric")
-    if isinstance(best_metric, (int, float)) and _is_finite(best_metric):
+    if _is_finite(best_metric):
         reg.add_value(best_metric, "refinement_log.best_metric")
 
     best_version = refinement_log.get("best_version", "")
@@ -405,7 +442,7 @@ def _enrich_from_refinement_log(reg: VerifiedRegistry, refinement_log: dict) -> 
     for it in iterations:
         ver = it.get("version_dir", "")
         metric = it.get("metric")
-        if isinstance(metric, (int, float)) and _is_finite(metric):
+        if _is_finite(metric):
             reg.add_value(metric, f"refinement_log.iteration.{ver}")
 
         # Extract per-seed values from sandbox stdout if available
@@ -416,7 +453,7 @@ def _enrich_from_refinement_log(reg: VerifiedRegistry, refinement_log: dict) -> 
             sb_metrics = sandbox.get("metrics", {})
             if isinstance(sb_metrics, dict):
                 for mk, mv in sb_metrics.items():
-                    if isinstance(mv, (int, float)) and _is_finite(mv) and mk not in _INFRA_KEYS:
+                    if _is_finite(mv) and mk not in _INFRA_KEYS:
                         reg.add_value(mv, f"refinement.{ver}.{sandbox_key}.{mk}")
 
                         # Parse per-seed keys here too
@@ -429,21 +466,37 @@ def _enrich_from_refinement_log(reg: VerifiedRegistry, refinement_log: dict) -> 
                                 reg.conditions[cond_name] = ConditionResult(name=cond_name)
                             # Only update per_seed if this is the best version
                             if ver == best_version or best_version in ver:
-                                reg.conditions[cond_name].per_seed_values[seed_idx] = mv
+                                numeric = _as_decimal(mv)
+                                assert numeric is not None
+                                reg.conditions[cond_name].per_seed_values[seed_idx] = numeric
 
 
-def _extract_primary_metric(metrics: dict) -> float | None:
+def _extract_primary_metric(metrics: dict) -> Decimal | None:
     """Extract primary_metric from metrics dict."""
     pm = metrics.get("primary_metric")
-    if isinstance(pm, (int, float)) and _is_finite(pm):
-        return float(pm)
-    return None
+    return _as_decimal(pm)
 
 
 def _is_finite(value: Any) -> bool:
     """Check if value is a finite number (not NaN, not Inf, not bool)."""
+    return _as_decimal(value) is not None
+
+
+def _as_decimal(value: Any) -> Decimal | None:
     if isinstance(value, bool):
-        return False
-    if not isinstance(value, (int, float)):
-        return False
-    return math.isfinite(value)
+        return None
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else None
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float) and math.isfinite(value):
+        return Decimal(str(value))
+    return None
+
+
+def _normalize_tolerance(value: int | float | Decimal) -> Decimal | None:
+    """Return a finite non-negative tolerance without accepting bools."""
+    numeric = _as_decimal(value)
+    if numeric is None or numeric < 0:
+        return None
+    return numeric

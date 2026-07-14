@@ -8,7 +8,10 @@ from typing import Any, cast
 
 import pytest
 
-pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
+pytestmark = pytest.mark.usefixtures(
+    "canonical_evidence_migration_complete",
+    "consumer_evidence_fixture",
+)
 
 from researchclaw.pipeline.stage_impls import _review_publish
 from researchclaw.pipeline.stage_impls._paper_writing import (

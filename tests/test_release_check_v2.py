@@ -1385,7 +1385,10 @@ def test_degraded_compatible_codes_are_closed_snapshot() -> None:
 
 
 def test_release_checker_invokes_real_e9_and_allow_suspicious_cannot_waive_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+    consumer_evidence_fixture: object,
 ) -> None:
     run = tmp_path / "run"
     _config, _keys = _prepare_e9_run(run, monkeypatch)

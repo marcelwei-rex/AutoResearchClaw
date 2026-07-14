@@ -5,6 +5,7 @@ import json
 import re
 import sys
 from dataclasses import replace
+from decimal import Decimal
 from http.client import IncompleteRead
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,10 @@ from typing import Any, cast
 
 import pytest
 
-pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
+pytestmark = pytest.mark.usefixtures(
+    "canonical_evidence_migration_complete",
+    "consumer_evidence_fixture",
+)
 import yaml
 
 from researchclaw.adapters import AdapterBundle
@@ -67,7 +71,9 @@ def _stub_effective_citation_policy_for_legacy_unit_tests(
         lambda *_args, **_kwargs: {"valid": True},
     )
     monkeypatch.setattr(
-        _paper_writing, "validate_experiment_fact_closure_report", lambda *_args: {}
+        _paper_writing,
+        "validate_experiment_fact_closure_report",
+        lambda *_args, **_kwargs: {},
     )
     monkeypatch.setattr(
         _paper_writing, "validate_citation_closure_report", lambda *_args: {}
@@ -1545,6 +1551,19 @@ class TestResearchDecisionStructured:
         assert data["decision"] is None
         assert data["decision_parse_failed"] is True
 
+    def test_agent_requirements_decision_uses_parseable_proceed_shape(self) -> None:
+        from researchclaw.pipeline.stage_impls._analysis import (
+            _format_agent_decision_md,
+        )
+
+        text = _format_agent_decision_md(
+            {"verdict": "accept", "per_requirement": []},
+            "proceed",
+            retry_count=0,
+            rerun_triggered=False,
+        )
+        assert rc_executor._parse_decision(text) == "proceed"
+
 
 class TestExperimentDesignGuard:
     # The schema-deficit guard added in _execute_experiment_design uses
@@ -2149,7 +2168,7 @@ class TestCollectRawExperimentMetrics:
         assert block == ""
         assert not has_parsed
 
-    def test_extracts_metrics_from_stdout(self, tmp_path: Path) -> None:
+    def test_ignores_unbound_stdout_metrics(self, tmp_path: Path) -> None:
         run_dir = tmp_path / "run"
         runs_dir = run_dir / "stage-12" / "runs"
         runs_dir.mkdir(parents=True)
@@ -2159,9 +2178,7 @@ class TestCollectRawExperimentMetrics:
         }
         (runs_dir / "run-1.json").write_text(json.dumps(payload))
         result, has_parsed = rc_executor._collect_raw_experiment_metrics(run_dir)
-        assert "361.92" in result
-        assert "576.24" in result
-        assert "1 run(s)" in result
+        assert result == ""
         assert not has_parsed
 
     def test_extracts_from_metrics_dict(self, tmp_path: Path) -> None:
@@ -2185,8 +2202,7 @@ class TestCollectRawExperimentMetrics:
         }
         (runs_dir / "run-1.json").write_text(json.dumps(payload))
         result, _ = rc_executor._collect_raw_experiment_metrics(run_dir)
-        # "loss: 0.5" should appear only once (deduplicated)
-        assert result.count("loss: 0.5") == 1
+        assert result.count("metric_observations.loss[0]: 0.5") == 1
 
 
 class TestCollectExperimentEvidence:
@@ -2639,11 +2655,10 @@ class TestDataIntegrityBlock:
         # LLM should NOT have been called
         assert len(llm.calls) == 0
 
-    def test_paper_draft_blocked_with_simulated_data(
+    def test_unbound_simulated_files_do_not_enter_writer_evidence(
         self, tmp_path: Path, run_dir: Path, rc_config: RCConfig, adapters: AdapterBundle,
     ) -> None:
-        # All run files report status="simulated" → R10 block fires.
-        # Post-cleanup: PAUSED with paper_meta.json and decision="blocked_simulated_data".
+        # Legacy run files are diagnostic-only after canonical migration.
         _write_prior_artifact(run_dir, 16, "outline.md", "# Outline\n## Abstract\n")
         runs_dir = run_dir / "stage-12" / "runs"
         runs_dir.mkdir(parents=True, exist_ok=True)
@@ -2659,35 +2674,9 @@ class TestDataIntegrityBlock:
                 encoding="utf-8",
             )
 
-        stage_dir = run_dir / "stage-17"
-        stage_dir.mkdir(parents=True, exist_ok=True)
-        stale_report = stage_dir / "paper_structure_report.json"
-        stale_report.write_text('{"valid": true}', encoding="utf-8")
-        stale_invalid = stage_dir / "paper_draft_invalid.md"
-        stale_invalid.write_text("stale invalid", encoding="utf-8")
-        stale_generation = stage_dir / "section_generation_report.json"
-        stale_generation.write_text("{}", encoding="utf-8")
-        stale_fact_diagnostic = stage_dir / "experiment_fact_closure_invalid.json"
-        stale_fact_diagnostic.write_text("{}", encoding="utf-8")
-
-        llm = FakeLLMClient("should not be called")
-        result = rc_executor._execute_paper_draft(
-            stage_dir, run_dir, rc_config, adapters, llm=llm
-        )
-
-        assert result.status == StageStatus.PAUSED
-        assert result.decision == "blocked_simulated_data"
-        assert "simulated" in (result.error or "").lower()
-        assert (stage_dir / "paper_draft.md").exists()
-        meta = json.loads((stage_dir / "paper_meta.json").read_text(encoding="utf-8"))
-        assert meta["outcome"] == "blocked_simulated_data"
-        assert not stale_report.exists()
-        assert not stale_invalid.exists()
-        assert not stale_generation.exists()
-        assert not stale_fact_diagnostic.exists()
-        assert meta.get("is_literature_first_topic") is False
-        # LLM should NOT have been called
-        assert len(llm.calls) == 0
+        block, has_metrics = rc_executor._collect_raw_experiment_metrics(run_dir)
+        assert block == ""
+        assert has_metrics is False
 
     def test_paper_draft_proceeds_with_metrics(
         self, tmp_path: Path, run_dir: Path, rc_config: RCConfig, adapters: AdapterBundle
@@ -2722,7 +2711,7 @@ class TestDataIntegrityBlock:
         )
         assert "Data Integrity" in all_prompts or "ONLY report numbers" in all_prompts
 
-    def test_grounded_metric_whitelist_reads_scaffold_results_json(
+    def test_grounded_metric_whitelist_uses_selected_result_manifest(
         self, run_dir: Path
     ) -> None:
         from researchclaw.pipeline.stage_impls import _paper_writing
@@ -2751,10 +2740,13 @@ class TestDataIntegrityBlock:
 
         assert "GROUNDED METRIC VALUE WHITELIST" in block
         assert (
-            "stage-12/runs/results.json :: metrics.detection_f1 = 0.4753327669"
+            "stage-12/experiment_result_set.json :: structured_results.metrics.detection_f1 = 0.4753327669"
             in block
         )
-        assert "stage-12/runs/results.json :: metrics.fpr = 0.0291666667" in block
+        assert (
+            "stage-12/experiment_result_set.json :: structured_results.metrics.fpr = 0.0291666667"
+            in block
+        )
         assert "Do NOT introduce any other decimal metric values" in block
 
     def test_paper_draft_injects_scaffold_results_into_first_prompt(
@@ -2992,16 +2984,18 @@ class TestDataIntegrityBlock:
             "paper_sha256": "a" * 64,
             "experiment_contract_path": "stage-09/experiment_contract.yaml",
             "experiment_contract_sha256": "b" * 64,
+            "canonical_experiment_evidence_path": "canonical_experiment_evidence.json",
+            "canonical_experiment_evidence_sha256": "d" * 64,
             "dataset_origin": "synthetic",
-            "grounded_numeric_values": [0.4753327669],
-            "manuscript_numeric_values": [0.4753327669, 0.47],
-            "unknown_numeric_values": [0.47],
+            "grounded_numeric_values": [Decimal("0.4753327669")],
+            "manuscript_numeric_values": [Decimal("0.4753327669"), Decimal("0.47")],
+            "unknown_numeric_values": [Decimal("0.47")],
             "dataset_claim_violations": ["SPEC CPU2006"],
             "valid": False,
         }
         valid_report = {**invalid_report, "paper_sha256": "c" * 64}
         valid_report.update(
-            manuscript_numeric_values=[0.4753327669],
+            manuscript_numeric_values=[Decimal("0.4753327669")],
             unknown_numeric_values=[],
             dataset_claim_violations=[],
             valid=True,
@@ -3055,11 +3049,11 @@ class TestDataIntegrityBlock:
 
     def test_fact_repair_cannot_add_grounded_numeric_authority(self) -> None:
         before = {
-            "manuscript_numeric_values": [0.64],
-            "unknown_numeric_values": [0.64],
+            "manuscript_numeric_values": [Decimal("0.64")],
+            "unknown_numeric_values": [Decimal("0.64")],
         }
         after = {
-            "manuscript_numeric_values": [0.639877],
+            "manuscript_numeric_values": [Decimal("0.639877")],
             "unknown_numeric_values": [],
         }
         assert _paper_writing._fact_repair_added_numeric_authority(
@@ -3091,10 +3085,12 @@ class TestDataIntegrityBlock:
             "paper_sha256": "a" * 64,
             "experiment_contract_path": "stage-09/experiment_contract.yaml",
             "experiment_contract_sha256": "b" * 64,
+            "canonical_experiment_evidence_path": "canonical_experiment_evidence.json",
+            "canonical_experiment_evidence_sha256": "d" * 64,
             "dataset_origin": "synthetic",
-            "grounded_numeric_values": [0.4753327669],
-            "manuscript_numeric_values": [0.47],
-            "unknown_numeric_values": [0.47],
+            "grounded_numeric_values": [Decimal("0.4753327669")],
+            "manuscript_numeric_values": [Decimal("0.47")],
+            "unknown_numeric_values": [Decimal("0.47")],
             "dataset_claim_violations": [],
             "valid": False,
         }
@@ -3158,10 +3154,12 @@ class TestDataIntegrityBlock:
             "paper_sha256": "a" * 64,
             "experiment_contract_path": "stage-09/experiment_contract.yaml",
             "experiment_contract_sha256": "b" * 64,
+            "canonical_experiment_evidence_path": "canonical_experiment_evidence.json",
+            "canonical_experiment_evidence_sha256": "d" * 64,
             "dataset_origin": "synthetic",
-            "grounded_numeric_values": [0.4753327669],
-            "manuscript_numeric_values": [0.47],
-            "unknown_numeric_values": [0.47],
+            "grounded_numeric_values": [Decimal("0.4753327669")],
+            "manuscript_numeric_values": [Decimal("0.47")],
+            "unknown_numeric_values": [Decimal("0.47")],
             "dataset_claim_violations": [],
             "valid": False,
         }
@@ -3231,16 +3229,18 @@ class TestDataIntegrityBlock:
             "paper_sha256": "a" * 64,
             "experiment_contract_path": "stage-09/experiment_contract.yaml",
             "experiment_contract_sha256": "b" * 64,
+            "canonical_experiment_evidence_path": "canonical_experiment_evidence.json",
+            "canonical_experiment_evidence_sha256": "d" * 64,
             "dataset_origin": "synthetic",
-            "grounded_numeric_values": [0.4753327669],
-            "manuscript_numeric_values": [0.4753327669, 0.47],
-            "unknown_numeric_values": [0.47],
+            "grounded_numeric_values": [Decimal("0.4753327669")],
+            "manuscript_numeric_values": [Decimal("0.4753327669"), Decimal("0.47")],
+            "unknown_numeric_values": [Decimal("0.47")],
             "dataset_claim_violations": [],
             "valid": False,
         }
         valid_report = {**invalid_report, "paper_sha256": "c" * 64}
         valid_report.update(
-            manuscript_numeric_values=[0.4753327669],
+            manuscript_numeric_values=[Decimal("0.4753327669")],
             unknown_numeric_values=[],
             valid=True,
         )

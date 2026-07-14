@@ -25,6 +25,12 @@ from researchclaw.experiment_runtime.contract import derive_contract, dump_contr
 from researchclaw.experiment_runtime.scaffold import render_main_py
 from researchclaw.literature.citation_policy import write_active_config_binding
 from researchclaw.literature.evidence_cards import canonical_json_text
+from researchclaw.literature.experiment_fact_closure import (
+    ExperimentFactClosureError,
+    build_experiment_fact_closure_report,
+    canonical_experiment_fact_json_text,
+    validate_experiment_fact_closure_report,
+)
 from researchclaw.mcp.server import ResearchClawMCPServer
 from researchclaw.memory.experiment_memory import ExperimentMemory
 from researchclaw.evolution import extract_lessons
@@ -74,6 +80,16 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     validate_single_invocation_aggregate,
     publish_canonical_experiment_manifest,
     _stage12_primary_metric,
+)
+from researchclaw.pipeline.stage_impls._analysis import _execute_research_decision
+from researchclaw.pipeline.stage_impls._paper_writing import (
+    _collect_grounded_metric_whitelist,
+    _collect_raw_experiment_metrics,
+    _execute_paper_draft,
+    _execute_paper_outline,
+    _load_bound_stage15_decision,
+    _load_bound_stage16_outline,
+    _write_outline_binding,
 )
 from researchclaw.pipeline.runner import execute_pipeline
 from researchclaw.pipeline import runner as pipeline_runner
@@ -2615,3 +2631,364 @@ def test_mcp_returns_structured_migration_error_without_reading_run(tmp_path: Pa
     assert payload["success"] is False
     assert payload["error_code"] == "canonical_evidence_migration_incomplete"
     assert not tmp_path.joinpath("does-not-exist").exists()
+
+
+def test_stage15_consumes_and_binds_only_canonical_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+    shadow = run_dir / "stage-14_v99"
+    shadow.mkdir()
+    (shadow / "analysis.md").write_text("POISON ANALYSIS", encoding="utf-8")
+    stage15 = run_dir / "stage-15"
+    stage15.mkdir()
+    captured: dict[str, str] = {}
+
+    class _Prompts:
+        def for_stage(self, _name: str, **kwargs: object) -> SimpleNamespace:
+            captured["analysis"] = str(kwargs["analysis"])
+            return SimpleNamespace(system="system", user=str(kwargs["analysis"]))
+
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._analysis._chat_with_prompt",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            content="PROCEED: baseline, seed, and metric evidence are bounded."
+        ),
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._analysis._write_socratic_critique",
+        lambda *_args, **_kwargs: None,
+    )
+    result = _execute_research_decision(
+        stage15,
+        run_dir,
+        config,
+        AdapterBundle(),
+        llm=SimpleNamespace(),
+        prompts=_Prompts(),  # type: ignore[arg-type]
+    )
+    assert result.status.value == "done"
+    assert captured["analysis"] == "Analysis.\n"
+    payload = json.loads((stage15 / "decision_structured.json").read_text())
+    evidence = load_canonical_experiment_evidence(run_dir)
+    assert payload["canonical_experiment_evidence_path"] == evidence.manifest_path
+    assert payload["canonical_experiment_evidence_sha256"] == evidence.manifest_sha256
+
+
+def test_stage17_fact_closure_binds_canonical_manifest_and_rejects_change(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    _config_value, _root = _write_canonical_bundle(run_dir)
+    evidence = load_canonical_experiment_evidence(run_dir)
+    paper = "# Paper\n\n## Results\n\nThe selected detection F1 is 0.5.\n"
+    stage17 = run_dir / "stage-17"
+    stage17.mkdir()
+    (stage17 / "paper_draft.md").write_text(paper, encoding="utf-8")
+    report = build_experiment_fact_closure_report(
+        run_dir, paper_text=paper, evidence=evidence
+    )
+    assert report["valid"] is True
+    assert report["canonical_experiment_evidence_sha256"] == evidence.manifest_sha256
+    (stage17 / "experiment_fact_closure_report.json").write_text(
+        canonical_experiment_fact_json_text(report), encoding="utf-8"
+    )
+    validate_experiment_fact_closure_report(run_dir)
+
+    (run_dir / "canonical_experiment_evidence.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ExperimentFactClosureError, match="canonical experiment evidence"):
+        validate_experiment_fact_closure_report(run_dir)
+
+
+def _write_stage15_decision_binding(
+    run_dir: Path,
+    evidence: object,
+    *,
+    decision_text: str,
+    structured_decision: object,
+    parse_failed: bool = False,
+) -> None:
+    stage15 = run_dir / "stage-15"
+    stage15.mkdir(exist_ok=True)
+    (stage15 / "decision.md").write_text(decision_text, encoding="utf-8")
+    payload: dict[str, object] = {
+        "decision": structured_decision,
+        "raw_text_excerpt": decision_text[:500],
+        "generated": "2026-07-14T00:00:00+00:00",
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+        "decision_path": "stage-15/decision.md",
+        "decision_sha256": sha256_text(decision_text),
+    }
+    if parse_failed:
+        payload["decision_parse_failed"] = True
+        payload["note"] = "No recognized decision."
+    else:
+        payload["quality_warnings"] = []
+    (stage15 / "decision_structured.json").write_text(
+        canonical_json_text(payload), encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("decision_text", "structured_decision", "parse_failed"),
+    (
+        ("## Decision\nREFINE\n", "refine", False),
+        ("## Decision\nPIVOT\n", "pivot", False),
+        ("## Decision\nREFINE\n", "proceed", False),
+        ("No decision token.\n", None, True),
+    ),
+)
+def test_bound_stage15_decision_requires_reparsed_proceed(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    decision_text: str,
+    structured_decision: object,
+    parse_failed: bool,
+) -> None:
+    run_dir = tmp_path / "run"
+    _config, _root = _write_canonical_bundle(run_dir)
+    evidence = load_canonical_experiment_evidence(run_dir)
+    _write_stage15_decision_binding(
+        run_dir,
+        evidence,
+        decision_text=decision_text,
+        structured_decision=structured_decision,
+        parse_failed=parse_failed,
+    )
+
+    with pytest.raises(ValueError, match="Stage 15 decision"):
+        _load_bound_stage15_decision(run_dir, evidence)
+
+
+def test_bound_stage15_decision_rejects_agent_requirements_tag(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    _config, _root = _write_canonical_bundle(run_dir)
+    evidence = load_canonical_experiment_evidence(run_dir)
+    decision_text = "## Decision\nPROCEED\n"
+    stage15 = run_dir / "stage-15"
+    stage15.mkdir(exist_ok=True)
+    (stage15 / "decision.md").write_text(decision_text, encoding="utf-8")
+    payload = {
+        "decision": "proceed",
+        "verdict": {},
+        "retry_count": 999,
+        "rerun_triggered": True,
+        "max_retries": 0,
+        "generated": "2026-07-14T00:00:00+00:00",
+        "source": "agent_requirements_gate",
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+        "decision_path": "stage-15/decision.md",
+        "decision_sha256": sha256_text(decision_text),
+    }
+    (stage15 / "decision_structured.json").write_text(
+        canonical_json_text(payload), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="agent requirements decisions"):
+        _load_bound_stage15_decision(run_dir, evidence)
+
+
+def test_stage16_rejects_agent_requirements_binding_before_llm(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+    evidence = load_canonical_experiment_evidence(run_dir)
+    decision_text = "## Decision\nPROCEED\n"
+    stage15 = run_dir / "stage-15"
+    stage15.mkdir(exist_ok=True)
+    (stage15 / "decision.md").write_text(decision_text, encoding="utf-8")
+    payload = {
+        "decision": "proceed",
+        "verdict": {},
+        "retry_count": 0,
+        "rerun_triggered": False,
+        "max_retries": 0,
+        "generated": "2026-07-14T00:00:00+00:00",
+        "source": "agent_requirements_gate",
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+        "decision_path": "stage-15/decision.md",
+        "decision_sha256": sha256_text(decision_text),
+    }
+    (stage15 / "decision_structured.json").write_text(
+        canonical_json_text(payload), encoding="utf-8"
+    )
+    stage16 = run_dir / "stage-16"
+    stage16.mkdir()
+
+    class _UnexpectedLLM:
+        calls = 0
+
+        def chat(self, *_args: object, **_kwargs: object) -> object:
+            self.calls += 1
+            raise AssertionError("Stage 16 must reject before invoking the LLM")
+
+    llm = _UnexpectedLLM()
+    result = _execute_paper_outline(
+        stage16, run_dir, config, AdapterBundle(), llm=llm  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert llm.calls == 0
+
+
+def test_stage16_rejects_paused_stage15_binding_before_llm(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+    evidence = load_canonical_experiment_evidence(run_dir)
+    _write_stage15_decision_binding(
+        run_dir,
+        evidence,
+        decision_text="No decision token.\n",
+        structured_decision=None,
+        parse_failed=True,
+    )
+    stage16 = run_dir / "stage-16"
+    stage16.mkdir()
+
+    class _UnexpectedLLM:
+        calls = 0
+
+        def chat(self, *_args: object, **_kwargs: object) -> object:
+            self.calls += 1
+            raise AssertionError("Stage 16 must reject before invoking the LLM")
+
+    llm = _UnexpectedLLM()
+    result = _execute_paper_outline(
+        stage16, run_dir, config, AdapterBundle(), llm=llm  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert llm.calls == 0
+
+
+def test_stage15_16_bindings_ignore_shadow_stage_paths(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    _config, _root = _write_canonical_bundle(run_dir)
+    evidence = load_canonical_experiment_evidence(run_dir)
+    decision_text = "## Decision\nPROCEED\n"
+    _write_stage15_decision_binding(
+        run_dir,
+        evidence,
+        decision_text=decision_text,
+        structured_decision="proceed",
+    )
+    outline = "# Outline\n\n## Abstract\n"
+    stage16 = run_dir / "stage-16"
+    stage16.mkdir()
+    (stage16 / "outline.md").write_text(outline, encoding="utf-8")
+    _write_outline_binding(
+        stage16,
+        outline=outline,
+        decision_sha256=sha256_text(decision_text),
+        evidence=evidence,
+    )
+    shadow = run_dir / "stage-99"
+    shadow.mkdir()
+    (shadow / "decision.md").write_text("## Decision\nPIVOT\n", encoding="utf-8")
+    (shadow / "outline.md").write_text("# Poison outline\n", encoding="utf-8")
+
+    assert _load_bound_stage15_decision(run_dir, evidence)[0] == decision_text
+    assert _load_bound_stage16_outline(run_dir, evidence) == outline
+
+
+@pytest.mark.parametrize(
+    ("stage_name", "execute", "owned_names"),
+    (
+        (
+            "stage-15",
+            _execute_research_decision,
+            ("decision.md", "decision_structured.json", "critique.json"),
+        ),
+        (
+            "stage-16",
+            _execute_paper_outline,
+            (
+                "outline.md",
+                "citation_policy_effective.json",
+                "citation_plan.preliminary.json",
+                "citation_plan.json",
+            ),
+        ),
+        (
+            "stage-17",
+            _execute_paper_draft,
+            (
+                "paper_draft.md",
+                "paper_draft_invalid.md",
+                "paper_structure_report.json",
+                "section_generation_report.json",
+                "citation_closure_report.json",
+                "experiment_fact_closure_report.json",
+                "paper_meta.json",
+                "quality_warnings.json",
+            ),
+        ),
+    ),
+)
+def test_stage15_17_reject_invalid_canonical_evidence_without_stale_outputs(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    stage_name: str,
+    execute: object,
+    owned_names: tuple[str, ...],
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+    stage_dir = run_dir / stage_name
+    stage_dir.mkdir()
+    for name in owned_names:
+        (stage_dir / name).write_text("stale\n", encoding="utf-8")
+    (run_dir / "canonical_experiment_evidence.json").write_text("{}\n", encoding="utf-8")
+
+    result = execute(  # type: ignore[operator]
+        stage_dir,
+        run_dir,
+        config,
+        AdapterBundle(),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert all(not (stage_dir / name).exists() for name in owned_names)
+
+
+def test_stage15_17_authoritative_functions_have_no_legacy_selectors() -> None:
+    forbidden = (
+        "experiment_summary_best",
+        "stage-14*",
+        "stage-12*/runs",
+        "stage-13*/refinement",
+        "_read_best_analysis",
+    )
+    functions = (
+        _execute_research_decision,
+        _execute_paper_outline,
+        _execute_paper_draft,
+        _collect_raw_experiment_metrics,
+        _collect_grounded_metric_whitelist,
+        build_experiment_fact_closure_report,
+        validate_experiment_fact_closure_report,
+    )
+    for function in functions:
+        source = inspect.getsource(function)
+        assert all(pattern not in source for pattern in forbidden), function.__name__

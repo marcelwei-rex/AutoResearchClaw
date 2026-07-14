@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import json
-import math
 import re
+from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
-from researchclaw.experiment_runtime.contract import find_stage09_contract, load_contract
+import yaml
+
+from researchclaw.experiment_runtime.contract import validate_contract_dict
+from researchclaw.pipeline.canonical_experiment_evidence import (
+    CanonicalExperimentEvidence,
+    CanonicalExperimentEvidenceError,
+    canonical_authority_json_text,
+    load_canonical_experiment_evidence,
+)
 from researchclaw.pipeline.manuscript_sections import (
     ManuscriptStructureError,
     merge_manuscript,
@@ -16,7 +25,7 @@ from researchclaw.pipeline.manuscript_sections import (
 )
 
 
-EXPERIMENT_FACT_CLOSURE_SCHEMA_VERSION = 1
+EXPERIMENT_FACT_CLOSURE_SCHEMA_VERSION = 2
 
 
 class ExperimentFactClosureError(ValueError):
@@ -73,42 +82,40 @@ def find_dataset_claim_violations(
 
 
 def build_experiment_fact_closure_report(
-    run_dir: Path, *, paper_text: str
+    run_dir: Path,
+    *,
+    paper_text: str,
+    evidence: CanonicalExperimentEvidence | None = None,
 ) -> dict[str, Any]:
-    contract_path = find_stage09_contract(run_dir)
-    if contract_path is None:
-        raise ExperimentFactClosureError("canonical Stage 9 experiment contract is missing")
     try:
-        if contract_path.is_symlink() or not contract_path.is_file():
-            raise ExperimentFactClosureError("experiment contract path is unsafe")
-        contract_text = contract_path.read_text(encoding="utf-8")
-        contract = load_contract(contract_path)
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        evidence = evidence or load_canonical_experiment_evidence(run_dir)
+        contract_text = evidence.experiment_contract_bytes.decode("utf-8")
+        contract_data = yaml.safe_load(contract_text)
+        if not isinstance(contract_data, dict):
+            raise ValueError("contract root must be an object")
+        contract = validate_contract_dict(contract_data)
+    except (
+        CanonicalExperimentEvidenceError,
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        yaml.YAMLError,
+    ) as exc:
         raise ExperimentFactClosureError(f"cannot load experiment contract: {exc}") from exc
 
-    grounded: list[float] = []
-    source_records: list[dict[str, str]] = []
-    for path in _metric_source_paths(run_dir):
-        try:
-            if path.is_symlink() or not path.is_file():
-                raise ExperimentFactClosureError(f"unsafe metric source: {path}")
-            text = path.read_text(encoding="utf-8")
-            payload = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ExperimentFactClosureError(f"invalid metric source {path.name}: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise ExperimentFactClosureError(f"metric source root is not an object: {path.name}")
-        before = len(grounded)
-        for key in ("primary_metric", "metrics", "key_metrics", "metrics_summary"):
-            if key in payload:
-                _collect_numbers(payload[key], grounded)
-        per_seed = payload.get("per_seed")
-        if isinstance(per_seed, list):
-            for row in per_seed[:20]:
-                if isinstance(row, dict) and isinstance(row.get("metrics"), dict):
-                    _collect_numbers(row["metrics"], grounded)
-        if len(grounded) > before:
-            source_records.append(_source_record(run_dir, path))
+    grounded: list[Decimal] = []
+    _collect_numbers(evidence.metric_observations, grounded)
+    _collect_numbers(evidence.structured_results, grounded)
+    source_records = [
+        {
+            "path": evidence.selected_result_manifest_path,
+            "sha256": evidence.selected_result_manifest_sha256,
+        },
+        {
+            "path": evidence.candidate_manifest_path,
+            "sha256": evidence.candidate_manifest_sha256,
+        },
+    ]
     if not grounded:
         raise ExperimentFactClosureError("no grounded metric values were found")
 
@@ -125,13 +132,14 @@ def build_experiment_fact_closure_report(
     dataset_violations = list(
         find_dataset_claim_violations(paper_text, contract.dataset_origin)
     )
-    relative_contract = contract_path.relative_to(run_dir).as_posix()
     payload = {
         "schema_version": EXPERIMENT_FACT_CLOSURE_SCHEMA_VERSION,
         "paper_path": "stage-17/paper_draft.md",
         "paper_sha256": _sha256(paper_text),
-        "experiment_contract_path": relative_contract,
-        "experiment_contract_sha256": _sha256(contract_text),
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+        "experiment_contract_path": evidence.experiment_contract_path,
+        "experiment_contract_sha256": evidence.experiment_contract_sha256,
         "dataset_origin": contract.dataset_origin,
         "metric_sources": source_records,
         "grounded_numeric_values": sorted(set(grounded)),
@@ -140,19 +148,27 @@ def build_experiment_fact_closure_report(
         "dataset_claim_violations": sorted(set(dataset_violations)),
         "valid": not unknown_values and not dataset_violations,
     }
-    return parse_experiment_fact_closure_report(_canonical_json(payload))
+    return parse_experiment_fact_closure_report(
+        canonical_experiment_fact_json_text(payload)
+    )
 
 
 def parse_experiment_fact_closure_report(text: str) -> dict[str, Any]:
     try:
-        payload = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+        payload = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_float=Decimal,
+            parse_constant=_reject_nonfinite_constant,
+        )
     except json.JSONDecodeError as exc:
         raise ExperimentFactClosureError(f"invalid experiment closure JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise ExperimentFactClosureError("experiment closure root must be an object")
     expected = {
         "schema_version", "paper_path", "paper_sha256", "experiment_contract_path",
-        "experiment_contract_sha256", "dataset_origin", "metric_sources",
+        "experiment_contract_sha256", "canonical_experiment_evidence_path",
+        "canonical_experiment_evidence_sha256", "dataset_origin", "metric_sources",
         "grounded_numeric_values", "manuscript_numeric_values",
         "unknown_numeric_values", "dataset_claim_violations", "valid",
     }
@@ -163,7 +179,13 @@ def parse_experiment_fact_closure_report(text: str) -> dict[str, Any]:
     if payload["paper_path"] != "stage-17/paper_draft.md":
         raise ExperimentFactClosureError("noncanonical experiment closure paper path")
     _safe_relative_path(payload["experiment_contract_path"])
-    for field in ("paper_sha256", "experiment_contract_sha256"):
+    if payload["canonical_experiment_evidence_path"] != "canonical_experiment_evidence.json":
+        raise ExperimentFactClosureError("noncanonical evidence manifest path")
+    for field in (
+        "paper_sha256",
+        "experiment_contract_sha256",
+        "canonical_experiment_evidence_sha256",
+    ):
         if not isinstance(payload[field], str) or re.fullmatch(r"[0-9a-f]{64}", payload[field]) is None:
             raise ExperimentFactClosureError(f"invalid {field}")
     if payload["dataset_origin"] not in {"synthetic", "public", "local_hardware"}:
@@ -181,7 +203,7 @@ def parse_experiment_fact_closure_report(text: str) -> dict[str, Any]:
     for field in ("grounded_numeric_values", "manuscript_numeric_values", "unknown_numeric_values"):
         values = payload[field]
         if not isinstance(values, list) or any(
-            isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value))
+            not _is_finite_decimal_number(value)
             for value in values
         ):
             raise ExperimentFactClosureError(f"invalid {field}")
@@ -196,7 +218,11 @@ def parse_experiment_fact_closure_report(text: str) -> dict[str, Any]:
     return payload
 
 
-def validate_experiment_fact_closure_report(run_dir: Path) -> dict[str, Any]:
+def validate_experiment_fact_closure_report(
+    run_dir: Path,
+    *,
+    evidence: CanonicalExperimentEvidence | None = None,
+) -> dict[str, Any]:
     paper_path = run_dir / "stage-17" / "paper_draft.md"
     report_path = run_dir / "stage-17" / "experiment_fact_closure_report.json"
     try:
@@ -204,64 +230,64 @@ def validate_experiment_fact_closure_report(run_dir: Path) -> dict[str, Any]:
         stored = parse_experiment_fact_closure_report(report_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError) as exc:
         raise ExperimentFactClosureError(f"cannot read experiment closure artifacts: {exc}") from exc
-    expected = build_experiment_fact_closure_report(run_dir, paper_text=paper_text)
+    if evidence is None:
+        try:
+            evidence = load_canonical_experiment_evidence(run_dir)
+        except CanonicalExperimentEvidenceError as exc:
+            raise ExperimentFactClosureError(
+                f"canonical experiment evidence is invalid: {exc}"
+            ) from exc
+    expected = build_experiment_fact_closure_report(
+        run_dir, paper_text=paper_text, evidence=evidence
+    )
     if stored != expected or not stored["valid"]:
         raise ExperimentFactClosureError("experiment fact closure replay failed")
     return stored
 
 
-def _metric_source_paths(run_dir: Path) -> tuple[Path, ...]:
-    best = run_dir / "experiment_summary_best.json"
-    if best.is_file():
-        return (best,)
-    direct_summary = run_dir / "stage-14" / "experiment_summary.json"
-    if direct_summary.is_file():
-        return (direct_summary,)
-    direct_runs = run_dir / "stage-12" / "runs"
-    if not direct_runs.is_dir() or direct_runs.is_symlink():
-        return ()
-    return tuple(
-        sorted(
-            (
-                path for path in direct_runs.iterdir()
-                if path.is_file() and not path.is_symlink() and path.suffix == ".json"
-            ),
-            key=lambda path: path.name,
-        )
-    )
-
-
-def _collect_numbers(value: Any, output: list[float]) -> None:
+def _collect_numbers(value: Any, output: list[Decimal]) -> None:
     if isinstance(value, bool):
         return
-    if isinstance(value, (int, float)) and math.isfinite(float(value)):
-        output.append(float(value))
-    elif isinstance(value, dict):
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ExperimentFactClosureError(
+                "canonical experiment evidence contains nonfinite authority"
+            )
+        output.append(value)
+    elif isinstance(value, int):
+        output.append(Decimal(value))
+    elif isinstance(value, float):
+        raise ExperimentFactClosureError(
+            "canonical experiment evidence contains binary float authority"
+        )
+    elif isinstance(value, Mapping):
         for child in value.values():
             _collect_numbers(child, output)
-    elif isinstance(value, list):
+    elif isinstance(value, (tuple, list)):
         for child in value:
             _collect_numbers(child, output)
 
 
-def _extract_metric_literals(text: str) -> list[tuple[float, bool]]:
+def _extract_metric_literals(text: str) -> list[tuple[Decimal, bool]]:
     prose = _CITATION_RE.sub("", text)
-    values: list[tuple[int, float, bool]] = []
+    values: list[tuple[int, Decimal, bool]] = []
     occupied: list[tuple[int, int]] = []
     for match in _DECIMAL_METRIC_RE.finditer(prose):
         token = match.group(0)
         percent = token.endswith("%")
-        value = float(token[:-1] if percent else token)
-        values.append((match.start(), value / 100.0 if percent else value, percent))
+        value = _decimal_token(token[:-1] if percent else token)
+        values.append(
+            (match.start(), value / Decimal(100) if percent else value, percent)
+        )
         occupied.append(match.span())
     for match in _INTEGER_UNIT_RE.finditer(prose):
         if any(start <= match.start() < end for start, end in occupied):
             continue
-        values.append((match.start(), float(match.group("number")), False))
+        values.append((match.start(), _decimal_token(match.group("number")), False))
     return [(value, percent) for _position, value, percent in sorted(values)]
 
 
-def _extract_experiment_metric_literals(text: str) -> list[tuple[float, bool]]:
+def _extract_experiment_metric_literals(text: str) -> list[tuple[Decimal, bool]]:
     try:
         document = parse_manuscript(text, strict=True)
     except ManuscriptStructureError as exc:
@@ -285,7 +311,7 @@ def _extract_experiment_metric_literals(text: str) -> list[tuple[float, bool]]:
 def remove_unsupported_experiment_fact_blocks(
     paper_text: str,
     *,
-    grounded_numeric_values: list[float],
+    grounded_numeric_values: list[Decimal],
     dataset_origin: str,
 ) -> tuple[str, dict[str, Any]]:
     """Remove the smallest deterministic blocks containing unsupported facts.
@@ -311,7 +337,7 @@ def remove_unsupported_experiment_fact_blocks(
     operations: list[dict[str, Any]] = []
     for section in document.sections:
         body = section.body
-        targets: list[tuple[int, str, float | None]] = []
+        targets: list[tuple[int, str, Decimal | None]] = []
         if _is_experiment_fact_section(section.title):
             for start, _end, value, is_percent in _metric_literal_spans(body):
                 if not any(
@@ -327,7 +353,7 @@ def remove_unsupported_experiment_fact_blocks(
         if not targets:
             continue
 
-        spans: list[tuple[int, int, str, list[float]]] = []
+        spans: list[tuple[int, int, str, list[Decimal]]] = []
         for position, reason, value in targets:
             start, end, block_type = _safe_fact_block_span(body, position)
             values = [] if value is None else [value]
@@ -374,22 +400,32 @@ def _is_experiment_fact_section(title: str) -> bool:
     )
 
 
-def _metric_literal_spans(text: str) -> list[tuple[int, int, float, bool]]:
-    spans: list[tuple[int, int, float, bool]] = []
+def _metric_literal_spans(text: str) -> list[tuple[int, int, Decimal, bool]]:
+    spans: list[tuple[int, int, Decimal, bool]] = []
     occupied: list[tuple[int, int]] = []
     for match in _DECIMAL_METRIC_RE.finditer(text):
         token = match.group(0)
         percent = token.endswith("%")
-        value = float(token[:-1] if percent else token)
+        value = _decimal_token(token[:-1] if percent else token)
         spans.append(
-            (match.start(), match.end(), value / 100.0 if percent else value, percent)
+            (
+                match.start(),
+                match.end(),
+                value / Decimal(100) if percent else value,
+                percent,
+            )
         )
         occupied.append(match.span())
     for match in _INTEGER_UNIT_RE.finditer(text):
         if any(start <= match.start() < end for start, end in occupied):
             continue
         spans.append(
-            (match.start(), match.end(), float(match.group("number")), False)
+            (
+                match.start(),
+                match.end(),
+                _decimal_token(match.group("number")),
+                False,
+            )
         )
     return sorted(spans)
 
@@ -495,9 +531,9 @@ def _is_abbreviation_boundary(paragraph: str, punctuation_start: int) -> bool:
 
 
 def _merge_repair_spans(
-    spans: list[tuple[int, int, str, list[float]]]
-) -> list[tuple[int, int, str, list[float]]]:
-    merged: list[tuple[int, int, str, list[float]]] = []
+    spans: list[tuple[int, int, str, list[Decimal]]]
+) -> list[tuple[int, int, str, list[Decimal]]]:
+    merged: list[tuple[int, int, str, list[Decimal]]] = []
     for start, end, block_type, values in sorted(spans):
         if merged and start < merged[-1][1]:
             prior_start, prior_end, prior_type, prior_values = merged[-1]
@@ -513,15 +549,35 @@ def _merge_repair_spans(
 
 
 def _numeric_equivalent(
-    value: float, expected: float, *, is_percent: bool
+    value: Decimal, expected: Decimal, *, is_percent: bool
 ) -> bool:
     if value == expected:
         return True
-    return is_percent and value * 100.0 == expected
+    return is_percent and value * Decimal(100) == expected
 
 
-def _source_record(run_dir: Path, path: Path) -> dict[str, str]:
-    return {"path": path.relative_to(run_dir).as_posix(), "sha256": _sha256(path.read_text(encoding="utf-8"))}
+def _decimal_token(token: str) -> Decimal:
+    try:
+        value = Decimal(token)
+    except InvalidOperation as exc:
+        raise ExperimentFactClosureError("invalid manuscript numeric token") from exc
+    if not value.is_finite():
+        raise ExperimentFactClosureError("manuscript numeric token must be finite")
+    return value
+
+
+def _is_finite_decimal_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and (
+            isinstance(value, int)
+            or (isinstance(value, Decimal) and value.is_finite())
+        )
+    )
+
+
+def _reject_nonfinite_constant(value: str) -> None:
+    raise ExperimentFactClosureError(f"nonfinite JSON number: {value}")
 
 
 def _safe_relative_path(value: Any) -> str:
@@ -547,5 +603,10 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _canonical_json(value: Mapping[str, Any]) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+def canonical_experiment_fact_json_text(value: Mapping[str, Any]) -> str:
+    try:
+        return canonical_authority_json_text(value)
+    except CanonicalExperimentEvidenceError as exc:
+        raise ExperimentFactClosureError(
+            f"invalid experiment closure authority JSON: {exc}"
+        ) from exc

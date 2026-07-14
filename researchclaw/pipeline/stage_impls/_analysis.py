@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -17,7 +18,6 @@ from researchclaw.pipeline._domain import _detect_domain, _is_ml_domain
 from researchclaw.pipeline._helpers import (
     StageResult,
     _chat_with_prompt,
-    _get_pipeline_evolution_overlay,
     _multi_perspective_generate,
     _read_prior_artifact,
     _safe_json_loads,
@@ -26,8 +26,11 @@ from researchclaw.pipeline._helpers import (
 )
 from researchclaw.pipeline.canonical_execution_controller import CanonicalAnalysisController
 from researchclaw.pipeline.canonical_experiment_evidence import (
+    CanonicalExperimentEvidence,
+    CanonicalExperimentEvidenceError,
     canonical_authority_json_text,
     canonical_decimal,
+    load_canonical_experiment_evidence,
     load_selected_result_for_analysis,
     publish_canonical_experiment_manifest,
     publish_experiment_evidence_candidate,
@@ -762,79 +765,29 @@ def _read_requirements_from_manifest(run_dir: Path) -> list[dict[str, object]]:
     return []
 
 
-def _read_experiment_summary(run_dir: Path) -> dict[str, object]:
-    """Return the most recent experiment_summary.json contents (or {})."""
-    p = run_dir / "experiment_summary_best.json"
-    if not p.is_file():
-        for sd in sorted(run_dir.glob("stage-14*/experiment_summary.json"), reverse=True):
-            p = sd
-            break
-    if p and p.is_file():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-    return {}
+def _plain_authority(value: Any) -> Any:
+    """Convert a frozen authority value for prompt-only consumers."""
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, dict) or hasattr(value, "items"):
+        return {str(key): _plain_authority(child) for key, child in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_plain_authority(child) for child in value]
+    return value
 
 
-def _read_agent_results_canonical(run_dir: Path) -> dict[str, object]:
-    """Read the agent-written results.json from the stage-12 sandbox workspace.
+def _read_experiment_summary(
+    evidence: CanonicalExperimentEvidence,
+) -> dict[str, object]:
+    """Return only the accessor-selected experiment summary."""
+    return _plain_authority(evidence.summary)
 
-    Mirrors the sandbox's own ``_read_agent_results`` fallback chain: prefers
-    a true canonical file (one with ``metrics``/``primary_metric``/``hypotheses``
-    keys), but skips a sandbox-meta-only stub and falls back to
-    ``analysis/summary.json`` so older runs without the canonical-output
-    contract still surface scientific data to the requirements judge.
-    """
-    sandbox_meta_keys = {"source", "returncode", "elapsed_sec", "timed_out", "artifacts", "status"}
-    workspace_roots = (
-        run_dir / "stage-12" / "runs" / "workspace" / "sandbox",
-        run_dir / "stage-12" / "runs",
-        run_dir / "stage-13" / "experiment_final",
-    )
-    for ws in workspace_roots:
-        if not ws.is_dir():
-            continue
-        for path in (
-            ws / "results.json",
-            ws / "analysis" / "summary.json",
-            ws / "analysis" / "flux_analysis_summary.json",
-            ws / "output" / "data" / "results.json",
-        ):
-            if not path.is_file():
-                continue
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(data, dict):
-                continue
-            has_agent_keys = (
-                "metrics" in data
-                or "primary_metric" in data
-                or "hypotheses" in data
-                or "structured_results" in data
-            )
-            if has_agent_keys:
-                return data
-            non_meta = set(data.keys()) - sandbox_meta_keys
-            if not non_meta:
-                continue
-            # Older convention: numeric / bool top-level keys → wrap.
-            numeric = {
-                k: v for k, v in data.items()
-                if k in non_meta and isinstance(v, (int, float)) and not isinstance(v, bool)
-            }
-            booleans = {
-                k: v for k, v in data.items()
-                if k in non_meta and isinstance(v, bool)
-            }
-            if numeric or booleans:
-                wrapped: dict[str, object] = {"metrics": numeric}
-                if booleans:
-                    wrapped["hypotheses"] = {k: {"supported": v} for k, v in booleans.items()}
-                return wrapped
-    return {}
+
+def _read_agent_results_canonical(
+    evidence: CanonicalExperimentEvidence,
+) -> dict[str, object]:
+    """Return only the selected result-set's structured evaluator payload."""
+    return _plain_authority(evidence.structured_results)
 
 
 def _read_retry_count(run_dir: Path) -> int:
@@ -914,7 +867,8 @@ def _format_agent_decision_md(
     lines = [
         "# Research Decision (agent-mode requirements gate)",
         "",
-        f"## Decision: {decision.upper()}",
+        "## Decision",
+        decision.upper(),
         "",
         f"## Verdict: {verdict.get('verdict', '?')} "
         f"(retry_count={retry_count}, rerun_triggered={rerun_triggered})",
@@ -969,6 +923,7 @@ def _agent_requirements_decision(
     run_dir: Path,
     config: RCConfig,
     llm: LLMClient | None,
+    evidence: CanonicalExperimentEvidence,
 ) -> StageResult | None:
     """Run the requirements judge and produce a stage-15 decision.
 
@@ -988,8 +943,8 @@ def _agent_requirements_decision(
 
     from researchclaw.pipeline.requirements_judge import judge_requirements
 
-    summary = _read_experiment_summary(run_dir)
-    agent_results = _read_agent_results_canonical(run_dir)
+    summary = _read_experiment_summary(evidence)
+    agent_results = _read_agent_results_canonical(evidence)
     verdict = judge_requirements(requirements, summary, agent_results, llm)
 
     retry_count = _read_retry_count(run_dir)
@@ -1012,6 +967,10 @@ def _agent_requirements_decision(
         "max_retries": _REQUIREMENTS_MAX_RETRIES,
         "generated": _utcnow_iso(),
         "source": "agent_requirements_gate",
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+        "decision_path": "stage-15/decision.md",
+        "decision_sha256": hashlib.sha256(decision_md.encode("utf-8")).hexdigest(),
     }
     (stage_dir / "decision_structured.json").write_text(
         json.dumps(decision_payload, indent=2), encoding="utf-8"
@@ -1043,6 +1002,18 @@ def _execute_research_decision(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    for owned_name in ("decision.md", "decision_structured.json", "critique.json"):
+        (stage_dir / owned_name).unlink(missing_ok=True)
+    try:
+        evidence = load_canonical_experiment_evidence(run_dir)
+    except (CanonicalExperimentEvidenceError, OSError, UnicodeDecodeError) as exc:
+        return StageResult(
+            stage=Stage.RESEARCH_DECISION,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Canonical experiment evidence is invalid: {exc}",
+            decision="retry",
+        )
     # ----------------------------------------------------------------------
     # Agent-mode requirements gate (collider_agent / biology_agent / stat_agent).
     # When the manifest declares a `requirements:` list, audit the run via
@@ -1053,99 +1024,59 @@ def _execute_research_decision(
     if config.experiment.mode in ("collider_agent", "biology_agent", "stat_agent"):
         agent_decision = _agent_requirements_decision(
             stage_dir=stage_dir, run_dir=run_dir, config=config, llm=llm,
+            evidence=evidence,
         )
         if agent_decision is not None:
             return agent_decision
 
-    analysis = _read_prior_artifact(run_dir, "analysis.md") or ""
+    analysis = evidence.analysis_text
 
     # P6: Detect degenerate REFINE cycles — inject warning if metrics stagnate
     _degenerate_hint = ""
-    _refine_log = _read_prior_artifact(run_dir, "refinement_log.json")
-    if _refine_log:
-        try:
-            _rl = json.loads(_refine_log)
-            _iters = _rl.get("iterations", [])
-            _metrics = [it.get("metric") for it in _iters if isinstance(it, dict)]
-            _valid = [m for m in _metrics if m is not None]
-            _all_saturated = _valid and all(m <= 0.001 or m >= 0.999 for m in _valid)
-            _all_identical = len(set(_valid)) <= 1 and len(_valid) >= 2
-            if _all_saturated or _all_identical:
-                _degenerate_hint = (
-                    "\n\nSYSTEM WARNING — DEGENERATE REFINE CYCLE DETECTED:\n"
-                    f"Metrics across {len(_valid)} iterations: {_valid}\n"
-                    "All iterations produce identical/saturated results. Further REFINE "
-                    "cycles CANNOT fix this — the underlying benchmark design is too "
-                    "easy/hard. You SHOULD choose PROCEED with a quality caveat rather "
-                    "than REFINE again.\n"
-                )
-                logger.warning("P6: Degenerate refine cycle detected, injecting PROCEED hint")
-        except (json.JSONDecodeError, OSError):
-            pass
+    _valid = [
+        value
+        for values in evidence.metric_observations.values()
+        for value in values
+    ]
+    _all_saturated = _valid and all(
+        m <= Decimal("0.001") or m >= Decimal("0.999") for m in _valid
+    )
+    _all_identical = len(set(_valid)) <= 1 and len(_valid) >= 2
+    if _all_saturated or _all_identical:
+        _degenerate_hint = (
+            "\n\nSYSTEM WARNING — DEGENERATE CANONICAL EVIDENCE DETECTED:\n"
+            f"Selected observations: {_valid}\n"
+            "The selected evidence is identical or saturated. Do not claim that an "
+            "unbound retry resolved this limitation.\n"
+        )
 
     # Phase 2: Inject experiment diagnosis into decision prompt
     _diagnosis_hint = ""
-    _diag_path = run_dir / "experiment_diagnosis.json"
-    if _diag_path.exists():
-        try:
-            _diag_data = json.loads(_diag_path.read_text(encoding="utf-8"))
-            _qa = _diag_data.get("quality_assessment", {})
-            _mode = _qa.get("mode", "unknown")
-            _sufficient = _qa.get("sufficient", False)
-            _deficiency_types = _qa.get("deficiency_types", [])
-            if not _sufficient:
-                _diagnosis_hint = (
-                    "\n\n## EXPERIMENT DIAGNOSIS (from automated analysis)\n"
-                    f"Quality mode: {_mode}\n"
-                    f"Sufficient for full paper: NO\n"
-                    f"Issues found: {', '.join(_deficiency_types)}\n\n"
-                    "IMPORTANT: The experiment has significant issues. "
-                    "If REFINE is chosen, a structured repair prompt is available "
-                    "at repair_prompt.txt with specific fixes for identified issues.\n"
-                    "If the same issues persist after 2+ REFINE cycles, choose PROCEED "
-                    "with appropriate quality caveats.\n"
-                )
-                logger.info(
-                    "Stage 15: Injected experiment diagnosis — mode=%s, issues=%s",
-                    _mode, _deficiency_types,
-                )
-        except (json.JSONDecodeError, OSError):
-            pass
 
     # Improvement C: Check ablation quality — if >50% trivial, push REFINE
     _ablation_refine_hint = ""
-    # BUG-DA8-16: Prefer experiment_summary_best.json (promoted best) over
-    # alphabetically-last stage-14* (which could be a stale versioned dir)
-    _exp_sum_path = run_dir / "experiment_summary_best.json"
-    if not _exp_sum_path.is_file():
-        _exp_sum_path = None
-        for _s14 in sorted(run_dir.glob("stage-14*/experiment_summary.json"), reverse=True):
-            _exp_sum_path = _s14
-            break
-    if _exp_sum_path and _exp_sum_path.is_file():
-        try:
-            from researchclaw.pipeline.stage_impls._paper_writing import _check_ablation_effectiveness
-            _abl_exp = json.loads(_exp_sum_path.read_text(encoding="utf-8"))
-            _abl_warnings = _check_ablation_effectiveness(_abl_exp, threshold=0.02)
-            if _abl_warnings:
-                _trivial_count = sum(1 for w in _abl_warnings if "ineffective" in w.lower() or "trivial" in w.lower())
-                _total_abl = max(1, len(_abl_warnings))
-                if _trivial_count / _total_abl > 0.5:
-                    _ablation_refine_hint = (
-                        "\n\n## ABLATION QUALITY ASSESSMENT (CRITICAL)\n"
-                        f"STRONG RECOMMENDATION: Choose REFINE.\n"
-                        f"{_trivial_count}/{_total_abl} ablations show <2% difference from baseline "
-                        f"(trivially similar). This means the ablation design is broken.\n"
-                        "Warnings:\n" + "\n".join(f"- {w}" for w in _abl_warnings) + "\n"
-                    )
-                    logger.warning("C: %d/%d ablations trivial → recommending REFINE", _trivial_count, _total_abl)
-        except Exception:  # noqa: BLE001
-            pass
+    try:
+        from researchclaw.pipeline.stage_impls._paper_writing import _check_ablation_effectiveness
+        _abl_exp = _read_experiment_summary(evidence)
+        _abl_warnings = _check_ablation_effectiveness(_abl_exp, threshold=0.02)
+        if _abl_warnings:
+            _trivial_count = sum(1 for w in _abl_warnings if "ineffective" in w.lower() or "trivial" in w.lower())
+            _total_abl = max(1, len(_abl_warnings))
+            if _trivial_count / _total_abl > 0.5:
+                _ablation_refine_hint = (
+                    "\n\n## ABLATION QUALITY ASSESSMENT (CRITICAL)\n"
+                    f"STRONG RECOMMENDATION: Choose REFINE.\n"
+                    f"{_trivial_count}/{_total_abl} ablations show <2% difference from baseline "
+                    f"(trivially similar). This means the ablation design is broken.\n"
+                    "Warnings:\n" + "\n".join(f"- {w}" for w in _abl_warnings) + "\n"
+                )
+                logger.warning("C: %d/%d ablations trivial → recommending REFINE", _trivial_count, _total_abl)
+    except Exception:  # noqa: BLE001
+        pass
 
     if llm is not None:
         _pm = prompts or PromptManager()
-        _overlay = _get_pipeline_evolution_overlay(run_dir, "research_decision")
-        sp = _pm.for_stage("research_decision", evolution_overlay=_overlay, analysis=analysis)
+        sp = _pm.for_stage("research_decision", evolution_overlay="", analysis=analysis)
         _user = sp.user + _degenerate_hint + _diagnosis_hint + _ablation_refine_hint
         resp = _chat_with_prompt(llm, sp.system, _user)
         decision_md = resp.content
@@ -1185,6 +1116,12 @@ Generated: {_utcnow_iso()}
                         "--from-stage RESEARCH_DECISION after refining inputs."
                     ),
                     "generated": _utcnow_iso(),
+                    "canonical_experiment_evidence_path": evidence.manifest_path,
+                    "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+                    "decision_path": "stage-15/decision.md",
+                    "decision_sha256": hashlib.sha256(
+                        decision_md.encode("utf-8")
+                    ).hexdigest(),
                 },
                 indent=2,
             ),
@@ -1219,6 +1156,10 @@ Generated: {_utcnow_iso()}
         "raw_text_excerpt": decision_md[:500],
         "quality_warnings": _quality_warnings,
         "generated": _utcnow_iso(),
+        "canonical_experiment_evidence_path": evidence.manifest_path,
+        "canonical_experiment_evidence_sha256": evidence.manifest_sha256,
+        "decision_path": "stage-15/decision.md",
+        "decision_sha256": hashlib.sha256(decision_md.encode("utf-8")).hexdigest(),
     }
     (stage_dir / "decision_structured.json").write_text(
         json.dumps(decision_payload, indent=2), encoding="utf-8"

@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1063,6 +1064,8 @@ def _build_context_preamble(
     config: RCConfig,
     run_dir: Path,
     *,
+    canonical_evidence: Any | None = None,
+    bound_decision: str | None = None,
     include_goal: bool = False,
     include_hypotheses: bool = False,
     include_synthesis: bool = False,
@@ -1093,28 +1096,31 @@ def _build_context_preamble(
         if plan:
             parts.append(f"\n### Experiment Plan\n{plan[:2000]}")
     if include_analysis:
-        analysis = _read_best_analysis(run_dir)
+        if canonical_evidence is None:
+            raise ValueError("canonical experiment evidence is required for analysis context")
+        analysis = canonical_evidence.analysis_text
         if analysis:
             parts.append(f"\n### Result Analysis\n{analysis[:2500]}")
     if include_decision:
-        decision = _read_prior_artifact(run_dir, "decision.md")
-        if decision:
-            parts.append(f"\n### Research Decision\n{decision[:1500]}")
+        if bound_decision is None:
+            raise ValueError("bound Stage 15 decision is required for decision context")
+        if bound_decision:
+            parts.append(f"\n### Research Decision\n{bound_decision[:1500]}")
     if include_experiment_data:
+        if canonical_evidence is None:
+            raise ValueError("canonical experiment evidence is required for experiment context")
         hw_profile = _load_hardware_profile(run_dir)
         if hw_profile:
             hw_lines = ["### Hardware Environment"]
             for hk, hv in hw_profile.items():
                 hw_lines.append(f"- **{hk}**: {hv}")
             parts.append("\n" + "\n".join(hw_lines))
-        exp_summary = _read_prior_artifact(run_dir, "experiment_summary.json")
-        if exp_summary:
-            summary = _safe_json_loads(exp_summary, {})
-            if isinstance(summary, dict) and summary.get("metrics_summary"):
+        summary = canonical_evidence.summary
+        if isinstance(summary, Mapping) and summary.get("metrics_summary"):
                 parts.append("\n### Experiment Results (Quantitative)")
                 ms = summary["metrics_summary"]
                 for mk, mv in ms.items():
-                    if isinstance(mv, dict):
+                    if isinstance(mv, Mapping):
                         parts.append(
                             f"- **{mk}**: mean={mv.get('mean', '?')}, "
                             f"min={mv.get('min', '?')}, max={mv.get('max', '?')}, n={mv.get('count', '?')}"

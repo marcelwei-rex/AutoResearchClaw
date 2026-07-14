@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -54,15 +55,15 @@ class TestConditionResult:
         cr = ConditionResult(name="test", per_seed_values={0: 10.0, 1: 20.0, 2: 30.0})
         cr.compute_stats()
         assert cr.n_seeds == 3
-        assert cr.mean == pytest.approx(20.0)
-        assert cr.std == pytest.approx(10.0)
+        assert cr.mean == pytest.approx(Decimal("20.0"))
+        assert cr.std == pytest.approx(Decimal("10.0"))
 
     def test_compute_stats_single_seed(self):
         cr = ConditionResult(name="test", per_seed_values={0: 42.0})
         cr.compute_stats()
         assert cr.n_seeds == 1
-        assert cr.mean == pytest.approx(42.0)
-        assert cr.std == 0.0
+        assert cr.mean == pytest.approx(Decimal("42.0"))
+        assert cr.std == Decimal(0)
 
     def test_compute_stats_with_nan(self):
         cr = ConditionResult(
@@ -70,7 +71,7 @@ class TestConditionResult:
         )
         cr.compute_stats()
         assert cr.n_seeds == 2  # NaN excluded
-        assert cr.mean == pytest.approx(20.0)
+        assert cr.mean == pytest.approx(Decimal("20.0"))
 
     def test_compute_stats_empty(self):
         cr = ConditionResult(name="test")
@@ -119,8 +120,33 @@ class TestVerifiedRegistryCore:
         reg = VerifiedRegistry()
         reg.add_value(0.0, "zero_metric")
         assert reg.is_verified(0.0)
-        assert reg.is_verified(1e-8)  # Very close to zero
-        assert not reg.is_verified(0.01)  # Not close enough
+        assert not reg.is_verified(1e-8)
+        assert not reg.is_verified(0.01)
+
+    def test_invalid_tolerance_is_rejected(self):
+        reg = VerifiedRegistry()
+        reg.add_value(100, "test")
+
+        for tolerance in (True, False, float("inf"), float("nan"), -0.01):
+            assert not reg.is_verified(999, tolerance=tolerance)
+            assert reg.lookup(999, tolerance=tolerance) is None
+
+    def test_relative_tolerance_only_uses_canonical_values(self):
+        reg = VerifiedRegistry()
+        base = Decimal("0.123456")
+        reg.add_value(base, "test")
+
+        # The automatic 0.1235 display alias remains exact-match only. It must
+        # not extend the strict relative tolerance around the raw observation.
+        at_one_percent = base * Decimal("1.01")
+        assert not reg.is_verified(at_one_percent, tolerance=Decimal("0.01"))
+        assert reg.is_verified(Decimal("0.1235"), tolerance=0)
+        assert reg.is_verified(base, tolerance=0)
+        assert not reg.is_verified(base + Decimal("0.000001"), tolerance=0)
+        assert reg.lookup(at_one_percent, tolerance=Decimal("0.01")) is None
+        assert reg.lookup(Decimal("0.1235"), tolerance=0) is not None
+        assert reg.lookup(base, tolerance=0) == "test"
+        assert reg.lookup(base + Decimal("0.000001"), tolerance=0) is None
 
     def test_negative_values(self):
         reg = VerifiedRegistry()
@@ -199,13 +225,13 @@ class TestFromExperiment:
         reg = VerifiedRegistry.from_experiment(self._make_summary())
         cond_a = reg.conditions["CondA"]
         assert cond_a.n_seeds == 2
-        assert cond_a.mean == pytest.approx(82.5)
-        assert cond_a.std == pytest.approx(3.5355, rel=0.01)
+        assert cond_a.mean == pytest.approx(Decimal("82.5"))
+        assert cond_a.std == pytest.approx(Decimal("3.5355"), rel=Decimal("0.01"))
 
     def test_primary_metric(self):
         reg = VerifiedRegistry.from_experiment(self._make_summary())
-        assert reg.primary_metric == pytest.approx(82.5)
-        assert reg.primary_metric_std == pytest.approx(3.5355)
+        assert reg.primary_metric == pytest.approx(Decimal("82.5"))
+        assert reg.primary_metric_std == pytest.approx(Decimal("3.5355"))
 
     def test_all_values_registered(self):
         reg = VerifiedRegistry.from_experiment(self._make_summary())

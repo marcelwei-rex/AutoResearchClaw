@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
+pytestmark = pytest.mark.usefixtures(
+    "canonical_evidence_migration_complete",
+    "consumer_evidence_fixture",
+)
 import yaml
 
 from researchclaw.adapters import AdapterBundle
@@ -52,6 +56,7 @@ from researchclaw.literature.evidence_cards import (
 )
 from researchclaw.literature.experiment_fact_closure import (
     build_experiment_fact_closure_report,
+    canonical_experiment_fact_json_text,
     parse_experiment_fact_closure_report,
     remove_unsupported_experiment_fact_blocks,
 )
@@ -361,7 +366,7 @@ def _prepare_e9_run(
         }
     )
     (stage17 / "paper_structure_report.json").write_text(structure_text)
-    experiment_text = canonical_json_text(
+    experiment_text = canonical_experiment_fact_json_text(
         build_experiment_fact_closure_report(run_dir, paper_text=paper_text)
     )
     (stage17 / "experiment_fact_closure_report.json").write_text(experiment_text)
@@ -964,7 +969,7 @@ def test_citation_closure_rejects_key_outside_assigned_section(
             "issues": [],
         }
     )
-    experiment = canonical_json_text(
+    experiment = canonical_experiment_fact_json_text(
         build_experiment_fact_closure_report(run_dir, paper_text=paper)
     )
     report = build_citation_closure_report(
@@ -997,7 +1002,7 @@ def test_experiment_fact_closure_binds_metrics_and_synthetic_origin(
     )
     report = build_experiment_fact_closure_report(run_dir, paper_text=paper)
     assert report["valid"] is True
-    assert report["manuscript_numeric_values"] == [0.95]
+    assert report["manuscript_numeric_values"] == [Decimal("0.95")]
     assert report["unknown_numeric_values"] == []
 
     contradicted = paper.replace(
@@ -1018,11 +1023,13 @@ def test_experiment_fact_closure_binds_metrics_and_synthetic_origin(
 
 def test_experiment_fact_closure_rejects_unknown_metric_and_duplicate_json() -> None:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "paper_path": "stage-17/paper_draft.md",
         "paper_sha256": "a" * 64,
         "experiment_contract_path": "stage-09/experiment_contract.yaml",
         "experiment_contract_sha256": "b" * 64,
+        "canonical_experiment_evidence_path": "canonical_experiment_evidence.json",
+        "canonical_experiment_evidence_sha256": "d" * 64,
         "dataset_origin": "synthetic",
         "metric_sources": [{"path": "stage-12/runs/run.json", "sha256": "c" * 64}],
         "grounded_numeric_values": [0.95],
@@ -1057,7 +1064,12 @@ def test_experiment_fact_closure_detects_integer_and_non_results_metrics(
     )
     report = build_experiment_fact_closure_report(run_dir, paper_text=paper)
     assert report["valid"] is False
-    assert report["unknown_numeric_values"] == [92.0, 0.7, 128.0, 3.0]
+    assert report["unknown_numeric_values"] == [
+        Decimal("92"),
+        Decimal("0.7"),
+        Decimal("128"),
+        Decimal("3"),
+    ]
 
 
 def test_experiment_fact_closure_percent_normalization_is_token_explicit(
@@ -1078,7 +1090,7 @@ def test_experiment_fact_closure_percent_normalization_is_token_explicit(
     unmarked = build_experiment_fact_closure_report(
         run_dir, paper_text="## Results\n\nThe rate was 50.0.\n"
     )
-    assert unmarked["unknown_numeric_values"] == [50.0]
+    assert unmarked["unknown_numeric_values"] == [Decimal("50.0")]
 
 
 def test_experiment_fact_closure_rejects_display_rounding_v1(
@@ -1099,7 +1111,10 @@ def test_experiment_fact_closure_rejects_display_rounding_v1(
         run_dir,
         paper_text="## Results\n\nF1 was 0.64 with standard deviation 0.0102.\n",
     )
-    assert rounded["unknown_numeric_values"] == [0.64, 0.0102]
+    assert rounded["unknown_numeric_values"] == [
+        Decimal("0.64"),
+        Decimal("0.0102"),
+    ]
     exact = build_experiment_fact_closure_report(
         run_dir,
         paper_text="## Results\n\nF1 was 0.639877 with standard deviation 0.010216.\n",
@@ -1117,7 +1132,7 @@ def test_experiment_fact_repair_removes_only_unsupported_sentence() -> None:
     )
     repaired, log = remove_unsupported_experiment_fact_blocks(
         paper,
-        grounded_numeric_values=[0.639877],
+        grounded_numeric_values=[Decimal("0.639877")],
         dataset_origin="synthetic",
     )
     assert "The exact F1 was 0.639877." in repaired
@@ -1125,7 +1140,7 @@ def test_experiment_fact_repair_removes_only_unsupported_sentence() -> None:
     assert "The following qualitative sentence remains." in repaired
     assert "The exact result was 0.639877." in repaired
     assert log["operations"][0]["block_type"] == "sentence"
-    assert log["operations"][0]["unknown_numeric_values"] == [0.64]
+    assert log["operations"][0]["unknown_numeric_values"] == [Decimal("0.64")]
 
 
 @pytest.mark.parametrize(
@@ -1143,7 +1158,7 @@ def test_experiment_fact_repair_removes_complete_structural_block(
     paper = f"## Results\n\n{body}\nSupported F1 is 0.639877.\n"
     repaired, log = remove_unsupported_experiment_fact_blocks(
         paper,
-        grounded_numeric_values=[0.639877],
+        grounded_numeric_values=[Decimal("0.639877")],
         dataset_origin="synthetic",
     )
     assert "0.64" not in repaired
@@ -1159,7 +1174,7 @@ def test_experiment_fact_repair_does_not_exempt_cited_or_conclusion_numbers() ->
     )
     repaired, log = remove_unsupported_experiment_fact_blocks(
         paper,
-        grounded_numeric_values=[0.5],
+        grounded_numeric_values=[Decimal("0.5")],
         dataset_origin="synthetic",
     )
     assert "0.97" not in repaired
@@ -1176,7 +1191,7 @@ def test_experiment_fact_repair_does_not_split_at_abbreviation(
     paper = f"## Results\n\n{sentence}{retained}"
     repaired, log = remove_unsupported_experiment_fact_blocks(
         paper,
-        grounded_numeric_values=[0.5],
+        grounded_numeric_values=[Decimal("0.5")],
         dataset_origin="synthetic",
     )
     assert sentence not in repaired
@@ -1194,7 +1209,7 @@ def test_experiment_fact_repair_does_not_bridge_separate_math_blocks() -> None:
     )
     repaired, log = remove_unsupported_experiment_fact_blocks(
         paper,
-        grounded_numeric_values=[0.5],
+        grounded_numeric_values=[Decimal("0.5")],
         dataset_origin="synthetic",
     )
     assert "unsupported prose" not in repaired
@@ -1212,7 +1227,7 @@ def test_experiment_fact_repair_rejects_unbalanced_math(body: str) -> None:
     with pytest.raises(ValueError, match="unbalanced"):
         remove_unsupported_experiment_fact_blocks(
             f"## Results\n\n{body}",
-            grounded_numeric_values=[0.5],
+            grounded_numeric_values=[Decimal("0.5")],
             dataset_origin="synthetic",
         )
 
@@ -1236,7 +1251,7 @@ def test_experiment_fact_closure_ignores_shadow_metric_stage_and_flags_hardware_
         "## Results\n\nThe rate was 0.97.\n"
     )
     report = build_experiment_fact_closure_report(run_dir, paper_text=paper)
-    assert report["unknown_numeric_values"] == [0.97]
+    assert report["unknown_numeric_values"] == [Decimal("0.97")]
     assert report["dataset_claim_violations"]
 
 
@@ -2088,7 +2103,7 @@ def test_citation_closure_does_not_merge_discussion_h3_into_related_work(
             "issues": [],
         }
     )
-    experiment_text = canonical_json_text(
+    experiment_text = canonical_experiment_fact_json_text(
         build_experiment_fact_closure_report(run_dir, paper_text=paper)
     )
     closure = build_citation_closure_report(
