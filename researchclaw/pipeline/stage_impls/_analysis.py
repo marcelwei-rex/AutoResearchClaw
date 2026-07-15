@@ -20,9 +20,18 @@ from researchclaw.pipeline._helpers import (
     _chat_with_prompt,
     _multi_perspective_generate,
     _read_prior_artifact,
-    _safe_json_loads,
     _synthesize_perspectives,
     _utcnow_iso,
+)
+from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
+from researchclaw.pipeline.stage15_critique import (
+    Stage15CritiqueError,
+    Stage15CritiquePublication,
+    capture_decision_binding,
+    parse_model_findings_response,
+    prepare_stage15_critique_namespace,
+    publish_external_critique_or_request,
+    publish_model_or_none_critique,
 )
 from researchclaw.pipeline.canonical_execution_controller import CanonicalAnalysisController
 from researchclaw.pipeline.canonical_experiment_evidence import (
@@ -924,6 +933,7 @@ def _agent_requirements_decision(
     config: RCConfig,
     llm: LLMClient | None,
     evidence: CanonicalExperimentEvidence,
+    namespace: BoundOutputNamespace,
 ) -> StageResult | None:
     """Run the requirements judge and produce a stage-15 decision.
 
@@ -958,7 +968,7 @@ def _agent_requirements_decision(
         decision = "proceed"
 
     decision_md = _format_agent_decision_md(verdict, decision, retry_count, rerun_triggered)
-    (stage_dir / "decision.md").write_text(decision_md, encoding="utf-8")
+    namespace.write_text_atomic("decision.md", decision_md)
     decision_payload = {
         "decision": decision,
         "verdict": verdict,
@@ -972,8 +982,8 @@ def _agent_requirements_decision(
         "decision_path": "stage-15/decision.md",
         "decision_sha256": hashlib.sha256(decision_md.encode("utf-8")).hexdigest(),
     }
-    (stage_dir / "decision_structured.json").write_text(
-        json.dumps(decision_payload, indent=2), encoding="utf-8"
+    namespace.write_text_atomic(
+        "decision_structured.json", json.dumps(decision_payload, indent=2)
     )
     # Also persist the verdict for the runner / downstream stages to pick up
     (run_dir / "requirements_verdict.json").write_text(
@@ -1002,8 +1012,148 @@ def _execute_research_decision(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
-    for owned_name in ("decision.md", "decision_structured.json", "critique.json"):
-        (stage_dir / owned_name).unlink(missing_ok=True)
+    try:
+        with BoundOutputNamespace.open(
+            run_dir, stage_dir, "stage-15"
+        ) as namespace:
+            prepare_stage15_critique_namespace(namespace)
+            try:
+                _validate_canonical_critique_config(config)
+            except Stage15CritiqueError:
+                namespace.remove_flat_entries(
+                    ("decision.md", "decision_structured.json")
+                )
+                raise
+            external_ready = _external_structured_review_present(
+                namespace, config
+            )
+            if not external_ready:
+                namespace.remove_flat_entries(
+                    ("decision.md", "decision_structured.json")
+                )
+            namespace.assert_canonical()
+            try:
+                if external_ready:
+                    result = _finalize_external_stage15_critique(
+                        run_dir, config, namespace
+                    )
+                else:
+                    result = _execute_research_decision_bound(
+                        stage_dir,
+                        run_dir,
+                        config,
+                        adapters,
+                        namespace=namespace,
+                        llm=llm,
+                        prompts=prompts,
+                    )
+                namespace.assert_canonical()
+                return result
+            except Exception as exc:  # noqa: BLE001
+                cleanup_errors: list[str] = []
+                try:
+                    prepare_stage15_critique_namespace(namespace)
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    cleanup_errors.append(str(cleanup_exc))
+                try:
+                    namespace.remove_flat_entries(
+                        ("decision.md", "decision_structured.json")
+                    )
+                except OSError as cleanup_exc:
+                    cleanup_errors.append(str(cleanup_exc))
+                if cleanup_errors:
+                    exc.add_note(
+                        "Stage 15 cleanup also failed: " + "; ".join(cleanup_errors)
+                    )
+                return StageResult(
+                    stage=Stage.RESEARCH_DECISION,
+                    status=StageStatus.FAILED,
+                    artifacts=(),
+                    error=f"Stage 15 publication failed: {exc}",
+                    decision="retry",
+                )
+    except (OSError, Stage15CritiqueError) as exc:
+        return StageResult(
+            stage=Stage.RESEARCH_DECISION,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Stage 15 output namespace is unsafe: {exc}",
+            decision="retry",
+        )
+
+
+def _external_structured_review_present(
+    namespace: BoundOutputNamespace, config: RCConfig
+) -> bool:
+    if (getattr(config.llm, "critic_source", "") or "").strip() != "external":
+        return False
+    try:
+        files = namespace.read_flat_directory("external-review")
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise Stage15CritiqueError(
+            f"external review namespace is unsafe: {exc}"
+        ) from exc
+    return "structured.json" in files
+
+
+def _validate_canonical_critique_config(config: RCConfig) -> None:
+    if config.experiment.mode in {
+        "collider_agent",
+        "biology_agent",
+        "stat_agent",
+    }:
+        raise Stage15CritiqueError("canonical_critique_mode_unsupported")
+    critic_source = (getattr(config.llm, "critic_source", "") or "").strip()
+    if critic_source not in {"", "model", "external"}:
+        raise Stage15CritiqueError("canonical_critic_source_invalid")
+
+
+def _finalize_external_stage15_critique(
+    run_dir: Path,
+    config: RCConfig,
+    namespace: BoundOutputNamespace,
+) -> StageResult:
+    evidence = load_canonical_experiment_evidence(run_dir)
+    canonical, decision_binding = capture_decision_binding(namespace, evidence)
+    publication = publish_external_critique_or_request(
+        namespace=namespace,
+        canonical_evidence=canonical,
+        decision=decision_binding,
+        writer_model=(getattr(config.llm, "primary_model", "") or "").strip(),
+    )
+    if publication.state != "external_final":
+        raise Stage15CritiqueError("external finalizer did not publish a final critique")
+    decision_text = namespace.read_bytes("decision.md").decode("utf-8")
+    decision = _parse_decision(decision_text)
+    if decision is None:
+        raise Stage15CritiqueError("bound external-review decision is ambiguous")
+    return StageResult(
+        stage=Stage.RESEARCH_DECISION,
+        status=StageStatus.DONE,
+        artifacts=(
+            "decision.md",
+            "decision_structured.json",
+            "critique.json",
+            "stage15_critique_manifest.json",
+        ),
+        evidence_refs=("stage-15/decision.md",),
+        decision=decision,
+    )
+
+
+def _execute_research_decision_bound(
+    stage_dir: Path,
+    run_dir: Path,
+    config: RCConfig,
+    adapters: AdapterBundle,
+    *,
+    namespace: BoundOutputNamespace,
+    llm: LLMClient | None = None,
+    prompts: PromptManager | None = None,
+) -> StageResult:
+    _validate_canonical_critique_config(config)
     try:
         evidence = load_canonical_experiment_evidence(run_dir)
     except (CanonicalExperimentEvidenceError, OSError, UnicodeDecodeError) as exc:
@@ -1014,21 +1164,6 @@ def _execute_research_decision(
             error=f"Canonical experiment evidence is invalid: {exc}",
             decision="retry",
         )
-    # ----------------------------------------------------------------------
-    # Agent-mode requirements gate (collider_agent / biology_agent / stat_agent).
-    # When the manifest declares a `requirements:` list, audit the run via
-    # an LLM judge and force-decide REFINE (rerun once) or PROCEED based on
-    # the verdict + per-run retry budget.  ML modes fall through to the
-    # existing decision logic below.
-    # ----------------------------------------------------------------------
-    if config.experiment.mode in ("collider_agent", "biology_agent", "stat_agent"):
-        agent_decision = _agent_requirements_decision(
-            stage_dir=stage_dir, run_dir=run_dir, config=config, llm=llm,
-            evidence=evidence,
-        )
-        if agent_decision is not None:
-            return agent_decision
-
     analysis = evidence.analysis_text
 
     # P6: Detect degenerate REFINE cycles — inject warning if metrics stagnate
@@ -1095,7 +1230,7 @@ Current evidence suggests measurable progress with actionable limitations.
 
 Generated: {_utcnow_iso()}
 """
-    (stage_dir / "decision.md").write_text(decision_md, encoding="utf-8")
+    namespace.write_text_atomic("decision.md", decision_md)
 
     # --- Extract structured decision ---
     decision = _parse_decision(decision_md)
@@ -1104,7 +1239,8 @@ Generated: {_utcnow_iso()}
     # user can review the model's reasoning rather than silently advancing
     # ambiguous output as "proceed".
     if decision is None:
-        (stage_dir / "decision_structured.json").write_text(
+        namespace.write_text_atomic(
+            "decision_structured.json",
             json.dumps(
                 {
                     "decision": None,
@@ -1125,7 +1261,6 @@ Generated: {_utcnow_iso()}
                 },
                 indent=2,
             ),
-            encoding="utf-8",
         )
         logger.warning(
             "Stage 15: model decision response contained no recognized keyword — pausing pipeline"
@@ -1161,8 +1296,8 @@ Generated: {_utcnow_iso()}
         "decision_path": "stage-15/decision.md",
         "decision_sha256": hashlib.sha256(decision_md.encode("utf-8")).hexdigest(),
     }
-    (stage_dir / "decision_structured.json").write_text(
-        json.dumps(decision_payload, indent=2), encoding="utf-8"
+    namespace.write_text_atomic(
+        "decision_structured.json", json.dumps(decision_payload, indent=2)
     )
     logger.info("Research decision: %s", decision)
 
@@ -1171,12 +1306,29 @@ Generated: {_utcnow_iso()}
     # it never sees the writer's conversation. Findings are resolved and
     # gated later (stage 24 + release_check); the critic never edits.
     artifacts: list[str] = ["decision.md", "decision_structured.json"]
-    try:
-        _write_socratic_critique(stage_dir, run_dir, config, llm, analysis)
-        if (stage_dir / "critique.json").exists():
-            artifacts.append("critique.json")
-    except Exception:  # noqa: BLE001
-        logger.warning("Socratic critique generation failed", exc_info=True)
+    publication = _write_socratic_critique(
+        stage_dir,
+        run_dir,
+        config,
+        llm,
+        analysis,
+        evidence=evidence,
+        namespace=namespace,
+    )
+    if publication.state == "external_pending":
+        return StageResult(
+            stage=Stage.RESEARCH_DECISION,
+            status=StageStatus.PAUSED,
+            artifacts=(
+                "decision.md",
+                "decision_structured.json",
+                "critique-pending/external_review_request.json",
+            ),
+            evidence_refs=("stage-15/decision.md",),
+            error="External critique is pending structured review input",
+            decision="external_review_pending",
+        )
+    artifacts.extend(("critique.json", "stage15_critique_manifest.json"))
 
     return StageResult(
         stage=Stage.RESEARCH_DECISION,
@@ -1190,7 +1342,7 @@ Generated: {_utcnow_iso()}
 _SOCRATIC_CRITIC_SYSTEM = """You are an independent Socratic critic for an \
 autonomous research pipeline. You did NOT write this analysis; interrogate it. \
 Output STRICT JSON only: {"findings": [{"id": "sc-01", "severity": "P0|P1|P2", \
-"category": "causal_reasoning|physical_constraint|counterexample|statistics|overclaim", \
+"category": "methodology|evidence|statistics|reproducibility|validity|scope|reporting", \
 "question": "<the Socratic question exposing the weakness>", \
 "finding": "<what is weak or unjustified>", \
 "falsification_criterion": "<what observation would falsify the claim>"}]}
@@ -1208,110 +1360,90 @@ def _write_socratic_critique(
     config: RCConfig,
     llm: LLMClient | None,
     analysis: str,
-) -> None:
-    """Write stage-15/critique.json (recommend-only Socratic critique)."""
+    *,
+    evidence: CanonicalExperimentEvidence,
+    namespace: BoundOutputNamespace,
+) -> Stage15CritiquePublication:
+    """Publish one strict manifest-bound critique-v2 state."""
     critic_model = (getattr(config.llm, "critic_model", "") or "").strip()
     writer_model = (getattr(config.llm, "primary_model", "") or "").strip()
     configured_source = (getattr(config.llm, "critic_source", "") or "").strip()
-    findings: list[dict[str, Any]] = []
-    critic_source = "none"
-
-    decision_text = ""
-    _dec = stage_dir / "decision.md"
-    if _dec.exists():
-        decision_text = _dec.read_text(encoding="utf-8")
+    canonical, decision = capture_decision_binding(namespace, evidence)
 
     if configured_source == "external":
-        # External reviewer workflow (e.g. Claude / Kiro as a separate agent):
-        # the pipeline records the declaration; the external reviewer writes
-        # its review artifact at llm.external_review_path, may append findings
-        # to this critique.json, and stages 24-25 are re-run before release.
-        from researchclaw.pipeline import release_artifacts as _ra_ext
-
-        _ra_ext.write_json_atomic(
-            stage_dir / "critique.json",
-            {
-                "schema_version": _ra_ext.SCHEMA_VERSION,
-                "recommend_only": True,
-                "critic_source": "external",
-                "critic_model": "",
-                "writer_model": writer_model,
-                "external_review_path": getattr(
-                    config.llm, "external_review_path", ""
-                )
-                or "",
-                "shared_context": False,
-                "findings": [],
-                "note": (
-                    "External review declared. The reviewer should add findings "
-                    "here (id/severity/question/finding/falsification_criterion), "
-                    "write the review artifact at external_review_path, then "
-                    "re-run stages 24-25. release_check fails if the artifact "
-                    "is missing or empty."
-                ),
-                "generated": _utcnow_iso(),
-            },
+        return publish_external_critique_or_request(
+            namespace=namespace,
+            canonical_evidence=canonical,
+            decision=decision,
+            writer_model=writer_model,
         )
-        return
 
-    if llm is not None and critic_model and critic_model != writer_model:
-        critic_source = "model"
-        try:
-            resp = llm.chat(
-                [
-                    {
-                        "role": "user",
-                        "content": (
-                            "ANALYSIS:\n" + (analysis or "")[:40000]
-                            + "\n\nDECISION:\n" + decision_text[:8000]
-                        ),
-                    }
-                ],
-                system=_SOCRATIC_CRITIC_SYSTEM,
-                json_mode=True,
-                model=critic_model,
-                strip_thinking=True,
-            )
-            raw = _safe_json_loads(resp.content, {})
-            if isinstance(raw, dict) and isinstance(raw.get("findings"), list):
-                for i, f in enumerate(raw["findings"][:12]):
-                    if not isinstance(f, dict):
-                        continue
-                    sev = str(f.get("severity", "P2")).upper()
-                    if sev not in ("P0", "P1", "P2"):
-                        sev = "P1"  # unknown severity → conservative
-                    findings.append(
-                        {
-                            "id": str(f.get("id") or f"sc-{i + 1:02d}"),
-                            "severity": sev,
-                            "category": str(f.get("category", ""))[:80],
-                            "question": str(f.get("question", ""))[:500],
-                            "finding": str(f.get("finding", ""))[:800],
-                            "falsification_criterion": str(
-                                f.get("falsification_criterion", "")
-                            )[:500],
-                        }
-                    )
-        except Exception:  # noqa: BLE001
-            logger.warning("Socratic critic LLM call failed", exc_info=True)
-            critic_source = "none"
+    if not critic_model:
+        return publish_model_or_none_critique(
+            namespace=namespace,
+            canonical_evidence=canonical,
+            decision=decision,
+            writer_model=writer_model,
+            critic_model="",
+            findings=None,
+            unavailability_reason="critic_not_configured",
+        )
+    if critic_model == writer_model:
+        return publish_model_or_none_critique(
+            namespace=namespace,
+            canonical_evidence=canonical,
+            decision=decision,
+            writer_model=writer_model,
+            critic_model="",
+            findings=None,
+            unavailability_reason="critic_not_isolated",
+        )
+    if llm is None:
+        return publish_model_or_none_critique(
+            namespace=namespace,
+            canonical_evidence=canonical,
+            decision=decision,
+            writer_model=writer_model,
+            critic_model="",
+            findings=None,
+            unavailability_reason="critic_call_failed",
+        )
 
-    from researchclaw.pipeline import release_artifacts as _ra
-
-    _ra.write_json_atomic(
-        stage_dir / "critique.json",
-        {
-            "schema_version": _ra.SCHEMA_VERSION,
-            "recommend_only": True,
-            "critic_source": critic_source,  # "model" | "none"
-            "critic_model": critic_model if critic_source == "model" else "",
-            "writer_model": writer_model,
-            "shared_context": False,
-            "findings": findings,
-            "note": (
-                "critic_source=none means no isolated critic was available; "
-                "release_check treats this as a reviewer_isolation failure."
-            ),
-            "generated": _utcnow_iso(),
-        },
+    try:
+        decision_text = namespace.read_bytes("decision.md").decode("utf-8")
+        resp = llm.chat(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "ANALYSIS:\n" + (analysis or "")[:40000]
+                        + "\n\nDECISION:\n" + decision_text[:8000]
+                    ),
+                }
+            ],
+            system=_SOCRATIC_CRITIC_SYSTEM,
+            json_mode=True,
+            model=critic_model,
+            strip_thinking=True,
+        )
+        findings = parse_model_findings_response(resp.content)
+    except Exception:  # noqa: BLE001
+        logger.warning("Socratic critic LLM call failed", exc_info=True)
+        return publish_model_or_none_critique(
+            namespace=namespace,
+            canonical_evidence=canonical,
+            decision=decision,
+            writer_model=writer_model,
+            critic_model="",
+            findings=None,
+            unavailability_reason="critic_call_failed",
+        )
+    return publish_model_or_none_critique(
+        namespace=namespace,
+        canonical_evidence=canonical,
+        decision=decision,
+        writer_model=writer_model,
+        critic_model=critic_model,
+        findings=findings,
+        unavailability_reason=None,
     )

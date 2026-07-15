@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from decimal import Decimal, ROUND_HALF_EVEN, getcontext, localcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -3010,10 +3011,6 @@ def test_stage15_consumes_and_binds_only_canonical_evidence(
             content="PROCEED: baseline, seed, and metric evidence are bounded."
         ),
     )
-    monkeypatch.setattr(
-        "researchclaw.pipeline.stage_impls._analysis._write_socratic_critique",
-        lambda *_args, **_kwargs: None,
-    )
     result = _execute_research_decision(
         stage15,
         run_dir,
@@ -3028,6 +3025,172 @@ def test_stage15_consumes_and_binds_only_canonical_evidence(
     evidence = load_canonical_experiment_evidence(run_dir)
     assert payload["canonical_experiment_evidence_path"] == evidence.manifest_path
     assert payload["canonical_experiment_evidence_sha256"] == evidence.manifest_sha256
+    critique = json.loads((stage15 / "critique.json").read_text())
+    assert critique["canonical_evidence"]["sha256"] == evidence.manifest_sha256
+    assert (stage15 / "stage15_critique_manifest.json").is_file()
+    from researchclaw.pipeline.stage15_critique import (
+        Stage15CritiqueError,
+        load_stage15_critique_publication,
+    )
+
+    replayed = load_stage15_critique_publication(run_dir)
+    assert replayed.manifest["canonical_evidence"]["sha256"] == evidence.manifest_sha256
+    (stage15 / "decision.md").write_text("PIVOT\n", encoding="utf-8")
+    with pytest.raises(Stage15CritiqueError, match="source fixpoint"):
+        load_stage15_critique_publication(run_dir)
+
+
+@pytest.mark.parametrize(
+    "mutation_target",
+    ["decision.md", "decision_structured.json", "canonical_experiment_evidence.json"],
+)
+def test_stage15_rejects_source_change_during_critic_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+    mutation_target: str,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+    stage15 = run_dir / "stage-15"
+    stage15.mkdir()
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._analysis._chat_with_prompt",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            content="PROCEED: baseline, seed, and metric evidence are bounded."
+        ),
+    )
+
+    class _MutatingCritic:
+        def chat(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
+            target = (
+                run_dir / mutation_target
+                if mutation_target == "canonical_experiment_evidence.json"
+                else stage15 / mutation_target
+            )
+            target.write_text("{}\n", encoding="utf-8")
+            return SimpleNamespace(content=json.dumps({"findings": []}))
+
+    result = _execute_research_decision(
+        stage15,
+        run_dir,
+        config,
+        AdapterBundle(),
+        llm=_MutatingCritic(),  # type: ignore[arg-type]
+    )
+    assert result.status is StageStatus.FAILED
+    assert "source fixpoint" in (result.error or "")
+    assert not (stage15 / "critique.json").exists()
+    assert not (stage15 / "stage15_critique_manifest.json").exists()
+    assert not (stage15 / "decision.md").exists()
+    assert not (stage15 / "decision_structured.json").exists()
+
+
+def test_stage15_agent_mode_fails_before_llm_or_decision_write(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+    config = replace(
+        config,
+        experiment=replace(config.experiment, mode="collider_agent"),
+    )
+    stage15 = run_dir / "stage-15"
+    stage15.mkdir()
+
+    class _LLMSpy:
+        calls = 0
+
+        def chat(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
+            self.calls += 1
+            return SimpleNamespace(content="PROCEED")
+
+    llm = _LLMSpy()
+    result = _execute_research_decision(
+        stage15,
+        run_dir,
+        config,
+        AdapterBundle(),
+        llm=llm,  # type: ignore[arg-type]
+    )
+    assert result.status is StageStatus.FAILED
+    assert "canonical_critique_mode_unsupported" in (result.error or "")
+    assert llm.calls == 0
+    assert not (stage15 / "decision.md").exists()
+    assert not (stage15 / "decision_structured.json").exists()
+
+
+def test_stage15_external_review_resume_preserves_bound_decision_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+    config = replace(
+        config,
+        llm=replace(
+            config.llm,
+            critic_source="external",
+            external_review_path="ignored/by/canonical/v2",
+        ),
+    )
+    stage15 = run_dir / "stage-15"
+    stage15.mkdir()
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._analysis._chat_with_prompt",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            content="PROCEED: baseline, seed, and metric evidence are bounded."
+        ),
+    )
+
+    pending = _execute_research_decision(
+        stage15, run_dir, config, AdapterBundle(), llm=SimpleNamespace()
+    )
+    assert pending.status.value == "paused"
+    request = json.loads(
+        (stage15 / "critique-pending" / "external_review_request.json").read_text()
+    )
+    decision_before = (stage15 / "decision.md").read_bytes()
+    structured_before = (stage15 / "decision_structured.json").read_bytes()
+
+    external = stage15 / "external-review"
+    external.mkdir()
+    review = {
+        "schema_version": request["schema_version"],
+        "policy_version": request["policy_version"],
+        "target_canonical_evidence": request["canonical_evidence"],
+        "target_decision": request["decision"],
+        "reviewer": {
+            "reviewer_id": "reviewer-1",
+            "reviewer_kind": "independent_agent",
+            "organization": "independent",
+        },
+        "findings": [
+            {
+                "id": "external-01",
+                "severity": "P1",
+                "category": "evidence",
+                "question": "Which bound observation supports the conclusion?",
+                "finding": "The conclusion needs an explicit evidence binding.",
+                "falsification_criterion": "A bound replicate contradicts it.",
+            }
+        ],
+    }
+    (external / "structured.json").write_text(
+        canonical_json_text(review), encoding="utf-8"
+    )
+
+    finalized = _execute_research_decision(
+        stage15, run_dir, config, AdapterBundle(), llm=None
+    )
+    assert finalized.status.value == "done"
+    assert (stage15 / "decision.md").read_bytes() == decision_before
+    assert (stage15 / "decision_structured.json").read_bytes() == structured_before
+    critique = json.loads((stage15 / "critique.json").read_text())
+    assert critique["state"] == "external_final"
+    assert critique["findings"] == review["findings"]
 
 
 def test_stage17_fact_closure_binds_canonical_manifest_and_rejects_change(

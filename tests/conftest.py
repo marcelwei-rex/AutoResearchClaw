@@ -245,6 +245,10 @@ def consumer_evidence_fixture(monkeypatch: pytest.MonkeyPatch):
         "researchclaw.pipeline.stage_impls._review_publish.load_canonical_experiment_evidence",
         _load,
     )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage15_critique.load_canonical_experiment_evidence",
+        _load,
+    )
     def _stage19_inputs(run_dir: Path, _config, evidence):
         from researchclaw.pipeline.stage19_input_bundle import (
             BoundArtifact,

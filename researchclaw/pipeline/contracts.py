@@ -154,8 +154,13 @@ CONTRACTS: dict[Stage, StageContract] = {
     Stage.RESEARCH_DECISION: StageContract(
         stage=Stage.RESEARCH_DECISION,
         input_files=("analysis.md",),
-        output_files=("decision.md", "decision_structured.json"),
-        dod="PROCEED/PIVOT decision with evidence-based justification",
+        output_files=(
+            "decision.md",
+            "decision_structured.json",
+            "critique.json",
+            "stage15_critique_manifest.json",
+        ),
+        dod="Bound decision and finalized isolated critique publication",
         error_code="E15_DECISION_FAIL",
     ),
     # Phase G: Paper Writing
