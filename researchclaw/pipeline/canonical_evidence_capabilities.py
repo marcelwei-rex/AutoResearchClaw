@@ -32,9 +32,9 @@ CANONICAL_EVIDENCE_CAPABILITIES: dict[str, int] = {
     "stage15_17_consumers": CAPABILITY_SCHEMA_VERSION,
     # This component covers the remaining manuscript path: Stage 18 peer
     # review through Stage 23 citation verification. The historical capability
-    # name is retained for schema compatibility. Activation waits until every
-    # consumer uses canonical snapshots and passes the repository guard.
-    "stage19_22_consumers": 0,
+    # name is retained for schema compatibility. Stage 18-23 now consume only
+    # canonical snapshots and pass the repository guard.
+    "stage19_22_consumers": CAPABILITY_SCHEMA_VERSION,
     "stage24_release_consumers": 0,
     "external_and_persistent_consumers": 0,
     "independent_release_reconstruction": 0,

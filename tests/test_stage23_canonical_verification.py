@@ -17,7 +17,9 @@ from researchclaw.literature.verify import (
     VerifyStatus,
 )
 from researchclaw.pipeline.canonical_evidence_capabilities import (
+    CAPABILITY_SCHEMA_VERSION,
     CANONICAL_EVIDENCE_CAPABILITIES,
+    incomplete_canonical_evidence_capabilities,
 )
 from researchclaw.pipeline.stage19_input_bundle import BoundArtifact
 from researchclaw.pipeline.stage22_publication import Stage22PublicationSnapshot
@@ -694,7 +696,15 @@ def test_stage18_23_authority_functions_have_no_legacy_selectors() -> None:
     assert executor._STAGE_EXECUTORS[Stage.EXPORT_PUBLISH] is functions[4]
     assert executor._STAGE_EXECUTORS[Stage.CITATION_VERIFY] is functions[5]
 
-    assert CANONICAL_EVIDENCE_CAPABILITIES["stage19_22_consumers"] == 0
+    assert (
+        CANONICAL_EVIDENCE_CAPABILITIES["stage19_22_consumers"]
+        == CAPABILITY_SCHEMA_VERSION
+    )
+    assert incomplete_canonical_evidence_capabilities() == (
+        "stage24_release_consumers",
+        "external_and_persistent_consumers",
+        "independent_release_reconstruction",
+    )
     assert {
         Stage.PAPER_DRAFT,
         Stage.PEER_REVIEW,

@@ -1455,6 +1455,10 @@ until C5.
   named `stage19_22_consumers` capability to v1 only after independent review.
   This migration binds existing verification results; it does not change DOI
   provider aggregation, title-only relevance policy, or release thresholds.
+- C3-E activation: after independent approval, set only
+  `stage19_22_consumers` to v1. The Stage 24, external/persistent-consumer, and
+  independent-release-reconstruction capabilities remain incomplete, so this
+  component activation does not unblock a Stage 12+ production run.
 - ensure each migrated manifest or closure report records the canonical-evidence
   manifest hash;
 - keep the runtime capability gate blocked.

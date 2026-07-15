@@ -660,9 +660,13 @@ def test_stage20_consumer_has_no_legacy_experiment_selector() -> None:
     assert "_get_evolution_overlay" not in source
 
 
-def test_stage19_22_capability_remains_blocked() -> None:
+def test_stage19_22_capability_is_activated_after_complete_migration() -> None:
     from researchclaw.pipeline.canonical_evidence_capabilities import (
+        CAPABILITY_SCHEMA_VERSION,
         CANONICAL_EVIDENCE_CAPABILITIES,
     )
 
-    assert CANONICAL_EVIDENCE_CAPABILITIES["stage19_22_consumers"] == 0
+    assert (
+        CANONICAL_EVIDENCE_CAPABILITIES["stage19_22_consumers"]
+        == CAPABILITY_SCHEMA_VERSION
+    )
