@@ -37,7 +37,9 @@ CANONICAL_EVIDENCE_CAPABILITIES: dict[str, int] = {
     # name is retained for schema compatibility. Stage 18-23 now consume only
     # canonical snapshots and pass the repository guard.
     "stage19_22_consumers": CAPABILITY_SCHEMA_VERSION,
-    "stage24_release_consumers": 0,
+    # Stage 24 truth publication and Stage 25 DEAI publication now consume and
+    # replay only the canonical Stage 04-23 authority graph.
+    "stage24_release_consumers": CAPABILITY_SCHEMA_VERSION,
     "external_and_persistent_consumers": 0,
     "independent_release_reconstruction": 0,
 }

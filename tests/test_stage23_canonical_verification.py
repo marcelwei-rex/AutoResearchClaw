@@ -898,8 +898,11 @@ def test_stage18_23_authority_functions_have_no_legacy_selectors() -> None:
         CANONICAL_EVIDENCE_CAPABILITIES["stage19_22_consumers"]
         == CAPABILITY_SCHEMA_VERSION
     )
+    assert (
+        CANONICAL_EVIDENCE_CAPABILITIES["stage24_release_consumers"]
+        == CAPABILITY_SCHEMA_VERSION
+    )
     assert incomplete_canonical_evidence_capabilities() == (
-        "stage24_release_consumers",
         "external_and_persistent_consumers",
         "independent_release_reconstruction",
     )
