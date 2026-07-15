@@ -807,6 +807,17 @@ _STAGE_EXECUTORS: dict[Stage, Callable[..., StageResult]] = {
 }
 
 
+_EXACT_AUTHORITY_NAMESPACE_STAGES = frozenset(
+    {
+        Stage.RESEARCH_DECISION,
+        Stage.EXPORT_PUBLISH,
+        Stage.CITATION_VERIFY,
+        Stage.TRUTH_AUDIT,
+        Stage.DEAI_AUDIT,
+    }
+)
+
+
 def execute_stage(
     stage: Stage,
     *,
@@ -1041,7 +1052,11 @@ def execute_stage(
     if bridge.use_memory:
         adapters.memory.append("stages", f"{run_id}:{int(stage)}:{result.status.value}")
 
-    _write_stage_meta(stage_dir, stage, run_id, result)
+    # These stages publish an exact, manifest-bound namespace. Generic
+    # executor diagnostics are not part of that authority and would make the
+    # next stage's strict replay reject an otherwise valid publication.
+    if stage not in _EXACT_AUTHORITY_NAMESPACE_STAGES:
+        _write_stage_meta(stage_dir, stage, run_id, result)
 
     _t_health_end = _time.monotonic()
     stage_health = {
@@ -1053,12 +1068,13 @@ def execute_stage(
         "error": result.error,
         "timestamp": _utcnow_iso(),
     }
-    try:
-        (stage_dir / "stage_health.json").write_text(
-            json.dumps(stage_health, indent=2), encoding="utf-8"
-        )
-    except OSError:
-        pass
+    if stage not in _EXACT_AUTHORITY_NAMESPACE_STAGES:
+        try:
+            (stage_dir / "stage_health.json").write_text(
+                json.dumps(stage_health, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass
 
     # --- HITL post-stage hook ---
     result = _run_hitl_post_stage(stage, result, run_dir, adapters, config=config)

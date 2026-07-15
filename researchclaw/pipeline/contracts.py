@@ -153,7 +153,9 @@ CONTRACTS: dict[Stage, StageContract] = {
     ),
     Stage.RESEARCH_DECISION: StageContract(
         stage=Stage.RESEARCH_DECISION,
-        input_files=("analysis.md",),
+        # Canonical Stage 15 owns input discovery and replays the selected
+        # Stage 14 generation before publishing its decision/critique pair.
+        input_files=(),
         output_files=(
             "decision.md",
             "decision_structured.json",
@@ -166,12 +168,9 @@ CONTRACTS: dict[Stage, StageContract] = {
     # Phase G: Paper Writing
     Stage.PAPER_OUTLINE: StageContract(
         stage=Stage.PAPER_OUTLINE,
-        input_files=(
-            "analysis.md",
-            "decision.md",
-            "decision_structured.json",
-            "citation_allowlist.json",
-        ),
+        # Canonical Stage 16 loads the experiment snapshot, bound Stage 15
+        # decision, and citation authority through their strict loaders.
+        input_files=(),
         output_files=(
             "outline.md",
             "outline_binding.json",
@@ -284,9 +283,9 @@ CONTRACTS: dict[Stage, StageContract] = {
             "citation_support.json",
             "critique_resolution.json",
             "truth_audit.json",
-            "citation-assessments/",
-            "generic-support-assessments/",
-            "resolution-assessments/",
+            # Assessment directories are manifest-bound but may legitimately
+            # be empty when their corresponding obligation class is absent.
+            # Stage 24's strict publication replay owns their closure.
             "stage24_truth_manifest.json",
         ),
         dod=(
