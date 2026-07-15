@@ -1215,7 +1215,7 @@ def validate_config(
                         f"runtime.skip_stages cannot skip evidence-authority "
                         f"stage: {stage}"
                     )
-                elif not 1 <= stage <= 23:
+                elif not 1 <= stage <= 25:
                     errors.append(f"Invalid runtime.skip_stages entry: {stage}")
 
     inject_artifacts = _get_by_path(data, "runtime.inject_artifacts")

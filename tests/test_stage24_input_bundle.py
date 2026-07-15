@@ -357,6 +357,7 @@ def test_truth_audit_maps_canonical_publisher_snapshot_to_done(
 
     snapshot = Stage24PublicationSnapshot(
         manifest=_bound("stage-24/stage24_truth_manifest.json", b"{}\n"),
+        paper=_bound("stage-23/paper_final_verified.md", b"Paper.\n"),
         outputs=(_bound("stage-24/truth_audit.json", b"{}\n"),),
         assessment_files=(),
     )

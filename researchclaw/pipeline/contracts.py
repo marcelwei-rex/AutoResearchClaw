@@ -298,12 +298,13 @@ CONTRACTS: dict[Stage, StageContract] = {
     ),
     Stage.DEAI_AUDIT: StageContract(
         stage=Stage.DEAI_AUDIT,
-        input_files=("truth_audit.json",),
-        output_files=("deai_audit.json",),
+        input_files=(),
+        output_files=("deai_audit.json", "stage25_deai_manifest.json"),
         dod=(
             "Recommend-only prose audit; paper unchanged since truth audit "
             "(hash invariance verified)"
         ),
         error_code="E25_DEAI_AUDIT_FAIL",
+        max_retries=0,
     ),
 }

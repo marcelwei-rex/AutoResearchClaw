@@ -147,6 +147,7 @@ SKIP_FORBIDDEN_STAGES: frozenset[Stage] = frozenset(
         Stage.EXPORT_PUBLISH,
         Stage.CITATION_VERIFY,
         Stage.TRUTH_AUDIT,
+        Stage.DEAI_AUDIT,
     }
 )
 

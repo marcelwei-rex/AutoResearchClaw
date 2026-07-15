@@ -27,8 +27,7 @@ from researchclaw.config import RCConfig
 from researchclaw.llm.client import LLMClient
 from researchclaw.prompts import PromptManager
 from researchclaw.pipeline.stages import Stage, StageStatus
-from researchclaw.pipeline._helpers import StageResult, _safe_json_loads, _utcnow_iso
-from researchclaw.pipeline import release_artifacts as ra
+from researchclaw.pipeline._helpers import StageResult, _safe_json_loads
 from researchclaw.pipeline.canonical_evidence_capabilities import (
     CanonicalEvidenceMigrationIncomplete,
 )
@@ -39,18 +38,12 @@ from researchclaw.pipeline.stage24_publication import (
     Stage24PublicationError,
     execute_stage24_truth,
 )
+from researchclaw.pipeline.stage25_publication import (
+    Stage25PublicationError,
+    execute_stage25_deai,
+)
 
 logger = logging.getLogger(__name__)
-
-
-_DEAI_SYSTEM = """You are a prose auditor detecting AI-generated stylistic tics in a research paper. \
-You are RECOMMEND-ONLY: you never rewrite the paper. Output STRICT JSON only: \
-{"suggestions": [{"span": "<verbatim excerpt>", "issue": "<what reads as AI-generated>", \
-"suggested_rewrite": "<optional shorter human alternative>", "risk": "style_only|touches_claim"}]}
-Rules:
-- Mark risk=touches_claim if the excerpt contains a number, comparison, or cited statement.
-- Never suggest changing any numeric value, claim meaning, or citation.
-- Maximum 40 suggestions."""
 
 
 # ---------------------------------------------------------------------------
@@ -123,20 +116,6 @@ def _execute_disabled_legacy_truth_audit(
 # Stage 25: De-AI Audit (recommend-only)
 # ---------------------------------------------------------------------------
 
-#: Deterministic stylistic-tic patterns (governance layer owns the taste;
-#: this list only produces *recommendations*, never a gate).
-_DEAI_PATTERNS: tuple[tuple[str, str], ...] = (
-    (r"\bdelve(?:s|d)?\b", "'delve' is a well-known AI-generated tic"),
-    (r"\bIt is worth noting that\b", "hedging filler common in AI prose"),
-    (r"\bIn conclusion,", "formulaic closer"),
-    (r"\bFurthermore,\s", "chained formal connectives read as generated"),
-    (r"\bMoreover,\s", "chained formal connectives read as generated"),
-    (r"\bplays a (?:crucial|pivotal|vital) role\b", "stock intensifier phrase"),
-    (r"\bunderscore(?:s|d)? the importance\b", "stock emphasis phrase"),
-    (r"\bcomprehensive(?:ly)?\b", "overused breadth adjective"),
-)
-
-
 def _execute_deai_audit(
     stage_dir: Path,
     run_dir: Path,
@@ -146,115 +125,39 @@ def _execute_deai_audit(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
-    truth = ra.read_json(run_dir / "stage-24" / "truth_audit.json")
-    if not isinstance(truth, dict) or not truth.get("paper_sha256"):
+    del adapters, prompts
+    try:
+        snapshot = execute_stage25_deai(
+            run_dir,
+            stage_dir,
+            runtime_config=config,
+            llm=llm,
+        )
+    except (
+        CanonicalEvidenceMigrationIncomplete,
+        Stage24InputBundleError,
+        Stage24PublicationError,
+        Stage25PublicationError,
+        OSError,
+        RuntimeError,
+        UnicodeDecodeError,
+        ValueError,
+    ) as exc:
         return StageResult(
             stage=Stage.DEAI_AUDIT,
             status=StageStatus.FAILED,
             artifacts=(),
-            error="De-AI audit requires a completed truth audit (stage-24/truth_audit.json).",
+            error=f"De-AI audit failed: {exc}",
             decision="retry",
         )
-
-    paper_path = ra.canonical_paper_path(run_dir)
-    if paper_path is None:
-        return StageResult(
-            stage=Stage.DEAI_AUDIT,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            error="De-AI audit: no canonical paper artifact found.",
-            decision="retry",
-        )
-    paper_text = paper_path.read_text(encoding="utf-8")
-    current_hash = ra.paper_sha256(paper_text)
-    frozen_hash = str(truth.get("paper_sha256"))
-
-    if current_hash != frozen_hash:
-        # The paper changed after the truth audit. Prose edits invalidate the
-        # frozen claim ledger — re-run stage 24 (and stage 23 if citations
-        # were touched) before auditing style. Fail closed.
-        return StageResult(
-            stage=Stage.DEAI_AUDIT,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            error=(
-                "Paper hash changed since truth audit "
-                f"({frozen_hash[:12]}… → {current_hash[:12]}…). "
-                "Re-run TRUTH_AUDIT before the de-AI audit."
-            ),
-            decision="retry",
-        )
-
-    suggestions: list[dict[str, Any]] = []
-    stripped = re.sub(r"```.*?```", "", paper_text, flags=re.DOTALL)
-    for pattern, issue in _DEAI_PATTERNS:
-        for m in re.finditer(pattern, stripped, flags=re.IGNORECASE):
-            lo = max(0, m.start() - 80)
-            hi = min(len(stripped), m.end() + 80)
-            span = ra.normalize_paper_text(stripped[lo:hi])
-            touches_claim = bool(re.search(r"\d|\\cite|\[[A-Za-z]+\d{4}", span))
-            suggestions.append(
-                {
-                    "source": "heuristic",
-                    "span": span[:300],
-                    "issue": issue,
-                    "suggested_rewrite": "",
-                    "risk": "touches_claim" if touches_claim else "style_only",
-                }
-            )
-            if len(suggestions) >= 60:
-                break
-
-    if llm is not None:
-        raw = _chat_json(llm, _DEAI_SYSTEM, paper_text[:60000])
-        if isinstance(raw, dict) and isinstance(raw.get("suggestions"), list):
-            for s in raw["suggestions"][:40]:
-                if not isinstance(s, dict):
-                    continue
-                risk = str(s.get("risk", "style_only"))
-                if risk not in ("style_only", "touches_claim"):
-                    risk = "touches_claim"  # unknown → conservative
-                suggestions.append(
-                    {
-                        "source": "llm",
-                        "span": str(s.get("span", ""))[:300],
-                        "issue": str(s.get("issue", ""))[:300],
-                        "suggested_rewrite": str(s.get("suggested_rewrite", ""))[:500],
-                        "risk": risk,
-                    }
-                )
-
-    ra.write_json_atomic(
-        stage_dir / "deai_audit.json",
-        {
-            "schema_version": ra.SCHEMA_VERSION,
-            "recommend_only": True,
-            "applied": False,
-            "paper_path": str(paper_path.relative_to(run_dir)),
-            "paper_sha256": current_hash,
-            "truth_audit_sha256": frozen_hash,
-            "hash_invariant_ok": True,
-            "suggestions": suggestions,
-            "counts": {
-                "total": len(suggestions),
-                "touches_claim": sum(
-                    1 for s in suggestions if s["risk"] == "touches_claim"
-                ),
-            },
-            "rework_rule": (
-                "If suggestions are adopted: edits touching citation instances or "
-                "claim spans require re-running stages 23+24; style-only edits "
-                "require re-running stage 24. Never edit automatically."
-            ),
-            "generated": _utcnow_iso(),
-        },
-    )
-
     return StageResult(
         stage=Stage.DEAI_AUDIT,
         status=StageStatus.DONE,
-        artifacts=("deai_audit.json",),
-        evidence_refs=("stage-25/deai_audit.json",),
+        artifacts=(
+            snapshot.audit.path.removeprefix("stage-25/"),
+            snapshot.manifest.path.removeprefix("stage-25/"),
+        ),
+        evidence_refs=(snapshot.manifest.path,),
     )
 
 

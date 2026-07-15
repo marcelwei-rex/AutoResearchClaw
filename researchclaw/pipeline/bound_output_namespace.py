@@ -23,7 +23,12 @@ class BoundOutputNamespace:
 
     @classmethod
     def open(
-        cls, run_dir: Path, stage_dir: Path, stage_name: str
+        cls,
+        run_dir: Path,
+        stage_dir: Path,
+        stage_name: str,
+        *,
+        create_stage: bool = False,
     ) -> "BoundOutputNamespace":
         if stage_dir != run_dir / stage_name:
             raise OSError(f"{stage_name} output directory is not the canonical path")
@@ -50,6 +55,11 @@ class BoundOutputNamespace:
                 run_path_info
             ):
                 raise OSError("run directory changed while opening output namespace")
+            if create_stage:
+                try:
+                    os.mkdir(stage_name, 0o700, dir_fd=run_fd)
+                except FileExistsError:
+                    pass
             stage_fd = os.open(stage_name, directory_flags, dir_fd=run_fd)
             try:
                 stage_info = os.fstat(stage_fd)

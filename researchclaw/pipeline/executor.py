@@ -39,6 +39,23 @@ from researchclaw.experiment.validator import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _MissingAuthorityNamespace:
+    """Record that no run namespace existed before an authority HITL wait."""
+
+    run_dir: Path
+
+    def assert_canonical(self) -> None:
+        try:
+            self.run_dir.lstat()
+        except FileNotFoundError:
+            return
+        raise OSError("run directory appeared during authority HITL wait")
+
+    def close(self) -> None:
+        return None
+
+
 def _select_output_files(contract, config) -> tuple[str, ...]:
     """Pick the contract's collider-mode outputs when running collider_agent."""
     if contract is None:
@@ -206,13 +223,47 @@ def _get_hitl_session(adapters: AdapterBundle) -> Any:
     return getattr(adapters, "hitl", None)
 
 
-def _invalidate_hitl_authority_stage(stage: Stage, run_dir: Path) -> None:
+def _capture_hitl_authority_namespace(
+    stage: Stage, run_dir: Path
+) -> BoundOutputNamespace | _MissingAuthorityNamespace | None:
+    """Hold Stage 25 identity across one HITL wait without following parents."""
+
+    if stage is not Stage.DEAI_AUDIT:
+        return None
+    try:
+        run_dir.lstat()
+    except FileNotFoundError:
+        return _MissingAuthorityNamespace(run_dir)
+    return BoundOutputNamespace.open(
+        run_dir,
+        run_dir / "stage-25",
+        "stage-25",
+        create_stage=True,
+    )
+
+
+def _invalidate_hitl_authority_stage(
+    stage: Stage,
+    run_dir: Path,
+    authority_namespace: BoundOutputNamespace | _MissingAuthorityNamespace | None = None,
+) -> None:
     """Remove stale authority when HITL prevents an evidence stage commit."""
 
-    stage_name = f"stage-{int(stage):02d}"
-    stage_dir = run_dir / stage_name
-    stage_dir.mkdir(parents=True, exist_ok=True)
-    with BoundOutputNamespace.open(run_dir, stage_dir, stage_name) as namespace:
+    if stage is Stage.DEAI_AUDIT and authority_namespace is None:
+        raise OSError("Stage 25 HITL invalidation requires a held namespace")
+    if isinstance(authority_namespace, _MissingAuthorityNamespace):
+        authority_namespace.assert_canonical()
+        return
+
+    if authority_namespace is not None and stage is Stage.DEAI_AUDIT:
+        from researchclaw.pipeline.stage25_publication import _reset_namespace
+
+        # Clean the held (possibly detached) inode before rejecting any live
+        # path replacement. _reset_namespace performs the final identity check.
+        _reset_namespace(authority_namespace)
+        return
+
+    def invalidate(namespace: BoundOutputNamespace) -> None:
         namespace.assert_canonical()
         if stage is Stage.TRUTH_AUDIT:
             from researchclaw.pipeline.stage24_publication import _reset_namespace
@@ -222,15 +273,26 @@ def _invalidate_hitl_authority_stage(stage: Stage, run_dir: Path) -> None:
             namespace.reset_flat_namespace()
         namespace.assert_canonical()
 
+    if authority_namespace is not None:
+        invalidate(authority_namespace)
+        return
+
+    stage_name = f"stage-{int(stage):02d}"
+    stage_dir = run_dir / stage_name
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    with BoundOutputNamespace.open(run_dir, stage_dir, stage_name) as namespace:
+        invalidate(namespace)
+
 
 def _forbidden_hitl_result(
     stage: Stage,
     run_dir: Path,
     *,
     action: str,
+    authority_namespace: BoundOutputNamespace | _MissingAuthorityNamespace | None = None,
 ) -> StageResult:
     try:
-        _invalidate_hitl_authority_stage(stage, run_dir)
+        _invalidate_hitl_authority_stage(stage, run_dir, authority_namespace)
     except Exception as exc:  # noqa: BLE001
         return StageResult(
             stage=stage,
@@ -252,17 +314,40 @@ def _guard_authority_human_input(
     stage: Stage,
     run_dir: Path,
     human_input: Any,
+    authority_namespace: BoundOutputNamespace | _MissingAuthorityNamespace | None = None,
 ) -> StageResult | None:
     from researchclaw.hitl.intervention import HumanAction
 
+    if stage is Stage.DEAI_AUDIT and authority_namespace is None:
+        return _forbidden_hitl_result(
+            stage,
+            run_dir,
+            action="missing held namespace",
+            authority_namespace=None,
+        )
+    mutation_requested = bool(
+        human_input.edited_files
+        or (stage is Stage.DEAI_AUDIT and human_input.guidance)
+    )
     if stage in SKIP_FORBIDDEN_STAGES and (
-        human_input.action != HumanAction.APPROVE or human_input.edited_files
+        human_input.action != HumanAction.APPROVE or mutation_requested
     ):
         return _forbidden_hitl_result(
             stage,
             run_dir,
             action=f"post-stage {human_input.action.value.upper()}",
+            authority_namespace=authority_namespace,
         )
+    if stage is Stage.DEAI_AUDIT and authority_namespace is not None:
+        try:
+            authority_namespace.assert_canonical()
+        except OSError:
+            return _forbidden_hitl_result(
+                stage,
+                run_dir,
+                action="namespace replacement",
+                authority_namespace=authority_namespace,
+            )
     return None
 
 
@@ -288,43 +373,60 @@ def _run_hitl_pre_stage(
     contract = CONTRACTS.get(stage)
     output_files = _select_output_files(contract, config)
 
-    session.pause(
-        stage_num,
-        stage.name,
-        PauseReason.PRE_STAGE,
-        context_summary=f"About to execute {stage.name}",
-        output_files=output_files,
-    )
-    human_input = session.wait_for_human()
-
-    authority_guard = _guard_authority_human_input(stage, run_dir, human_input)
-    if authority_guard is not None:
-        return authority_guard
-
-    if human_input.action == HumanAction.SKIP:
-        return StageResult(
-            stage=stage,
-            status=StageStatus.DONE,
-            artifacts=(),
-            decision="proceed",
-        )
-    if human_input.action == HumanAction.ABORT:
+    try:
+        authority_namespace = _capture_hitl_authority_namespace(stage, run_dir)
+    except OSError as exc:
         return StageResult(
             stage=stage,
             status=StageStatus.FAILED,
             artifacts=(),
-            error="Aborted by user",
+            error=f"Cannot capture authority namespace before HITL wait: {exc}",
             decision="abort",
         )
+    try:
+        session.pause(
+            stage_num,
+            stage.name,
+            PauseReason.PRE_STAGE,
+            context_summary=f"About to execute {stage.name}",
+            output_files=output_files,
+        )
+        human_input = session.wait_for_human()
 
-    # Inject guidance if provided
-    if human_input.guidance:
-        stage_dir = run_dir / f"stage-{stage_num:02d}"
-        stage_dir.mkdir(parents=True, exist_ok=True)
-        guidance_file = stage_dir / "hitl_guidance.md"
-        guidance_file.write_text(human_input.guidance, encoding="utf-8")
+        authority_guard = _guard_authority_human_input(
+            stage, run_dir, human_input, authority_namespace
+        )
+        if authority_guard is not None:
+            return authority_guard
 
-    return None  # Proceed with execution
+        if human_input.action == HumanAction.SKIP:
+            return StageResult(
+                stage=stage,
+                status=StageStatus.DONE,
+                artifacts=(),
+                decision="proceed",
+            )
+        if human_input.action == HumanAction.ABORT:
+            return StageResult(
+                stage=stage,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error="Aborted by user",
+                decision="abort",
+            )
+
+        # Inject guidance if provided. Stage 25 rejects guidance above because
+        # its deterministic audit has no mutable prompt input.
+        if human_input.guidance:
+            stage_dir = run_dir / f"stage-{stage_num:02d}"
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            guidance_file = stage_dir / "hitl_guidance.md"
+            guidance_file.write_text(human_input.guidance, encoding="utf-8")
+
+        return None  # Proceed with execution
+    finally:
+        if authority_namespace is not None:
+            authority_namespace.close()
 
 
 def _run_hitl_post_stage(
@@ -351,26 +453,40 @@ def _run_hitl_post_stage(
         if budget > 0 and guard.should_pause(run_dir):
             from researchclaw.hitl.intervention import HumanAction, PauseReason
 
-            session.pause(
-                stage_num,
-                stage.name,
-                PauseReason.COST_BUDGET_EXCEEDED,
-                context_summary=f"Cost budget alert: {guard.format_display(run_dir)}",
-            )
-            human_input = session.wait_for_human()
-            authority_result = _guard_authority_human_input(
-                stage, run_dir, human_input
-            )
-            if authority_result is not None:
-                return authority_result
-            if human_input.action == HumanAction.ABORT:
+            try:
+                authority_namespace = _capture_hitl_authority_namespace(stage, run_dir)
+            except OSError as exc:
                 return StageResult(
                     stage=stage,
                     status=StageStatus.FAILED,
-                    artifacts=result.artifacts,
-                    error="Aborted due to cost",
+                    artifacts=(),
+                    error=f"Cannot capture authority namespace before cost HITL: {exc}",
                     decision="abort",
                 )
+            try:
+                session.pause(
+                    stage_num,
+                    stage.name,
+                    PauseReason.COST_BUDGET_EXCEEDED,
+                    context_summary=f"Cost budget alert: {guard.format_display(run_dir)}",
+                )
+                human_input = session.wait_for_human()
+                authority_result = _guard_authority_human_input(
+                    stage, run_dir, human_input, authority_namespace
+                )
+                if authority_result is not None:
+                    return authority_result
+                if human_input.action == HumanAction.ABORT:
+                    return StageResult(
+                        stage=stage,
+                        status=StageStatus.FAILED,
+                        artifacts=result.artifacts,
+                        error="Aborted due to cost",
+                        decision="abort",
+                    )
+            finally:
+                if authority_namespace is not None:
+                    authority_namespace.close()
     except Exception as _cg_exc:
         logger.debug("CostGuard check skipped: %s", _cg_exc)
 
@@ -449,74 +565,90 @@ def _run_hitl_post_stage(
             except (OSError, UnicodeDecodeError):
                 pass
 
-    session.pause(
-        stage_num,
-        stage.name,
-        reason,
-        context_summary="\n".join(context_lines),
-        output_files=output_files,
-    )
-    human_input = session.wait_for_human()
-
-    authority_result = _guard_authority_human_input(stage, run_dir, human_input)
-    if authority_result is not None:
-        return authority_result
-
-    if human_input.action == HumanAction.APPROVE:
-        return result
-
-    if human_input.action == HumanAction.REJECT:
-        return StageResult(
-            stage=stage,
-            status=StageStatus.REJECTED,
-            artifacts=result.artifacts,
-            error=human_input.message or "Rejected by human reviewer",
-            decision="pivot",
-            evidence_refs=result.evidence_refs,
-        )
-
-    if human_input.action == HumanAction.EDIT:
-        # Human already edited files via the adapter
-        return result
-
-    if human_input.action == HumanAction.SKIP:
-        return StageResult(
-            stage=stage,
-            status=StageStatus.DONE,
-            artifacts=result.artifacts,
-            decision="proceed",
-            evidence_refs=result.evidence_refs,
-        )
-
-    if human_input.action == HumanAction.ABORT:
+    try:
+        authority_namespace = _capture_hitl_authority_namespace(stage, run_dir)
+    except OSError as exc:
         return StageResult(
             stage=stage,
             status=StageStatus.FAILED,
-            artifacts=result.artifacts,
-            error="Aborted by user",
+            artifacts=(),
+            error=f"Cannot capture authority namespace before post-stage HITL: {exc}",
             decision="abort",
-            evidence_refs=result.evidence_refs,
         )
+    try:
+        session.pause(
+            stage_num,
+            stage.name,
+            reason,
+            context_summary="\n".join(context_lines),
+            output_files=output_files,
+        )
+        human_input = session.wait_for_human()
 
-    if human_input.action == HumanAction.COLLABORATE:
-        session.enter_collaboration(stage_num, stage.name)
-        try:
-            result = _run_collaboration_loop(
-                stage, result, run_dir, adapters, session, config=config
+        authority_result = _guard_authority_human_input(
+            stage, run_dir, human_input, authority_namespace
+        )
+        if authority_result is not None:
+            return authority_result
+
+        if human_input.action == HumanAction.APPROVE:
+            return result
+
+        if human_input.action == HumanAction.REJECT:
+            return StageResult(
+                stage=stage,
+                status=StageStatus.REJECTED,
+                artifacts=result.artifacts,
+                error=human_input.message or "Rejected by human reviewer",
+                decision="pivot",
+                evidence_refs=result.evidence_refs,
             )
-        except Exception as _collab_exc:
-            logger.warning("Collaboration failed: %s", _collab_exc)
-        session.exit_collaboration()
-        return result
 
-    if human_input.action == HumanAction.INJECT:
-        # Save guidance for potential re-run
-        if human_input.guidance:
-            guidance_file = stage_dir / "hitl_guidance.md"
-            guidance_file.write_text(human_input.guidance, encoding="utf-8")
-        return result
+        if human_input.action == HumanAction.EDIT:
+            # Human already edited files via the adapter
+            return result
 
-    return result
+        if human_input.action == HumanAction.SKIP:
+            return StageResult(
+                stage=stage,
+                status=StageStatus.DONE,
+                artifacts=result.artifacts,
+                decision="proceed",
+                evidence_refs=result.evidence_refs,
+            )
+
+        if human_input.action == HumanAction.ABORT:
+            return StageResult(
+                stage=stage,
+                status=StageStatus.FAILED,
+                artifacts=result.artifacts,
+                error="Aborted by user",
+                decision="abort",
+                evidence_refs=result.evidence_refs,
+            )
+
+        if human_input.action == HumanAction.COLLABORATE:
+            session.enter_collaboration(stage_num, stage.name)
+            try:
+                result = _run_collaboration_loop(
+                    stage, result, run_dir, adapters, session, config=config
+                )
+            except Exception as _collab_exc:
+                logger.warning("Collaboration failed: %s", _collab_exc)
+            session.exit_collaboration()
+            return result
+
+        if human_input.action == HumanAction.INJECT:
+            # Save guidance for potential re-run
+            if human_input.guidance:
+                guidance_file = stage_dir / "hitl_guidance.md"
+                guidance_file.write_text(human_input.guidance, encoding="utf-8")
+            return result
+
+        return result
+    finally:
+        if authority_namespace is not None:
+            authority_namespace.close()
 
 
 def _run_collaboration_loop(

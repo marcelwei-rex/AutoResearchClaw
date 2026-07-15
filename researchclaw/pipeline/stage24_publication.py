@@ -79,8 +79,18 @@ class Stage24PublicationError(ValueError):
 @dataclass(frozen=True)
 class Stage24PublicationSnapshot:
     manifest: BoundArtifact
+    paper: BoundArtifact
     outputs: tuple[BoundArtifact, ...]
     assessment_files: tuple[BoundArtifact, ...]
+
+    def require_output(self, name: str) -> BoundArtifact:
+        expected = f"stage-24/{name}"
+        matches = tuple(item for item in self.outputs if item.path == expected)
+        if len(matches) != 1:
+            raise Stage24PublicationError(
+                f"Stage 24 publication does not contain exactly one {name}"
+            )
+        return matches[0]
 
 
 def _publish_stage24_truth(
@@ -202,6 +212,25 @@ def _load_stage24_truth_publication(
         )
 
 
+def load_stage24_publication_snapshot(
+    run_dir: Path,
+    runtime_config: RCConfig,
+) -> Stage24PublicationSnapshot:
+    """Capture one immutable Stage 24 publication and its source paper."""
+
+    require_canonical_evidence_capabilities("load_stage24_publication_snapshot")
+    bundle = load_stage24_input_bundle(run_dir, runtime_config)
+    snapshot = _load_stage24_truth_publication(run_dir, bundle=bundle)
+    verify_stage24_input_bundle_unchanged(run_dir, runtime_config, bundle)
+    final = _load_stage24_truth_publication(run_dir, bundle=bundle)
+    if final != snapshot:
+        raise Stage24PublicationError(
+            "Stage 24 publication changed during consumer capture"
+        )
+    verify_stage24_input_bundle_unchanged(run_dir, runtime_config, bundle)
+    return snapshot
+
+
 def _load_stage24_truth_publication_from_namespace(
     namespace: BoundOutputNamespace,
     *,
@@ -237,6 +266,7 @@ def _load_stage24_truth_publication_from_namespace(
             _sha256(manifest_bytes),
             manifest_bytes,
         ),
+        paper=bundle.paper,
         outputs=tuple(
             BoundArtifact(f"stage-24/{name}", _sha256(content), content)
             for name, content in sorted(outputs.items())

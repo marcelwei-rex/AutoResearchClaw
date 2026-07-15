@@ -340,7 +340,7 @@ def test_execute_pipeline_injects_artifacts_and_skips_configured_stages(
     assert (run_dir / "stage-09" / "exp_plan.yaml").exists()
 
 
-@pytest.mark.parametrize("stage_num", [4, 5, 24])
+@pytest.mark.parametrize("stage_num", [4, 5, 24, 25])
 def test_execute_pipeline_rejects_programmatic_evidence_stage_skip(
     run_dir: Path,
     rc_config: RCConfig,
