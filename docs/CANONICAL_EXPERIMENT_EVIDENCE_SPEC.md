@@ -883,6 +883,13 @@ from the selected Stage 12 or accepted Stage 13 execution payload. It does not
 accept substring, suffix, prefix, case-folded, mean-key, or LLM-proposed aliases.
 For example, `detection_f1_mean` cannot satisfy `detection_f1`.
 
+C0-C3 originally implement contract schema v1. The final authority model after
+C4-U0 requires contract schema v2, which retains every v1 field and adds the
+exact top-level `metric_units` and `metric_display_labels` mappings defined in
+C4-U0. Schema v1 remains historical documentation only after that migration
+and is rejected by every authority producer, accessor, consumer, and release
+reconstructor.
+
 JSON numbers are parsed with `Decimal`, rejecting booleans, NaN, infinity, and
 non-number strings. Negative zero is normalized to Decimal zero. The candidate
 score is the Decimal arithmetic mean of the nonempty observation array under a
@@ -1263,6 +1270,7 @@ stage10_sealed_input
 stage12_result_set
 stage13_refinement_set
 stage14_candidate_and_promotion
+metric_contract_authority
 shared_accessor
 stage15_17_consumers
 stage19_22_consumers
@@ -1465,10 +1473,733 @@ until C5.
 
 ### C4: Stage 24 and release replay
 
-- migrate Stage 24 provenance;
-- add `reconstruct_expected_canonical_evidence(run_dir)` and exact comparison;
-- bind release packaging and registry artifacts;
-- add all adversarial release tests.
+Stage 24 is not permitted to treat an LLM-produced claim list as a complete
+inventory. C4 is split into the following separately reviewable commits and
+must land in order. `stage24_release_consumers` remains zero through C4-U0,
+C4-P0, C4-A0, C4-A1, and C4-A2. It is raised only by a separate activation
+commit after both Stage 24 and Stage 25 publications have independent approval.
+
+#### C4-U0: metric-authority schema migration
+
+- add a new required capability component `metric_contract_authority`, initially
+  zero, so every public pipeline/external entrypoint remains mechanically
+  blocked while this upstream schema changes;
+- publish Stage 9 experiment-contract schema v2 with exact `metric_units` and
+  `metric_display_labels` mappings owned by the selected domain evaluator;
+- require every evaluator-emittable metric key to appear exactly once in both
+  mappings, reject extra/missing/conflicting keys or labels shared by different
+  metrics, and forbid summary/analysis/LLM-derived units or labels;
+- upgrade the Stage 10 seal, Stage 12 result-set producer/replay, Stage 13
+  refinement producer/replay, Stage 14 candidates/promotion, shared accessor,
+  and a pure independent Stage 9-14 expected-reconstruction helper to require
+  contract schema v2 and preserve those mappings unchanged;
+- reject every mixed v1/v2 chain and every resume that attempts to reuse v1
+  Stage 9-14 authority under a v2 consumer. Such a run must rerun Stage 9-14;
+- raise only `metric_contract_authority` after producer, loader, replay,
+  rollback, resume, and independent tests pass. All later C4 capabilities stay
+  zero.
+
+This is an upstream authority migration, not an implicit Stage 24 parser
+feature. C4-P0 cannot start until C4-U0 is independently approved.
+
+Contract schema v2 has exactly the v1 top-level fields plus
+`metric_authority`, `metric_units`, and `metric_display_labels`; duplicate,
+missing, or unknown YAML keys reject. `metric_authority` has exactly `{path,
+sha256, policy_version, domain_id, evaluator_id, domain_profile_path,
+domain_profile_sha256, selector_index_path, selector_index_sha256,
+domain_selector_package_path, domain_selector_package_sha256,
+domain_selector_snapshot_path, domain_selector_snapshot_sha256,
+selector_input_sha256, selector_policy_version, experiment_mode,
+evaluator_kind}`. Its authority path is fixed to
+`stage-09/metric_authority.json`, the profile path to
+`stage-09/domain_profile.json`, and the index path to
+`stage-09/metric_authority_index.json`; the domain selector snapshot path is
+fixed to `stage-09/domain_selector_policy.json`, and the package path is fixed
+to the trusted package path defined below. `metric_units` is an object from
+metric key to one closed unit string. `metric_display_labels` is an object over
+the identical key set whose values are nonempty ordered arrays of 1-8 nonempty
+strings.
+Metric keys match `[a-z][a-z0-9_]{0,63}`. Label identity uses NFKC, Unicode
+casefold, trim, and Unicode-whitespace collapse to one ASCII space. Raw labels
+must already equal their trimmed form; normalized labels are unique within and
+across metrics, and array order is authority.
+
+The mappings do not originate in the contract. Code-owned domain registries
+live at the fixed package namespace
+`researchclaw/experiment_runtime/metric_authority/<evaluator_id>-v1.json`. Each
+strict registry has exactly `{schema_version, policy_version, domain_id,
+evaluator_id, owner, metrics}`, where owner is exactly `scaffold` and metrics is
+an ordered metric-key-sorted array of exact `{key, unit, display_labels}`
+objects using the rules above. The code-owned selector index is fixed at
+`researchclaw/experiment_runtime/metric_authority/index-v1.json` and has exactly
+`{schema_version, selector_policy_version, entries}`. Entries are an ordered,
+lexicographically sorted array of exact `{domain_id, experiment_mode,
+evaluator_kind, evaluator_id}` objects; the first three fields are globally
+unique.
+
+Canonical metric-domain profiles are separate from mutable prompt-adapter
+profiles and live at
+`researchclaw/experiment_runtime/metric_authority/profiles/<domain_id>-v1.json`.
+Each has exactly `{schema_version, selector_policy_version, domain_id, owner,
+supported_experiment_modes}`, with owner `scaffold`, a nonempty ordered closed
+mode array, and a filename stem matching the domain ID. Prompt profile text,
+display names, hypotheses, and Stage 9 prose are not selector inputs.
+
+The first-level code-owned policy is fixed at
+`researchclaw/experiment_runtime/metric_authority/domain-selector-v1.json` and
+has exactly `{schema_version, selector_policy_version, normalization,
+no_match, rules}`. Schema version is 1, selector policy is
+`domain_selector_v1`, normalization is `nfkc_casefold_space_v1`, and no-match
+policy is `error`. `rules` is a nonempty ordered array of exact `{rule_id,
+pattern_kind, normalized_pattern, domain_id, priority}` objects. Rule IDs are
+unique nonempty ASCII identifiers; pattern kind is `whole_word` or `substring`;
+priority is a JSON integer from 0 through 1000 with booleans rejected. Every
+domain ID names exactly one versioned canonical metric-domain profile.
+
+Topic normalization strict-decodes the active-config string, applies Unicode
+NFKC, Unicode casefold, trims, and collapses every Unicode whitespace run to
+one ASCII space. A policy pattern must already equal that normalized form and
+be nonempty. `substring` is literal normalized-string containment.
+`whole_word` is literal containment with both edges at string boundaries or
+adjacent to a non-word code point; word code points are Unicode Letter, Unicode
+Number, or underscore. Regex, locale, stemming, tokenization, and fuzzy matching
+are forbidden. All matching rules are collected. The maximum priority wins;
+all maximum-priority matches must name the same domain or selection fails as
+ambiguous. Zero matches fails. Array order cannot break a tie and rules are
+canonically sorted by descending priority then `rule_id`.
+
+Package policy files are immutable validator inputs for their declared policy
+version. Changing a selector mapping, profile semantics, registry content, or
+metric labels requires a new selector/policy version and, where registry
+content changes, a new evaluator ID; v1 files are never overwritten in place.
+Replay loads these trusted package policy bytes first and requires every
+run-local snapshot to be byte-identical to the independently selected package
+source.
+
+Stage 9 runs two pure selectors before reading plan-derived evaluator fields:
+
+```text
+select_canonical_domain_profile(
+  active_config.research.topic,
+  code_owned_domain_selector_policy,
+  domain_selector_policy_v1
+) -> {domain_id, package_profile_path, package_profile_sha256}
+
+select_metric_authority(
+  canonical_domain_profile_identity,
+  active_config.experiment.mode,
+  evaluator_kind_for_mode,
+  metric_selector_policy_v1,
+  code_owned_selector_index
+) -> evaluator_id
+```
+
+The domain selector is the exact topic-only policy above; process-global forced
+profiles, environment overrides, hypotheses, literature, plan, Stage 9 output,
+and an LLM fallback cannot alter it. It must select exactly one code-owned
+profile or fail. Its identity is canonical JSON over `{domain_id,
+package_profile_path, package_profile_sha256, topic_raw_sha256,
+topic_normalized_sha256, domain_selector_package_path,
+domain_selector_package_sha256, selector_policy_version}`. Experiment mode
+comes from the active config semantic projection. Evaluator kind is the
+closed deterministic mode mapping: `sandbox` and `docker` map to `scaffold`;
+every other mode is unsupported by canonical metric policy v1. The metric
+selector performs an exact unique tuple lookup in the code-owned index and
+never accepts a producer-supplied evaluator ID.
+
+Stage 9 copies the domain selector policy, selected profile, selector index, and
+selected registry to the four fixed run-local paths above.
+`domain_selector_package_sha256` is computed from the trusted fixed package
+path; `domain_selector_snapshot_sha256` is computed independently from the
+run-local snapshot, and the two hashes and bytes must match. The contract may
+record these derived identities but cannot choose either source.
+`selector_input_sha256` hashes exactly
+`{canonical_domain_profile_identity, experiment_mode, evaluator_kind,
+selector_policy_version, domain_selector_package_sha256,
+selector_index_sha256}`. The contract records the
+independently derived result, and its mappings must be exact projections of the
+separate registry snapshot. Config, LLM output, plan, contract fields, summary,
+and analysis cannot add, override, or select registry content.
+
+Stage 10 binds contract v2 and all four run-local policy/profile/index/registry
+snapshots and requires its
+deterministic scaffold to declare the same registry hash. Stage 12/13 result
+sets record that hash and may emit exactly the registry metric-key set permitted
+by evaluator policy. Stage 10-14 replay and the U0 expected helper rerun both
+selectors from active config plus the versioned trusted package domain policy,
+profile, index, and registry, then compare the independently selected package
+bytes with the fixed run-local snapshots and the derived domain/evaluator IDs
+with every stored copy; contract, run-local domain policy/index, or snapshot
+domain/evaluator ID is never the selector oracle. Stage
+14 candidates, promotion, and accessor preserve the same selector-input and
+owner/path/hash/key/unit/label closure. The helper imports no Stage 24 or
+release producer and does not inspect stored winner/status fields. C4-B later
+extends this already approved helper through Stage 15/23/24/25; C4-U0 does not
+set or depend on `independent_release_reconstruction`.
+
+#### C4-P0: bound Stage 15 critique publication
+
+- replace the mutable `stage-15/critique.json` workflow with critique schema v2
+  and a manifest-last `stage15_critique_manifest.json` publication;
+- bind the critique generation to the canonical experiment-evidence manifest,
+  raw `decision.md` bytes, strict `decision_structured.json` bytes, critic
+  source, critic model, writer model, policy version, and any external-review
+  bytes;
+- require exact finding fields, nonempty unique finding IDs, closed severity
+  and category vocabularies, and no unknown or duplicate JSON fields. Critique
+  policy v2 severities are exactly `P0`, `P1`, and `P2`; categories are exactly
+  `methodology`, `evidence`, `statistics`, `reproducibility`, `validity`,
+  `scope`, and `reporting`;
+- define four generation states: `model_final`, `none_final`,
+  `external_pending`, and `external_final`. A `none_final` publication is a
+  byte-bound record that no isolated critic was available and cannot satisfy a
+  release reviewer-isolation gate. `external_pending` is not critique authority
+  and publishes no `stage15_critique_manifest.json`;
+- retire append-in-place external findings. External review uses a strict
+  structured artifact plus an optional prose artifact. Both paths and raw-byte
+  hashes are fixed before `external_final` is published. The finalizer copies
+  the exact structured findings into critique v2 and never asks an LLM to
+  interpret the external review;
+- Stage 15 rerun invalidates the old critique manifest and owned critique
+  namespace before reading decision or experiment evidence. Any failure leaves
+  no finalized critique authority;
+- Stage 24 binds and replays the critique bytes and critique-manifest bytes, not
+  only a `critique_path`. Every resolution record binds the finding ID,
+  finding-content hash, critique hash, resolution-assessment input hash, model,
+  and policy version. An LLM resolution cannot delete a P0/P1 finding or turn
+  an unresolved finding into release authority by omission.
+
+The external structured review schema is the sole external findings source.
+Its identity is the tuple of normalized run-relative path, raw SHA-256, schema
+version, reviewer identity declaration, and ordered finding closure. A prose
+review is evidence for a human but is not parsed as a second findings source.
+
+Critique policy v2 uses this exact state matrix:
+
+| State | Authority name/manifest | Required fields | Forbidden fields |
+| --- | --- | --- | --- |
+| `model_final` | `critique.json` plus manifest | nonempty isolated `critic_model`, `writer_model`, canonical/decision bindings, ordered findings | every external path/hash |
+| `none_final` | `critique.json` plus manifest | `writer_model`, canonical/decision bindings, empty findings, categorical unavailability reason | critic model and every external path/hash |
+| `external_pending` | `critique-pending/external_review_request.json`; no manifest | target canonical/decision bindings, safe structured/prose target paths, policy version | success-named `critique.json`, findings, critic model |
+| `external_final` | `critique.json` plus manifest | external reviewer declaration, structured path/hash, target bindings, ordered findings; optional distinct prose path/hash | critic model and pending request as authority |
+
+`model_final` requires critic and writer models to be nonempty and unequal.
+`none_final` and `external_pending` cannot satisfy Stage 24 success. Every
+state uses an exact field set; fields forbidden by the matrix are absent, not
+empty compatibility placeholders.
+
+The literal top-level field sets are:
+
+- `model_final`: `{schema_version, policy_version, state, recommend_only,
+  canonical_evidence, decision, writer_model, critic_model, shared_context,
+  findings}`;
+- `none_final`: `{schema_version, policy_version, state, recommend_only,
+  canonical_evidence, decision, writer_model, unavailability_reason,
+  findings}`;
+- `external_pending`: `{schema_version, policy_version, state,
+  canonical_evidence, decision, writer_model, structured_target_path,
+  prose_target_path}`;
+- `external_final`: `{schema_version, policy_version, state, recommend_only,
+  canonical_evidence, decision, writer_model, reviewer,
+  external_structured, external_prose, findings}`.
+
+`recommend_only` is exactly true and `shared_context` exactly false where those
+fields occur. `none_final.findings` is exactly empty and
+`unavailability_reason` is exactly `critic_not_configured`,
+`critic_not_isolated`, or `critic_call_failed`. `external_prose` and
+`prose_target_path` are JSON null when absent; no other nullable compatibility
+fields exist. `reviewer` has exactly `{reviewer_id, reviewer_kind,
+organization}`, where every string is nonempty and reviewer kind is `human` or
+`independent_agent`. `canonical_evidence` has exactly `{path, sha256}` and
+`decision` exactly `{text_path, text_sha256, structured_path,
+structured_sha256}`. Each finding has exactly `{id, severity, category,
+question, finding, falsification_criterion}`. Nested objects reject missing,
+unknown, or duplicate fields.
+`external_structured` is exactly `{path, sha256}`;
+`external_prose` is exactly `{path, sha256}` or JSON null.
+`structured_target_path` is exactly
+`stage-15/external-review/structured.json`; `prose_target_path` is exactly
+`stage-15/external-review/review.md` or JSON null. A bare path string cannot
+substitute for a path/hash object in a finalized record.
+
+Canonical discovery does not consult config-selected arbitrary paths. The
+namespaces are fixed:
+
+- final critique: `stage-15/critique.json` and
+  `stage-15/stage15_critique_manifest.json`;
+- pending request: `stage-15/critique-pending/external_review_request.json`;
+- external structured input: `stage-15/external-review/structured.json`;
+- optional external prose: `stage-15/external-review/review.md`.
+
+Each directory has exact closure for its state and rejects symlinks,
+subdirectories, temporary files, renamed/shadow records, or any extra entry.
+`external-review/` is a user-supplied input namespace, not a Stage 15 owned
+output namespace: rerun invalidation never deletes or rewrites it. Stage 15 owns
+only final critique/manifest and `critique-pending/`; stale external bytes are
+harmless unless their embedded target generation matches the current inputs.
+The finalized critique manifest has exactly `{schema_version, policy_version,
+state, critique_path, critique_sha256, canonical_evidence, decision,
+external_inputs, findings_sha256, finding_count, output_namespace}`.
+`external_inputs` is an empty array for model/none and the ordered structured
+then optional prose `{path, sha256}` closure for external final. The output
+namespace is independently enumerated and must equal the state-specific names;
+the manifest cannot declare an alternate source path.
+
+The strict external structured review records its target canonical-evidence
+manifest path/hash, `decision.md` path/hash, `decision_structured.json`
+path/hash, critique/review policy versions, reviewer identity declaration, and
+ordered findings. The finalizer requires these target fields to equal the
+current captured generation before copying findings. Structured and optional
+prose paths are normalized run-relative regular files: absolute paths, `..`,
+backslashes, percent-encoded path syntax, parent or leaf symlinks, non-files,
+and a structured/prose path collision are rejected. The finalizer compares
+both external files' raw bytes before and after publication. An old external
+review cannot be rebound to a new decision or canonical generation.
+
+`external-review/structured.json` has exactly `{schema_version,
+policy_version, target_canonical_evidence, target_decision, reviewer,
+findings}` and reuses the exact nested schemas above. Its target objects are
+part of the external review bytes and cannot be supplied later by the
+finalizer.
+
+All identity hashes introduced by C4 use canonical identity JSON bytes:
+`json.dumps(payload, sort_keys=True, separators=(",", ":"),
+ensure_ascii=False, allow_nan=False).encode("utf-8")`. Identity payloads use
+only JSON null/boolean/string/array/object values; Decimal values appear as the
+canonical Decimal strings defined by their policy. Concatenated ad hoc byte
+hashes are forbidden. This rule applies to finding-content,
+resolution-assessment-input, citation-assessment-input, obligation, bundle,
+and publication identities.
+
+`finding_content_sha256` hashes exactly `{finding_id, severity, category,
+question, finding, falsification_criterion}`. A resolution-assessment input
+hashes exactly `{schema_version, policy_version, critique_sha256,
+finding_content_sha256, raw_paper_sha256, critic_model}`. Its raw source record
+has exactly `{schema_version, assessment_id, assessment_input_sha256,
+critic_model, policy_version, resolution, note}`; assessment ID is derived from
+the input hash and resolution is limited to `fixed`, `rebutted`, or
+`unresolved`. `accepted-risk` is not a v1 LLM resolution and no LLM output can
+authorize release risk. A future human risk-acceptance workflow requires a new
+policy and a separate permission-checked artifact; it is not a compatibility
+field in v1. Independent replay reads this raw source
+record only after reconstructing its complete bound input graph, then derives
+resolution counts and release status without consulting a producer-manifest
+copy of those values.
+
+#### C4-A0: immutable Stage 24 input graph
+
+- add an immutable `Stage23PublicationSnapshot` whose paper identity is the
+  SHA-256 of exact Stage 23 paper bytes. Whitespace-normalized paper hashes may
+  remain diagnostic fields but never participate in identity, replay, or a
+  fixpoint;
+- add one `Stage24InputBundle` that captures the Stage 23 publication, its
+  nested Stage 22/19/canonical-experiment input graph, the finalized Stage 15
+  critique publication, citation plan and effective policy, evidence-card JSON
+  and deterministic Markdown bytes, Stage 23 verification bytes, Stage 9
+  contract bytes, and the active run-config binding. Its strict model projection
+  records `writer_model=config.llm.primary_model`,
+  `citation_assessment_model=config.paper_revision.critic_model`,
+  `generic_support_model=config.paper_revision.critic_model`, and
+  `resolution_assessment_model=config.llm.critic_model`;
+- load the bundle once before any Stage 24 LLM call. Consumers receive frozen
+  mappings and bytes only and must not reopen diagnostic paths;
+- replace `build_citation_support_closure(run_dir, ...)` in the producer with
+  the pure
+  `replay_citation_support_closure(inputs, assessment_records)`. Its input
+  object contains only bytes and strict parsed values captured by the bundle;
+  it performs no run-directory read, selector, glob, or config load;
+- each citation-support assessment binds the citation instance, claim span,
+  cited key, exact card/excerpt hashes, Stage 23 verification record, critic
+  model, policy version, and `assessment_input_sha256`. Assessment identity and
+  isolation are checked independently; critic prose alone cannot establish
+  support;
+- immediately before publication, rediscover and replay the complete Stage
+  04-23 source graph and compare selected paths, namespace, raw bytes, and
+  semantic objects without consuming the fresh bytes as producer input.
+
+`Stage24InputBundle` identity is the canonical identity JSON hash of an exact
+ordered array of `{role, normalized_run_relative_path, raw_sha256}` entries plus
+the canonical experiment manifest path/hash, Stage 23 publication path/hash,
+critique publication path/hash, active-config semantic hash, and bundle policy
+version. It also includes the four exact model-projection fields above. The
+projection is derived from the already captured active config before any
+assessment source record is discovered; all three assessment models must be
+nonempty and unequal to the writer model. Source-record `critic_model` is only
+an equality check against that projection and cannot select or change the
+expected assessment ID. Roles and their order are fixed by the strict bundle
+schema; filesystem enumeration order never enters identity.
+
+Citation `assessment_input_sha256` is the canonical identity JSON hash of
+exactly `{schema_version, policy_version, canonical_manifest_sha256,
+paper_sha256, obligation_id, byte_start, byte_end, source_sha256, instance_id,
+cite_key, stage23_verification_record_sha256, evidence_records, critic_model}`.
+`evidence_records` is the ordered exact closure of `{card_id, card_sha256,
+excerpt_id, excerpt_sha256, byte_start, byte_end}`. The raw assessment source
+record has the exact fields `{schema_version, assessment_id,
+assessment_input_sha256, critic_model, policy_version, verdict, reason}`;
+`assessment_id` is independently derived from the input hash. Duplicate keys,
+unknown fields, identity mismatch, a writer-equal critic, or a verdict outside
+`supported`/`unsupported` rejects the record.
+
+Non-deterministic Stage 24 source records use fixed, default-deny namespaces:
+
+- citation assessments:
+  `stage-24/citation-assessments/<full-assessment_id>.json`;
+- generic-claim assessments:
+  `stage-24/generic-support-assessments/<full-assessment_id>.json`;
+- critique resolutions:
+  `stage-24/resolution-assessments/<full-assessment_id>.json`.
+
+The full lowercase assessment ID is the filename stem; truncation, aliases,
+producer-declared paths, and nested directories are forbidden. Expected IDs
+are derived from the independently reconstructed input graph before any source
+record is opened. Each directory must equal the expected filename set exactly,
+in lexicographic ID order, and rejects missing, extra, duplicate-ID,
+misnamed, symlink, non-file, temporary, or shadow records. These source-record
+directories are inputs to staged semantic replay but are not consulted through
+the stored Stage 24 manifest to discover records.
+All three assessment directories are success-publication content: the producer
+builds them under same-filesystem staging, the Stage 24 manifest binds their
+exact file closure and hashes, and attempt-start invalidation removes any prior
+live assessment directories before making a new LLM call.
+
+#### C4-A1: deterministic obligations and Stage 24 publication
+
+Add a pure `build_claim_obligation_inventory(paper_bytes)` before any claim
+classification. It strict-decodes UTF-8 and returns exactly the ordered union
+of these four policy-v1 kinds, with no additional inferred obligations:
+
+1. `numeric_token`: every numeric-token occurrence;
+2. `citation_instance`: every citation instance;
+3. `comparative_sentence`: every sentence matching the versioned explicit
+   comparison grammar; and
+4. `declarative_sentence`: every declarative sentence in Results, Discussion,
+   and Contributions
+   sections, including normalized heading aliases fixed by the policy version.
+
+Inventory positions are half-open offsets into the original UTF-8 byte string,
+not offsets into normalized text. Every obligation records policy version,
+kind, section identity, byte start/end, exact source bytes SHA-256, sentence or
+token bytes SHA-256, and an ID derived only from those fields. Parsing may use a
+strict UTF-8 text view, but producer and replay map every span back to raw bytes
+and require exact round-trip equality. Multiple obligation kinds may point to
+the same sentence; they are not silently deduplicated across kinds.
+
+The ordered union sorts by `(byte_start, byte_end, kind_rank, occurrence_rank)`,
+where kind rank is the order above and occurrence rank is the zero-based source
+order within that kind. A repeated candidate record within the same kind and
+span is an error; overlap across kinds is preserved. Section identity is
+exactly `{ordinal, level, normalized_path, heading_sha256}`. Preamble identity
+is the string `preamble`. Normalized paths use NFKC, Unicode casefold, trim,
+and collapse each Unicode whitespace run to one ASCII space; no semantic alias
+replacement occurs inside identity.
+
+Each obligation identity payload has exactly:
+
+```json
+{
+  "schema_version": 1,
+  "policy_version": "claim_obligation_v1",
+  "paper_sha256": "<raw-paper-sha256>",
+  "kind": "numeric_token",
+  "section_identity": {
+    "ordinal": 6,
+    "level": 2,
+    "normalized_path": ["results"],
+    "heading_sha256": "<raw-heading-sha256>"
+  },
+  "byte_start": 123,
+  "byte_end": 127,
+  "source_sha256": "<paper-bytes[start:end]-sha256>",
+  "occurrence_rank": 0,
+  "kind_payload": {
+    "numeric_role": "claim_numeric",
+    "number_lexeme": "0.95",
+    "unit_lexeme": null
+  }
+}
+```
+
+`obligation_id` is `obl-` plus the full SHA-256 of the canonical identity JSON
+bytes. Producer, loader, and reconstruction reject missing, unknown, duplicate,
+or reordered identity fields and independently derive every ID.
+`kind_payload` is exact per kind: numeric uses `{numeric_role, number_lexeme,
+unit_lexeme}`; citation uses `{cite_key, marker_byte_start, marker_byte_end,
+marker_sha256, key_rank}`; comparative uses `{matched_terms}` in source order;
+declarative uses `{selected_section_class}` with exactly `results`,
+`discussion`, or `contributions`.
+
+Claim-obligation policy v1 fixes the sentence and comparison grammar rather
+than delegating it to an NLP model. It requires `markdown-it-py==4.2.0`, the
+`commonmark` preset, and no plugins; a runtime version/profile mismatch fails
+before inventory construction. It uses `parse_manuscript(strict=True)` for the
+heading/section sequence and scans CommonMark paragraph and list-item source
+blocks. Core CommonMark has no table or caption extension, so v1 does not
+invent table-cell or caption blocks. Pipe-table syntax remains paragraph text;
+an extension-specific table/caption interpretation requires a new policy
+version. Fenced/indented code, inline code, link destinations, raw HTML, and
+bibliography entry bodies are not declarative-sentence blocks. A sentence
+ends at `.`, `?`, or `!` followed by whitespace or block end, after protecting
+the policy's fixed abbreviation set (`e.g.`, `i.e.`, `et al.`, `Fig.`, `Eq.`,
+`Sec.`, `Dr.`, `Mr.`, `Ms.`, `vs.`). The final nonempty block fragment is also
+an obligation. A declarative sentence is every such nonempty sentence in the
+selected sections; the producer does not ask an LLM whether it is declarative.
+Abbreviation matching is ASCII-case-insensitive after collapsing internal ASCII
+space and does not cross a line ending. The comparison grammar uses
+ASCII-case-insensitive whole-word matching for exactly `better`, `worse`,
+`higher`, `lower`, `greater`, `less`, `outperform`, `outperforms`,
+`outperformed`, `improve`, `improves`, `improved`, `reduce`, `reduces`,
+`reduced`, `increase`, `increases`, `increased`, `decrease`, `decreases`,
+`decreased`, `versus`, `vs.`, `compared with`, and `compared to`; punctuation
+cannot substitute for a word boundary. The selected heading aliases, after the
+identity normalization above, are exactly: Results = `results`, `experimental
+results`, `evaluation results`, `findings`; Discussion = `discussion`, `results
+and discussion`, `discussion and implications`; Contributions =
+`contributions`, `main contributions`, `contributions and impact`. Changing
+blocks, aliases, abbreviations, headings, or comparison tokens requires a new
+claim-obligation policy version.
+
+Raw offsets are constructed without source-text search. The shared offset
+builder rejects a UTF-8 BOM and bare CR, strict-decodes once, preserves CRLF as
+two source bytes, accepts LF and a missing final newline, and builds (a) a
+monotonic line-start byte table by scanning raw bytes and (b) a
+codepoint-to-byte boundary table by cumulatively encoding each decoded code
+point. The `parse_manuscript` line ranges are converted only through those
+tables. `bytes.find()`, `str.find()`, normalized-text search, and first-match
+recovery are forbidden for span identity. Repeated sections and repeated
+sentences therefore retain distinct offsets.
+
+Citation-instance policy v1 recognizes only bracket markers whose complete
+content is one or more canonical cite keys separated by comma or semicolon, and
+LaTeX `\cite{...}` markers with comma-separated canonical keys; surrounding
+ASCII space is permitted. Each key produces one `citation_instance` obligation.
+Its source span is the exact key substring excluding marker punctuation and
+space, while separate `marker_byte_start`/`marker_byte_end` fields bind the
+whole marker. A multi-key marker therefore yields one independently ordered
+obligation per key. Repeated keys at different source positions remain distinct
+instances. A malformed marker, author-year prose, or unknown key is not guessed
+into a citation and is rejected by the existing citation-closure policy when it
+occupies citation syntax.
+
+An LLM may return only classification and bounded explanation for the exact
+ordered obligation-ID closure. It cannot add, omit, merge, split, reorder, or
+rewrite an obligation, source span, text, numeric token, citation key, or type.
+The deterministic `obligation_kind` is immutable. The LLM-provided
+`claim_class` uses exactly `quantitative`, `comparative`, `result`, or
+`citation` and cannot confer support; unknown classes are rejected rather than
+rewritten to `result`. The strict
+claims ledger contains exactly one row per obligation and disk replay rebuilds
+the inventory from Stage 23 paper bytes before accepting the ledger.
+
+Claim support policy v1 is conservative:
+
+- summary, analysis, attempt-log, or artifact existence is never claim support;
+- every quantitative or comparative obligation closes each deterministically
+  parsed numeric token to a specific canonical metric/condition/observation
+  identity under the exact unit grammar below. Equality with an otherwise
+  unrelated canonical value is not support;
+- a comparative obligation with no `claim_numeric` token is always unsupported
+  in policy v1. An empty token collection never establishes support through
+  `all(empty)` or an equivalent vacuous predicate. A numeric comparison is
+  supported only when its exact bound observations and comparison direction
+  deterministically establish the stated relation; value closure alone is not
+  relation closure;
+- every citation obligation requires both the Stage 23 `VERIFIED` identity
+  record and the matching citation-instance support closure;
+- generic result, discussion, or contribution obligations default to
+  `unsupported`;
+- only a valid `GenericClaimSupportRecord` bound to the same obligation ID,
+  source span/hash, paper generation, evidence closure, critic identity, and
+  policy may make a generic obligation supported;
+- an LLM verdict cannot independently change unsupported to supported.
+
+For every `declarative_sentence` obligation, the generic-support input builder
+constructs an exact ordered candidate-evidence set only from canonical
+structured result observations and already replayed citation/numeric/comparison
+support records whose source spans overlap that sentence. Summary/analysis
+prose, attempt logs, and artifact existence are excluded. Numeric, citation,
+or comparative closure for the same span does not automatically support the
+remaining prose. With no candidate evidence, the obligation remains
+unsupported without an LLM call.
+
+Otherwise, `generic_assessment_input_sha256` hashes exactly
+`{schema_version, policy_version, canonical_manifest_sha256, paper_sha256,
+obligation_id, byte_start, byte_end, source_sha256, evidence_records,
+critic_model}`. Each evidence record has exactly `{evidence_kind,
+authority_path, authority_sha256, semantic_pointer, semantic_value_sha256}` and
+the array is sorted by that tuple. The source record has exactly
+`{schema_version, assessment_id, assessment_input_sha256, critic_model,
+policy_version, verdict, reason}`, with verdict `supported` or `unsupported`.
+It uses the fixed generic-support namespace and the same isolation, identity,
+strict-loader, and independent-replay rules as citation assessments. This
+record is the only v1 semantic support producer for residual declarative prose.
+
+The numeric grammar is one versioned pure function shared by inventory
+production, claim parsing, support matching, strict loaders, and replay. JSON
+authority values use `json.loads(..., parse_float=Decimal,
+parse_int=Decimal)`. Booleans, strings masquerading as numbers, NaN, infinity,
+and nonfinite Decimal values are rejected. Manuscript numeric tokens, including
+scientific notation, are parsed directly to finite `Decimal` without binary
+float conversion. Canonical numeric authority uses exact Decimal equality and
+never tolerance, rounded aliases, or display-rounded fallback. Unit transforms
+are explicit and versioned: for example, a `%` token is divided by
+`Decimal("100")` only when the bound canonical observation has ratio units.
+Unitless and percent forms are not interchangeable without that declared
+transform.
+
+Metric units are authority, not inferred presentation metadata. The sealed
+Stage 9 experiment contract contains an exact `metric_units` mapping whose keys
+close over every metric key the Stage 12/13 evaluator may publish and whose
+values are from `ratio`, `percent`, `count`, `seconds`, `milliseconds`,
+`microseconds`, `nanoseconds`, `bytes`, and `unitless`. Stage 10 binds that
+contract; result-set replay rejects an observed metric with a missing or
+unknown unit, an extra unit key, or a unit conflicting with the evaluator's
+domain-owned metric schema. Summary, analysis, manuscript, and LLM output are
+never unit sources. A percent manuscript token maps to a `ratio` observation by
+exact division by 100, maps to a `percent` observation without scaling, and is
+invalid for every other unit. Other cross-unit transforms are forbidden in
+policy v1. Decimal negative zero is normalized to Decimal zero for mathematical
+comparison while the obligation retains the exact original token bytes and
+hash.
+
+Numeric-token policy v1 uses the exact lexical form
+`(?<![A-Za-z0-9_])(?P<number>[-+]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?)(?P<unit>%|[ \t]?(?:ns|us|\u00b5s|ms|s|bytes))?(?![A-Za-z0-9_])`.
+The pre-scan is a byte-defined state machine. At an ASCII boundary whose prior
+byte is not `[A-Za-z0-9_]`, a candidate starts with a digit, a sign followed by
+a digit or dot-plus-digit, or a dot followed by a digit. It consumes the
+maximal contiguous ASCII run from `[0-9,+.eE-]`. It may remove exactly one final
+`,` or `.` as prose punctuation only when that byte is followed by EOF or ASCII
+whitespace and the remaining run fully matches the numeric-core grammar. The
+remaining complete run must match the `number` group above; otherwise the
+entire paper is invalid for policy v1 and the scanner does not recover
+submatches. A valid core may then consume at most one ASCII space or tab plus
+one exact unit lexeme, followed by EOF or a non-`[A-Za-z0-9_]` boundary.
+Thousands commas are removed only after this full-run validation. Thus `1,000`
+is one value, `1,000,` followed by whitespace is one value plus punctuation,
+`1.` is integer one plus sentence punctuation, and `1,,000`, `1,00abc`,
+`12,34,567`, `1e`, or `1-2` reject rather than split.
+Unit lexemes map exactly to the closed Stage 9 units; `us` and `µs` both map
+to `microseconds`. A missing lexeme can match only `ratio`, `count`, or
+`unitless` when the same sentence has exactly one deterministic metric display
+label and the observation-bound support record fixes which unit applies.
+Metric display labels are a second exact Stage 9 contract mapping owned by the
+domain evaluator; unknown, duplicate-across-metric, missing, or LLM-supplied
+labels are invalid. A numeric sentence with zero or multiple matching metric
+labels is unsupported in policy v1.
+Every match receives a deterministic lexical role. A token wholly inside a
+citation marker/key, link destination, DOI/arXiv identifier, heading ordinal,
+equation/figure/table label, or bibliography metadata field is
+`identifier_metadata`; all other matches are `claim_numeric`. The protected
+contexts are derived from the same CommonMark/source grammar and cannot be
+selected by the LLM. An ambiguous token defaults to `claim_numeric`.
+`identifier_metadata` remains in the obligation ledger and must replay its
+exact context, but it is not matched to an experiment observation.
+
+Stage 24 publication follows this order:
+
+1. open a directory-fd-bound `stage-24` namespace;
+2. as the first operation, invalidate `stage24_truth_manifest.json` and clear
+   every owned success name;
+3. capture one `Stage24InputBundle`;
+4. build the deterministic obligation inventory;
+5. create all proposed outputs in same-filesystem staging;
+6. strict-read and semantically replay every staged output;
+7. perform the complete source fixpoint;
+8. publish the success files;
+9. write `stage24_truth_manifest.json` last;
+10. replay the manifest and publication from disk; and
+11. perform the complete source fixpoint again.
+
+The manifest binds the raw Stage 23 paper hash, Stage 23 publication,
+Stage24InputBundle identity, critique publication, obligation inventory,
+claims ledger, citation-support assessments, citation-instance mapping,
+critique resolution, truth-audit result, exact output namespace, and every raw
+output hash. `truth_audit.json` is a bound result, not the commit point. Any
+exception clears the success namespace and manifest. Optional diagnostics live
+under a separate `stage-24-diagnostics/` non-authoritative namespace, are
+cleared on the next attempt, never enter the manifest, and cannot coexist with
+a successful publication.
+
+Stage 24 has `input_files=()` and `max_retries=0`; its strict bundle loader is
+the only input selector.
+
+`stage24_success` is a pure derived predicate and is true exactly when:
+
+- critique state is `model_final` or `external_final`;
+- every P0/P1 critique finding has exactly one resolution allowed by release
+  policy (`fixed` or `rebutted`), with no orphan or duplicate resolution;
+- when the paper contains any audited prose block or inventory candidate, the
+  deterministic obligation inventory is nonempty;
+- every support-required obligation is supported and `unsupported_count == 0`;
+- citation-support replay is valid and has no missing, orphan, duplicate, or
+  unsupported citation instance;
+- `dataset_claim_violations` is exactly empty; and
+- every schema, publication replay, namespace closure, source fixpoint, and
+  post-manifest check succeeds.
+
+`identifier_metadata` numeric obligations are deterministically marked
+non-support-required but remain in the exact ledger. Every other obligation is
+support-required. `none_final`, `external_pending`, a zero inventory over
+audited source blocks, any unsupported obligation, any unresolved P0/P1,
+invalid citation support, or any dataset-claim violation makes
+`stage24_success` false. A false predicate returns Stage FAILED, publishes no
+`stage24_truth_manifest.json`, removes every success-named Stage 24 output, and
+may retain only the separate non-authoritative diagnostics described above.
+
+#### C4-A2: Stage 25 publication
+
+- give Stage 25 `input_files=()` and `max_retries=0`;
+- add an immutable `Stage24PublicationSnapshot` as its sole authority input;
+- remove direct reads of `truth_audit.json` and all paper reselection;
+- publish `deai_audit.json` under a directory-fd-bound namespace and write
+  `stage25_deai_manifest.json` last;
+- bind the Stage 24 manifest/path/hash, raw paper bytes/hash, exact Stage 24
+  output closure, DEAI policy version, and `deai_audit.json` hash;
+- invalidate old authority before loading Stage 24, then require staged replay,
+  source fixpoint, manifest-last publication, post-manifest replay, and a final
+  source fixpoint. Once a Stage 25 attempt acquires its fd-bound namespace, it
+  invalidates the previous manifest as its first operation; every later failure
+  leaves no Stage 25 authority. A failed attempt never preserves a prior valid
+  generation in the live namespace.
+
+After C4-A2 receives independent approval, a narrow activation commit may set
+only `stage24_release_consumers` to v1. External/persistent consumers and
+independent release reconstruction remain zero, so the complete runtime stays
+blocked.
+
+#### C4-B: independent release reconstruction
+
+- add `reconstruct_expected_canonical_evidence(run_dir)` and independent Stage
+  15/23/24/25 publication reconstruction using only strict run-local disk
+  inputs;
+- reconstruct the deterministic claim-obligation inventory and all numeric,
+  citation, critique, and publication semantics without importing producer
+  objects or accepting stored winner/status/reason fields as authority;
+- before expected reconstruction is complete, treat stored manifests only as
+  ordinary regular-file bytes. Do not parse or trust a stored winner, metric,
+  reason, verdict, resolution, or status to choose reconstruction inputs;
+- non-deterministic critic output is a strict, hash-bound source record rather
+  than a reproducible computation. Reconstruction never calls an LLM. After it
+  independently reconstructs the complete assessment input graph and verifies
+  source-record identity/isolation, it may read the raw assessment record's
+  verdict/reason or resolution/note under the trusted isolated-critic
+  assumption. It then deterministically derives expected support states,
+  resolution states, counts, `stage24_success`, and manifest fields. A verdict,
+  status, count, reason, or resolution copied into a producer manifest or
+  derived report is never an oracle;
+- compare the complete expected publications byte-for-byte and field-for-field
+  with stored manifests, then bind release packaging and registry artifacts;
+- migrate `release_check.py` and external/persistent consumers to this
+  reconstruction result and add the complete adversarial release suite;
+- raise `external_and_persistent_consumers` and
+  `independent_release_reconstruction` only in their own independently approved
+  commits.
+
+This chain proves run-local byte binding and deterministic closure under the
+trusted producer and isolated-critic assumptions. It does not claim that a
+hash proves scientific truth, that an external critic is organizationally
+independent, or that natural-language support outside the deterministic
+obligation grammar is complete.
 
 ### C5: activation
 
@@ -1629,6 +2360,139 @@ At minimum:
 71. in a black-box fixture where a hidden wrapper would fail once then succeed,
     the controller journal prevents the second execution and release replay
     cannot observe a success-only history.
+72. a paper contains two unsupported numeric claims while the classifier returns
+    only one obligation: exact inventory closure rejects the ledger before
+    support assessment;
+73. a comparative sentence or a declarative Results/Discussion/Contributions
+    sentence is omitted, merged, retyped, reordered, or rewritten by the LLM:
+    strict obligation replay rejects it;
+74. the paper contains multibyte UTF-8 before a numeric token or citation:
+    producer and replay derive identical raw-byte offsets and IDs; changing one
+    byte without changing visible normalized text rejects;
+75. an unknown claim type is returned: reject rather than coercing it to
+    `result`;
+76. a citation-support producer attempts to reopen citation plan, cards,
+    verification report, contract, or config after bundle capture: repository
+    guard and call-site tests reject it;
+77. a citation assessment changes card hash, excerpt hash, citation instance,
+    claim span, critic model, policy version, or assessment-input hash: replay
+    rejects;
+78. Stage 15 decision or canonical evidence changes after critique generation:
+    critique v2 and Stage 24 replay reject the stale critique;
+79. external review is appended directly to `critique.json`, lacks its strict
+    structured artifact, targets the wrong canonical/decision generation, uses
+    an unsafe or colliding structured/prose path, changes during finalization,
+    or supplies duplicate finding IDs: no finalized critique manifest is
+    accepted;
+80. a Stage 24 rerun fails during bundle loading, inventory construction, LLM
+    assessment, staging replay, or either source fixpoint: an old truth manifest
+    and every success-named Stage 24 output are absent; synchronous output plus
+    manifest-hash forgery, post-manifest disk corruption, and parent replacement
+    by an external symlink also reject without touching the external target;
+81. two paper byte strings normalize to the same whitespace-collapsed text but
+    differ in raw bytes: Stage 24/25 identity and fixpoint reject substitution;
+82. high-precision Decimal, exponent notation, negative zero, percent/ratio
+    conversion, wrong/missing/conflicting unit authority, boolean, NaN,
+    infinity, and a display-rounded near match follow the single exact
+    numeric/unit grammar in producer, parser, and replay;
+83. summary, analysis, attempt log, or artifact presence exists without an
+    obligation-bound `GenericClaimSupportRecord`: generic result/contribution
+    remains unsupported;
+84. a citation marker is verified but its claim-instance assessment is missing,
+    mismatched, or unsupported: the citation obligation cannot be supported;
+85. Stage 25 sees a shadow/versioned paper, direct truth-audit replacement,
+    missing Stage 24 manifest, or changed Stage 24 output after snapshot:
+    reject without publishing a DEAI manifest;
+86. Stage 25 fails before input load, during render, before manifest replace,
+    after manifest replace, or during final fixpoint: after namespace acquisition
+    every failure leaves no Stage 25 authority; synchronized output/manifest
+    forgery and fd-bound parent replacement also reject without writing an
+    external target;
+87. independent reconstruction is presented a self-consistent stored manifest
+    with a forged winner, metric, reason, verdict, resolution, or status: it
+    selects and derives expected authority without consulting those fields and
+    rejects the stored publication;
+88. every partial C4 map, including `stage24_release_consumers=v1` with either
+    `metric_contract_authority`, external/persistent consumers, or independent
+    reconstruction still zero, remains blocked at all public entrypoints before
+    run artifacts are read.
+89. the ledger is complete but one support-required obligation is unsupported,
+    critique is `none_final`, a P0/P1 is unresolved, citation support is invalid,
+    or a dataset claim violation exists: `stage24_success` is false and no truth
+    manifest or success-named output is published;
+90. `Our method outperforms the baseline.` and equivalent numeric-free
+    comparison forms are unsupported in policy v1 and cannot pass through an
+    empty-token predicate;
+91. producer and replay receive duplicate identical sentences, duplicate
+    section bodies, multibyte text, CRLF, missing final newline, Setext headings,
+    and inline-code numerics: exact obligation offsets, kinds, order, and IDs
+    agree or the explicitly unsupported syntax rejects;
+92. BOM and bare-CR input, an unpinned markdown-it version/profile, a table or
+    caption plugin, unknown heading alias, or changed abbreviation/comparison
+    grammar cannot be silently interpreted under policy v1;
+93. an LLM returns the exact obligation IDs but changes kind, occurrence rank,
+    section identity, span, order, source hash, or adds an implementation-defined
+    fifth obligation kind: strict ledger replay rejects;
+94. citation and resolution raw assessment records remain unchanged while a
+    producer report or manifest changes supported/status/count/reason/resolution:
+    independent reconstruction rederives expected values from the bound source
+    records and rejects the derived forgery without calling an LLM;
+95. the same raw critic record is paired with a different assessment-input
+    payload, writer-equal model, policy version, evidence excerpt, finding hash,
+    or paper generation: identity/isolation replay rejects;
+96. a metric unit is added only by summary, analysis, manuscript, or LLM output,
+    or an observed metric lacks an exact Stage 9/domain-evaluator unit mapping:
+    the numeric obligation remains unsupported and Stage 24 cannot publish.
+97. a resolution LLM returns `accepted-risk` for an unresolved P0/P1 without a
+    separately versioned human-authorization policy: strict source parsing
+    rejects the enum and no Stage 24 manifest is published;
+98. an expected citation/generic/resolution assessment is renamed, shadowed,
+    duplicated under another filename, omitted, nested, symlinked, or joined by
+    an extra file: independent namespace discovery rejects without consulting
+    the stored Stage 24 manifest;
+99. numeric and citation obligations for a sentence are supported while its
+    overlapping declarative obligation has no valid generic support record:
+    the declarative obligation remains unsupported and prevents publication;
+100. contract schema v1 evidence is presented to metric policy v2, a v2 Stage 9
+    contract is mixed with v1 Stage 10-14 evidence, or an old run resumes at
+    Stage 12 after C4-U0: capability/version and replay checks reject before
+    execution or claim assessment;
+101. `[key1; key2]`, `\cite{key1,key2}`, repeated keys, malformed multi-key
+    markers, and key/marker span tampering follow the per-key citation-instance
+    closure exactly;
+102. `1,000`, malformed `1,00`, sentence-final `1.`, `.5`, exponent notation,
+    `10ms`, and `10 ms` produce the exact policy-v1 token/span/Decimal result or
+    reject without splitting a malformed token into apparently valid values;
+103. critique state records vary each required, forbidden, null, enum, and
+    nested field; only the four literal schemas pass, and pending/external
+    namespaces retain exact closure;
+104. generic support evidence is drawn from summary/analysis prose, an attempt
+    log, an unbound value-equal observation, or an overlapping child closure
+    without residual-prose assessment: strict input derivation rejects or keeps
+    the declarative obligation unsupported.
+105. an assessment record changes `critic_model`, recomputes its input hash and
+    assessment ID, and renames the file consistently: the pre-captured
+    active-config model projection still rejects it before source-record
+    semantics are consumed;
+106. contract v2 self-declares units/labels without the fixed run-local registry,
+    changes registry owner/evaluator/hash, duplicates a normalized label across
+    metrics, changes array order, or emits a metric outside the registry: Stage
+    9-14 producer/replay and the U0 expected helper reject;
+107. the mandatory capability registry omits or zeros
+    `metric_contract_authority`, or raises it while any U0 producer/loader/replay
+    remains v1: every guarded entrypoint fails before artifact access;
+108. C4-B reconstructs Stage 9-14 metric authority by extending the independently
+    approved U0 helper; a substitute release-only selector or dependence on
+    `independent_release_reconstruction` during U0 is rejected by call-site and
+    partial-map tests.
+109. two valid metric registries A and B exist; an attacker selects B for an
+    A-domain topic and synchronously rewrites the run-local domain-selector
+    policy snapshot, profile, index, registry, contract, Stage 10-14 hashes,
+    and stored domain/evaluator IDs so that the run-local chain selects B: the
+    U0 expected helper first loads the trusted package domain-selector policy,
+    independently derives A from the active-config topic, then reruns the tuple
+    selector and rejects the coherent B chain. Recomputing every run-local hash
+    cannot make the substituted domain-selector policy an oracle.
 
 ## 14. Separate Stage 23 DOI/Title Workstream
 
