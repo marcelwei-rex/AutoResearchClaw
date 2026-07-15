@@ -42,6 +42,16 @@ class ActiveConfigSnapshotInputs:
     checkpoint_text: str | None
 
 
+@dataclass(frozen=True)
+class ConfigSnapshotNamespaceInputs:
+    """Complete captured config namespace for independent release replay."""
+
+    snapshots: tuple[tuple[str, str], ...]
+    pointer_text: str | None
+    history_text: str | None
+    checkpoint_text: str | None
+
+
 def build_citation_allowlist(run_dir: Path, config: RCConfig) -> dict[str, Any]:
     """Recompute citation eligibility from canonical Stage 4-6 artifacts."""
     inputs = load_validated_card_inputs(run_dir, config)
@@ -407,6 +417,67 @@ def replay_active_config_snapshot(
         ):
             raise CitationPolicyContractError("checkpoint config binding mismatch")
     return snapshot_config, relative, digest
+
+
+def replay_config_snapshot_namespace(
+    inputs: ConfigSnapshotNamespaceInputs,
+    *,
+    project_root: Path,
+) -> tuple[RCConfig, str, str, str, tuple[tuple[str, str], ...]]:
+    """Replay the exact run-local config namespace without a runtime oracle."""
+
+    snapshots = tuple(sorted(inputs.snapshots, key=lambda item: item[0]))
+    paths = tuple(path for path, _text in snapshots)
+    if len(paths) != len(set(paths)):
+        raise CitationPolicyContractError("duplicate config snapshot path")
+    if any(not _is_config_snapshot_name(path) for path in paths):
+        raise CitationPolicyContractError("noncanonical config snapshot path")
+    snapshot_map = dict(snapshots)
+
+    if inputs.pointer_text is None:
+        if inputs.history_text is not None or inputs.checkpoint_text is not None:
+            raise CitationPolicyContractError(
+                "resume state exists without active config pointer"
+            )
+        if paths != ("config.yaml",):
+            raise CitationPolicyContractError(
+                "unbound config snapshot exists without active pointer"
+            )
+        selected_path = "config.yaml"
+    else:
+        if inputs.history_text is None:
+            raise CitationPolicyContractError("config snapshot history is missing")
+        history = _parse_config_snapshot_history(inputs.history_text)
+        history_paths = tuple(entry["config_source_path"] for entry in history)
+        if len(history_paths) != len(set(history_paths)):
+            raise CitationPolicyContractError("duplicate config path in history")
+        if set(paths) != set(history_paths):
+            raise CitationPolicyContractError(
+                "config snapshot namespace/history path mismatch"
+            )
+        for entry in history:
+            path = entry["config_source_path"]
+            if sha256_text(snapshot_map[path]) != entry["config_source_sha256"]:
+                raise CitationPolicyContractError(
+                    f"config snapshot history hash mismatch: {path}"
+                )
+        selected_path = history[-1]["config_source_path"]
+
+    selected_text = snapshot_map.get(selected_path)
+    if selected_text is None:
+        raise CitationPolicyContractError("active config snapshot is missing")
+    config, relative, digest = replay_active_config_snapshot(
+        ActiveConfigSnapshotInputs(
+            config_source_path=selected_path,
+            config_source_text=selected_text,
+            pointer_text=inputs.pointer_text,
+            history_text=inputs.history_text,
+            checkpoint_text=inputs.checkpoint_text,
+        ),
+        None,
+        project_root=project_root,
+    )
+    return config, relative, selected_text, digest, snapshots
 
 
 def parse_config_snapshot_text(

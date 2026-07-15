@@ -35,8 +35,15 @@ from researchclaw.experiment_runtime.metric_authority import (
     MetricAuthorityError,
     replay_metric_authority,
 )
-from researchclaw.literature.citation_policy import resolve_active_config_snapshot
+from researchclaw.literature.citation_policy import (
+    ConfigSnapshotNamespaceInputs,
+    replay_config_snapshot_namespace,
+    resolve_active_config_snapshot,
+)
 from researchclaw.literature.evidence_cards import canonical_json_text
+from researchclaw.pipeline.canonical_evidence_capabilities import (
+    require_canonical_evidence_capabilities,
+)
 
 
 STAGE10_SEAL_SCHEMA_VERSION = 2
@@ -125,6 +132,13 @@ class CanonicalExperimentEvidence:
     structured_results: Mapping[str, Any]
     artifacts: tuple[CanonicalEvidenceArtifact, ...]
     project_artifacts: tuple[CanonicalProjectArtifact, ...]
+
+
+@dataclass(frozen=True)
+class _CanonicalPublicationPlan:
+    manifest: Mapping[str, Any]
+    summary_bytes: bytes
+    analysis_bytes: bytes
 
 
 def sha256_text(text: str) -> str:
@@ -1652,6 +1666,17 @@ def load_canonical_experiment_evidence(run_dir: Path) -> CanonicalExperimentEvid
 
     controller = CanonicalAnalysisController.acquire_reader(run_dir)
     try:
+        return _load_canonical_experiment_evidence_under_lock(run_dir)
+    finally:
+        controller.close()
+
+
+def _load_canonical_experiment_evidence_under_lock(
+    run_dir: Path,
+) -> CanonicalExperimentEvidence:
+    """Snapshot the canonical bundle while the caller owns the reader lock."""
+
+    def snapshot() -> CanonicalExperimentEvidence:
         manifest_relative = "canonical_experiment_evidence.json"
         manifest_text = _read_regular_file(
             run_dir / manifest_relative,
@@ -1802,8 +1827,176 @@ def load_canonical_experiment_evidence(run_dir: Path) -> CanonicalExperimentEvid
             artifacts=tuple(artifact_snapshots),
             project_artifacts=project_artifacts,
         )
+
+    return snapshot()
+
+def _load_active_config_for_reconstruction(
+    run_dir: Path,
+) -> tuple[RCConfig, str, str, str, tuple[tuple[str, str], ...]]:
+    """Select and replay the active config without consulting the root manifest."""
+
+    config_snapshots = tuple(
+        (
+            path.name,
+            _read_regular_file(path, f"config snapshot {path.name}"),
+        )
+        for path in sorted(
+            (run_dir / "config.yaml", *run_dir.glob("config.resumed-*.yaml")),
+            key=lambda item: item.name,
+        )
+    )
+    pointer_path = run_dir / "active_config_snapshot.json"
+    pointer_text: str | None = None
+    if pointer_path.exists() or pointer_path.is_symlink():
+        pointer_text = _read_regular_file(
+            pointer_path, "active config snapshot pointer"
+        )
+
+    history_path = run_dir / "config_snapshot_history.jsonl"
+    checkpoint_path = run_dir / "checkpoint.json"
+    history_text = (
+        _read_regular_file(history_path, "config snapshot history")
+        if history_path.exists() or history_path.is_symlink()
+        else None
+    )
+    checkpoint_text = (
+        _read_regular_file(checkpoint_path, "checkpoint")
+        if checkpoint_path.exists() or checkpoint_path.is_symlink()
+        else None
+    )
+    try:
+        return replay_config_snapshot_namespace(
+            ConfigSnapshotNamespaceInputs(
+                snapshots=config_snapshots,
+                pointer_text=pointer_text,
+                history_text=history_text,
+                checkpoint_text=checkpoint_text,
+            ),
+            project_root=run_dir,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise CanonicalExperimentEvidenceError(
+            f"active config reconstruction failed: {exc}"
+        ) from exc
+
+
+def reconstruct_expected_canonical_evidence(
+    run_dir: Path,
+) -> CanonicalExperimentEvidence:
+    """Reconstruct the expected Stage 9-14 authority before trusting its root."""
+
+    require_canonical_evidence_capabilities(
+        "reconstruct_expected_canonical_evidence"
+    )
+    from researchclaw.pipeline.canonical_execution_controller import (
+        CanonicalAnalysisController,
+    )
+
+    controller = CanonicalAnalysisController.acquire_reader(run_dir)
+    try:
+        return _reconstruct_expected_canonical_evidence_under_lock(run_dir)
     finally:
         controller.close()
+
+
+def _reconstruct_expected_canonical_evidence_under_lock(
+    run_dir: Path,
+) -> CanonicalExperimentEvidence:
+    """Reconstruct while the caller holds the canonical publication lock."""
+
+    config, config_relative, config_text, config_sha256, config_snapshots = (
+        _load_active_config_for_reconstruction(run_dir)
+    )
+    expected = _build_expected_canonical_experiment_manifest(run_dir, config)
+
+    manifest_text = _read_regular_file(
+        run_dir / "canonical_experiment_evidence.json",
+        "canonical experiment evidence manifest",
+    )
+    stored = parse_canonical_experiment_manifest(manifest_text)
+    if stored != expected:
+        raise CanonicalExperimentEvidenceError(
+            "stored canonical experiment manifest differs from expected reconstruction"
+        )
+
+    evidence = _load_canonical_experiment_evidence_under_lock(run_dir)
+    if dict(evidence.manifest) != expected:
+        raise CanonicalExperimentEvidenceError(
+            "canonical experiment evidence changed during reconstruction"
+        )
+    if (
+        evidence.run_config_path != config_relative
+        or evidence.run_config_sha256 != config_sha256
+        or evidence.run_config_bytes != config_text.encode("utf-8")
+    ):
+        raise CanonicalExperimentEvidenceError(
+            "canonical experiment config differs from active reconstruction input"
+        )
+
+    (
+        final_config,
+        final_relative,
+        final_text,
+        final_sha256,
+        final_config_snapshots,
+    ) = (
+        _load_active_config_for_reconstruction(run_dir)
+    )
+    final_expected = _build_expected_canonical_experiment_manifest(
+        run_dir, final_config
+    )
+    if (
+        final_expected != expected
+        or final_relative != config_relative
+        or final_text != config_text
+        or final_sha256 != config_sha256
+        or final_config_snapshots != config_snapshots
+    ):
+        raise CanonicalExperimentEvidenceError(
+            "canonical reconstruction inputs changed during replay"
+        )
+    final_evidence = _load_canonical_experiment_evidence_under_lock(run_dir)
+    if final_evidence != evidence:
+        raise CanonicalExperimentEvidenceError(
+            "canonical experiment evidence changed during final reconstruction"
+        )
+    if _read_regular_file(
+        run_dir / "canonical_experiment_evidence.json",
+        "canonical experiment evidence manifest",
+    ) != manifest_text:
+        raise CanonicalExperimentEvidenceError(
+            "canonical manifest changed during release reconstruction"
+        )
+    for field, expected_bytes in (
+        ("selected_summary", evidence.summary_bytes),
+        ("selected_analysis", evidence.analysis_bytes),
+    ):
+        relative = expected[field]["canonical_path"]
+        if _read_regular_bytes(
+            run_dir / relative, f"{field} compatibility copy"
+        ) != expected_bytes:
+            raise CanonicalExperimentEvidenceError(
+                f"{field} compatibility copy changed during release reconstruction"
+            )
+    (
+        settled_config,
+        settled_relative,
+        settled_text,
+        settled_sha256,
+        settled_config_snapshots,
+    ) = _load_active_config_for_reconstruction(run_dir)
+    if (
+        canonical_json_text(settled_config.to_dict())
+        != canonical_json_text(config.to_dict())
+        or settled_relative != config_relative
+        or settled_text != config_text
+        or settled_sha256 != config_sha256
+        or settled_config_snapshots != config_snapshots
+    ):
+        raise CanonicalExperimentEvidenceError(
+            "active config namespace changed during final reconstruction"
+        )
+    return evidence
 
 
 def _snapshot_selected_execution_artifact(
@@ -1969,11 +2162,12 @@ def _snapshot_selected_project(
     return tuple(snapshots)
 
 
-def publish_canonical_experiment_manifest(
+def _build_canonical_publication_plan(
     run_dir: Path,
     config: RCConfig,
-) -> dict[str, Any]:
-    """Deterministically select Stage 14 evidence and publish the root pointer last."""
+) -> _CanonicalPublicationPlan:
+    """Select and capture one immutable Stage 14 publication plan."""
+
     selected, upstream, metric_key, direction, metric_value = _derive_selected_result(
         run_dir, config
     )
@@ -2033,8 +2227,56 @@ def publish_canonical_experiment_manifest(
             "canonical_sha256": artifact_map["analysis"]["sha256"],
         },
     }
+    manifest = parse_canonical_experiment_manifest(canonical_json_text(payload))
+    summary_bytes = summary_source.read_bytes()
+    analysis_bytes = analysis_source.read_bytes()
+    if hashlib.sha256(summary_bytes).hexdigest() != artifact_map["summary"]["sha256"]:
+        raise CanonicalExperimentEvidenceError(
+            "selected candidate summary changed during publication planning"
+        )
+    if hashlib.sha256(analysis_bytes).hexdigest() != artifact_map["analysis"]["sha256"]:
+        raise CanonicalExperimentEvidenceError(
+            "selected candidate analysis changed during publication planning"
+        )
+    return _CanonicalPublicationPlan(
+        manifest=_freeze_authority_value(manifest),
+        summary_bytes=summary_bytes,
+        analysis_bytes=analysis_bytes,
+    )
+
+
+def _build_expected_canonical_experiment_manifest(
+    run_dir: Path,
+    config: RCConfig,
+) -> dict[str, Any]:
+    """Derive the complete root manifest without reading or writing that root."""
+
+    return _thaw_authority_value(
+        _build_canonical_publication_plan(run_dir, config).manifest
+    )
+
+
+def publish_canonical_experiment_manifest(
+    run_dir: Path,
+    config: RCConfig,
+) -> dict[str, Any]:
+    """Deterministically select Stage 14 evidence and publish the root pointer last."""
+
+    root_manifest = run_dir / "canonical_experiment_evidence.json"
+    if root_manifest.exists() or root_manifest.is_symlink():
+        if root_manifest.is_symlink() or root_manifest.is_file():
+            root_manifest.unlink()
+        else:
+            raise CanonicalExperimentEvidenceError(
+                "canonical publication destination is unsafe"
+            )
+    plan = _build_canonical_publication_plan(run_dir, config)
+    if _build_canonical_publication_plan(run_dir, config) != plan:
+        raise CanonicalExperimentEvidenceError(
+            "canonical publication sources changed before write"
+        )
+    payload = _thaw_authority_value(plan.manifest)
     manifest_text = canonical_json_text(payload)
-    parse_canonical_experiment_manifest(manifest_text)
 
     destinations = {
         "summary": run_dir / "experiment_summary_best.json",
@@ -2047,17 +2289,14 @@ def publish_canonical_experiment_manifest(
     temporary: dict[str, Path] = {}
     try:
         temporary["summary"] = _write_publication_temp(
-            run_dir, ".experiment-summary-", summary_source.read_bytes()
+            run_dir, ".experiment-summary-", plan.summary_bytes
         )
         temporary["analysis"] = _write_publication_temp(
-            run_dir, ".analysis-", analysis_source.read_bytes()
+            run_dir, ".analysis-", plan.analysis_bytes
         )
         temporary["manifest"] = _write_publication_temp(
             run_dir, ".canonical-manifest-", manifest_text.encode("utf-8")
         )
-        root_manifest = destinations["manifest"]
-        if root_manifest.exists() or root_manifest.is_symlink():
-            root_manifest.unlink()
         os.replace(temporary.pop("summary"), destinations["summary"])
         os.replace(temporary.pop("analysis"), destinations["analysis"])
         os.replace(temporary.pop("manifest"), root_manifest)
@@ -2803,6 +3042,16 @@ def _freeze_authority_value(value: Any) -> Any:
         )
     if isinstance(value, list):
         return tuple(_freeze_authority_value(item) for item in value)
+    return value
+
+
+def _thaw_authority_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _thaw_authority_value(item) for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return [_thaw_authority_value(item) for item in value]
     return value
 
 

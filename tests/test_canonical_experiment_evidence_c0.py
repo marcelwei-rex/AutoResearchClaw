@@ -64,6 +64,7 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     canonical_decimal,
     invocation_generation_binding_sha256,
     load_canonical_experiment_evidence,
+    reconstruct_expected_canonical_evidence,
     reconstruct_expected_stage9_14_metric_authority,
     parse_aggregate_results,
     parse_canonical_experiment_manifest,
@@ -459,6 +460,305 @@ def test_accessor_snapshots_selected_project_bytes_under_canonical_lock(
     assert evidence.project_artifacts[0].content == captured
     with pytest.raises(CanonicalExperimentEvidenceError):
         load_canonical_experiment_evidence(run_dir)
+
+
+def test_release_reconstruction_derives_expected_root_before_reading_stored_root(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _config, root = _write_canonical_bundle(run_dir)
+    from researchclaw.pipeline import canonical_experiment_evidence as evidence_impl
+
+    builder_state = "not-entered"
+    root_read_states: list[str] = []
+    real_build = evidence_impl._build_expected_canonical_experiment_manifest
+    real_read = evidence_impl._read_regular_file
+
+    def record_build(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal builder_state
+        builder_state = "entered"
+        result = real_build(*args, **kwargs)  # type: ignore[arg-type]
+        builder_state = "completed"
+        return result
+
+    def record_read(path: Path, label: str) -> str:
+        if path == run_dir / "canonical_experiment_evidence.json":
+            root_read_states.append(builder_state)
+        return real_read(path, label)
+
+    monkeypatch.setattr(
+        evidence_impl, "_build_expected_canonical_experiment_manifest", record_build
+    )
+    monkeypatch.setattr(
+        evidence_impl, "_read_regular_file", record_read
+    )
+
+    evidence = reconstruct_expected_canonical_evidence(run_dir)
+
+    assert root_read_states
+    assert root_read_states[0] == "completed"
+    assert dict(evidence.manifest) == root
+
+
+def test_release_reconstruction_rejects_stored_root_as_selection_oracle(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _config, root = _write_canonical_bundle(run_dir)
+    forged = json.loads(canonical_json_text(root))
+    forged["selected_candidate"]["candidate_id"] = "cand-" + "f" * 64
+    forged["selected_candidate"]["path"] = (
+        "stage-14/evidence_candidates/cand-"
+        + "f" * 64
+        + "/experiment_evidence_candidate.json"
+    )
+    forged["selected_candidate"]["sha256"] = "f" * 64
+    (run_dir / "canonical_experiment_evidence.json").write_text(
+        canonical_json_text(forged), encoding="utf-8"
+    )
+
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="stored canonical experiment manifest differs",
+    ):
+        reconstruct_expected_canonical_evidence(run_dir)
+
+
+def test_release_reconstruction_capability_guard_precedes_all_artifact_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "missing-run"
+    from researchclaw.pipeline import canonical_experiment_evidence as evidence_impl
+
+    calls: list[str] = []
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        calls.append("called")
+        raise AssertionError("artifact access occurred before capability guard")
+
+    monkeypatch.setattr(
+        evidence_impl, "_load_active_config_for_reconstruction", forbidden
+    )
+    monkeypatch.setattr(
+        evidence_impl, "_build_expected_canonical_experiment_manifest", forbidden
+    )
+    monkeypatch.setattr(evidence_impl, "_read_regular_file", forbidden)
+
+    with pytest.raises(CanonicalEvidenceMigrationIncomplete):
+        reconstruct_expected_canonical_evidence(run_dir)
+
+    assert calls == []
+    assert not run_dir.exists()
+
+
+def test_release_reconstruction_rejects_resumed_config_without_pointer(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_canonical_bundle(run_dir)
+    (run_dir / "active_config_snapshot.json").unlink()
+    (run_dir / "config_snapshot_history.jsonl").unlink()
+    (run_dir / "config.resumed-20260716-110000.yaml").write_text(
+        (run_dir / "config.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="without active pointer",
+    ):
+        reconstruct_expected_canonical_evidence(run_dir)
+
+
+def test_release_reconstruction_rejects_unbound_resumed_config_shadow(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_canonical_bundle(run_dir)
+    (run_dir / "config.resumed-20260716-130000.yaml").write_text(
+        (run_dir / "config.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="namespace/history path mismatch",
+    ):
+        reconstruct_expected_canonical_evidence(run_dir)
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    [
+        "root_manifest",
+        "summary_compatibility_copy",
+        "analysis_compatibility_copy",
+        "selected_result_manifest",
+        "selected_execution",
+        "candidate_artifact",
+    ],
+)
+def test_release_reconstruction_rejects_mutation_after_accessor_snapshot(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    monkeypatch: pytest.MonkeyPatch,
+    target_name: str,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _config, root = _write_canonical_bundle(run_dir)
+    from researchclaw.pipeline import canonical_experiment_evidence as evidence_impl
+
+    targets = {
+        "root_manifest": run_dir / "canonical_experiment_evidence.json",
+        "summary_compatibility_copy": run_dir / "experiment_summary_best.json",
+        "analysis_compatibility_copy": run_dir / "analysis_best.md",
+        "selected_result_manifest": run_dir / root["selected_result"]["manifest_path"],
+        "selected_execution": run_dir / "stage-12/evidence-v1/run-1.json",
+        "candidate_artifact": run_dir / root["selected_analysis"]["source_path"],
+    }
+    target = targets[target_name]
+    real_build = evidence_impl._build_expected_canonical_experiment_manifest
+    calls = 0
+
+    def mutate_after_final_expected(
+        *args: object, **kwargs: object
+    ) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        result = real_build(*args, **kwargs)  # type: ignore[arg-type]
+        if calls == 2:
+            target.write_bytes(b"{}\n")
+        return result
+
+    monkeypatch.setattr(
+        evidence_impl,
+        "_build_expected_canonical_experiment_manifest",
+        mutate_after_final_expected,
+    )
+
+    with pytest.raises(CanonicalExperimentEvidenceError):
+        reconstruct_expected_canonical_evidence(run_dir)
+
+    assert calls == 2
+
+
+def test_release_reconstruction_rejects_resumed_namespace_change_at_fixpoint(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_canonical_bundle(run_dir)
+    from researchclaw.pipeline import canonical_experiment_evidence as evidence_impl
+
+    real_load = evidence_impl._load_active_config_for_reconstruction
+    calls = 0
+
+    def add_shadow_after_capture(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        result = real_load(*args, **kwargs)  # type: ignore[arg-type]
+        if calls == 2:
+            (run_dir / "config.resumed-shadow.yaml").write_text(
+                (run_dir / "config.yaml").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+        return result
+
+    monkeypatch.setattr(
+        evidence_impl, "_load_active_config_for_reconstruction", add_shadow_after_capture
+    )
+
+    with pytest.raises(CanonicalExperimentEvidenceError):
+        reconstruct_expected_canonical_evidence(run_dir)
+
+    assert calls == 3
+
+
+def test_release_reconstruction_rejects_active_config_switch_after_final_evidence(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_canonical_bundle(run_dir)
+    from researchclaw.pipeline import canonical_experiment_evidence as evidence_impl
+
+    real_load = evidence_impl._load_canonical_experiment_evidence_under_lock
+    calls = 0
+
+    def switch_after_final_evidence(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        evidence = real_load(*args, **kwargs)  # type: ignore[arg-type]
+        if calls == 2:
+            resumed = run_dir / "config.resumed-20260716-120000.yaml"
+            raw = yaml.safe_load((run_dir / "config.yaml").read_text(encoding="utf-8"))
+            raw["research"]["quality_threshold"] = 9.0
+            resumed.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+            write_active_config_binding(run_dir, resumed)
+        return evidence
+
+    monkeypatch.setattr(
+        evidence_impl,
+        "_load_canonical_experiment_evidence_under_lock",
+        switch_after_final_evidence,
+    )
+
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="active config namespace changed",
+    ):
+        reconstruct_expected_canonical_evidence(run_dir)
+
+    assert calls == 2
+
+
+def test_stage14_publication_plan_change_invalidates_old_root(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    config, root = _write_canonical_bundle(run_dir)
+    from researchclaw.pipeline import canonical_experiment_evidence as evidence_impl
+
+    source = run_dir / root["selected_analysis"]["source_path"]
+    real_build = evidence_impl._build_canonical_publication_plan
+    calls = 0
+
+    def mutate_between_plans(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        plan = real_build(*args, **kwargs)  # type: ignore[arg-type]
+        if calls == 1:
+            source.write_text("changed after first plan\n", encoding="utf-8")
+        return plan
+
+    monkeypatch.setattr(
+        evidence_impl, "_build_canonical_publication_plan", mutate_between_plans
+    )
+
+    with pytest.raises(CanonicalExperimentEvidenceError):
+        publish_canonical_experiment_manifest(run_dir, config)
+
+    assert calls == 2
+    assert not (run_dir / "canonical_experiment_evidence.json").exists()
 
 
 def test_accessor_snapshots_real_selected_execution_authority(
