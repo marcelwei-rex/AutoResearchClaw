@@ -2229,8 +2229,10 @@ class TestResultAnalysisDebate:
         stage_dir.mkdir(parents=True)
         llm = FakeLLMClient('{"claims": []}')
         monkeypatch.setattr(
-            "researchclaw.pipeline.stage_impls._release_audit.load_stage24_input_bundle",
-            lambda *_args, **_kwargs: object(),
+            "researchclaw.pipeline.stage24_publication.load_stage24_input_bundle",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                ValueError("invalid canonical graph")
+            ),
         )
 
         result = rc_executor._execute_truth_audit(
@@ -2238,7 +2240,7 @@ class TestResultAnalysisDebate:
         )
 
         assert result.status == StageStatus.FAILED
-        assert result.error == "canonical_stage24_mode_not_activated"
+        assert "invalid canonical graph" in (result.error or "")
         assert llm.calls == []
         assert tuple(stage_dir.iterdir()) == ()
 
@@ -2256,8 +2258,10 @@ class TestResultAnalysisDebate:
         stage_dir.mkdir(parents=True)
         llm = FakeLLMClient("not json")
         monkeypatch.setattr(
-            "researchclaw.pipeline.stage_impls._release_audit.load_stage24_input_bundle",
-            lambda *_args, **_kwargs: object(),
+            "researchclaw.pipeline.stage24_publication.load_stage24_input_bundle",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                ValueError("invalid canonical graph")
+            ),
         )
 
         result = rc_executor._execute_truth_audit(
@@ -2265,7 +2269,7 @@ class TestResultAnalysisDebate:
         )
 
         assert result.status == StageStatus.FAILED
-        assert result.error == "canonical_stage24_mode_not_activated"
+        assert "invalid canonical graph" in (result.error or "")
         assert llm.calls == []
         assert tuple(stage_dir.iterdir()) == ()
 

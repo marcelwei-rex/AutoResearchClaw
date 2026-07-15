@@ -20,7 +20,13 @@ from researchclaw.pipeline.stage24_input_bundle import (
     verify_stage24_input_bundle_unchanged,
 )
 from researchclaw.pipeline.stage_impls._release_audit import _execute_truth_audit
+from researchclaw.pipeline.stage24_publication import (
+    Stage24PublicationError,
+    Stage24PublicationSnapshot,
+)
 from researchclaw.pipeline.canonical_evidence_capabilities import (
+    CANONICAL_EVIDENCE_CAPABILITIES,
+    CAPABILITY_SCHEMA_VERSION,
     CanonicalEvidenceMigrationIncomplete,
 )
 from researchclaw.pipeline.stages import StageStatus
@@ -28,6 +34,45 @@ from researchclaw.pipeline.stages import StageStatus
 
 def _bound(path: str, content: bytes) -> BoundArtifact:
     return BoundArtifact(path, hashlib.sha256(content).hexdigest(), content)
+
+
+@pytest.fixture(autouse=True)
+def _enable_complete_capability_map(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "researchclaw.pipeline.canonical_evidence_capabilities.CANONICAL_EVIDENCE_CAPABILITIES",
+        {
+            name: CAPABILITY_SCHEMA_VERSION
+            for name in CANONICAL_EVIDENCE_CAPABILITIES
+        },
+    )
+
+
+def test_stage24_bundle_guard_precedes_stage23_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "researchclaw.pipeline.canonical_evidence_capabilities.CANONICAL_EVIDENCE_CAPABILITIES",
+        dict(CANONICAL_EVIDENCE_CAPABILITIES),
+    )
+    calls = 0
+
+    def read_stage23(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("Stage 23 must not be read before the capability guard")
+
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage24_input_bundle.load_stage23_input_bundle",
+        read_stage23,
+    )
+    config = RCConfig.load(
+        Path("config.deepseek.sectional-dry-run.yaml"), check_paths=False
+    )
+
+    with pytest.raises(CanonicalEvidenceMigrationIncomplete):
+        load_stage24_input_bundle(tmp_path / "run", config)
+
+    assert calls == 0
 
 
 def _fixture_graph(tmp_path: Path, config: RCConfig):
@@ -49,6 +94,11 @@ def _fixture_graph(tmp_path: Path, config: RCConfig):
         experiment_contract_path=contract.path,
         experiment_contract_sha256=contract.sha256,
         experiment_contract_bytes=contract.content,
+        selected_execution_artifact=SimpleNamespace(
+            path="stage-12/evidence-v1/run-1.json",
+            sha256="1" * 64,
+            content=b'{"metric_observations":{}}\n',
+        ),
     )
     citation_plan = _bound("stage-16/citation_plan.json", b'{"claims":[]}\n')
     card = _bound("stage-06/cards/card-001.json", b'{"card_id":"card-001"}\n')
@@ -278,7 +328,7 @@ def test_truth_audit_rejects_bundle_before_first_llm_call(
 
     llm = SpyLLM()
     monkeypatch.setattr(
-        "researchclaw.pipeline.stage_impls._release_audit.load_stage24_input_bundle",
+        "researchclaw.pipeline.stage24_publication.load_stage24_input_bundle",
         lambda *_args: (_ for _ in ()).throw(
             Stage24InputBundleError("invalid canonical graph")
         ),
@@ -297,7 +347,7 @@ def test_truth_audit_rejects_bundle_before_first_llm_call(
     assert tuple(stage_dir.iterdir()) == ()
 
 
-def test_truth_audit_preflight_does_not_activate_legacy_producer(
+def test_truth_audit_maps_canonical_publisher_snapshot_to_done(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = RCConfig.load(Path("config.deepseek.sectional-dry-run.yaml"), check_paths=False)
@@ -305,17 +355,14 @@ def test_truth_audit_preflight_does_not_activate_legacy_producer(
     stage_dir = run_dir / "stage-24"
     stage_dir.mkdir(parents=True)
 
-    class SpyLLM:
-        calls = 0
-
-        def chat(self, *_args, **_kwargs):
-            self.calls += 1
-            raise AssertionError("LLM must not be called before C4-A1")
-
-    llm = SpyLLM()
+    snapshot = Stage24PublicationSnapshot(
+        manifest=_bound("stage-24/stage24_truth_manifest.json", b"{}\n"),
+        outputs=(_bound("stage-24/truth_audit.json", b"{}\n"),),
+        assessment_files=(),
+    )
     monkeypatch.setattr(
-        "researchclaw.pipeline.stage_impls._release_audit.load_stage24_input_bundle",
-        lambda *_args: object(),
+        "researchclaw.pipeline.stage_impls._release_audit.execute_stage24_truth",
+        lambda *_args, **_kwargs: snapshot,
     )
 
     result = _execute_truth_audit(
@@ -323,14 +370,14 @@ def test_truth_audit_preflight_does_not_activate_legacy_producer(
         run_dir,
         config,
         AdapterBundle(),
-        llm=llm,  # type: ignore[arg-type]
+        llm=None,
     )
 
-    assert result.status is StageStatus.FAILED
-    assert result.error == "canonical_stage24_mode_not_activated"
-    assert result.artifacts == ()
-    assert llm.calls == 0
-    assert tuple(stage_dir.iterdir()) == ()
+    assert result.status is StageStatus.DONE
+    assert result.artifacts == (
+        "truth_audit.json",
+        "stage24_truth_manifest.json",
+    )
 
 
 def test_truth_audit_cleanup_does_not_short_circuit_on_unsafe_entry(
@@ -347,16 +394,9 @@ def test_truth_audit_cleanup_does_not_short_circuit_on_unsafe_entry(
         "truth_audit.json",
     ):
         (stage_dir / name).write_text("stale", encoding="utf-8")
-    called = False
-
-    def load_bundle(*_args):
-        nonlocal called
-        called = True
-        return object()
-
     monkeypatch.setattr(
-        "researchclaw.pipeline.stage_impls._release_audit.load_stage24_input_bundle",
-        load_bundle,
+        "researchclaw.pipeline.stage24_publication.load_stage24_input_bundle",
+        lambda *_args: object(),
     )
 
     result = _execute_truth_audit(
@@ -364,9 +404,7 @@ def test_truth_audit_cleanup_does_not_short_circuit_on_unsafe_entry(
     )
 
     assert result.status is StageStatus.FAILED
-    assert "could not invalidate legacy outputs" in (result.error or "")
-    assert called is False
-    assert {entry.name for entry in stage_dir.iterdir()} == {"claims.json"}
+    assert "authority cleanup was incomplete" in (result.error or "")
 
 
 def test_truth_audit_rejects_stage24_parent_symlink_without_external_deletion(
@@ -394,7 +432,7 @@ def test_truth_audit_rejects_stage24_parent_symlink_without_external_deletion(
     )
 
     assert result.status is StageStatus.FAILED
-    assert "could not invalidate legacy outputs" in (result.error or "")
+    assert "Truth audit failed" in (result.error or "")
     assert {
         name: (external / name).read_text(encoding="utf-8") for name in owned
     } == {name: f"external-{name}" for name in owned}
@@ -448,7 +486,7 @@ def test_truth_audit_maps_capability_failure_to_failed_result(
     stage_dir = run_dir / "stage-24"
     stage_dir.mkdir(parents=True)
     monkeypatch.setattr(
-        "researchclaw.pipeline.stage_impls._release_audit.load_stage24_input_bundle",
+        "researchclaw.pipeline.stage24_publication.load_stage24_input_bundle",
         lambda *_args: (_ for _ in ()).throw(
             CanonicalEvidenceMigrationIncomplete("stage24", ("remaining",))
         ),
@@ -459,4 +497,4 @@ def test_truth_audit_maps_capability_failure_to_failed_result(
     )
 
     assert result.status is StageStatus.FAILED
-    assert "canonical input replay failed" in (result.error or "")
+    assert "canonical_evidence_migration_incomplete" in (result.error or "")

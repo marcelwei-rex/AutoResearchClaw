@@ -17,6 +17,9 @@ from researchclaw.experiment_runtime.contract import validate_contract_dict
 from researchclaw.pipeline.canonical_experiment_evidence import (
     semantic_config_sha256,
 )
+from researchclaw.pipeline.canonical_evidence_capabilities import (
+    require_canonical_evidence_capabilities,
+)
 from researchclaw.pipeline.stage15_critique import (
     Stage15CritiquePublication,
     load_stage15_critique_publication,
@@ -85,6 +88,7 @@ def load_stage24_input_bundle(
 ) -> Stage24InputBundle:
     """Capture the complete Stage 04-23 authority graph before Stage 24 calls."""
 
+    require_canonical_evidence_capabilities("load_stage24_input_bundle")
     try:
         stage23_inputs = load_stage23_input_bundle(run_dir, runtime_config)
         stage23_publication = load_stage23_verification_publication(
@@ -248,6 +252,14 @@ def _build_entries(
     artifacts: list[tuple[str, BoundArtifact]] = [
         ("canonical_manifest", canonical_manifest),
         ("experiment_contract", experiment_contract),
+        (
+            "selected_execution",
+            BoundArtifact(
+                stage22.evidence.selected_execution_artifact.path,
+                stage22.evidence.selected_execution_artifact.sha256,
+                stage22.evidence.selected_execution_artifact.content,
+            ),
+        ),
         *[("stage04_18_source", item) for item in stage19.artifacts],
         ("stage19_revised_paper", stage22.stage20_inputs.revised_paper),
         ("stage19_publication_binding", stage22.stage20_inputs.publication_binding),

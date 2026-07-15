@@ -276,19 +276,25 @@ CONTRACTS: dict[Stage, StageContract] = {
     # Phase I: Release Audit (v2)
     Stage.TRUTH_AUDIT: StageContract(
         stage=Stage.TRUTH_AUDIT,
-        input_files=("paper_final.md",),
+        input_files=(),
         output_files=(
+            "obligation_inventory.json",
             "claims.json",
             "citations.json",
             "citation_support.json",
             "critique_resolution.json",
             "truth_audit.json",
+            "citation-assessments/",
+            "generic-support-assessments/",
+            "resolution-assessments/",
+            "stage24_truth_manifest.json",
         ),
         dod=(
             "Claim ledger with run-internal provenance pointers; citation "
             "instances mapped to claims; paper hash and claims digest frozen"
         ),
         error_code="E24_TRUTH_AUDIT_FAIL",
+        max_retries=0,
     ),
     Stage.DEAI_AUDIT: StageContract(
         stage=Stage.DEAI_AUDIT,

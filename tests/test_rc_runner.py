@@ -340,7 +340,7 @@ def test_execute_pipeline_injects_artifacts_and_skips_configured_stages(
     assert (run_dir / "stage-09" / "exp_plan.yaml").exists()
 
 
-@pytest.mark.parametrize("stage_num", [4, 5])
+@pytest.mark.parametrize("stage_num", [4, 5, 24])
 def test_execute_pipeline_rejects_programmatic_evidence_stage_skip(
     run_dir: Path,
     rc_config: RCConfig,
@@ -364,6 +364,17 @@ def test_execute_pipeline_rejects_programmatic_evidence_stage_skip(
         )
 
     assert not (run_dir / f"stage-{stage_num:02d}").exists()
+
+
+def test_generic_skip_writer_rejects_stage24_without_creating_artifacts(
+    run_dir: Path,
+) -> None:
+    with pytest.raises(ValueError, match="evidence-authority stage: 24"):
+        rc_runner._write_skipped_stage_outputs(
+            run_dir, Stage.TRUTH_AUDIT, "run-stage24-skip"
+        )
+
+    assert not (run_dir / "stage-24").exists()
 
 
 def test_execute_pipeline_records_and_writes_trajectory_signal(

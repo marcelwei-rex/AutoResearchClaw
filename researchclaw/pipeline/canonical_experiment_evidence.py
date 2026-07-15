@@ -110,6 +110,7 @@ class CanonicalExperimentEvidence:
     selected_result_manifest_path: str
     selected_result_manifest_sha256: str
     selected_result: Mapping[str, Any]
+    selected_execution_artifact: CanonicalEvidenceArtifact
     experiment_contract_path: str
     experiment_contract_sha256: str
     experiment_contract_bytes: bytes
@@ -1690,6 +1691,12 @@ def load_canonical_experiment_evidence(run_dir: Path) -> CanonicalExperimentEvid
         )
         if sha256_text(selected_result_text) != manifest["selected_result"]["manifest_sha256"]:
             raise CanonicalExperimentEvidenceError("selected result manifest changed during access")
+        selected_execution_artifact = _snapshot_selected_execution_artifact(
+            run_dir,
+            config,
+            selected_data["upstream"],
+            selected_data["metric_observations"],
+        )
 
         candidate_relative = manifest["selected_candidate"]["path"]
         candidate_manifest_path = run_dir / candidate_relative
@@ -1775,6 +1782,7 @@ def load_canonical_experiment_evidence(run_dir: Path) -> CanonicalExperimentEvid
             selected_result_manifest_path=selected_result_relative,
             selected_result_manifest_sha256=sha256_text(selected_result_text),
             selected_result=_freeze_authority_value(selected_data["upstream"]),
+            selected_execution_artifact=selected_execution_artifact,
             experiment_contract_path=contract_relative,
             experiment_contract_sha256=manifest["experiment_contract_sha256"],
             experiment_contract_bytes=contract_bytes,
@@ -1796,6 +1804,78 @@ def load_canonical_experiment_evidence(run_dir: Path) -> CanonicalExperimentEvid
         )
     finally:
         controller.close()
+
+
+def _snapshot_selected_execution_artifact(
+    run_dir: Path,
+    config: RCConfig,
+    upstream: Mapping[str, Any],
+    expected_observations: Mapping[str, Any],
+) -> CanonicalEvidenceArtifact:
+    """Capture the invocation JSON that actually owns selected observations."""
+
+    if upstream.get("result_set_type") == "stage12_baseline":
+        result_set = upstream
+        ref = next(
+            (
+                item
+                for item in result_set["evidence_files"]
+                if item["path"] == "stage-12/evidence-v1/run-1.json"
+            ),
+            None,
+        )
+    elif upstream.get("result_set_type") == "stage13_refinement":
+        selected = upstream["selected_result"]
+        if selected["type"] == "baseline":
+            result_set = validate_experiment_result_set(run_dir, config)
+            ref = next(
+                (
+                    item
+                    for item in result_set["evidence_files"]
+                    if item["path"] == "stage-12/evidence-v1/run-1.json"
+                ),
+                None,
+            )
+        else:
+            iteration = next(
+                (
+                    item
+                    for item in upstream["iterations"]
+                    if item["iteration_id"] == selected["iteration_id"]
+                ),
+                None,
+            )
+            if not isinstance(iteration, Mapping):
+                raise CanonicalExperimentEvidenceError(
+                    "selected refinement iteration is missing"
+                )
+            ref = iteration["initial_execution"]
+    else:
+        raise CanonicalExperimentEvidenceError("unsupported selected result set type")
+    if not isinstance(ref, Mapping):
+        raise CanonicalExperimentEvidenceError("selected execution artifact is missing")
+    path = _required_string(ref.get("path"), "selected execution path")
+    expected_sha = _required_string(ref.get("sha256"), "selected execution sha256")
+    content = _read_regular_bytes(run_dir / path, "selected execution artifact")
+    actual_sha = hashlib.sha256(content).hexdigest()
+    if actual_sha != expected_sha:
+        raise CanonicalExperimentEvidenceError("selected execution artifact hash mismatch")
+    try:
+        invocation = parse_invocation_result(content.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise CanonicalExperimentEvidenceError(
+            "selected execution artifact is not UTF-8"
+        ) from exc
+    if invocation["metric_observations"] != expected_observations:
+        raise CanonicalExperimentEvidenceError(
+            "selected execution observations differ from canonical snapshot"
+        )
+    return CanonicalEvidenceArtifact(
+        role="selected_execution",
+        path=path,
+        sha256=actual_sha,
+        content=content,
+    )
 
 
 def _snapshot_selected_project(

@@ -409,6 +409,21 @@ def test_confirmed_inline_link_is_not_a_citation_obligation() -> None:
     assert rows == []
 
 
+def test_confirmed_image_source_is_not_retyped_as_plain_link() -> None:
+    raw = (
+        b"# Study\n\n## Introduction\n\n"
+        b"![smith2024test](https://example.test/figure.png)\n"
+    )
+
+    rows = [
+        row
+        for row in build_claim_obligation_inventory(raw)
+        if row.kind == "citation_instance"
+    ]
+
+    assert rows == []
+
+
 def test_confirmed_inline_link_may_contain_code_label() -> None:
     raw = (
         b"# Study\n\n## Introduction\n\n"

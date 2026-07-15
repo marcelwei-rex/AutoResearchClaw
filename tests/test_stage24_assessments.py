@@ -6,9 +6,14 @@ import hashlib
 import pytest
 
 from researchclaw.pipeline.stage24_assessments import (
+    GenericEvidenceRecord,
     Stage24AssessmentError,
     build_citation_assessment_input,
+    build_generic_support_input,
+    build_resolution_assessment_input,
     parse_citation_assessment_record,
+    parse_generic_support_record,
+    parse_resolution_assessment_record,
 )
 
 
@@ -208,3 +213,71 @@ def test_citation_assessment_input_rejects_string_aliases(
         match="(?i)" + field.replace("_", " "),
     ):
         _input(**{field: value})
+
+
+def test_generic_support_record_is_identity_and_model_bound() -> None:
+    expected = build_generic_support_input(
+        canonical_manifest_sha256="a" * 64,
+        paper_sha256="b" * 64,
+        obligation_id="obl-" + "c" * 64,
+        byte_start=10,
+        byte_end=20,
+        source_sha256="d" * 64,
+        evidence_records=(
+            GenericEvidenceRecord(
+                evidence_kind="metric_observation",
+                authority_path="stage-12/evidence-v1/result_set_manifest.json",
+                authority_sha256="e" * 64,
+                semantic_pointer="/metric_observations/f1/0",
+                semantic_value_sha256="f" * 64,
+            ),
+        ),
+        critic_model="critic",
+    )
+    record = {
+        "schema_version": 1,
+        "assessment_id": expected.assessment_id,
+        "assessment_input_sha256": expected.assessment_input_sha256,
+        "critic_model": "critic",
+        "policy_version": expected.policy_version,
+        "verdict": "supported",
+        "reason": "Canonical evidence supports the sentence.",
+    }
+    parsed = parse_generic_support_record(
+        json.dumps(record), expected_input=expected, writer_model="writer"
+    )
+    assert parsed.verdict == "supported"
+    record["critic_model"] = "writer"
+    with pytest.raises(Stage24AssessmentError, match="critic mismatch"):
+        parse_generic_support_record(
+            json.dumps(record), expected_input=expected, writer_model="writer"
+        )
+
+
+def test_resolution_record_rejects_accepted_risk() -> None:
+    expected = build_resolution_assessment_input(
+        critique_sha256="a" * 64,
+        finding={
+            "id": "finding-1",
+            "severity": "P1",
+            "category": "evidence",
+            "question": "Is the result supported?",
+            "finding": "The result lacks support.",
+            "falsification_criterion": "Provide canonical evidence.",
+        },
+        raw_paper_sha256="b" * 64,
+        critic_model="critic",
+    )
+    record = {
+        "schema_version": 1,
+        "assessment_id": expected.assessment_id,
+        "assessment_input_sha256": expected.assessment_input_sha256,
+        "critic_model": "critic",
+        "policy_version": expected.policy_version,
+        "resolution": "accepted-risk",
+        "note": "Risk accepted.",
+    }
+    with pytest.raises(Stage24AssessmentError, match="resolution is invalid"):
+        parse_resolution_assessment_record(
+            json.dumps(record), expected_input=expected, writer_model="writer"
+        )

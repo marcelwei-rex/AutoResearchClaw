@@ -522,7 +522,7 @@ class _HITLActionSession:
         return SimpleNamespace(require_approval=False, min_quality_score=0.0)
 
 
-@pytest.mark.parametrize("stage", tuple(Stage(number) for number in range(18, 24)))
+@pytest.mark.parametrize("stage", tuple(Stage(number) for number in range(18, 25)))
 @pytest.mark.parametrize("action", (HumanAction.SKIP, HumanAction.ABORT))
 def test_authority_hitl_pre_stage_stop_fails_and_clears_stale_outputs(
     tmp_path: Path,
@@ -533,7 +533,12 @@ def test_authority_hitl_pre_stage_stop_fails_and_clears_stale_outputs(
     run_dir = tmp_path / "run"
     stage_dir = run_dir / f"stage-{int(stage):02d}"
     stage_dir.mkdir(parents=True)
-    (stage_dir / "stale-authority.json").write_text("stale", encoding="utf-8")
+    authority_name = (
+        "stage24_truth_manifest.json"
+        if stage is Stage.TRUTH_AUDIT
+        else "stale-authority.json"
+    )
+    (stage_dir / authority_name).write_text("stale", encoding="utf-8")
     adapters = AdapterBundle(hitl=_HITLActionSession(action))
 
     result = executor._run_hitl_pre_stage(
@@ -546,11 +551,72 @@ def test_authority_hitl_pre_stage_stop_fails_and_clears_stale_outputs(
     assert list(stage_dir.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    "action,edited",
+    tuple((action, False) for action in HumanAction if action is not HumanAction.APPROVE)
+    + ((HumanAction.APPROVE, True),),
+)
+def test_stage24_hitl_pre_stage_only_accepts_unedited_approval(
+    tmp_path: Path,
+    canonical_config: RCConfig,
+    action: HumanAction,
+    edited: bool,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-24"
+    stage_dir.mkdir(parents=True)
+    (stage_dir / "stage24_truth_manifest.json").write_text(
+        "stale", encoding="utf-8"
+    )
+    diagnostic = stage_dir / "diagnostic.txt"
+    diagnostic.write_text("retain", encoding="utf-8")
+    external = tmp_path / "external.txt"
+    external.write_text("external", encoding="utf-8")
+    (stage_dir / "diagnostic-link").symlink_to(external)
+
+    result = executor._run_hitl_pre_stage(
+        Stage.TRUTH_AUDIT,
+        run_dir,
+        AdapterBundle(hitl=_HITLActionSession(action, edited=edited)),
+        config=canonical_config,
+    )
+
+    assert result is not None
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert not (stage_dir / "stage24_truth_manifest.json").exists()
+    assert diagnostic.read_text(encoding="utf-8") == "retain"
+    assert (stage_dir / "diagnostic-link").is_symlink()
+    assert external.read_text(encoding="utf-8") == "external"
+
+
+def test_stage24_hitl_pre_stage_unedited_approval_proceeds(
+    tmp_path: Path,
+    canonical_config: RCConfig,
+) -> None:
+    result = executor._run_hitl_pre_stage(
+        Stage.TRUTH_AUDIT,
+        tmp_path / "run",
+        AdapterBundle(hitl=_HITLActionSession(HumanAction.APPROVE)),
+        config=canonical_config,
+    )
+
+    assert result is None
+    assert not (tmp_path / "run").exists()
+
+
 def test_execute_stage_hitl_skip_cannot_reuse_stale_stage23_authority(
     tmp_path: Path,
     canonical_config: RCConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "researchclaw.pipeline.canonical_evidence_capabilities.CANONICAL_EVIDENCE_CAPABILITIES",
+        {
+            name: CAPABILITY_SCHEMA_VERSION
+            for name in CANONICAL_EVIDENCE_CAPABILITIES
+        },
+    )
     run_dir = tmp_path / "run"
     stage_dir = run_dir / "stage-23"
     stage_dir.mkdir(parents=True)
@@ -580,7 +646,29 @@ def test_execute_stage_hitl_skip_cannot_reuse_stale_stage23_authority(
     assert list(stage_dir.iterdir()) == []
 
 
-@pytest.mark.parametrize("stage", tuple(Stage(number) for number in range(18, 24)))
+def test_stage24_hitl_collision_still_invalidates_manifest(
+    tmp_path: Path,
+    canonical_config: RCConfig,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-24"
+    (stage_dir / "claims.json" / "nested").mkdir(parents=True)
+    manifest = stage_dir / "stage24_truth_manifest.json"
+    manifest.write_text("stale", encoding="utf-8")
+    adapters = AdapterBundle(
+        hitl=_HITLActionSession(HumanAction.SKIP)
+    )
+
+    result = executor._run_hitl_pre_stage(
+        Stage.TRUTH_AUDIT, run_dir, adapters, config=canonical_config
+    )
+
+    assert result is not None
+    assert result.status is StageStatus.FAILED
+    assert not manifest.exists()
+
+
+@pytest.mark.parametrize("stage", tuple(Stage(number) for number in range(18, 25)))
 @pytest.mark.parametrize(
     "action,edited",
     tuple((action, False) for action in HumanAction if action is not HumanAction.APPROVE)
@@ -596,14 +684,19 @@ def test_authority_hitl_post_stage_mutation_fails_and_clears_publication(
     run_dir = tmp_path / "run"
     stage_dir = run_dir / f"stage-{int(stage):02d}"
     stage_dir.mkdir(parents=True)
-    (stage_dir / "committed-authority.json").write_text("valid", encoding="utf-8")
+    authority_name = (
+        "stage24_truth_manifest.json"
+        if stage is Stage.TRUTH_AUDIT
+        else "committed-authority.json"
+    )
+    (stage_dir / authority_name).write_text("valid", encoding="utf-8")
     adapters = AdapterBundle(
         hitl=_HITLActionSession(action, edited=edited)
     )
     completed = StageResult(
         stage=stage,
         status=StageStatus.DONE,
-        artifacts=("committed-authority.json",),
+        artifacts=(authority_name,),
     )
 
     result = executor._run_hitl_post_stage(

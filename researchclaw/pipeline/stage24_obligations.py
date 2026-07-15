@@ -620,7 +620,14 @@ def _raw_inline_link_candidates(
             elif raw[cursor] == 41:
                 depth -= 1
                 if depth == 0:
-                    links.append((index, cursor + 1))
+                    candidate_start = (
+                        index - 1
+                        if index > start
+                        and raw[index - 1] == 33
+                        and not _is_escaped(raw, index - 1)
+                        else index
+                    )
+                    links.append((candidate_start, cursor + 1))
                     destinations.append((destination_start, cursor))
                     index = cursor + 1
                     break
@@ -681,8 +688,13 @@ def _commonmark_link_ranges(
     for token in tokens:
         if token.type != "inline" or token.map is None:
             continue
-        expected_hrefs = [
-            child.attrs.get("src") if child.type == "image" else child.attrs.get("href")
+        expected_descriptors = [
+            (
+                child.type,
+                child.attrs.get("src")
+                if child.type == "image"
+                else child.attrs.get("href"),
+            )
             for child in (token.children or ())
             if child.type == "image"
             or (child.type == "link_open" and child.markup != "autolink")
@@ -704,20 +716,20 @@ def _commonmark_link_ranges(
             for candidate, destination in zip(direct, direct_destinations, strict=True)
         }
         candidates = sorted(set((*direct, *references_candidates)))
-        confirmed: list[tuple[tuple[int, int], str]] = []
+        confirmed: list[tuple[tuple[int, int], tuple[str, str]]] = []
         for candidate in candidates:
             if _contained_by_any(candidate[0], candidate[1], excluded):
                 continue
             source = maps.raw[candidate[0] : candidate[1]].decode("utf-8")
-            href = _parse_single_link_fragment(parser, source, references)
-            if href is not None:
-                confirmed.append((candidate, href))
-        if [href for _candidate, href in confirmed] != expected_hrefs:
+            descriptor = _parse_single_link_fragment(parser, source, references)
+            if descriptor is not None:
+                confirmed.append((candidate, descriptor))
+        if [descriptor for _candidate, descriptor in confirmed] != expected_descriptors:
             raise ClaimObligationError("CommonMark inline link source closure mismatch")
-        ranges.extend(candidate for candidate, _href in confirmed)
+        ranges.extend(candidate for candidate, _descriptor in confirmed)
         destinations.extend(
             candidate_destinations[candidate]
-            for candidate, _href in confirmed
+            for candidate, _descriptor in confirmed
             if candidate in candidate_destinations
         )
     return tuple(ranges), tuple(destinations)
@@ -745,7 +757,14 @@ def _raw_reference_link_candidates(
         else:
             target = label
         if target in defined_labels:
-            ranges.append(match.span())
+            candidate_start = (
+                match.start() - 1
+                if match.start() > start
+                and raw[match.start() - 1] == 33
+                and not _is_escaped(raw, match.start() - 1)
+                else match.start()
+            )
+            ranges.append((candidate_start, match.end()))
     return tuple(ranges)
 
 
@@ -753,14 +772,14 @@ def _parse_single_link_fragment(
     parser: MarkdownIt,
     source: str,
     references: Mapping[str, Any],
-) -> str | None:
+) -> tuple[str, str] | None:
     parsed = parser.parseInline(source, {"references": dict(references)})
     if len(parsed) != 1:
         return None
     children = parsed[0].children or ()
     if len(children) == 1 and children[0].type == "image":
         src = children[0].attrs.get("src")
-        return src if isinstance(src, str) else None
+        return ("image", src) if isinstance(src, str) else None
     if (
         len(children) < 2
         or children[0].type != "link_open"
@@ -771,7 +790,7 @@ def _parse_single_link_fragment(
     ):
         return None
     href = children[0].attrs.get("href")
-    return href if isinstance(href, str) else None
+    return ("link_open", href) if isinstance(href, str) else None
 
 
 def _normalize_reference_label(value: str) -> str:

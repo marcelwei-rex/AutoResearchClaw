@@ -91,6 +91,10 @@ def _write_skipped_stage_outputs(
     run_dir: Path, stage: Stage, run_id: str
 ) -> tuple[str, ...]:
     """Create minimal contract outputs for a deliberately skipped stage."""
+    if stage in SKIP_FORBIDDEN_STAGES:
+        raise ValueError(
+            f"cannot create skipped outputs for evidence-authority stage: {int(stage)}"
+        )
     stage_dir = run_dir / f"stage-{int(stage):02d}"
     stage_dir.mkdir(parents=True, exist_ok=True)
     artifacts: list[str] = []

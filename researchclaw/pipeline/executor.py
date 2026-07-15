@@ -214,7 +214,12 @@ def _invalidate_hitl_authority_stage(stage: Stage, run_dir: Path) -> None:
     stage_dir.mkdir(parents=True, exist_ok=True)
     with BoundOutputNamespace.open(run_dir, stage_dir, stage_name) as namespace:
         namespace.assert_canonical()
-        namespace.reset_flat_namespace()
+        if stage is Stage.TRUTH_AUDIT:
+            from researchclaw.pipeline.stage24_publication import _reset_namespace
+
+            _reset_namespace(namespace)
+        else:
+            namespace.reset_flat_namespace()
         namespace.assert_canonical()
 
 
@@ -243,7 +248,7 @@ def _forbidden_hitl_result(
     )
 
 
-def _guard_authority_post_input(
+def _guard_authority_human_input(
     stage: Stage,
     run_dir: Path,
     human_input: Any,
@@ -292,9 +297,11 @@ def _run_hitl_pre_stage(
     )
     human_input = session.wait_for_human()
 
+    authority_guard = _guard_authority_human_input(stage, run_dir, human_input)
+    if authority_guard is not None:
+        return authority_guard
+
     if human_input.action == HumanAction.SKIP:
-        if stage in SKIP_FORBIDDEN_STAGES:
-            return _forbidden_hitl_result(stage, run_dir, action="pre-stage SKIP")
         return StageResult(
             stage=stage,
             status=StageStatus.DONE,
@@ -302,8 +309,6 @@ def _run_hitl_pre_stage(
             decision="proceed",
         )
     if human_input.action == HumanAction.ABORT:
-        if stage in SKIP_FORBIDDEN_STAGES:
-            return _forbidden_hitl_result(stage, run_dir, action="pre-stage ABORT")
         return StageResult(
             stage=stage,
             status=StageStatus.FAILED,
@@ -353,7 +358,7 @@ def _run_hitl_post_stage(
                 context_summary=f"Cost budget alert: {guard.format_display(run_dir)}",
             )
             human_input = session.wait_for_human()
-            authority_result = _guard_authority_post_input(
+            authority_result = _guard_authority_human_input(
                 stage, run_dir, human_input
             )
             if authority_result is not None:
@@ -453,7 +458,7 @@ def _run_hitl_post_stage(
     )
     human_input = session.wait_for_human()
 
-    authority_result = _guard_authority_post_input(stage, run_dir, human_input)
+    authority_result = _guard_authority_human_input(stage, run_dir, human_input)
     if authority_result is not None:
         return authority_result
 
@@ -680,6 +685,13 @@ def execute_stage(
     auto_approve_gates: bool = False,
 ) -> StageResult:
     """Execute one pipeline stage, validate outputs, and apply gate logic."""
+
+    if int(stage) >= int(Stage.EXPERIMENT_RUN):
+        from researchclaw.pipeline.canonical_evidence_capabilities import (
+            require_canonical_evidence_capabilities,
+        )
+
+        require_canonical_evidence_capabilities(f"execute_stage.{stage.name}")
 
     # --- HITL pre-stage hook ---
     hitl_result = _run_hitl_pre_stage(stage, run_dir, adapters, config=config)

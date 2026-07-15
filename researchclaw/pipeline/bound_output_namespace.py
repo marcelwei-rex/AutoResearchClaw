@@ -198,19 +198,7 @@ class BoundOutputNamespace:
         staging_fd = os.open(staging, directory_flags, dir_fd=self._stage_fd)
         try:
             for child, content in sorted(files.items()):
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                flags |= getattr(os, "O_CLOEXEC", 0)
-                descriptor = os.open(child, flags, 0o600, dir_fd=staging_fd)
-                try:
-                    offset = 0
-                    while offset < len(content):
-                        written = os.write(descriptor, content[offset:])
-                        if written <= 0:
-                            raise OSError("flat directory write made no progress")
-                        offset += written
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
+                _write_new_file(staging_fd, child, content)
             os.fsync(staging_fd)
         except Exception:
             os.close(staging_fd)
@@ -241,6 +229,108 @@ class BoundOutputNamespace:
         )
         self.assert_canonical()
         self._remove_flat_entry(quarantine)
+
+    def stage_flat_tree(
+        self,
+        name: str,
+        *,
+        direct_files: Mapping[str, bytes],
+        flat_directories: Mapping[str, Mapping[str, bytes]],
+    ) -> None:
+        """Create one same-filesystem staging tree with exact flat children."""
+
+        _require_child_name(name)
+        self._remove_flat_entry(name)
+        os.mkdir(name, 0o700, dir_fd=self._stage_fd)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        tree_fd = os.open(name, flags, dir_fd=self._stage_fd)
+        try:
+            for child, content in sorted(direct_files.items()):
+                _require_child_name(child)
+                _write_new_file(tree_fd, child, content)
+            for directory, files in sorted(flat_directories.items()):
+                _require_child_name(directory)
+                os.mkdir(directory, 0o700, dir_fd=tree_fd)
+                child_fd = os.open(directory, flags, dir_fd=tree_fd)
+                try:
+                    for child, content in sorted(files.items()):
+                        _require_child_name(child)
+                        _write_new_file(child_fd, child, content)
+                    os.fsync(child_fd)
+                finally:
+                    os.close(child_fd)
+            os.fsync(tree_fd)
+        except Exception:
+            os.close(tree_fd)
+            self._remove_flat_entry(name)
+            raise
+        else:
+            os.close(tree_fd)
+
+    def read_flat_tree(
+        self, name: str
+    ) -> tuple[dict[str, bytes], dict[str, dict[str, bytes]]]:
+        """Read an exact staged tree without following any symlink."""
+
+        _require_child_name(name)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        tree_fd = os.open(name, flags, dir_fd=self._stage_fd)
+        direct: dict[str, bytes] = {}
+        directories: dict[str, dict[str, bytes]] = {}
+        try:
+            for child in sorted(os.listdir(tree_fd)):
+                _require_child_name(child)
+                info = os.stat(child, dir_fd=tree_fd, follow_symlinks=False)
+                if stat.S_ISREG(info.st_mode):
+                    direct[child] = _read_regular_file(tree_fd, child)
+                elif stat.S_ISDIR(info.st_mode):
+                    child_fd = os.open(child, flags, dir_fd=tree_fd)
+                    try:
+                        files: dict[str, bytes] = {}
+                        for leaf in sorted(os.listdir(child_fd)):
+                            _require_child_name(leaf)
+                            files[leaf] = _read_regular_file(child_fd, leaf)
+                        directories[child] = files
+                    finally:
+                        os.close(child_fd)
+                else:
+                    raise OSError(f"staged tree contains unsafe entry: {child}")
+            return direct, directories
+        finally:
+            os.close(tree_fd)
+
+    def publish_staged_tree(
+        self,
+        name: str,
+        *,
+        direct_names: tuple[str, ...],
+        directory_names: tuple[str, ...],
+    ) -> None:
+        """Move a validated staged tree into the live namespace."""
+
+        _require_child_name(name)
+        expected = set(direct_names) | set(directory_names)
+        direct, directories = self.read_flat_tree(name)
+        if set(direct) != set(direct_names) or set(directories) != set(directory_names):
+            raise OSError("staged tree namespace mismatch")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        tree_fd = os.open(name, flags, dir_fd=self._stage_fd)
+        try:
+            for child in sorted(expected):
+                self._remove_flat_entry(child)
+                os.rename(
+                    child,
+                    child,
+                    src_dir_fd=tree_fd,
+                    dst_dir_fd=self._stage_fd,
+                )
+        finally:
+            os.close(tree_fd)
+        os.rmdir(name, dir_fd=self._stage_fd)
+        self.assert_canonical()
 
     def reset_flat_namespace(self) -> None:
         """Remove prior direct files and flat directories from this owned stage."""
@@ -334,3 +424,38 @@ def _identity(info: os.stat_result) -> tuple[int, int]:
 def _require_child_name(name: str) -> None:
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise OSError(f"output name is not a direct child: {name!r}")
+
+
+def _write_new_file(directory_fd: int, name: str, content: bytes) -> None:
+    if not isinstance(content, bytes):
+        raise OSError(f"output content is not bytes: {name}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("staged output write made no progress")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _read_regular_file(directory_fd: int, name: str) -> bytes:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"staged output is not a regular file: {name}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)

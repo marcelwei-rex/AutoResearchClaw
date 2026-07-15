@@ -29,13 +29,15 @@ from researchclaw.prompts import PromptManager
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.pipeline._helpers import StageResult, _safe_json_loads, _utcnow_iso
 from researchclaw.pipeline import release_artifacts as ra
-from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 from researchclaw.pipeline.canonical_evidence_capabilities import (
     CanonicalEvidenceMigrationIncomplete,
 )
 from researchclaw.pipeline.stage24_input_bundle import (
     Stage24InputBundleError,
-    load_stage24_input_bundle,
+)
+from researchclaw.pipeline.stage24_publication import (
+    Stage24PublicationError,
+    execute_stage24_truth,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,45 +66,22 @@ def _execute_truth_audit(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
-    """Preflight canonical Stage 24 inputs without activating publication."""
+    """Publish one manifest-bound canonical Stage 24 truth generation."""
 
-    del adapters, llm, prompts
-    owned_outputs = (
-        "truth_audit.json",
-        "critique_resolution.json",
-        "citation_support.json",
-        "citations.json",
-        "claims.json",
-    )
-    cleanup_errors: list[str] = []
+    del adapters, prompts
     try:
-        with BoundOutputNamespace.open(run_dir, stage_dir, "stage-24") as namespace:
-            for name in owned_outputs:
-                try:
-                    namespace.remove_flat_entries((name,))
-                except OSError as exc:
-                    cleanup_errors.append(f"{name}: {exc}")
-            try:
-                namespace.assert_canonical()
-            except OSError as exc:
-                cleanup_errors.append(f"stage-24: {exc}")
-    except OSError as exc:
-        cleanup_errors.append(f"stage-24: {exc}")
-    if cleanup_errors:
-        return StageResult(
-            stage=Stage.TRUTH_AUDIT,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            error="Truth audit: could not invalidate legacy outputs: "
-            + "; ".join(cleanup_errors),
-            decision="retry",
+        snapshot = execute_stage24_truth(
+            run_dir,
+            stage_dir,
+            runtime_config=config,
+            llm=llm,
         )
-    try:
-        load_stage24_input_bundle(run_dir, config)
     except (
         CanonicalEvidenceMigrationIncomplete,
         Stage24InputBundleError,
+        Stage24PublicationError,
         OSError,
+        RuntimeError,
         UnicodeDecodeError,
         ValueError,
     ) as exc:
@@ -110,15 +89,21 @@ def _execute_truth_audit(
             stage=Stage.TRUTH_AUDIT,
             status=StageStatus.FAILED,
             artifacts=(),
-            error=f"Truth audit: canonical input replay failed: {exc}",
+            error=f"Truth audit failed: {exc}",
             decision="retry",
         )
     return StageResult(
         stage=Stage.TRUTH_AUDIT,
-        status=StageStatus.FAILED,
-        artifacts=(),
-        error="canonical_stage24_mode_not_activated",
-        decision="retry",
+        status=StageStatus.DONE,
+        artifacts=tuple(
+            artifact.path.removeprefix("stage-24/")
+            for artifact in (
+                *snapshot.outputs,
+                *snapshot.assessment_files,
+                snapshot.manifest,
+            )
+        ),
+        evidence_refs=(snapshot.manifest.path,),
     )
 
 

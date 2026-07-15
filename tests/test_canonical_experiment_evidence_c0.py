@@ -461,6 +461,30 @@ def test_accessor_snapshots_selected_project_bytes_under_canonical_lock(
         load_canonical_experiment_evidence(run_dir)
 
 
+def test_accessor_snapshots_real_selected_execution_authority(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _config, _manifest = _write_canonical_bundle(run_dir)
+
+    evidence = load_canonical_experiment_evidence(run_dir)
+    selected = evidence.selected_execution_artifact
+    payload = parse_invocation_result(selected.content.decode("utf-8"))
+
+    assert selected.path == "stage-12/evidence-v1/run-1.json"
+    assert hashlib.sha256(selected.content).hexdigest() == selected.sha256
+    assert payload["metric_observations"] == {
+        key: list(values) for key, values in evidence.metric_observations.items()
+    }
+    captured = selected.content
+    (run_dir / selected.path).write_text("{}\n", encoding="utf-8")
+    assert evidence.selected_execution_artifact.content == captured
+    with pytest.raises(CanonicalExperimentEvidenceError):
+        load_canonical_experiment_evidence(run_dir)
+
+
 def test_u0_expected_helper_replays_metric_authority_through_stage14(
     tmp_path: Path,
     canonical_evidence_migration_complete: None,
@@ -1607,7 +1631,7 @@ def test_shared_accessor_rejects_bundle_change_during_final_replay(
         "candidate_manifest": run_dir / root["selected_candidate"]["path"],
         "candidate_summary": run_dir / root["selected_summary"]["source_path"],
         "selected_result_manifest": run_dir / root["selected_result"]["manifest_path"],
-        "selected_execution": run_dir / "stage-12/evidence-v1/results.json",
+        "selected_execution": run_dir / "stage-12/evidence-v1/run-1.json",
         "experiment_contract": run_dir / root["experiment_contract_path"],
         "run_config": run_dir / root["run_config_path"],
         "summary_compatibility_copy": run_dir / root["selected_summary"]["canonical_path"],
