@@ -8,9 +8,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from researchclaw.config import PaperRevisionConfig
 from researchclaw.experiment_runtime.contract import dump_contract, validate_contract_dict
+from researchclaw.experiment_runtime.metric_authority import (
+    publish_metric_authority_snapshots,
+    select_metric_authority,
+)
 from researchclaw.pipeline.sectional_execution import (
     ResolutionAssessment,
     SectionProposal,
@@ -142,10 +147,15 @@ def _prepare_run(
     stage10 = run_dir / "stage-10" / "smoke" / "smoke_results.json"
     stage10.parent.mkdir(parents=True)
     stage10.write_text(json.dumps({"metrics": {"fabricated": 0.99}}), encoding="utf-8")
+    topic = (
+        "Hardware-performance-counter based runtime detection of Spectre and "
+        "transient-execution side-channel attacks"
+    )
+    authority = select_metric_authority(topic, "sandbox")
     contract = validate_contract_dict(
         {
-            "schema_version": 1,
-            "topic": "sectional execution fixture",
+            "schema_version": 2,
+            "topic": topic,
             "claim_scope": claim_scope,
             "dataset_origin": (
                 "public" if claim_scope == "research_release" else "synthetic"
@@ -153,21 +163,38 @@ def _prepare_run(
             "dataset_name": (
                 "fixture-public" if claim_scope == "research_release" else "fixture-synthetic"
             ),
-            "primary_metric": {"key": "detection_f1", "direction": "maximize"},
+            "primary_metric": {
+                "key": "detection_f1",
+                "direction": "maximize",
+                "minimum_valid_value": 0.0,
+            },
             "smoke_budget_sec": 60,
             "run_budget_sec": 300,
             "allowed_inputs": [],
             "allowed_outputs": [{"path": "results.json", "required": True}],
             "evaluator": {
+                "command": "python main.py",
                 "owner": "scaffold",
+                "timeout_sec": 300,
                 "required_result_keys": ["dataset_origin", "metrics"],
             },
-            "safety": {},
-            "sealing": {},
+            "safety": {
+                "network": "none",
+                "env_policy": "allowlist",
+                "evidence_policy": "stage12_recomputed_only",
+            },
+            "sealing": {
+                "candidate_manifest": "selected_candidate_manifest.json",
+                "content_hash_algorithm": "sha256",
+            },
+            "metric_authority": authority.contract_identity(),
+            "metric_units": authority.metric_units,
+            "metric_display_labels": authority.metric_display_labels,
         }
     )
     contract_path = run_dir / "stage-09" / "experiment_contract.yaml"
     contract_path.parent.mkdir(parents=True, exist_ok=True)
+    publish_metric_authority_snapshots(contract_path.parent, authority)
     dump_contract(contract, contract_path)
     (run_dir / "canonical_experiment_evidence.json").write_bytes(b"test-evidence")
     reviews_hash = hashlib.sha256(REVIEWS.encode("utf-8")).hexdigest()
@@ -225,17 +252,53 @@ def _config() -> PaperRevisionConfig:
 
 def _evidence(claim_scope: str = "pipeline_validation") -> SimpleNamespace:
     dataset_origin = "public" if claim_scope == "research_release" else "synthetic"
-    contract_bytes = (
-        "schema_version: 1\n"
-        "topic: sectional execution fixture\n"
-        f"claim_scope: {claim_scope}\n"
-        f"dataset_origin: {dataset_origin}\n"
-        "primary_metric:\n  key: detection_f1\n  direction: maximize\n"
-        "smoke_budget_sec: 60\nrun_budget_sec: 300\n"
-        "allowed_inputs: []\n"
-        "allowed_outputs:\n  - path: results.json\n    required: true\n"
-        "evaluator:\n  owner: scaffold\n  required_result_keys:\n    - dataset_origin\n    - metrics\n"
-        "safety: {}\nsealing: {}\n"
+    topic = (
+        "Hardware-performance-counter based runtime detection of Spectre and "
+        "transient-execution side-channel attacks"
+    )
+    authority = select_metric_authority(topic, "sandbox")
+    contract = validate_contract_dict(
+        {
+            "schema_version": 2,
+            "topic": topic,
+            "claim_scope": claim_scope,
+            "dataset_origin": dataset_origin,
+            "dataset_name": (
+                "fixture-public"
+                if claim_scope == "research_release"
+                else "fixture-synthetic"
+            ),
+            "primary_metric": {
+                "key": "detection_f1",
+                "direction": "maximize",
+                "minimum_valid_value": 0.0,
+            },
+            "smoke_budget_sec": 60,
+            "run_budget_sec": 300,
+            "allowed_inputs": [],
+            "allowed_outputs": [{"path": "results.json", "required": True}],
+            "evaluator": {
+                "command": "python main.py",
+                "owner": "scaffold",
+                "timeout_sec": 300,
+                "required_result_keys": ["dataset_origin", "metrics"],
+            },
+            "safety": {
+                "network": "none",
+                "env_policy": "allowlist",
+                "evidence_policy": "stage12_recomputed_only",
+            },
+            "sealing": {
+                "candidate_manifest": "selected_candidate_manifest.json",
+                "content_hash_algorithm": "sha256",
+            },
+            "metric_authority": authority.contract_identity(),
+            "metric_units": authority.metric_units,
+            "metric_display_labels": authority.metric_display_labels,
+        }
+    )
+    contract_bytes = yaml.safe_dump(
+        contract.to_dict(), sort_keys=False, allow_unicode=True
     ).encode("utf-8")
     return SimpleNamespace(
         manifest_path="canonical_experiment_evidence.json",

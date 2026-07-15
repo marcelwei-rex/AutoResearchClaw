@@ -39,7 +39,7 @@ def _cfg(tmp_path: Path) -> RCConfig:
         {
             "project": {"name": "rc-test", "mode": "docs-first"},
             "research": {
-                "topic": "smoke gate test",
+                "topic": "Hardware-performance-counter detection of Spectre attacks",
                 "domains": ["ml"],
                 "daily_paper_count": 2,
                 "quality_threshold": 8.2,
@@ -113,7 +113,11 @@ def _write_stage9_contract(
     _write_config_snapshot(run_dir, cfg)
     stage9 = run_dir / "stage-09"
     stage9.mkdir(parents=True, exist_ok=True)
-    contract_data = derive_contract(cfg, {"datasets": ["synthetic traces"]}).to_dict()
+    contract_data = derive_contract(
+        cfg,
+        {"datasets": ["synthetic traces"]},
+        stage_dir=stage9,
+    ).to_dict()
     if claim_scope is not None:
         contract_data["claim_scope"] = claim_scope
     if dataset_origin is not None:
@@ -186,7 +190,7 @@ def test_stage10_selected_candidate_is_python_only(tmp_path: Path) -> None:
     _write_config_snapshot(run_dir, cfg)
     stage9.mkdir(parents=True)
     contract_path = stage9 / "experiment_contract.yaml"
-    contract = derive_contract(cfg, {"datasets": ["synthetic"]})
+    contract = derive_contract(cfg, {"datasets": ["synthetic"]}, stage_dir=stage9)
     dump_contract(contract, contract_path)
     exp_dir.mkdir(parents=True, exist_ok=True)
     (exp_dir / "main.py").write_text(render_main_py(contract), encoding="utf-8")
@@ -215,7 +219,10 @@ def test_stage10_pipeline_validation_uses_scaffold_owned_main(tmp_path: Path) ->
     cfg = _cfg(tmp_path)
     _write_config_snapshot(run_dir, cfg)
     stage9.mkdir(parents=True)
-    dump_contract(derive_contract(cfg, {"datasets": ["synthetic"]}), stage9 / "experiment_contract.yaml")
+    dump_contract(
+        derive_contract(cfg, {"datasets": ["synthetic"]}, stage_dir=stage9),
+        stage9 / "experiment_contract.yaml",
+    )
     (stage9 / "exp_plan.yaml").write_text("objectives: []\n", encoding="utf-8")
 
     result = _execute_code_generation(

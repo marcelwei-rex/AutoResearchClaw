@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "policy_version": 1,
+  "domain_id": "security_detection",
+  "evaluator_id": "hpc_anomaly_detection",
+  "owner": "scaffold",
+  "metrics": [
+    {
+      "key": "accuracy",
+      "unit": "ratio",
+      "display_labels": ["accuracy"]
+    },
+    {
+      "key": "detection_f1",
+      "unit": "ratio",
+      "display_labels": ["detection F1", "F1", "F1 score"]
+    },
+    {
+      "key": "fpr",
+      "unit": "ratio",
+      "display_labels": ["false positive rate", "FPR"]
+    },
+    {
+      "key": "latency_ms",
+      "unit": "milliseconds",
+      "display_labels": ["detection latency", "latency", "latency ms"]
+    },
+    {
+      "key": "precision",
+      "unit": "ratio",
+      "display_labels": ["precision"]
+    },
+    {
+      "key": "tnr",
+      "unit": "ratio",
+      "display_labels": ["true negative rate", "TNR"]
+    },
+    {
+      "key": "tpr",
+      "unit": "ratio",
+      "display_labels": ["true positive rate", "TPR"]
+    }
+  ]
+}

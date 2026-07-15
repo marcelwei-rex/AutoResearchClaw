@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
+
+from researchclaw.experiment_runtime.metric_authority import (
+    MetricAuthorityError,
+    publish_metric_authority_snapshots,
+    select_metric_authority,
+)
 
 
 CLAIM_SCOPES = {"pipeline_validation", "exploratory", "research_release"}
@@ -34,6 +43,9 @@ class ExperimentContract:
     evaluator: dict[str, Any]
     safety: dict[str, Any]
     sealing: dict[str, Any]
+    metric_authority: dict[str, Any]
+    metric_units: dict[str, str]
+    metric_display_labels: dict[str, list[str]]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +62,11 @@ class ExperimentContract:
             "evaluator": dict(self.evaluator),
             "safety": dict(self.safety),
             "sealing": dict(self.sealing),
+            "metric_authority": dict(self.metric_authority),
+            "metric_units": dict(self.metric_units),
+            "metric_display_labels": {
+                key: list(value) for key, value in self.metric_display_labels.items()
+            },
         }
 
 
@@ -61,26 +78,41 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def contract_sha256(path: Path) -> str:
-    return sha256_file(path)
+def contract_sha256(
+    path: Path, *, namespace: BoundOutputNamespace | None = None
+) -> str:
+    return hashlib.sha256(_read_contract_bytes(path, namespace=namespace)).hexdigest()
 
 
 def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
     errors: list[str] = []
 
-    schema_version = data.get("schema_version")
-    if schema_version != 1:
-        errors.append("schema_version must be 1")
+    expected_fields = {
+        "schema_version", "topic", "claim_scope", "dataset_origin",
+        "dataset_name", "primary_metric", "smoke_budget_sec",
+        "run_budget_sec", "allowed_inputs", "allowed_outputs", "evaluator",
+        "safety", "sealing", "metric_authority", "metric_units",
+        "metric_display_labels",
+    }
+    if set(data) != expected_fields:
+        errors.append("contract fields must match schema v2 exactly")
 
-    topic = str(data.get("topic") or "").strip()
-    if not topic:
+    schema_version = data.get("schema_version")
+    if type(schema_version) is not int or schema_version != 2:
+        errors.append("schema_version must be 2")
+
+    topic_value = data.get("topic")
+    topic = topic_value if isinstance(topic_value, str) else ""
+    if not topic.strip():
         errors.append("topic is required")
 
-    claim_scope = str(data.get("claim_scope") or "").strip()
+    claim_scope_value = data.get("claim_scope")
+    claim_scope = claim_scope_value if isinstance(claim_scope_value, str) else ""
     if claim_scope not in CLAIM_SCOPES:
         errors.append(f"claim_scope must be one of {sorted(CLAIM_SCOPES)}")
 
-    dataset_origin = str(data.get("dataset_origin") or "").strip()
+    dataset_origin_value = data.get("dataset_origin")
+    dataset_origin = dataset_origin_value if isinstance(dataset_origin_value, str) else ""
     if dataset_origin not in DATASET_ORIGINS:
         errors.append(f"dataset_origin must be one of {sorted(DATASET_ORIGINS)}")
 
@@ -92,10 +124,19 @@ def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
         errors.append("primary_metric must be an object")
         primary_metric = {}
     else:
-        if not str(primary_metric.get("key") or "").strip():
+        _require_exact_fields(
+            primary_metric,
+            {"key", "direction", "minimum_valid_value"},
+            "primary_metric",
+            errors,
+        )
+        if not isinstance(primary_metric.get("key"), str) or not primary_metric["key"]:
             errors.append("primary_metric.key is required")
-        if str(primary_metric.get("direction") or "").strip() not in METRIC_DIRECTIONS:
+        if primary_metric.get("direction") not in METRIC_DIRECTIONS:
             errors.append("primary_metric.direction must be maximize or minimize")
+        minimum = primary_metric.get("minimum_valid_value")
+        if isinstance(minimum, bool) or not isinstance(minimum, (int, float)) or not math.isfinite(minimum):
+            errors.append("primary_metric.minimum_valid_value must be finite")
 
     smoke_budget_sec = _int_value(data.get("smoke_budget_sec"))
     run_budget_sec = _int_value(data.get("run_budget_sec"))
@@ -113,44 +154,118 @@ def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
         errors.append("evaluator must be an object")
         evaluator = {}
     else:
+        _require_exact_fields(
+            evaluator,
+            {"command", "owner", "timeout_sec", "required_result_keys"},
+            "evaluator",
+            errors,
+        )
+        if evaluator.get("command") != "python main.py":
+            errors.append("evaluator.command must be python main.py")
         if evaluator.get("owner") != "scaffold":
             errors.append("evaluator.owner must be scaffold")
+        timeout_sec = evaluator.get("timeout_sec")
+        if type(timeout_sec) is not int or timeout_sec <= 0:
+            errors.append("evaluator.timeout_sec must be a positive integer")
         required = evaluator.get("required_result_keys")
         if not isinstance(required, list):
             errors.append("evaluator.required_result_keys must be a list")
         else:
-            missing = {"dataset_origin", "metrics"} - {str(x) for x in required}
-            if missing:
-                errors.append(
-                    "evaluator.required_result_keys missing "
-                    + ", ".join(sorted(missing))
-                )
+            if required != ["dataset_origin", "metrics"]:
+                errors.append("evaluator.required_result_keys must match policy exactly")
 
-    allowed_inputs = data.get("allowed_inputs") or []
-    allowed_outputs = data.get("allowed_outputs") or []
+    allowed_inputs = data.get("allowed_inputs")
+    allowed_outputs = data.get("allowed_outputs")
     if not isinstance(allowed_inputs, list):
         errors.append("allowed_inputs must be a list")
         allowed_inputs = []
+    elif allowed_inputs:
+        errors.append("allowed_inputs must be empty in contract policy v2")
     if not isinstance(allowed_outputs, list):
         errors.append("allowed_outputs must be a list")
         allowed_outputs = []
+    elif len(allowed_outputs) != 1 or not isinstance(allowed_outputs[0], dict):
+        errors.append("allowed_outputs must contain one result declaration")
+    else:
+        output = allowed_outputs[0]
+        _require_exact_fields(output, {"path", "required"}, "allowed_outputs item", errors)
+        if output.get("path") != "results.json" or output.get("required") is not True:
+            errors.append("allowed_outputs must require results.json")
 
-    safety = data.get("safety") or {}
-    sealing = data.get("sealing") or {}
+    safety = data.get("safety")
+    sealing = data.get("sealing")
     if not isinstance(safety, dict):
         errors.append("safety must be an object")
         safety = {}
+    else:
+        _require_exact_fields(
+            safety, {"network", "env_policy", "evidence_policy"}, "safety", errors
+        )
+        if safety.get("network") != "none":
+            errors.append("safety.network must be none")
+        if safety.get("env_policy") != "allowlist":
+            errors.append("safety.env_policy must be allowlist")
+        if safety.get("evidence_policy") != "stage12_recomputed_only":
+            errors.append("safety.evidence_policy mismatch")
     if not isinstance(sealing, dict):
         errors.append("sealing must be an object")
         sealing = {}
+    else:
+        _require_exact_fields(
+            sealing,
+            {"candidate_manifest", "content_hash_algorithm"},
+            "sealing",
+            errors,
+        )
+        if sealing.get("candidate_manifest") != "selected_candidate_manifest.json":
+            errors.append("sealing.candidate_manifest mismatch")
+        if sealing.get("content_hash_algorithm") != "sha256":
+            errors.append("sealing.content_hash_algorithm must be sha256")
+
+    metric_authority = data.get("metric_authority")
+    metric_units = data.get("metric_units")
+    metric_display_labels = data.get("metric_display_labels")
+    if not isinstance(metric_authority, dict):
+        errors.append("metric_authority must be an object")
+        metric_authority = {}
+    if not isinstance(metric_units, dict):
+        errors.append("metric_units must be an object")
+        metric_units = {}
+    if not isinstance(metric_display_labels, dict):
+        errors.append("metric_display_labels must be an object")
+        metric_display_labels = {}
+
+    if not errors:
+        try:
+            experiment_mode = metric_authority.get("experiment_mode")
+            selected = select_metric_authority(topic, experiment_mode)
+            if metric_authority != selected.contract_identity():
+                errors.append("metric_authority does not match trusted selector result")
+            if metric_units != selected.metric_units:
+                errors.append("metric_units do not match trusted registry projection")
+            if metric_display_labels != selected.metric_display_labels:
+                errors.append(
+                    "metric_display_labels do not match trusted registry projection"
+                )
+            metric_key = primary_metric.get("key")
+            if metric_key not in selected.metric_units:
+                errors.append("primary_metric.key is absent from metric authority")
+        except MetricAuthorityError as exc:
+            errors.append(f"metric authority is invalid: {exc}")
 
     if errors:
         raise ContractValidationError("; ".join(errors))
 
     dataset_name_raw = data.get("dataset_name")
-    dataset_name = str(dataset_name_raw).strip() if dataset_name_raw else None
+    if dataset_name_raw is not None and (
+        not isinstance(dataset_name_raw, str)
+        or not dataset_name_raw
+        or dataset_name_raw != dataset_name_raw.strip()
+    ):
+        raise ContractValidationError("dataset_name must be null or a trimmed nonempty string")
+    dataset_name = dataset_name_raw
     return ExperimentContract(
-        schema_version=1,
+        schema_version=2,
         topic=topic,
         claim_scope=claim_scope,
         dataset_origin=dataset_origin,
@@ -163,12 +278,22 @@ def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
         evaluator=evaluator,
         safety=safety,
         sealing=sealing,
+        metric_authority=metric_authority,
+        metric_units={str(key): str(value) for key, value in metric_units.items()},
+        metric_display_labels={
+            str(key): list(value) for key, value in metric_display_labels.items()
+        },
     )
 
 
-def load_contract(path: Path) -> ExperimentContract:
+def load_contract(
+    path: Path, *, namespace: BoundOutputNamespace | None = None
+) -> ExperimentContract:
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw = yaml.load(
+            _read_contract_bytes(path, namespace=namespace).decode("utf-8"),
+            Loader=_StrictLoader,
+        )
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         raise ContractValidationError(f"cannot read contract: {exc}") from exc
     if not isinstance(raw, dict):
@@ -176,15 +301,42 @@ def load_contract(path: Path) -> ExperimentContract:
     return validate_contract_dict(raw)
 
 
-def dump_contract(contract: ExperimentContract, path: Path) -> str:
-    path.write_text(
-        yaml.safe_dump(contract.to_dict(), sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
-    )
-    return contract_sha256(path)
+def dump_contract(
+    contract: ExperimentContract,
+    path: Path,
+    *,
+    namespace: BoundOutputNamespace | None = None,
+) -> str:
+    text = yaml.safe_dump(contract.to_dict(), sort_keys=False, allow_unicode=True)
+
+    def publish(bound: BoundOutputNamespace) -> None:
+        if bound.stage_dir != path.parent:
+            raise OSError("contract namespace does not match output directory")
+        bound.write_text_atomic(path.name, text)
+        if bound.read_bytes(path.name) != text.encode("utf-8"):
+            raise OSError("contract readback mismatch")
+        bound.assert_canonical()
+
+    try:
+        if namespace is not None:
+            publish(namespace)
+        else:
+            with BoundOutputNamespace.open(
+                path.parent.parent, path.parent, path.parent.name
+            ) as opened:
+                publish(opened)
+    except OSError as exc:
+        raise ContractValidationError(f"cannot publish contract: {exc}") from exc
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def derive_contract(config: Any, plan: dict[str, Any] | None) -> ExperimentContract:
+def derive_contract(
+    config: Any,
+    plan: dict[str, Any] | None,
+    *,
+    stage_dir: Path | None = None,
+    namespace: BoundOutputNamespace | None = None,
+) -> ExperimentContract:
     experiment = getattr(config, "experiment", None)
     claim_scope = str(getattr(experiment, "claim_scope", "pipeline_validation") or "pipeline_validation")
     dataset_origin = str(getattr(experiment, "dataset_origin", "synthetic") or "synthetic")
@@ -192,14 +344,24 @@ def derive_contract(config: Any, plan: dict[str, Any] | None) -> ExperimentContr
     smoke_budget_sec = max(1, min(60, time_budget_sec))
     metric_key = str(getattr(experiment, "metric_key", "primary_metric") or "primary_metric")
     metric_direction = str(getattr(experiment, "metric_direction", "minimize") or "minimize")
+    topic = str(getattr(getattr(config, "research", None), "topic", "") or "")
+    experiment_mode = str(getattr(experiment, "mode", "") or "")
+    try:
+        authority = select_metric_authority(topic, experiment_mode)
+        if stage_dir is not None:
+            publish_metric_authority_snapshots(
+                stage_dir, authority, namespace=namespace
+            )
+    except MetricAuthorityError as exc:
+        raise ContractValidationError(f"metric authority selection failed: {exc}") from exc
     dataset_name = (
         "synthetic_pipeline_validation_v1"
         if dataset_origin == "synthetic"
         else _first_dataset_name(plan)
     )
     contract = ExperimentContract(
-        schema_version=1,
-        topic=str(getattr(getattr(config, "research", None), "topic", "") or ""),
+        schema_version=2,
+        topic=topic,
         claim_scope=claim_scope,
         dataset_origin=dataset_origin,
         dataset_name=dataset_name,
@@ -227,13 +389,16 @@ def derive_contract(config: Any, plan: dict[str, Any] | None) -> ExperimentContr
             "candidate_manifest": "selected_candidate_manifest.json",
             "content_hash_algorithm": "sha256",
         },
+        metric_authority=authority.contract_identity(),
+        metric_units=authority.metric_units,
+        metric_display_labels=authority.metric_display_labels,
     )
     return validate_contract_dict(contract.to_dict())
 
 
 def find_stage09_contract(run_dir: Path) -> Path | None:
     direct = run_dir / "stage-09" / "experiment_contract.yaml"
-    if direct.is_file():
+    if _contract_exists_bound(direct):
         return direct
     if any(
         (direct.parent / marker).exists()
@@ -242,7 +407,7 @@ def find_stage09_contract(run_dir: Path) -> Path | None:
         return None
     candidates: list[Path] = []
     for path in run_dir.glob("stage-09_v*/experiment_contract.yaml"):
-        if path.is_file():
+        if _contract_exists_bound(path):
             candidates.append(path)
     if not candidates:
         return None
@@ -259,12 +424,72 @@ def _stage09_version(name: str) -> int:
 
 
 def _int_value(value: Any) -> int | None:
+    return value if type(value) is int else None
+
+
+def _require_exact_fields(
+    value: dict[str, Any],
+    expected: set[str],
+    label: str,
+    errors: list[str],
+) -> None:
+    if set(value) != expected:
+        errors.append(f"{label} fields must match policy exactly")
+
+
+class _StrictLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_unique_mapping(
+    loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    result: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in result:
+            raise yaml.YAMLError(f"duplicate YAML key: {key}")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+_StrictLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def _read_contract_bytes(
+    path: Path, *, namespace: BoundOutputNamespace | None = None
+) -> bytes:
+    if namespace is not None:
+        if namespace.stage_dir != path.parent:
+            raise ContractValidationError(
+                "contract namespace does not match contract directory"
+            )
+        try:
+            return namespace.read_bytes(path.name)
+        except OSError as exc:
+            raise ContractValidationError(
+                f"contract path is missing or unsafe: {exc}"
+            ) from exc
     try:
-        if isinstance(value, bool):
-            return None
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+        with BoundOutputNamespace.open(
+            path.parent.parent, path.parent, path.parent.name
+        ) as namespace:
+            content = namespace.read_bytes(path.name)
+            namespace.assert_canonical()
+            return content
+    except OSError as exc:
+        raise ContractValidationError(f"contract path is missing or unsafe: {exc}") from exc
+
+
+def _contract_exists_bound(path: Path) -> bool:
+    try:
+        _read_contract_bytes(path)
+    except ContractValidationError:
+        return False
+    return True
 
 
 def _first_dataset_name(plan: dict[str, Any] | None) -> str | None:

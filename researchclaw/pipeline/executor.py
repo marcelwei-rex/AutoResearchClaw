@@ -687,7 +687,29 @@ def execute_stage(
         return hitl_result
 
     stage_dir = run_dir / f"stage-{int(stage):02d}"
-    stage_dir.mkdir(parents=True, exist_ok=True)
+    if stage_dir.is_symlink():
+        return StageResult(
+            stage=stage,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Stage output directory is a symlink: {stage_dir.name}",
+        )
+    try:
+        stage_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return StageResult(
+            stage=stage,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Cannot create stage output directory: {exc}",
+        )
+    if stage_dir.is_symlink() or not stage_dir.is_dir():
+        return StageResult(
+            stage=stage,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Stage output directory is unsafe: {stage_dir.name}",
+        )
     _t_health_start = _time.monotonic()
     contract: StageContract = CONTRACTS[stage]
 

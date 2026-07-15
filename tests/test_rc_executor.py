@@ -27,6 +27,7 @@ from researchclaw.experiment_runtime.contract import (
     sha256_file,
 )
 from researchclaw.pipeline import executor as rc_executor
+from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 from researchclaw.pipeline.stage_impls import _release_audit as release_audit
 from researchclaw.pipeline.stage_impls import _paper_writing, _review_publish
 from researchclaw.pipeline.stages import Stage, StageStatus
@@ -621,7 +622,9 @@ def _write_experiment_contract(run_dir: Path, cfg: RCConfig) -> Path:
     stage_dir = run_dir / "stage-09"
     stage_dir.mkdir(parents=True, exist_ok=True)
     contract_path = stage_dir / "experiment_contract.yaml"
-    contract = derive_contract(cfg, {"datasets": ["synthetic traces"]})
+    contract = derive_contract(
+        cfg, {"datasets": ["synthetic traces"]}, stage_dir=stage_dir
+    )
     # These legacy execution tests intentionally exercise model-owned main.py
     # below the simulated C5 gate; pipeline_validation now requires scaffold bytes.
     dump_contract(replace(contract, claim_scope="exploratory"), contract_path)
@@ -1636,6 +1639,44 @@ class TestResearchDecisionStructured:
         assert rc_executor._parse_decision(text) == "proceed"
 
 
+def _governed_stage9_config(config: RCConfig) -> RCConfig:
+    return replace(
+        config,
+        research=replace(
+            config.research,
+            topic="Hardware-performance-counter detection of Spectre attacks",
+        ),
+        experiment=replace(
+            config.experiment,
+            metric_key="detection_f1",
+            metric_direction="maximize",
+        ),
+    )
+
+
+def _prepare_stage9_run(tmp_path: Path) -> tuple[Path, Path]:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    stage_dir = run_dir / "stage-09"
+    stage_dir.mkdir()
+    _write_prior_artifact(
+        run_dir, 8, "hypotheses.md", "# Hypotheses\n\nSecurity detection.\n"
+    )
+    return run_dir, stage_dir
+
+
+def _valid_stage9_plan() -> dict[str, object]:
+    return {
+        "objectives": ["Evaluate detection"],
+        "datasets": ["synthetic traces"],
+        "baselines": ["threshold detector"],
+        "proposed_methods": ["change point detector"],
+        "ablations": ["without normalization"],
+        "metrics": ["detection_f1"],
+        "risks": ["distribution shift"],
+    }
+
+
 class TestExperimentDesignGuard:
     # The schema-deficit guard added in _execute_experiment_design uses
     # _normalize_plan_field so that valid non-list field shapes (str, dict,
@@ -1696,7 +1737,21 @@ class TestExperimentDesignGuard:
     def test_exact_experiment_plan_wrapper_is_unwrapped(
         self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
     ) -> None:
+        from dataclasses import replace
         from researchclaw.experiment_runtime.contract import find_stage09_contract
+
+        rc_config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="Hardware-performance-counter detection of Spectre attacks",
+            ),
+            experiment=replace(
+                rc_config.experiment,
+                metric_key="detection_f1",
+                metric_direction="maximize",
+            ),
+        )
 
         run_dir = tmp_path / "run"
         run_dir.mkdir()
@@ -1782,6 +1837,207 @@ class TestExperimentDesignGuard:
         assert result.status == StageStatus.PAUSED
         assert result.decision == "schema_deficient"
         assert not (stage_dir / "experiment_contract.yaml").exists()
+
+    def test_parent_replacement_between_snapshots_and_contract_fails_closed(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = _governed_stage9_config(rc_config)
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        detached = run_dir / "stage-09-detached"
+        original = module.dump_contract
+
+        def replace_before_contract(contract, path, *, namespace=None):
+            stage_dir.rename(detached)
+            stage_dir.mkdir()
+            return original(contract, path, namespace=namespace)
+
+        monkeypatch.setattr(module, "dump_contract", replace_before_contract)
+        result = rc_executor._execute_experiment_design(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=FakeLLMClient(json.dumps(_valid_stage9_plan())),
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert list(stage_dir.iterdir()) == []
+        assert list(detached.iterdir()) == []
+
+    def test_diagnostic_collision_cannot_preserve_stale_stage9_authority(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+    ) -> None:
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        nested = stage_dir / "benchmark_agent" / "nested"
+        nested.mkdir(parents=True)
+        for name in module._STAGE9_AUTHORITY_OUTPUTS:
+            (stage_dir / name).write_text("stale authority\n", encoding="utf-8")
+
+        result = rc_executor._execute_experiment_design(
+            stage_dir,
+            run_dir,
+            _governed_stage9_config(rc_config),
+            adapters,
+            llm=FakeLLMClient(json.dumps(_valid_stage9_plan())),
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert nested.is_dir()
+        assert not any(
+            (stage_dir / name).exists()
+            for name in module._STAGE9_AUTHORITY_OUTPUTS
+        )
+
+    def test_parent_replacement_before_sidecar_never_writes_external_target(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config = _governed_stage9_config(rc_config)
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        detached = run_dir / "stage-09-detached"
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "sentinel").write_text("unchanged", encoding="utf-8")
+        original = BoundOutputNamespace.write_text_atomic
+
+        def replace_before_sidecar(namespace, name, text):
+            if name == "experiment_contract.sha256":
+                stage_dir.rename(detached)
+                stage_dir.symlink_to(external, target_is_directory=True)
+            return original(namespace, name, text)
+
+        monkeypatch.setattr(
+            BoundOutputNamespace, "write_text_atomic", replace_before_sidecar
+        )
+        result = rc_executor._execute_experiment_design(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=FakeLLMClient(json.dumps(_valid_stage9_plan())),
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert sorted(path.name for path in external.iterdir()) == ["sentinel"]
+        assert (external / "sentinel").read_text(encoding="utf-8") == "unchanged"
+        assert list(detached.iterdir()) == []
+
+    def test_parent_replacement_after_cleanup_cannot_split_stage9_generation(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = _governed_stage9_config(rc_config)
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        detached = run_dir / "stage-09-detached"
+        original = module._cleanup_stage9_outputs
+        calls = 0
+
+        def replace_after_cleanup(namespace, *, preserve_diagnostics=()):
+            nonlocal calls
+            original(namespace, preserve_diagnostics=preserve_diagnostics)
+            calls += 1
+            if calls == 1:
+                stage_dir.rename(detached)
+                stage_dir.mkdir()
+
+        monkeypatch.setattr(module, "_cleanup_stage9_outputs", replace_after_cleanup)
+        result = rc_executor._execute_experiment_design(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=FakeLLMClient(json.dumps(_valid_stage9_plan())),
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert list(stage_dir.iterdir()) == []
+        assert list(detached.iterdir()) == []
+
+    def test_final_stage9_replay_failure_removes_complete_commit_point(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.experiment_runtime.metric_authority import (
+            MetricAuthorityError,
+        )
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = _governed_stage9_config(rc_config)
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+
+        def reject_replay(**_kwargs):
+            raise MetricAuthorityError("injected final replay failure")
+
+        monkeypatch.setattr(module, "replay_metric_authority", reject_replay)
+        result = rc_executor._execute_experiment_design(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=FakeLLMClient(json.dumps(_valid_stage9_plan())),
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert list(stage_dir.iterdir()) == []
+
+    def test_final_failure_collision_still_invalidates_stage9_authority(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.experiment_runtime.metric_authority import (
+            MetricAuthorityError,
+        )
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = _governed_stage9_config(rc_config)
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+
+        def reject_with_collision(_namespace, _run_dir, _config):
+            (stage_dir / "benchmark_agent" / "nested").mkdir(parents=True)
+            raise MetricAuthorityError("injected final replay failure")
+
+        monkeypatch.setattr(
+            module, "_validate_stage9_publication", reject_with_collision
+        )
+        result = rc_executor._execute_experiment_design(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=FakeLLMClient(json.dumps(_valid_stage9_plan())),
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert (stage_dir / "benchmark_agent" / "nested").is_dir()
+        assert not any(
+            (stage_dir / name).exists()
+            for name in module._STAGE9_AUTHORITY_OUTPUTS
+        )
 
 
 class TestResourcePlanningFallback:
@@ -2520,8 +2776,11 @@ class TestComputeBudgetBlock:
         data = {
             "project": {"name": "rc-test", "mode": "docs-first"},
             "research": {
-                "topic": "optimizer comparison",
-                "domains": ["ml"],
+                "topic": (
+                    "Hardware-performance-counter runtime detection of Spectre "
+                    "and transient-execution attacks"
+                ),
+                "domains": ["security"],
                 "daily_paper_count": 2,
                 "quality_threshold": 8.2,
             },
@@ -2546,8 +2805,8 @@ class TestComputeBudgetBlock:
             "experiment": {
                 "mode": "sandbox",
                 "time_budget_sec": 60,
-                "metric_key": "best_loss",
-                "metric_direction": "minimize",
+                "metric_key": "detection_f1",
+                "metric_direction": "maximize",
                 "sandbox": {
                     "python_path": sys.executable,
                     "gpu_required": False,
@@ -2563,7 +2822,7 @@ class TestComputeBudgetBlock:
 
         # Capture what the LLM receives
         llm = FakeLLMClient(
-            "```filename:main.py\nimport numpy as np\nprint('best_loss: 0.1')\n```"
+            "```filename:main.py\nimport numpy as np\nprint('detection_f1: 0.1')\n```"
         )
         stage_dir = run_dir / "stage-11"
         stage_dir.mkdir(parents=True, exist_ok=True)
@@ -2592,8 +2851,11 @@ class TestPartialTimeoutStatus:
         data = {
             "project": {"name": "rc-test", "mode": "docs-first"},
             "research": {
-                "topic": "test topic",
-                "domains": ["ml"],
+                "topic": (
+                    "Hardware-performance-counter runtime detection of Spectre "
+                    "and transient-execution attacks"
+                ),
+                "domains": ["security"],
                 "daily_paper_count": 2,
                 "quality_threshold": 8.2,
             },
@@ -2618,8 +2880,8 @@ class TestPartialTimeoutStatus:
             "experiment": {
                 "mode": "sandbox",
                 "time_budget_sec": 2,
-                "metric_key": "best_loss",
-                "metric_direction": "minimize",
+                "metric_key": "detection_f1",
+                "metric_direction": "maximize",
                 "sandbox": {
                     "python_path": sys.executable,
                     "gpu_required": False,
@@ -2634,7 +2896,7 @@ class TestPartialTimeoutStatus:
             run_dir,
             cfg,
             "import time, sys\n"
-            "print('best_loss: 0.5', flush=True)\n"
+            "print('detection_f1: 0.5', flush=True)\n"
             "sys.stdout.flush()\n"
             "time.sleep(10)\n",
         )
@@ -3634,7 +3896,7 @@ class TestStdoutFailureDetection:
 
         data = {
             "project": {"name": "rc-test", "mode": "docs-first"},
-            "research": {"topic": "test", "domains": ["ml"],
+            "research": {"topic": "Hardware-performance-counter runtime detection of Spectre and transient-execution attacks", "domains": ["security"],
                          "daily_paper_count": 2, "quality_threshold": 8.2},
             "runtime": {"timezone": "UTC"},
             "notifications": {"channel": "local", "on_stage_start": True,
@@ -3649,8 +3911,8 @@ class TestStdoutFailureDetection:
                 "mode": "sandbox",
                 "time_budget_sec": 30,
                 "max_iterations": 1,
-                "metric_key": "primary_metric",
-                "metric_direction": "minimize",
+                "metric_key": "detection_f1",
+                "metric_direction": "maximize",
                 "sandbox": {
                     "python_path": sys.executable,
                     "gpu_required": False,
@@ -3696,7 +3958,7 @@ class TestStdoutFailureDetection:
 
         data = {
             "project": {"name": "rc-test", "mode": "docs-first"},
-            "research": {"topic": "test", "domains": ["ml"],
+            "research": {"topic": "Hardware-performance-counter runtime detection of Spectre and transient-execution attacks", "domains": ["security"],
                          "daily_paper_count": 2, "quality_threshold": 8.2},
             "runtime": {"timezone": "UTC"},
             "notifications": {"channel": "local", "on_stage_start": True,
@@ -3711,8 +3973,8 @@ class TestStdoutFailureDetection:
                 "mode": "sandbox",
                 "time_budget_sec": 30,
                 "max_iterations": 1,
-                "metric_key": "primary_metric",
-                "metric_direction": "minimize",
+                "metric_key": "detection_f1",
+                "metric_direction": "maximize",
                 "sandbox": {
                     "python_path": sys.executable,
                     "gpu_required": False,
@@ -3726,7 +3988,7 @@ class TestStdoutFailureDetection:
         _write_sealed_candidate(
             run_dir,
             cfg,
-            "print('primary_metric: 0.95')\n",
+            "print('detection_f1: 0.95')\n",
         )
 
         result = _execute_experiment_run(

@@ -24,6 +24,7 @@ from researchclaw.collaboration.subscriber import ArtifactSubscriber
 from researchclaw.config import RCConfig
 from researchclaw.experiment_runtime.contract import derive_contract, dump_contract, sha256_file
 from researchclaw.experiment_runtime.scaffold import render_main_py
+from researchclaw.experiment_runtime.metric_authority import normalize_topic, select_metric_authority
 from researchclaw.literature.citation_policy import write_active_config_binding
 from researchclaw.literature.evidence_cards import canonical_json_text
 from researchclaw.literature.experiment_fact_closure import (
@@ -62,6 +63,7 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     canonical_decimal,
     invocation_generation_binding_sha256,
     load_canonical_experiment_evidence,
+    reconstruct_expected_stage9_14_metric_authority,
     parse_aggregate_results,
     parse_canonical_experiment_manifest,
     parse_execution_invocation_journal,
@@ -107,6 +109,10 @@ from researchclaw.report import generate_report
 
 
 SHA = "1" * 64
+METRIC_AUTHORITY = select_metric_authority(
+    "Hardware-performance-counter detection of Spectre attacks",
+    "sandbox",
+).contract_identity()
 EMPTY_FIGURE_PLAN_TEXT = canonical_authority_json_text(
     {
         "schema_version": 1,
@@ -181,7 +187,11 @@ def _sealed_candidate(run_dir: Path) -> tuple[RCConfig, dict[str, object]]:
     stage9 = run_dir / "stage-09"
     stage9.mkdir()
     contract_path = stage9 / "experiment_contract.yaml"
-    contract = derive_contract(config, {"datasets": ["synthetic"]})
+    contract = derive_contract(
+        config,
+        {"datasets": ["synthetic"]},
+        stage_dir=stage9,
+    )
     dump_contract(contract, contract_path)
     stage10 = run_dir / "stage-10"
     experiment = stage10 / "experiment"
@@ -211,6 +221,7 @@ def _write_canonical_bundle(run_dir: Path) -> tuple[RCConfig, dict[str, object]]
         "claim_scope": "pipeline_validation",
         "dataset_origin": "synthetic",
         "evaluator_schema": "hpc_anomaly_detection_v1",
+        "metric_authority": seal["metric_authority"],
     }
     stage12 = run_dir / "stage-12"
     evidence12 = stage12 / "evidence-v1"
@@ -354,6 +365,7 @@ def _write_canonical_bundle(run_dir: Path) -> tuple[RCConfig, dict[str, object]]
         "selected_result_manifest_sha256": sha256_text(refinement_text),
         "experiment_contract_sha256": common["experiment_contract_sha256"],
         "config_semantic_sha256": common["config_semantic_sha256"],
+        "metric_authority_selector_input_sha256": common["metric_authority"]["selector_input_sha256"],
         "primary_metric_key": "detection_f1",
         "optimization_direction": "maximize",
         "artifacts": identity_artifacts,
@@ -446,6 +458,313 @@ def test_accessor_snapshots_selected_project_bytes_under_canonical_lock(
     assert evidence.project_artifacts[0].content == captured
     with pytest.raises(CanonicalExperimentEvidenceError):
         load_canonical_experiment_evidence(run_dir)
+
+
+def test_u0_expected_helper_replays_metric_authority_through_stage14(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    config, _manifest = _write_canonical_bundle(run_dir)
+
+    expected = reconstruct_expected_stage9_14_metric_authority(run_dir, config)
+
+    assert expected["schema_version"] == 1
+    assert expected["metric_authority"]["domain_id"] == "security_detection"
+    assert expected["metric_authority"]["evaluator_id"] == "hpc_anomaly_detection"
+    assert expected["metric_units"]["detection_f1"] == "ratio"
+
+
+def test_u0_expected_helper_rejects_run_local_domain_selector_as_oracle(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    config, _manifest = _write_canonical_bundle(run_dir)
+    snapshot_path = run_dir / "stage-09" / "domain_selector_policy.json"
+    substituted = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    for rule in substituted["rules"]:
+        rule["domain_id"] = "attacker_selected_domain"
+    snapshot_path.write_text(
+        json.dumps(substituted, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="expected metric authority reconstruction failed",
+    ):
+        reconstruct_expected_stage9_14_metric_authority(run_dir, config)
+
+
+def test_u0_expected_helper_rejects_root_metric_authority_tamper(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    config, _manifest = _write_canonical_bundle(run_dir)
+    root_path = run_dir / "canonical_experiment_evidence.json"
+    root = json.loads(root_path.read_text(encoding="utf-8"))
+    root["metric_authority"]["evaluator_id"] = "attacker_selected_evaluator"
+    root_path.write_text(canonical_json_text(root), encoding="utf-8")
+
+    with pytest.raises(CanonicalExperimentEvidenceError):
+        reconstruct_expected_stage9_14_metric_authority(run_dir, config)
+
+
+def test_u0_expected_helper_replays_versioned_stage14_collections(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    config, _manifest = _write_canonical_bundle(run_dir)
+    poisoned = run_dir / "stage-14_v2" / "evidence_candidates" / "not-canonical"
+    poisoned.mkdir(parents=True)
+
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="noncanonical entry",
+    ):
+        reconstruct_expected_stage9_14_metric_authority(run_dir, config)
+
+
+def test_u0_expected_helper_rejects_versioned_mixed_authority_collision(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    config, _manifest = _write_canonical_bundle(run_dir)
+    source = next((run_dir / "stage-14/evidence_candidates").glob("cand-*"))
+    duplicate = run_dir / "stage-14_v2/evidence_candidates" / source.name
+    shutil.copytree(source, duplicate)
+    manifest_path = duplicate / "experiment_evidence_candidate.json"
+    candidate = json.loads(manifest_path.read_text(encoding="utf-8"))
+    candidate["metric_authority"]["evaluator_id"] = "mixed_authority"
+    manifest_path.write_text(canonical_json_text(candidate), encoding="utf-8")
+
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="candidate ID collision",
+    ):
+        reconstruct_expected_stage9_14_metric_authority(run_dir, config)
+
+
+def test_u0_expected_helper_rejects_coherent_run_local_b_authority_chain(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    config, _manifest = _write_canonical_bundle(run_dir)
+    stage9 = run_dir / "stage-09"
+
+    policy = json.loads((stage9 / "domain_selector_policy.json").read_text())
+    for rule in policy["rules"]:
+        rule["domain_id"] = "attacker_domain"
+    profile = {
+        "schema_version": 1,
+        "selector_policy_version": "domain_selector_v1",
+        "domain_id": "attacker_domain",
+        "owner": "scaffold",
+        "supported_experiment_modes": ["sandbox"],
+    }
+    index = {
+        "schema_version": 1,
+        "selector_policy_version": "metric_selector_v1",
+        "entries": [{
+            "domain_id": "attacker_domain",
+            "experiment_mode": "sandbox",
+            "evaluator_kind": "scaffold",
+            "evaluator_id": "attacker_evaluator",
+        }],
+    }
+    registry = {
+        "schema_version": 1,
+        "policy_version": 1,
+        "domain_id": "attacker_domain",
+        "evaluator_id": "attacker_evaluator",
+        "owner": "scaffold",
+        "metrics": [{
+            "key": "detection_f1",
+            "unit": "ratio",
+            "display_labels": ["attacker F1"],
+        }],
+    }
+    snapshot_payloads = {
+        "domain_selector_policy.json": policy,
+        "domain_profile.json": profile,
+        "metric_authority_index.json": index,
+        "metric_authority.json": registry,
+    }
+    snapshot_hashes: dict[str, str] = {}
+    for name, payload in snapshot_payloads.items():
+        text = canonical_json_text(payload)
+        (stage9 / name).write_text(text, encoding="utf-8")
+        snapshot_hashes[name] = sha256_text(text)
+
+    normalized = normalize_topic(config.research.topic)
+    profile_identity = {
+        "domain_id": "attacker_domain",
+        "package_profile_path": (
+            "experiment_runtime/metric_authority/profiles/attacker_domain-v1.json"
+        ),
+        "package_profile_sha256": snapshot_hashes["domain_profile.json"],
+        "topic_raw_sha256": hashlib.sha256(
+            config.research.topic.encode("utf-8")
+        ).hexdigest(),
+        "topic_normalized_sha256": hashlib.sha256(
+            normalized.encode("utf-8")
+        ).hexdigest(),
+        "domain_selector_package_path": (
+            "experiment_runtime/metric_authority/domain-selector-v1.json"
+        ),
+        "domain_selector_package_sha256": snapshot_hashes[
+            "domain_selector_policy.json"
+        ],
+        "selector_policy_version": "domain_selector_v1",
+    }
+    selector_input = {
+        "canonical_domain_profile_identity": profile_identity,
+        "experiment_mode": "sandbox",
+        "evaluator_kind": "scaffold",
+        "selector_policy_version": "metric_selector_v1",
+        "domain_selector_package_sha256": snapshot_hashes[
+            "domain_selector_policy.json"
+        ],
+        "selector_index_sha256": snapshot_hashes["metric_authority_index.json"],
+    }
+    selector_input_sha = hashlib.sha256(
+        json.dumps(
+            selector_input,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    forged = {
+        "path": "stage-09/metric_authority.json",
+        "sha256": snapshot_hashes["metric_authority.json"],
+        "policy_version": 1,
+        "domain_id": "attacker_domain",
+        "evaluator_id": "attacker_evaluator",
+        "domain_profile_path": "stage-09/domain_profile.json",
+        "domain_profile_sha256": snapshot_hashes["domain_profile.json"],
+        "selector_index_path": "stage-09/metric_authority_index.json",
+        "selector_index_sha256": snapshot_hashes["metric_authority_index.json"],
+        "domain_selector_package_path": (
+            "experiment_runtime/metric_authority/domain-selector-v1.json"
+        ),
+        "domain_selector_package_sha256": snapshot_hashes[
+            "domain_selector_policy.json"
+        ],
+        "domain_selector_snapshot_path": "stage-09/domain_selector_policy.json",
+        "domain_selector_snapshot_sha256": snapshot_hashes[
+            "domain_selector_policy.json"
+        ],
+        "selector_input_sha256": selector_input_sha,
+        "selector_policy_version": "metric_selector_v1",
+        "experiment_mode": "sandbox",
+        "evaluator_kind": "scaffold",
+    }
+
+    contract_path = stage9 / "experiment_contract.yaml"
+    contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
+    contract["metric_authority"] = forged
+    contract["metric_units"] = {"detection_f1": "ratio"}
+    contract["metric_display_labels"] = {"detection_f1": ["attacker F1"]}
+    contract_path.write_text(
+        yaml.safe_dump(contract, sort_keys=False), encoding="utf-8"
+    )
+    contract_sha = sha256_file(contract_path)
+
+    seal_path = run_dir / "stage-10/selected_candidate_manifest.json"
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    seal["contract_sha256"] = contract_sha
+    seal["metric_authority"] = forged
+    seal_text = canonical_json_text(seal)
+    seal_path.write_text(seal_text, encoding="utf-8")
+    seal_sha = sha256_text(seal_text)
+
+    result_path = run_dir / "stage-12/experiment_result_set.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["experiment_contract_sha256"] = contract_sha
+    result["sealed_candidate_manifest_sha256"] = seal_sha
+    result["metric_authority"] = forged
+    journal_path = run_dir / "stage-12/execution_invocation_journal.jsonl"
+    journal = [json.loads(line) for line in journal_path.read_text().splitlines()]
+    binding = invocation_generation_binding_sha256(
+        experiment_contract_sha256=contract_sha,
+        sealed_candidate_manifest_sha256=seal_sha,
+        config_semantic_sha256=result["config_semantic_sha256"],
+        experiment_mode="sandbox",
+        evaluator_schema=result["evaluator_schema"],
+    )
+    journal[0]["experiment_contract_sha256"] = contract_sha
+    journal[0]["sealed_candidate_manifest_sha256"] = seal_sha
+    journal[0]["generation_binding_sha256"] = binding
+    journal_text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in journal)
+    journal_path.write_text(journal_text, encoding="utf-8")
+    result["invocation_journal"]["sha256"] = sha256_text(journal_text)
+    result_text = canonical_json_text(result)
+    result_path.write_text(result_text, encoding="utf-8")
+
+    refinement_path = run_dir / "stage-13/refinement_result_set.json"
+    refinement = json.loads(refinement_path.read_text(encoding="utf-8"))
+    refinement["experiment_contract_sha256"] = contract_sha
+    refinement["sealed_candidate_manifest_sha256"] = seal_sha
+    refinement["metric_authority"] = forged
+    refinement["baseline_manifest"]["sha256"] = sha256_text(result_text)
+    refinement_text = canonical_json_text(refinement)
+    refinement_path.write_text(refinement_text, encoding="utf-8")
+
+    candidate_path = next(
+        (run_dir / "stage-14/evidence_candidates").glob(
+            "cand-*/experiment_evidence_candidate.json"
+        )
+    )
+    candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+    candidate["experiment_contract_sha256"] = contract_sha
+    candidate["sealed_candidate_manifest_sha256"] = seal_sha
+    candidate["metric_authority"] = forged
+    candidate["selected_result"]["manifest_sha256"] = sha256_text(refinement_text)
+    identity = candidate["identity_payload"]
+    identity["experiment_contract_sha256"] = contract_sha
+    identity["selected_result_manifest_sha256"] = sha256_text(refinement_text)
+    identity["metric_authority_selector_input_sha256"] = selector_input_sha
+    identity_sha = sha256_text(canonical_json_text(identity))
+    candidate_id = "cand-" + identity_sha
+    candidate["candidate_id"] = candidate_id
+    candidate["identity_payload_sha256"] = identity_sha
+    candidate_text = canonical_json_text(candidate)
+    old_dir = candidate_path.parent
+    new_dir = old_dir.parent / candidate_id
+    old_dir.rename(new_dir)
+    candidate_path = new_dir / candidate_path.name
+    candidate_path.write_text(candidate_text, encoding="utf-8")
+
+    root_path = run_dir / "canonical_experiment_evidence.json"
+    root = json.loads(root_path.read_text(encoding="utf-8"))
+    root["experiment_contract_sha256"] = contract_sha
+    root["sealed_candidate_manifest_sha256"] = seal_sha
+    root["metric_authority"] = forged
+    root["selected_result"]["manifest_sha256"] = sha256_text(refinement_text)
+    root["selected_candidate"] = {
+        "candidate_id": candidate_id,
+        "path": candidate_path.relative_to(run_dir).as_posix(),
+        "sha256": sha256_text(candidate_text),
+    }
+    root_path.write_text(canonical_json_text(root), encoding="utf-8")
+
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="expected metric authority reconstruction failed",
+    ):
+        reconstruct_expected_stage9_14_metric_authority(run_dir, config)
 
 
 def _prepare_stage14_upstream(run_dir: Path) -> RCConfig:
@@ -722,6 +1041,7 @@ def test_stage12_stage13_candidate_and_root_schemas_round_trip() -> None:
         "claim_scope": "pipeline_validation",
         "dataset_origin": "synthetic",
         "evaluator_schema": "hpc_anomaly_detection_v1",
+        "metric_authority": METRIC_AUTHORITY,
     }
     stage12 = {
         "schema_version": 1,
@@ -766,6 +1086,7 @@ def test_stage12_stage13_candidate_and_root_schemas_round_trip() -> None:
         "selected_result_manifest_sha256": SHA,
         "experiment_contract_sha256": SHA,
         "config_semantic_sha256": SHA,
+        "metric_authority_selector_input_sha256": METRIC_AUTHORITY["selector_input_sha256"],
         "primary_metric_key": "detection_f1",
         "optimization_direction": "maximize",
         "artifacts": [
@@ -2348,6 +2669,7 @@ def test_candidate_file_closure_and_identity_tokens_are_default_deny(tmp_path: P
         "selected_result_manifest_sha256": SHA,
         "experiment_contract_sha256": SHA,
         "config_semantic_sha256": SHA,
+        "metric_authority_selector_input_sha256": METRIC_AUTHORITY["selector_input_sha256"],
         "primary_metric_key": "detection_f1",
         "optimization_direction": "maximize",
         "artifacts": [
@@ -2380,6 +2702,7 @@ def test_candidate_file_closure_and_identity_tokens_are_default_deny(tmp_path: P
         "claim_scope": "pipeline_validation",
         "dataset_origin": "synthetic",
         "evaluator_schema": "hpc_anomaly_detection_v1",
+        "metric_authority": METRIC_AUTHORITY,
         "primary_metric_key": "detection_f1",
         "optimization_direction": "maximize",
         "primary_metric_value": "0.5",

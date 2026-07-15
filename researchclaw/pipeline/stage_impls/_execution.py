@@ -392,6 +392,7 @@ def _execute_experiment_run(
         "claim_scope": contract.claim_scope,
         "dataset_origin": contract.dataset_origin,
         "evaluator_schema": evaluator_schema,
+        "metric_authority": contract.metric_authority,
         "invocation_journal": {
             "path": "stage-12/execution_invocation_journal.jsonl",
             "sha256": sha256_text(journal_text),
@@ -836,6 +837,7 @@ def _execute_iterative_refine(
             "claim_scope": baseline["claim_scope"],
             "dataset_origin": baseline["dataset_origin"],
             "evaluator_schema": baseline["evaluator_schema"],
+            "metric_authority": baseline["metric_authority"],
             "primary_metric_key": metric_key,
             "optimization_direction": direction,
             "iterations": iterations,

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "selector_policy_version": "metric_selector_v1",
+  "entries": [
+    {
+      "domain_id": "security_detection",
+      "experiment_mode": "docker",
+      "evaluator_kind": "scaffold",
+      "evaluator_id": "hpc_anomaly_detection"
+    },
+    {
+      "domain_id": "security_detection",
+      "experiment_mode": "sandbox",
+      "evaluator_kind": "scaffold",
+      "evaluator_id": "hpc_anomaly_detection"
+    }
+  ]
+}

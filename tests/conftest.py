@@ -7,6 +7,7 @@ from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
+import yaml
 
 
 @pytest.fixture
@@ -31,19 +32,51 @@ def consumer_evidence_fixture(monkeypatch: pytest.MonkeyPatch):
     Real accessor replay is covered separately by canonical evidence tests.
     """
     def _load(run_dir: Path):
+        from researchclaw.experiment_runtime.metric_authority import (
+            select_metric_authority,
+        )
+
         contract_path = run_dir / "stage-09/experiment_contract.yaml"
+        fixture_topic = "Hardware-performance-counter detection of Spectre attacks"
+        authority = select_metric_authority(fixture_topic, "sandbox")
+        fallback_contract = {
+            "schema_version": 2,
+            "topic": fixture_topic,
+            "claim_scope": "pipeline_validation",
+            "dataset_origin": "synthetic",
+            "dataset_name": "synthetic_pipeline_validation_v1",
+            "primary_metric": {
+                "key": "detection_f1",
+                "direction": "maximize",
+                "minimum_valid_value": 0.0,
+            },
+            "smoke_budget_sec": 60,
+            "run_budget_sec": 300,
+            "allowed_inputs": [],
+            "allowed_outputs": [{"path": "results.json", "required": True}],
+            "evaluator": {
+                "command": "python main.py",
+                "owner": "scaffold",
+                "timeout_sec": 300,
+                "required_result_keys": ["dataset_origin", "metrics"],
+            },
+            "safety": {
+                "network": "none",
+                "env_policy": "allowlist",
+                "evidence_policy": "stage12_recomputed_only",
+            },
+            "sealing": {
+                "candidate_manifest": "selected_candidate_manifest.json",
+                "content_hash_algorithm": "sha256",
+            },
+            "metric_authority": authority.contract_identity(),
+            "metric_units": authority.metric_units,
+            "metric_display_labels": authority.metric_display_labels,
+        }
         contract_bytes = (
             contract_path.read_bytes()
             if contract_path.is_file()
-            else (
-                b"schema_version: 1\ntopic: consumer fixture\n"
-                b"claim_scope: pipeline_validation\ndataset_origin: synthetic\n"
-                b"primary_metric:\n  key: metric\n  direction: maximize\n"
-                b"smoke_budget_sec: 60\nrun_budget_sec: 300\nallowed_inputs: []\n"
-                b"allowed_outputs:\n  - path: results.json\n    required: true\n"
-                b"evaluator:\n  owner: scaffold\n  required_result_keys:\n    - dataset_origin\n    - metrics\n"
-                b"safety: {}\nsealing: {}\n"
-            )
+            else yaml.safe_dump(fallback_contract, sort_keys=False).encode("utf-8")
         )
         summary_path = run_dir / "experiment_summary_best.json"
         if not summary_path.is_file():

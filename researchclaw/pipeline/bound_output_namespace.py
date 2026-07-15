@@ -120,6 +120,13 @@ class BoundOutputNamespace:
                 raise OSError(f"output collision is a directory: {name}")
             os.unlink(name, dir_fd=self._stage_fd)
 
+    def remove_flat_entries(self, names: tuple[str, ...]) -> None:
+        """Remove owned direct entries without following their path targets."""
+
+        for name in names:
+            _require_child_name(name)
+            self._remove_flat_entry(name)
+
     def write_text_atomic(self, name: str, text: str) -> None:
         self.write_bytes_atomic(name, text.encode("utf-8"))
 

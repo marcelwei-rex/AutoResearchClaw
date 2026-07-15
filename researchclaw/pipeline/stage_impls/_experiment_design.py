@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +15,12 @@ from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
 from researchclaw.experiment_runtime.contract import (
     ContractValidationError,
+    contract_sha256,
     derive_contract,
     dump_contract,
+    load_contract,
 )
+from researchclaw.experiment_runtime.metric_authority import replay_metric_authority
 from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._helpers import (
     StageResult,
@@ -29,10 +33,66 @@ from researchclaw.pipeline._helpers import (
     _safe_json_loads,
     _utcnow_iso,
 )
+from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
+
+
+_STAGE9_OWNED_OUTPUTS = (
+    "benchmark_agent",
+    "benchmark_plan.json",
+    "domain_profile.json",
+    "domain_selector_policy.json",
+    "exp_plan.yaml",
+    "experiment_contract.sha256",
+    "experiment_contract.yaml",
+    "metric_authority.json",
+    "metric_authority_index.json",
+    "plan_meta.json",
+    "prompt_domain_profile.json",
+)
+
+_STAGE9_AUTHORITY_OUTPUTS = (
+    "experiment_contract.yaml",
+    "experiment_contract.sha256",
+    "domain_selector_policy.json",
+    "domain_profile.json",
+    "metric_authority_index.json",
+    "metric_authority.json",
+)
+
+_STAGE9_DIAGNOSTIC_OUTPUTS = tuple(
+    name for name in _STAGE9_OWNED_OUTPUTS if name not in _STAGE9_AUTHORITY_OUTPUTS
+)
+
+
+def _cleanup_stage9_outputs(
+    namespace: BoundOutputNamespace,
+    *,
+    preserve_diagnostics: tuple[str, ...] = (),
+) -> None:
+    """Invalidate authority first and never let one collision stop cleanup."""
+
+    preserved = set(preserve_diagnostics)
+    if not preserved.issubset(_STAGE9_DIAGNOSTIC_OUTPUTS):
+        raise OSError("Stage 9 cleanup may preserve diagnostic outputs only")
+    errors: list[str] = []
+    for name in _STAGE9_AUTHORITY_OUTPUTS:
+        try:
+            namespace.remove_flat_entries((name,))
+        except OSError as exc:
+            errors.append(f"{name}: {exc}")
+    for name in _STAGE9_DIAGNOSTIC_OUTPUTS:
+        if name in preserved:
+            continue
+        try:
+            namespace.remove_flat_entries((name,))
+        except OSError as exc:
+            errors.append(f"{name}: {exc}")
+    if errors:
+        raise OSError("Stage 9 cleanup was incomplete: " + "; ".join(errors))
 
 
 def _normalize_plan_field(value: Any) -> list:
@@ -85,26 +145,70 @@ def _execute_experiment_design(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
-    # Keep executor-owned decision.json/stage_health.json. Contract selection
-    # uses them to distinguish an authoritative incomplete direct attempt from
-    # a legacy run that may safely fall back to a versioned Stage 9 contract.
     try:
-        for artifact_name in (
-            "exp_plan.yaml",
-            "experiment_contract.yaml",
-            "experiment_contract.sha256",
-            "plan_meta.json",
-            "domain_profile.json",
-        ):
-            (stage_dir / artifact_name).unlink(missing_ok=True)
+        with BoundOutputNamespace.open(
+            run_dir, stage_dir, "stage-09"
+        ) as namespace:
+            _cleanup_stage9_outputs(namespace)
+            namespace.assert_canonical()
+            try:
+                result = _execute_experiment_design_bound(
+                    stage_dir,
+                    run_dir,
+                    config,
+                    adapters,
+                    namespace=namespace,
+                    llm=llm,
+                    prompts=prompts,
+                )
+                if result.status == StageStatus.DONE:
+                    _validate_stage9_publication(namespace, run_dir, config)
+                else:
+                    preserved = tuple(
+                        name
+                        for name in result.artifacts
+                        if name in _STAGE9_DIAGNOSTIC_OUTPUTS
+                    )
+                    _cleanup_stage9_outputs(
+                        namespace, preserve_diagnostics=preserved
+                    )
+                namespace.assert_canonical()
+                return result
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    _cleanup_stage9_outputs(namespace)
+                except OSError as cleanup_exc:
+                    exc.add_note(f"Stage 9 fd-bound cleanup also failed: {cleanup_exc}")
+                return StageResult(
+                    stage=Stage.EXPERIMENT_DESIGN,
+                    status=StageStatus.FAILED,
+                    artifacts=(),
+                    error=f"Stage 9 publication failed: {exc}",
+                    decision="retry",
+                )
     except OSError as exc:
         return StageResult(
             stage=Stage.EXPERIMENT_DESIGN,
             status=StageStatus.FAILED,
             artifacts=(),
-            error=f"Failed to clear stale Stage 9 artifacts: {exc}",
+            error=f"Stage 9 output namespace is unsafe: {exc}",
             decision="retry",
         )
+
+
+def _execute_experiment_design_bound(
+    stage_dir: Path,
+    run_dir: Path,
+    config: RCConfig,
+    adapters: AdapterBundle,
+    *,
+    namespace: BoundOutputNamespace,
+    llm: LLMClient | None = None,
+    prompts: PromptManager | None = None,
+) -> StageResult:
+    # Keep executor-owned decision.json/stage_health.json. Contract selection
+    # uses them to distinguish an authoritative incomplete direct attempt from
+    # a legacy run that may safely fall back to a versioned Stage 9 contract.
     hypotheses = _read_prior_artifact(run_dir, "hypotheses.md") or ""
     preamble = _build_context_preamble(
         config, run_dir, include_goal=True, include_hypotheses=True
@@ -128,7 +232,8 @@ def _execute_experiment_design(
         )
         # Persist domain profile for Stage 10
         import json as _json_dd
-        (stage_dir / "domain_profile.json").write_text(
+        namespace.write_text_atomic(
+            "prompt_domain_profile.json",
             _json_dd.dumps({
                 "domain_id": _domain_profile.domain_id,
                 "display_name": _domain_profile.display_name,
@@ -136,7 +241,6 @@ def _execute_experiment_design(
                 "core_libraries": _domain_profile.core_libraries,
                 "gpu_required": _domain_profile.gpu_required,
             }, indent=2),
-            encoding="utf-8",
         )
     except Exception:  # noqa: BLE001
         logger.debug("Domain detection unavailable", exc_info=True)
@@ -384,7 +488,8 @@ def _execute_experiment_design(
     _required_any = ("baselines", "proposed_methods", "ablations")
     _normalized = {k: _normalize_plan_field(plan.get(k)) for k in _required_any}
     if not any(_normalized.values()):
-        (stage_dir / "plan_meta.json").write_text(
+        namespace.write_text_atomic(
+            "plan_meta.json",
             json.dumps(
                 {
                     "outcome": "model_response_schema_deficient",
@@ -399,7 +504,6 @@ def _execute_experiment_design(
                 },
                 indent=2,
             ),
-            encoding="utf-8",
         )
         logger.warning(
             "Stage 9: model plan parsed but missing required content keys — pausing pipeline"
@@ -466,25 +570,26 @@ def _execute_experiment_design(
             )
 
             _hw = _load_hardware_profile(run_dir)
-            _ba = BenchmarkOrchestrator(
-                llm,
-                config=_ba_cfg,
-                gpu_memory_mb=(
-                    _hw.get("gpu_memory_mb", 49000) if _hw else 49000
-                ),
-                time_budget_sec=config.experiment.time_budget_sec,
-                network_policy=(
-                    config.experiment.docker.network_policy
-                    if config.experiment.mode == "docker"
-                    else "full"
-                ),
-                stage_dir=stage_dir / "benchmark_agent",
-            )
-            _benchmark_plan = _ba.orchestrate({
-                "topic": config.research.topic,
-                "hypothesis": hypotheses,
-                "experiment_plan": plan.get("objectives", "") if isinstance(plan, dict) else "",
-            })
+            with tempfile.TemporaryDirectory(prefix="researchclaw-stage09-ba-") as work:
+                _ba = BenchmarkOrchestrator(
+                    llm,
+                    config=_ba_cfg,
+                    gpu_memory_mb=(
+                        _hw.get("gpu_memory_mb", 49000) if _hw else 49000
+                    ),
+                    time_budget_sec=config.experiment.time_budget_sec,
+                    network_policy=(
+                        config.experiment.docker.network_policy
+                        if config.experiment.mode == "docker"
+                        else "full"
+                    ),
+                    stage_dir=Path(work),
+                )
+                _benchmark_plan = _ba.orchestrate({
+                    "topic": config.research.topic,
+                    "hypothesis": hypotheses,
+                    "experiment_plan": plan.get("objectives", "") if isinstance(plan, dict) else "",
+                })
 
             # Inject BenchmarkAgent selections into experiment plan
             if isinstance(plan, dict) and _benchmark_plan.selected_benchmarks:
@@ -515,9 +620,9 @@ def _execute_experiment_design(
     # Save benchmark plan for code_generation stage
     if _benchmark_plan is not None:
         try:
-            (stage_dir / "benchmark_plan.json").write_text(
+            namespace.write_text_atomic(
+                "benchmark_plan.json",
                 json.dumps(_benchmark_plan.to_dict(), indent=2, ensure_ascii=False),
-                encoding="utf-8",
             )
         except Exception:  # noqa: BLE001
             pass
@@ -572,10 +677,14 @@ def _execute_experiment_design(
             )
 
     # --- HITL: Read human guidance if available ---
-    guidance_file = stage_dir / "hitl_guidance.md"
-    if guidance_file.exists():
+    try:
+        guidance = namespace.read_bytes("hitl_guidance.md").decode("utf-8").strip()
+    except FileNotFoundError:
+        guidance = ""
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ContractValidationError(f"HITL guidance is unsafe: {exc}") from exc
+    if guidance:
         try:
-            guidance = guidance_file.read_text(encoding="utf-8").strip()
             if guidance and llm is not None and isinstance(plan, dict):
                 logger.info("Applying HITL guidance to experiment design")
                 resp = llm.chat(
@@ -596,7 +705,7 @@ def _execute_experiment_design(
                         plan = parsed_update
                 except yaml.YAMLError:
                     pass
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.debug("HITL guidance application failed (non-blocking)")
 
     # --- HITL: Baseline Navigator data persistence ---
@@ -622,16 +731,20 @@ def _execute_experiment_design(
     except Exception:
         pass
 
-    (stage_dir / "exp_plan.yaml").write_text(
+    namespace.write_text_atomic(
+        "exp_plan.yaml",
         yaml.dump(plan, default_flow_style=False, allow_unicode=True),
-        encoding="utf-8",
     )
     try:
-        contract = derive_contract(config, plan)
-        contract_sha = dump_contract(contract, stage_dir / "experiment_contract.yaml")
-        (stage_dir / "experiment_contract.sha256").write_text(
-            contract_sha + "\n", encoding="utf-8"
+        contract = derive_contract(
+            config, plan, stage_dir=stage_dir, namespace=namespace
         )
+        contract_sha = dump_contract(
+            contract,
+            stage_dir / "experiment_contract.yaml",
+            namespace=namespace,
+        )
+        namespace.write_text_atomic("experiment_contract.sha256", contract_sha + "\n")
     except ContractValidationError as exc:
         error = f"Experiment contract invalid: {exc}"
         logger.error("Stage 9: %s", error)
@@ -645,9 +758,53 @@ def _execute_experiment_design(
     return StageResult(
         stage=Stage.EXPERIMENT_DESIGN,
         status=StageStatus.DONE,
-        artifacts=("exp_plan.yaml", "experiment_contract.yaml", "experiment_contract.sha256"),
+        artifacts=(
+            "exp_plan.yaml",
+            "experiment_contract.yaml",
+            "experiment_contract.sha256",
+            "domain_selector_policy.json",
+            "domain_profile.json",
+            "metric_authority_index.json",
+            "metric_authority.json",
+        ),
         evidence_refs=(
             "stage-09/exp_plan.yaml",
             "stage-09/experiment_contract.yaml",
         ),
     )
+
+
+def _validate_stage9_publication(
+    namespace: BoundOutputNamespace,
+    run_dir: Path,
+    config: RCConfig,
+) -> None:
+    """Replay the Stage 9 commit point through the held directory identity."""
+
+    try:
+        plan = yaml.safe_load(namespace.read_bytes("exp_plan.yaml").decode("utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise ContractValidationError(f"experiment plan replay failed: {exc}") from exc
+    if not isinstance(plan, dict):
+        raise ContractValidationError("experiment plan replay root must be an object")
+
+    contract_path = namespace.stage_dir / "experiment_contract.yaml"
+    contract = load_contract(contract_path, namespace=namespace)
+    digest = contract_sha256(contract_path, namespace=namespace)
+    try:
+        sidecar = namespace.read_bytes("experiment_contract.sha256").decode("ascii")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ContractValidationError(f"contract sidecar replay failed: {exc}") from exc
+    if sidecar != digest + "\n":
+        raise ContractValidationError("contract sidecar does not bind contract bytes")
+
+    replay_metric_authority(
+        run_dir=run_dir,
+        topic=config.research.topic,
+        experiment_mode=config.experiment.mode,
+        stored_identity=contract.metric_authority,
+        metric_units=contract.metric_units,
+        metric_display_labels=contract.metric_display_labels,
+        namespace=namespace,
+    )
+    namespace.assert_canonical()

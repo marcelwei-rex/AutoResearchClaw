@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "selector_policy_version": "domain_selector_v1",
+  "domain_id": "security_detection",
+  "owner": "scaffold",
+  "supported_experiment_modes": [
+    "docker",
+    "sandbox"
+  ]
+}

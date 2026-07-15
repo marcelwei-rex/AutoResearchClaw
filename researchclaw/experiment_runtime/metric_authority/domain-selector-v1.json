@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "selector_policy_version": "domain_selector_v1",
+  "normalization": "nfkc_casefold_space_v1",
+  "no_match": "error",
+  "rules": [
+    {
+      "rule_id": "security_transient_execution",
+      "pattern_kind": "substring",
+      "normalized_pattern": "transient-execution",
+      "domain_id": "security_detection",
+      "priority": 1000
+    },
+    {
+      "rule_id": "security_hardware_performance_counter",
+      "pattern_kind": "substring",
+      "normalized_pattern": "hardware-performance-counter",
+      "domain_id": "security_detection",
+      "priority": 990
+    },
+    {
+      "rule_id": "security_meltdown",
+      "pattern_kind": "whole_word",
+      "normalized_pattern": "meltdown",
+      "domain_id": "security_detection",
+      "priority": 980
+    },
+    {
+      "rule_id": "security_spectre",
+      "pattern_kind": "whole_word",
+      "normalized_pattern": "spectre",
+      "domain_id": "security_detection",
+      "priority": 980
+    },
+    {
+      "rule_id": "security_intrusion_detection",
+      "pattern_kind": "substring",
+      "normalized_pattern": "intrusion detection",
+      "domain_id": "security_detection",
+      "priority": 900
+    },
+    {
+      "rule_id": "security_cybersecurity",
+      "pattern_kind": "whole_word",
+      "normalized_pattern": "cybersecurity",
+      "domain_id": "security_detection",
+      "priority": 890
+    }
+  ]
+}

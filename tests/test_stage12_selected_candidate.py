@@ -50,7 +50,10 @@ def _cfg(tmp_path: Path) -> RCConfig:
     return RCConfig.from_dict(
         {
             "project": {"name": "rc-test", "mode": "docs-first"},
-            "research": {"topic": "topic", "domains": ["security"]},
+            "research": {
+                "topic": "Hardware-performance-counter detection of Spectre attacks",
+                "domains": ["security"],
+            },
             "runtime": {"timezone": "UTC"},
             "notifications": {"channel": "none"},
             "knowledge_base": {"backend": "markdown", "root": str(tmp_path / "kb")},
@@ -82,9 +85,13 @@ def _write_contract(run: Path, cfg: RCConfig) -> Path:
         raw = json.loads(json.dumps(cfg.to_dict()))
         snapshot.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
         write_active_config_binding(run, snapshot)
-    contract = derive_contract(cfg, {"datasets": ["synthetic traces"]})
     path = run / "stage-09" / "experiment_contract.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
+    contract = derive_contract(
+        cfg,
+        {"datasets": ["synthetic traces"]},
+        stage_dir=path.parent,
+    )
     dump_contract(contract, path)
     return path
 

@@ -25,11 +25,16 @@ from researchclaw.config import RCConfig
 from researchclaw.experiment_runtime.contract import (
     ContractValidationError,
     ExperimentContract,
+    contract_sha256,
     find_stage09_contract,
     load_contract,
     sha256_file,
 )
 from researchclaw.experiment_runtime.scaffold import render_main_py, scaffold_sha256
+from researchclaw.experiment_runtime.metric_authority import (
+    MetricAuthorityError,
+    replay_metric_authority,
+)
 from researchclaw.literature.citation_policy import resolve_active_config_snapshot
 from researchclaw.literature.evidence_cards import canonical_json_text
 
@@ -511,7 +516,7 @@ def parse_selected_candidate_manifest(text: str) -> dict[str, Any]:
             "contract_path", "contract_sha256", "run_config_path",
             "run_config_sha256", "config_semantic_policy_version",
             "config_semantic_sha256", "scaffold_sha256", "entry_point",
-            "files", "scaffold_files", "plugin_files",
+            "metric_authority", "files", "scaffold_files", "plugin_files",
         },
         "selected candidate manifest",
     )
@@ -530,6 +535,7 @@ def parse_selected_candidate_manifest(text: str) -> dict[str, Any]:
         "config_semantic_policy_version",
         CONFIG_SEMANTIC_POLICY_VERSION,
     )
+    _metric_authority_identity(payload["metric_authority"])
     if payload["entry_point"] != "main.py":
         raise CanonicalExperimentEvidenceError("entry_point must be main.py")
     files = _file_map(payload["files"], "files", owner=None, nonempty=True)
@@ -566,8 +572,24 @@ def validate_selected_candidate_manifest(
         raise CanonicalExperimentEvidenceError(f"canonical contract is invalid: {exc}") from exc
     if payload["contract_path"] != contract_relative:
         raise CanonicalExperimentEvidenceError("contract_path does not match canonical selector")
-    if sha256_file(contract_path) != payload["contract_sha256"]:
+    if contract_sha256(contract_path) != payload["contract_sha256"]:
         raise CanonicalExperimentEvidenceError("contract hash mismatch")
+
+    try:
+        replay_metric_authority(
+            run_dir=run_dir,
+            topic=config.research.topic,
+            experiment_mode=config.experiment.mode,
+            stored_identity=contract.metric_authority,
+            metric_units=contract.metric_units,
+            metric_display_labels=contract.metric_display_labels,
+        )
+    except MetricAuthorityError as exc:
+        raise CanonicalExperimentEvidenceError(
+            f"metric authority replay failed: {exc}"
+        ) from exc
+    if payload["metric_authority"] != contract.metric_authority:
+        raise CanonicalExperimentEvidenceError("Stage 10 metric authority mismatch")
 
     config_text, config_hash = _resolve_producer_config_identity(
         run_dir, config, payload["run_config_path"], payload["run_config_sha256"]
@@ -670,7 +692,7 @@ def parse_experiment_result_set(text: str) -> dict[str, Any]:
             "sealed_candidate_manifest_path", "sealed_candidate_manifest_sha256",
             "run_config_path", "run_config_sha256", "config_semantic_policy_version",
             "config_semantic_sha256", "claim_scope", "dataset_origin",
-            "evaluator_schema", "invocation_journal", "execution_statuses",
+            "evaluator_schema", "metric_authority", "invocation_journal", "execution_statuses",
             "evidence_files",
         },
         "Stage 12 result set",
@@ -776,6 +798,7 @@ def parse_refinement_result_set(text: str) -> dict[str, Any]:
             "sealed_candidate_manifest_path", "sealed_candidate_manifest_sha256",
             "run_config_path", "run_config_sha256", "config_semantic_policy_version",
             "config_semantic_sha256", "claim_scope", "dataset_origin", "evaluator_schema",
+            "metric_authority",
             "primary_metric_key", "optimization_direction", "iterations",
             "refinement_log", "selected_result",
         },
@@ -996,6 +1019,7 @@ def parse_experiment_evidence_candidate(text: str) -> dict[str, Any]:
             "sealed_candidate_manifest_path", "sealed_candidate_manifest_sha256",
             "run_config_path", "run_config_sha256", "config_semantic_policy_version",
             "config_semantic_sha256", "claim_scope", "dataset_origin", "evaluator_schema",
+            "metric_authority",
             "primary_metric_key", "optimization_direction", "primary_metric_value",
             "artifacts",
         },
@@ -1017,6 +1041,8 @@ def parse_experiment_evidence_candidate(text: str) -> dict[str, Any]:
         or identity["selected_result_manifest_sha256"] != selected["manifest_sha256"]
         or identity["experiment_contract_sha256"] != payload["experiment_contract_sha256"]
         or identity["config_semantic_sha256"] != payload["config_semantic_sha256"]
+        or identity["metric_authority_selector_input_sha256"]
+        != payload["metric_authority"]["selector_input_sha256"]
         or identity["primary_metric_key"] != payload["primary_metric_key"]
         or identity["optimization_direction"] != payload["optimization_direction"]
     ):
@@ -1206,6 +1232,7 @@ def publish_experiment_evidence_candidate(
         "selected_result_manifest_sha256": selected["manifest_sha256"],
         "experiment_contract_sha256": upstream["experiment_contract_sha256"],
         "config_semantic_sha256": upstream["config_semantic_sha256"],
+        "metric_authority_selector_input_sha256": upstream["metric_authority"]["selector_input_sha256"],
         "primary_metric_key": metric_key,
         "optimization_direction": direction,
         "artifacts": identity_artifacts,
@@ -1230,6 +1257,7 @@ def publish_experiment_evidence_candidate(
         "claim_scope": upstream["claim_scope"],
         "dataset_origin": upstream["dataset_origin"],
         "evaluator_schema": upstream["evaluator_schema"],
+        "metric_authority": upstream["metric_authority"],
         "primary_metric_key": metric_key,
         "optimization_direction": direction,
         "primary_metric_value": canonical_decimal(metric_value),
@@ -1459,6 +1487,7 @@ def parse_canonical_experiment_manifest(text: str) -> dict[str, Any]:
             "sealed_candidate_manifest_path", "sealed_candidate_manifest_sha256",
             "run_config_path", "run_config_sha256", "config_semantic_policy_version",
             "config_semantic_sha256", "claim_scope", "dataset_origin", "evaluator_schema",
+            "metric_authority",
             "primary_metric", "optimization_direction", "selected_candidate",
             "selected_summary", "selected_analysis",
         },
@@ -1561,6 +1590,57 @@ def validate_canonical_experiment_manifest(
         if source.read_bytes() != canonical.read_bytes() or sha256_file(canonical) != ref["canonical_sha256"]:
             raise CanonicalExperimentEvidenceError(f"{field} compatibility copy mismatch")
     return payload
+
+
+def reconstruct_expected_stage9_14_metric_authority(
+    run_dir: Path,
+    config: RCConfig,
+) -> dict[str, Any]:
+    """Independently replay metric authority through every Stage 9-14 layer."""
+    contract_path = find_stage09_contract(run_dir)
+    if contract_path is None:
+        raise CanonicalExperimentEvidenceError("canonical experiment contract is missing")
+    try:
+        contract = load_contract(contract_path)
+        selection = replay_metric_authority(
+            run_dir=run_dir,
+            topic=config.research.topic,
+            experiment_mode=config.experiment.mode,
+            stored_identity=contract.metric_authority,
+            metric_units=contract.metric_units,
+            metric_display_labels=contract.metric_display_labels,
+        )
+    except (ContractValidationError, MetricAuthorityError) as exc:
+        raise CanonicalExperimentEvidenceError(
+            f"expected metric authority reconstruction failed: {exc}"
+        ) from exc
+
+    seal = validate_selected_candidate_manifest(run_dir, config)
+    if seal["metric_authority"] != selection.contract_identity():
+        raise CanonicalExperimentEvidenceError("Stage 10 metric authority replay mismatch")
+    baseline = validate_experiment_result_set(run_dir, config)
+    if baseline["metric_authority"] != selection.contract_identity():
+        raise CanonicalExperimentEvidenceError("Stage 12 metric authority replay mismatch")
+
+    refinement_path = run_dir / "stage-13/refinement_result_set.json"
+    if refinement_path.exists() or refinement_path.is_symlink():
+        refinement = validate_refinement_result_set(run_dir, config)
+        if refinement["metric_authority"] != selection.contract_identity():
+            raise CanonicalExperimentEvidenceError(
+                "Stage 13 metric authority replay mismatch"
+            )
+
+    root = validate_canonical_experiment_manifest(run_dir, config)
+    if root["metric_authority"] != selection.contract_identity():
+        raise CanonicalExperimentEvidenceError(
+            "Stage 14 root metric authority replay mismatch"
+        )
+    return {
+        "schema_version": 1,
+        "metric_authority": selection.contract_identity(),
+        "metric_units": selection.metric_units,
+        "metric_display_labels": selection.metric_display_labels,
+    }
 
 
 def load_canonical_experiment_evidence(run_dir: Path) -> CanonicalExperimentEvidence:
@@ -1852,6 +1932,7 @@ def publish_canonical_experiment_manifest(
         "claim_scope": upstream["claim_scope"],
         "dataset_origin": upstream["dataset_origin"],
         "evaluator_schema": upstream["evaluator_schema"],
+        "metric_authority": upstream["metric_authority"],
         "primary_metric": metric_key,
         "optimization_direction": direction,
         "selected_candidate": {
@@ -2001,12 +2082,27 @@ def _validate_common_run_bindings(
         raise CanonicalExperimentEvidenceError(f"canonical contract is invalid: {exc}") from exc
     if payload["experiment_contract_path"] != relative:
         raise CanonicalExperimentEvidenceError("experiment contract path mismatch")
-    if sha256_file(contract_path) != payload["experiment_contract_sha256"]:
+    if contract_sha256(contract_path) != payload["experiment_contract_sha256"]:
         raise CanonicalExperimentEvidenceError("experiment contract hash mismatch")
     if payload["claim_scope"] != contract.claim_scope or payload["dataset_origin"] != contract.dataset_origin:
         raise CanonicalExperimentEvidenceError("contract scope/origin binding mismatch")
     if payload["evaluator_schema"] != "hpc_anomaly_detection_v1":
         raise CanonicalExperimentEvidenceError("unsupported evaluator schema")
+    try:
+        replay_metric_authority(
+            run_dir=run_dir,
+            topic=config.research.topic,
+            experiment_mode=config.experiment.mode,
+            stored_identity=contract.metric_authority,
+            metric_units=contract.metric_units,
+            metric_display_labels=contract.metric_display_labels,
+        )
+    except MetricAuthorityError as exc:
+        raise CanonicalExperimentEvidenceError(
+            f"metric authority replay failed: {exc}"
+        ) from exc
+    if payload["metric_authority"] != contract.metric_authority:
+        raise CanonicalExperimentEvidenceError("contract metric authority binding mismatch")
 
     seal_path = run_dir / "stage-10/selected_candidate_manifest.json"
     seal_text = _read_regular_file(seal_path, "selected candidate manifest")
@@ -2019,6 +2115,7 @@ def _validate_common_run_bindings(
         seal["contract_sha256"] != payload["experiment_contract_sha256"]
         or seal["config_semantic_policy_version"] != payload["config_semantic_policy_version"]
         or seal["config_semantic_sha256"] != payload["config_semantic_sha256"]
+        or seal["metric_authority"] != payload["metric_authority"]
     ):
         raise CanonicalExperimentEvidenceError("producer binding differs from Stage 10 seal")
     _resolve_producer_config_identity(
@@ -2045,6 +2142,7 @@ def _common_bindings_equal(
         "sealed_candidate_manifest_path", "sealed_candidate_manifest_sha256",
         "config_semantic_policy_version", "config_semantic_sha256",
         "claim_scope", "dataset_origin", "evaluator_schema",
+        "metric_authority",
     )
     return all(left[field] == right[field] for field in fields)
 
@@ -2279,7 +2377,8 @@ def _parse_candidate_identity(value: object) -> dict[str, Any]:
         {
             "candidate_identity_policy_version", "selected_result_type",
             "selected_result_manifest_sha256", "experiment_contract_sha256",
-            "config_semantic_sha256", "primary_metric_key", "optimization_direction",
+            "config_semantic_sha256", "metric_authority_selector_input_sha256",
+            "primary_metric_key", "optimization_direction",
             "artifacts",
         },
         "candidate identity payload",
@@ -2287,7 +2386,10 @@ def _parse_candidate_identity(value: object) -> dict[str, Any]:
     _require_equal(value, "candidate_identity_policy_version", 1)
     if value["selected_result_type"] not in {"stage12_baseline", "stage13_refinement"}:
         raise CanonicalExperimentEvidenceError("invalid selected_result_type")
-    for field in ("selected_result_manifest_sha256", "experiment_contract_sha256", "config_semantic_sha256"):
+    for field in (
+        "selected_result_manifest_sha256", "experiment_contract_sha256",
+        "config_semantic_sha256", "metric_authority_selector_input_sha256",
+    ):
         _sha256(value[field], field)
     _required_string(value["primary_metric_key"], "primary_metric_key")
     if value["optimization_direction"] not in {"maximize", "minimize"}:
@@ -2333,6 +2435,54 @@ def _common_producer_bindings(payload: Mapping[str, Any]) -> None:
         raise CanonicalExperimentEvidenceError("unsupported config semantic policy")
     for field in ("claim_scope", "dataset_origin", "evaluator_schema"):
         _required_string(payload[field], field)
+    _metric_authority_identity(payload["metric_authority"])
+
+
+def _metric_authority_identity(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CanonicalExperimentEvidenceError("metric_authority must be an object")
+    _exact_keys(
+        value,
+        {
+            "path", "sha256", "policy_version", "domain_id", "evaluator_id",
+            "domain_profile_path", "domain_profile_sha256",
+            "selector_index_path", "selector_index_sha256",
+            "domain_selector_package_path", "domain_selector_package_sha256",
+            "domain_selector_snapshot_path", "domain_selector_snapshot_sha256",
+            "selector_input_sha256", "selector_policy_version",
+            "experiment_mode", "evaluator_kind",
+        },
+        "metric_authority",
+    )
+    expected_paths = {
+        "path": "stage-09/metric_authority.json",
+        "domain_profile_path": "stage-09/domain_profile.json",
+        "selector_index_path": "stage-09/metric_authority_index.json",
+        "domain_selector_snapshot_path": "stage-09/domain_selector_policy.json",
+        "domain_selector_package_path": (
+            "experiment_runtime/metric_authority/domain-selector-v1.json"
+        ),
+    }
+    for field, expected in expected_paths.items():
+        if value[field] != expected:
+            raise CanonicalExperimentEvidenceError(
+                f"noncanonical metric_authority.{field}"
+            )
+    for field in (
+        "sha256", "domain_profile_sha256", "selector_index_sha256",
+        "domain_selector_package_sha256", "domain_selector_snapshot_sha256",
+        "selector_input_sha256",
+    ):
+        _sha256(value[field], f"metric_authority.{field}")
+    if value["domain_selector_package_sha256"] != value["domain_selector_snapshot_sha256"]:
+        raise CanonicalExperimentEvidenceError("domain selector snapshot hash mismatch")
+    if value["policy_version"] != 1:
+        raise CanonicalExperimentEvidenceError("unsupported metric authority policy")
+    if value["selector_policy_version"] != "metric_selector_v1":
+        raise CanonicalExperimentEvidenceError("unsupported metric selector policy")
+    for field in ("domain_id", "evaluator_id", "experiment_mode", "evaluator_kind"):
+        _required_string(value[field], f"metric_authority.{field}")
+    return value
 
 
 def _artifact_list(value: object, label: str, *, path_field: str) -> list[dict[str, Any]]:

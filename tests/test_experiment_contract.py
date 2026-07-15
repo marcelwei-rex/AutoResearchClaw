@@ -14,12 +14,15 @@ from researchclaw.experiment_runtime.contract import (
     load_contract,
     validate_contract_dict,
 )
+from researchclaw.experiment_runtime.metric_authority import select_metric_authority
 
 
 def _valid_contract() -> dict:
+    topic = "Hardware-performance-counter detection of Spectre attacks"
+    authority = select_metric_authority(topic, "sandbox")
     return {
-        "schema_version": 1,
-        "topic": "test topic",
+        "schema_version": 2,
+        "topic": topic,
         "claim_scope": "pipeline_validation",
         "dataset_origin": "synthetic",
         "dataset_name": None,
@@ -47,6 +50,9 @@ def _valid_contract() -> dict:
             "candidate_manifest": "selected_candidate_manifest.json",
             "content_hash_algorithm": "sha256",
         },
+        "metric_authority": authority.contract_identity(),
+        "metric_units": authority.metric_units,
+        "metric_display_labels": authority.metric_display_labels,
     }
 
 
@@ -103,6 +109,51 @@ def test_contract_rejects_empty_primary_metric_key() -> None:
     data["primary_metric"]["key"] = ""
     with pytest.raises(ContractValidationError, match="primary_metric.key"):
         validate_contract_dict(data)
+
+
+@pytest.mark.parametrize("value", [True, 60.5, "60"])
+def test_contract_rejects_non_integer_budget_types(value: object) -> None:
+    data = _valid_contract()
+    data["smoke_budget_sec"] = value
+    with pytest.raises(ContractValidationError, match="smoke_budget_sec"):
+        validate_contract_dict(data)
+
+
+def test_contract_rejects_unknown_nested_field() -> None:
+    data = _valid_contract()
+    data["primary_metric"] = copy.deepcopy(data["primary_metric"])
+    data["primary_metric"]["extra"] = "not-authority"
+    with pytest.raises(ContractValidationError, match="primary_metric fields"):
+        validate_contract_dict(data)
+
+
+def test_contract_loader_rejects_duplicate_yaml_key(tmp_path: Path) -> None:
+    stage9 = tmp_path / "stage-09"
+    stage9.mkdir()
+    path = stage9 / "experiment_contract.yaml"
+    text = dump_contract(validate_contract_dict(_valid_contract()), path)
+    assert text
+    original = path.read_text(encoding="utf-8")
+    path.write_text(original + "schema_version: 2\n", encoding="utf-8")
+    with pytest.raises(ContractValidationError, match="duplicate YAML key"):
+        load_contract(path)
+
+
+def test_contract_publication_rejects_stage9_parent_symlink(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    external = tmp_path / "external"
+    run_dir.mkdir()
+    external.mkdir()
+    (external / "sentinel").write_text("unchanged", encoding="utf-8")
+    (run_dir / "stage-09").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ContractValidationError, match="cannot publish contract"):
+        dump_contract(
+            validate_contract_dict(_valid_contract()),
+            run_dir / "stage-09" / "experiment_contract.yaml",
+        )
+
+    assert sorted(path.name for path in external.iterdir()) == ["sentinel"]
 
 
 def test_contract_sha256_is_deterministic(tmp_path: Path) -> None:
@@ -173,7 +224,10 @@ def test_derive_contract_splits_smoke_and_run_budgets(tmp_path: Path) -> None:
     cfg = RCConfig.from_dict(
         {
             "project": {"name": "rc-test", "mode": "docs-first"},
-            "research": {"topic": "topic", "domains": ["security"]},
+                "research": {
+                    "topic": "Hardware-performance-counter detection of Spectre attacks",
+                    "domains": ["security"],
+                },
             "runtime": {"timezone": "UTC"},
             "notifications": {"channel": "none"},
             "knowledge_base": {"backend": "markdown", "root": str(tmp_path / "kb")},
@@ -206,7 +260,10 @@ def test_derive_contract_keeps_named_public_dataset(tmp_path: Path) -> None:
     cfg = RCConfig.from_dict(
         {
             "project": {"name": "rc-test", "mode": "docs-first"},
-            "research": {"topic": "topic", "domains": ["security"]},
+                "research": {
+                    "topic": "Hardware-performance-counter detection of Spectre attacks",
+                    "domains": ["security"],
+                },
             "runtime": {"timezone": "UTC"},
             "notifications": {"channel": "none"},
             "knowledge_base": {"backend": "markdown", "root": str(tmp_path / "kb")},

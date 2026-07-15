@@ -13,6 +13,7 @@ REQUIRED_CAPABILITIES = (
     "stage12_result_set",
     "stage13_refinement_set",
     "stage14_candidate_and_promotion",
+    "metric_contract_authority",
     "shared_accessor",
     "stage15_17_consumers",
     "stage19_22_consumers",
@@ -28,6 +29,7 @@ CANONICAL_EVIDENCE_CAPABILITIES: dict[str, int] = {
     "stage12_result_set": CAPABILITY_SCHEMA_VERSION,
     "stage13_refinement_set": CAPABILITY_SCHEMA_VERSION,
     "stage14_candidate_and_promotion": CAPABILITY_SCHEMA_VERSION,
+    "metric_contract_authority": CAPABILITY_SCHEMA_VERSION,
     "shared_accessor": CAPABILITY_SCHEMA_VERSION,
     "stage15_17_consumers": CAPABILITY_SCHEMA_VERSION,
     # This component covers the remaining manuscript path: Stage 18 peer

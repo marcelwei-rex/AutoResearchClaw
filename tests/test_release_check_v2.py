@@ -23,6 +23,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import release_check  # noqa: E402
 from researchclaw.pipeline import release_artifacts as ra  # noqa: E402
 from researchclaw.config import PaperRevisionConfig, RCConfig  # noqa: E402
+from researchclaw.experiment_runtime.contract import derive_contract, dump_contract  # noqa: E402
 from researchclaw.literature.citation_policy import (  # noqa: E402
     build_effective_citation_policy,
     write_active_config_binding,
@@ -252,32 +253,14 @@ def good_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # --- experiment evidence ---
     _write(
         run / "stage-14" / "experiment_summary.json",
-        {"metrics_summary": {"loss": {"mean": 0.1234}}},
+        {"metrics_summary": {"detection_f1": {"mean": 0.1234}}},
     )
     evidence_rel = "stage-14/experiment_summary.json"
     evidence_sha = ra.sha256_file(run / evidence_rel)
 
-    _write(
-        run / "stage-09" / "experiment_contract.yaml",
-        "\n".join(
-            [
-                "schema_version: 1",
-                "topic: release check fixture",
-                "claim_scope: research_release",
-                "dataset_origin: public",
-                "primary_metric:",
-                "  key: loss",
-                "  direction: minimize",
-                "smoke_budget_sec: 60",
-                "run_budget_sec: 300",
-                "evaluator:",
-                "  owner: scaffold",
-                "  required_result_keys:",
-                "    - dataset_origin",
-                "    - metrics",
-            ]
-        ),
-    )
+    contract_path = run / "stage-09" / "experiment_contract.yaml"
+    contract_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_contract(derive_contract(config, None, stage_dir=contract_path.parent), contract_path)
     contract_sha = ra.sha256_file(run / "stage-09" / "experiment_contract.yaml")
     _write(
         run / "stage-10" / "selected_candidate_manifest.json",
@@ -334,8 +317,8 @@ def good_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
             "stage-14/evidence_candidates/cand-release/experiment_evidence_candidate.json"
         ),
         candidate_manifest_sha256="d" * 64,
-        metric_observations={"loss": (Decimal("0.1234"),)},
-        structured_results={"metrics": {"loss": Decimal("0.1234")}},
+        metric_observations={"detection_f1": (Decimal("0.1234"),)},
+        structured_results={"metrics": {"detection_f1": Decimal("0.1234")}},
         summary={},
         experiment_contract_path="stage-09/experiment_contract.yaml",
         experiment_contract_sha256=contract_sha,
