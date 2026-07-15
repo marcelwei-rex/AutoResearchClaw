@@ -21,6 +21,7 @@ from researchclaw.pipeline.stage22_export import (
 )
 from researchclaw.pipeline.stage22_publication import (
     Stage22PublicationError,
+    load_stage22_export_publication,
     parse_stage22_export_manifest,
     publish_stage22_outputs,
     validate_stage22_export_publication,
@@ -28,6 +29,7 @@ from researchclaw.pipeline.stage22_publication import (
 from researchclaw.pipeline.stage22_semantics import (
     build_stage22_deterministic_outputs,
 )
+from researchclaw.pipeline.stage23_input_bundle import load_stage23_input_bundle
 from researchclaw.pipeline import stage22_export as export_module
 from researchclaw.pipeline.stage_impls._review_publish import (
     _execute_export_publish_legacy_disabled,
@@ -109,6 +111,7 @@ def _bundle(config: RCConfig) -> SimpleNamespace:
         stage19_inputs=stage19_inputs,
         stage20_inputs=stage20,
         stage21_inputs=stage21,
+        claim_scope=config.experiment.claim_scope,
     )
 
 
@@ -171,6 +174,46 @@ def test_stage22_publication_writes_manifest_last_and_binds_code(
     assert "code/main.py" in output_paths
     assert manifest["template_name"]
     assert validate_stage22_export_publication(run_dir, bundle) == manifest
+    snapshot = load_stage22_export_publication(run_dir, bundle)
+    assert snapshot.require_output("paper_final.md").content == direct_files[
+        "paper_final.md"
+    ]
+    assert snapshot.require_output("references.bib").content == direct_files[
+        "references.bib"
+    ]
+    assert snapshot.require_output("paper.tex").content == direct_files["paper.tex"]
+
+
+def test_stage23_input_loader_captures_only_replayed_stage22_publication(
+    tmp_path: Path,
+    canonical_config: RCConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-22"
+    stage_dir.mkdir(parents=True)
+    bundle = _bundle(canonical_config)
+    direct_files, code_files = _publication_payload(bundle)
+    publish_stage22_outputs(
+        run_dir,
+        stage_dir,
+        bundle=bundle,
+        direct_files=direct_files,
+        code_files=code_files,
+        generated=_GENERATED,
+        precommit_check=lambda: None,
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage23_input_bundle.load_stage22_input_bundle",
+        lambda *_args, **_kwargs: bundle,
+    )
+
+    captured = load_stage23_input_bundle(run_dir, canonical_config)
+
+    assert captured.paper.content == direct_files["paper_final.md"]
+    assert captured.bibliography.content == direct_files["references.bib"]
+    assert captured.latex.content == direct_files["paper.tex"]
+    assert captured.cited_keys == ()
 
 
 def test_stage22_publication_cleans_outputs_when_precommit_fixpoint_fails(

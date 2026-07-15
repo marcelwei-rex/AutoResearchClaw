@@ -387,11 +387,6 @@ def test_stage21_uses_only_captured_authority_and_hash_indexes_it(
         "_read_best_analysis",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy analysis")),
     )
-    monkeypatch.setattr(
-        _review_publish,
-        "_get_evolution_overlay",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("overlay")),
-    )
 
     class Prompts:
         def for_stage(self, _stage: str, **kwargs):

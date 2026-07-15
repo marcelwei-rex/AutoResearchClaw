@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping
 
@@ -12,6 +13,7 @@ from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 from researchclaw.pipeline.canonical_experiment_evidence import (
     canonical_authority_json_text,
 )
+from researchclaw.pipeline.stage19_input_bundle import BoundArtifact
 from researchclaw.pipeline.stage22_input_bundle import Stage22InputBundle
 from researchclaw.pipeline.stage22_semantics import (
     Stage22SemanticError,
@@ -26,11 +28,40 @@ class Stage22PublicationError(ValueError):
     """Raised when Stage 22 outputs do not form one replayable publication."""
 
 
+@dataclass(frozen=True)
+class Stage22PublicationSnapshot:
+    """Immutable Stage 22 publication bytes captured under one directory fd."""
+
+    manifest: BoundArtifact
+    outputs: tuple[BoundArtifact, ...]
+
+    def require_output(self, path: str) -> BoundArtifact:
+        canonical_path = f"stage-22/{path}"
+        matches = tuple(
+            artifact for artifact in self.outputs if artifact.path == canonical_path
+        )
+        if len(matches) != 1:
+            raise Stage22PublicationError(
+                f"Stage 22 publication does not contain exactly one {path}"
+            )
+        return matches[0]
+
+
 def validate_stage22_export_publication(
     run_dir: Path,
     bundle: Stage22InputBundle,
 ) -> dict[str, object]:
     """Independently replay the committed Stage 22 publication from disk."""
+
+    snapshot = load_stage22_export_publication(run_dir, bundle)
+    return parse_stage22_export_manifest(snapshot.manifest.content.decode("utf-8"))
+
+
+def load_stage22_export_publication(
+    run_dir: Path,
+    bundle: Stage22InputBundle,
+) -> Stage22PublicationSnapshot:
+    """Replay and capture the committed Stage 22 publication from one namespace."""
 
     stage_dir = run_dir / "stage-22"
     with BoundOutputNamespace.open(run_dir, stage_dir, "stage-22") as namespace:
@@ -44,7 +75,7 @@ def validate_stage22_export_publication(
                 "Stage 22 export manifest is not UTF-8"
             ) from exc
         manifest = parse_stage22_export_manifest(manifest_text)
-        _verify_published_files(
+        captured = _verify_published_files(
             namespace,
             manifest,
             bundle=bundle,
@@ -57,7 +88,22 @@ def validate_stage22_export_publication(
             "utf-8"
         ):
             raise Stage22PublicationError("Stage 22 export manifest changed during replay")
-        return manifest
+        manifest_bytes = manifest_text.encode("utf-8")
+        return Stage22PublicationSnapshot(
+            manifest=BoundArtifact(
+                "stage-22/stage22_export_manifest.json",
+                hashlib.sha256(manifest_bytes).hexdigest(),
+                manifest_bytes,
+            ),
+            outputs=tuple(
+                BoundArtifact(
+                    f"stage-22/{path}",
+                    hashlib.sha256(content).hexdigest(),
+                    content,
+                )
+                for path, content in sorted(captured.items())
+            ),
+        )
 
 
 def publish_stage22_outputs(
@@ -305,7 +351,7 @@ def _verify_published_files(
     *,
     bundle: Stage22InputBundle,
     generated: str,
-) -> None:
+) -> dict[str, bytes]:
     code_files = namespace.read_flat_directory("code")
     expected_code = {
         entry["path"].removeprefix("code/"): entry["sha256"]
@@ -337,6 +383,10 @@ def _verify_published_files(
         raise Stage22PublicationError(
             "Stage 22 manifest differs from semantic reconstruction"
         )
+    return {
+        **direct_files,
+        **{f"code/{name}": content for name, content in code_files.items()},
+    }
 
 
 def _parse_template_entries(value: object) -> None:

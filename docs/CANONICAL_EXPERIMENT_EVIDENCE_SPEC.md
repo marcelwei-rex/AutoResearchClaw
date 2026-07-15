@@ -1439,8 +1439,22 @@ until C5.
   forbids a PDF. A paper-verifier `REJECT` fails Stage 22 rather than
   heuristically rewriting numeric claims. The legacy Stage 22 producer is a
   mechanically disabled entrypoint and cannot be invoked as alternate authority.
-- C3-E: add the complete call-site and forbidden-scan guard, then set
-  `stage19_22_consumers` to v1 only after Stage 18 through Stage 22 pass it.
+- C3-E: migrate Stage 23 to an immutable Stage 22 publication snapshot and a
+  success-only, manifest-last verification publication. Failed or fatal
+  verification leaves no success-named Stage 23 outputs. Stage 23 relevance
+  scores are serialized from their full finite decimal text and compared using
+  that same stored value; `references_verified.bib` contains only entries whose
+  verification status is `verified`. The publisher invalidates its prior
+  manifest and owned namespace before validating any proposed output mapping.
+  `SKIP_FORBIDDEN_STAGES` also governs every HITL input path, including the
+  independent CostGuard pause: pre-stage SKIP/ABORT and every post-stage action
+  other than an unedited APPROVE fail the stage after the controller clears its
+  authority namespace. Relevance JSON numbers are parsed directly as finite
+  `Decimal` values, without an intermediate binary float conversion. Add the complete
+  Stage 18-23 call-site and forbidden-scan guard, then set the historically
+  named `stage19_22_consumers` capability to v1 only after independent review.
+  This migration binds existing verification results; it does not change DOI
+  provider aggregation, title-only relevance policy, or release thresholds.
 - ensure each migrated manifest or closure report records the canonical-evidence
   manifest hash;
 - keep the runtime capability gate blocked.

@@ -31,8 +31,9 @@ CANONICAL_EVIDENCE_CAPABILITIES: dict[str, int] = {
     "shared_accessor": CAPABILITY_SCHEMA_VERSION,
     "stage15_17_consumers": CAPABILITY_SCHEMA_VERSION,
     # This component covers the remaining manuscript path: Stage 18 peer
-    # review through Stage 22 export/publish. It activates only after all five
-    # stages use the accessor and pass the repository guard.
+    # review through Stage 23 citation verification. The historical capability
+    # name is retained for schema compatibility. Activation waits until every
+    # consumer uses canonical snapshots and passes the repository guard.
     "stage19_22_consumers": 0,
     "stage24_release_consumers": 0,
     "external_and_persistent_consumers": 0,

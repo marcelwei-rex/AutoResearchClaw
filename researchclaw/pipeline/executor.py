@@ -20,6 +20,7 @@ from researchclaw.llm.client import LLMClient
 from researchclaw.prompts import PromptManager
 from researchclaw.pipeline.stages import (
     NEXT_STAGE,
+    SKIP_FORBIDDEN_STAGES,
     Stage,
     StageStatus,
     TransitionEvent,
@@ -28,6 +29,7 @@ from researchclaw.pipeline.stages import (
     gate_required,
 )
 from researchclaw.pipeline.contracts import CONTRACTS, StageContract
+from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 from researchclaw.experiment.validator import (
     CodeValidation,
     format_issues_for_llm,
@@ -204,6 +206,61 @@ def _get_hitl_session(adapters: AdapterBundle) -> Any:
     return getattr(adapters, "hitl", None)
 
 
+def _invalidate_hitl_authority_stage(stage: Stage, run_dir: Path) -> None:
+    """Remove stale authority when HITL prevents an evidence stage commit."""
+
+    stage_name = f"stage-{int(stage):02d}"
+    stage_dir = run_dir / stage_name
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    with BoundOutputNamespace.open(run_dir, stage_dir, stage_name) as namespace:
+        namespace.assert_canonical()
+        namespace.reset_flat_namespace()
+        namespace.assert_canonical()
+
+
+def _forbidden_hitl_result(
+    stage: Stage,
+    run_dir: Path,
+    *,
+    action: str,
+) -> StageResult:
+    try:
+        _invalidate_hitl_authority_stage(stage, run_dir)
+    except Exception as exc:  # noqa: BLE001
+        return StageResult(
+            stage=stage,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"HITL {action} is forbidden and authority invalidation failed: {exc}",
+            decision="abort",
+        )
+    return StageResult(
+        stage=stage,
+        status=StageStatus.FAILED,
+        artifacts=(),
+        error=f"HITL {action} is forbidden for evidence-authority stage {stage.name}",
+        decision="abort",
+    )
+
+
+def _guard_authority_post_input(
+    stage: Stage,
+    run_dir: Path,
+    human_input: Any,
+) -> StageResult | None:
+    from researchclaw.hitl.intervention import HumanAction
+
+    if stage in SKIP_FORBIDDEN_STAGES and (
+        human_input.action != HumanAction.APPROVE or human_input.edited_files
+    ):
+        return _forbidden_hitl_result(
+            stage,
+            run_dir,
+            action=f"post-stage {human_input.action.value.upper()}",
+        )
+    return None
+
+
 def _run_hitl_pre_stage(
     stage: Stage, run_dir: Path, adapters: AdapterBundle,
     config: RCConfig | None = None,
@@ -236,6 +293,8 @@ def _run_hitl_pre_stage(
     human_input = session.wait_for_human()
 
     if human_input.action == HumanAction.SKIP:
+        if stage in SKIP_FORBIDDEN_STAGES:
+            return _forbidden_hitl_result(stage, run_dir, action="pre-stage SKIP")
         return StageResult(
             stage=stage,
             status=StageStatus.DONE,
@@ -243,6 +302,8 @@ def _run_hitl_pre_stage(
             decision="proceed",
         )
     if human_input.action == HumanAction.ABORT:
+        if stage in SKIP_FORBIDDEN_STAGES:
+            return _forbidden_hitl_result(stage, run_dir, action="pre-stage ABORT")
         return StageResult(
             stage=stage,
             status=StageStatus.FAILED,
@@ -292,6 +353,11 @@ def _run_hitl_post_stage(
                 context_summary=f"Cost budget alert: {guard.format_display(run_dir)}",
             )
             human_input = session.wait_for_human()
+            authority_result = _guard_authority_post_input(
+                stage, run_dir, human_input
+            )
+            if authority_result is not None:
+                return authority_result
             if human_input.action == HumanAction.ABORT:
                 return StageResult(
                     stage=stage,
@@ -386,6 +452,10 @@ def _run_hitl_post_stage(
         output_files=output_files,
     )
     human_input = session.wait_for_human()
+
+    authority_result = _guard_authority_post_input(stage, run_dir, human_input)
+    if authority_result is not None:
+        return authority_result
 
     if human_input.action == HumanAction.APPROVE:
         return result

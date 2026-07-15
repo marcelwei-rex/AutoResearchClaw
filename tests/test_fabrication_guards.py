@@ -218,8 +218,10 @@ class TestStage20HardGuard:
         mock_vr.values = []  # zero verified values
         mock_vr.condition_names = []
 
-        with patch("researchclaw.pipeline.stage_impls._review_publish._read_prior_artifact", return_value="test paper"), \
-             patch("researchclaw.pipeline.stage_impls._review_publish._get_evolution_overlay", return_value=None):
+        with patch(
+            "researchclaw.pipeline.stage_impls._review_publish._read_prior_artifact",
+            return_value="test paper",
+        ):
             # We need to inject the mock VR - patch the import inside the function
             with patch(
                 "researchclaw.pipeline.verified_registry.VerifiedRegistry.from_run_dir",

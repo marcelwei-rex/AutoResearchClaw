@@ -257,10 +257,16 @@ CONTRACTS: dict[Stage, StageContract] = {
     ),
     Stage.CITATION_VERIFY: StageContract(
         stage=Stage.CITATION_VERIFY,
-        input_files=("paper_final.md",),  # references.bib is optional (BUG-50)
-        output_files=("verification_report.json", "references_verified.bib"),
+        input_files=(),
+        output_files=(
+            "verification_report.json",
+            "references_verified.bib",
+            "paper_final_verified.md",
+            "stage23_verification_manifest.json",
+        ),
         dod="All citations verified against real APIs; hallucinated refs flagged",
         error_code="E23_VERIFY_FAIL",
+        max_retries=0,
     ),
     # Phase I: Release Audit (v2)
     Stage.TRUTH_AUDIT: StageContract(

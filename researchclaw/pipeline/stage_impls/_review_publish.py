@@ -28,10 +28,8 @@ from researchclaw.literature.citation_policy import (
 )
 from researchclaw.literature.citation_plan import (
     CitationPlanContractError,
-    load_canonical_bibliography,
     replay_citation_plan_provenance,
     replay_citation_closure,
-    validate_final_paper_citations,
     validate_paper_citation_minimum,
     validate_paper_citation_minimum_from_authority,
     validate_citation_closure_report,
@@ -91,7 +89,6 @@ from researchclaw.pipeline._helpers import (
     _extract_paper_title,
     _generate_framework_diagram_prompt,
     _generate_neurips_checklist,
-    _get_evolution_overlay,
     _read_best_analysis,
     _read_prior_artifact,
     _safe_json_loads,
@@ -839,10 +836,9 @@ def _execute_paper_revision(
                 _rev_blocks[_bname] = _pm.block(_bname)
             except (KeyError, Exception):  # noqa: BLE001
                 _rev_blocks[_bname] = ""
-        _overlay = _get_evolution_overlay(run_dir, "paper_revision")
         sp = _pm.for_stage(
             "paper_revision",
-            evolution_overlay=_overlay,
+            evolution_overlay=None,
             topic_constraint=_pm.block("topic_constraint", topic=config.research.topic),
             writing_structure=_ws_revision,
             draft=draft,
@@ -2696,7 +2692,7 @@ def _check_citation_relevance(
     llm: Any,
     topic: str,
     results: list[Any],
-) -> dict[str, float | None]:
+) -> dict[str, Decimal]:
     """Use LLM to assess relevance of each citation to the research topic.
 
     Returns a dict mapping cite_key → relevance score (0.0–1.0).
@@ -2708,7 +2704,7 @@ def _check_citation_relevance(
     if not citation_lines:
         return {}
 
-    all_scores: dict[str, float] = {}
+    all_scores: dict[str, Decimal] = {}
     _BATCH_SIZE = 30
 
     for batch_start in range(0, len(citation_lines), _BATCH_SIZE):
@@ -2733,6 +2729,11 @@ def _check_citation_relevance(
             parsed = json.loads(
                 resp.content,
                 object_pairs_hook=_reject_duplicate_relevance_keys,
+                parse_float=Decimal,
+                parse_int=Decimal,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"non-finite relevance value: {value}")
+                ),
             )
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ValueError(
@@ -2749,13 +2750,12 @@ def _check_citation_relevance(
             )
         for key, value in parsed.items():
             if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or not 0.0 <= float(value) <= 1.0
+                not isinstance(value, Decimal)
+                or not value.is_finite()
+                or not Decimal("0") <= value <= Decimal("1")
             ):
                 raise ValueError(f"invalid relevance score for {key}")
-            all_scores[key] = float(value)
+            all_scores[key] = value
 
     return all_scores
 
@@ -2772,27 +2772,21 @@ def _reject_duplicate_relevance_keys(
 
 
 def _remove_bibtex_entries(bib_text: str, keys_to_remove: set[str]) -> str:
-    """Remove BibTeX entries whose keys are in *keys_to_remove*."""
+    """Return BibTeX text without the named complete entries."""
+
     kept: list[str] = []
-    for m in re.finditer(r"@\w+\{([^,]+),", bib_text):
-        key = m.group(1).strip()
-        if key in keys_to_remove:
+    for match in re.finditer(r"@\w+\{([^,]+),", bib_text):
+        if match.group(1).strip() in keys_to_remove:
             continue
-        # Find the full entry (from @ to the next @ or end)
-        start = m.start()
-        # Find balanced braces
         depth = 0
-        end = start
-        for i in range(start, len(bib_text)):
-            if bib_text[i] == "{":
+        for index in range(match.start(), len(bib_text)):
+            if bib_text[index] == "{":
                 depth += 1
-            elif bib_text[i] == "}":
+            elif bib_text[index] == "}":
                 depth -= 1
                 if depth == 0:
-                    end = i + 1
+                    kept.append(bib_text[match.start() : index + 1])
                     break
-        if end > start:
-            kept.append(bib_text[start:end])
     return "\n\n".join(kept) + "\n" if kept else ""
 
 
@@ -2809,416 +2803,42 @@ def _execute_citation_verify(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
-    from researchclaw.literature.verify import (
-        VerifyStatus,
-        filter_verified_bibtex,
-        verify_citations,
+    """Run the canonical Stage 23 verifier without reopening authority paths."""
+
+    from researchclaw.pipeline.stage23_verification import (
+        Stage23VerificationError,
+        execute_canonical_stage23,
     )
 
+    del adapters, prompts
+    relevance_checker = (
+        (
+            lambda results: _check_citation_relevance(
+                llm, config.research.topic, list(results)
+            )
+        )
+        if llm is not None
+        else None
+    )
     try:
-        for owned_name in (
-            "verification_report.json",
-            "references_verified.bib",
-            "paper_final_verified.md",
-            "bib_strip_warning.json",
-        ):
-            owned_path = stage_dir / owned_name
-            if owned_path.is_symlink() or owned_path.exists():
-                owned_path.unlink()
-    except OSError as exc:
+        outcome = execute_canonical_stage23(
+            run_dir,
+            stage_dir,
+            config,
+            relevance_checker=relevance_checker,
+        )
+    except (OSError, UnicodeDecodeError, ValueError, Stage23VerificationError) as exc:
         return StageResult(
             stage=Stage.CITATION_VERIFY,
             status=StageStatus.FAILED,
             artifacts=(),
-            error=f"Could not clean stale Stage 23 outputs: {exc}",
-            decision="retry",
-        )
-
-    paper_path = run_dir / "stage-22" / "paper_final.md"
-    try:
-        if paper_path.is_symlink() or not paper_path.is_file():
-            raise OSError("canonical stage-22/paper_final.md is missing or unsafe")
-        paper_text = paper_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        return StageResult(
-            stage=Stage.CITATION_VERIFY,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            error=f"Could not read canonical final paper: {exc}",
-            decision="retry",
-        )
-    cited_keys = extract_citation_keys(paper_text)
-    has_plan = (run_dir / "stage-16" / "citation_plan.json").is_file()
-    try:
-        bib_text = load_canonical_bibliography(run_dir)
-    except CitationPlanContractError as exc:
-        if cited_keys or has_plan:
-            return StageResult(
-                stage=Stage.CITATION_VERIFY,
-                status=StageStatus.FAILED,
-                artifacts=(),
-                error=f"Canonical bibliography is invalid: {exc}",
-                decision="retry",
-            )
-        bib_text = ""
-    if cited_keys or has_plan:
-        try:
-            validate_final_paper_citations(run_dir, config, paper_text)
-        except CitationPlanContractError as exc:
-            return StageResult(
-                stage=Stage.CITATION_VERIFY,
-                status=StageStatus.FAILED,
-                artifacts=(),
-                error=f"Evidence-bound final citation closure failed: {exc}",
-                decision="retry",
-            )
-
-    if not bib_text.strip():
-        # v2 fail-closed: if the paper cites keys but there is no bib,
-        # verification CANNOT succeed. Previously this wrote
-        # integrity_score=1.0 and returned DONE — a fail-open path.
-        _cited_keys_no_bib = set(cited_keys)
-        has_citations = bool(_cited_keys_no_bib)
-        report_data = {
-            "summary": {
-                "total": 0,
-                "verified": 0,
-                "suspicious": 0,
-                "hallucinated": 0,
-                "skipped": 0,
-                # No bib + citations in paper = zero integrity, not perfect.
-                "integrity_score": 0.0 if has_citations else 1.0,
-                "missing_bib": True,
-                "cited_keys_without_bib": sorted(_cited_keys_no_bib)[:50],
-            },
-            "results": [],
-            "note": (
-                "No references.bib found, but the paper cites "
-                f"{len(_cited_keys_no_bib)} key(s) — verification impossible."
-                if has_citations
-                else "No references.bib found and no citations in paper."
-            ),
-        }
-        (stage_dir / "verification_report.json").write_text(
-            json.dumps(report_data, indent=2), encoding="utf-8"
-        )
-        (stage_dir / "references_verified.bib").write_text(
-            "% No references to verify\n", encoding="utf-8"
-        )
-        # Always write paper_final_verified.md so deliverables packaging gets
-        # the latest paper (not a stale copy from a previous run)
-        if paper_text.strip():
-            (stage_dir / "paper_final_verified.md").write_text(
-                paper_text, encoding="utf-8"
-            )
-        if has_citations:
-            return StageResult(
-                stage=Stage.CITATION_VERIFY,
-                status=StageStatus.FAILED,
-                artifacts=("verification_report.json", "references_verified.bib"),
-                evidence_refs=("stage-23/verification_report.json",),
-                error=(
-                    f"Paper cites {len(_cited_keys_no_bib)} key(s) but no "
-                    "references.bib exists — citations cannot be verified."
-                ),
-                decision="retry",
-            )
-        return StageResult(
-            stage=Stage.CITATION_VERIFY,
-            status=StageStatus.DONE,
-            artifacts=("verification_report.json", "references_verified.bib"),
-            evidence_refs=(
-                "stage-23/verification_report.json",
-                "stage-23/references_verified.bib",
-            ),
-        )
-
-    from researchclaw.literature.verify import parse_bibtex_entries
-    all_bib_keys = {
-        str(entry.get("key") or "").strip()
-        for entry in parse_bibtex_entries(bib_text)
-        if str(entry.get("key") or "").strip()
-    }
-    bounded_bib = _remove_bibtex_entries(bib_text, all_bib_keys - set(cited_keys))
-    bounded_entries = parse_bibtex_entries(bounded_bib)
-    bounded_keys = {
-        str(entry.get("key") or "").strip()
-        for entry in bounded_entries
-        if str(entry.get("key") or "").strip()
-    }
-    if bounded_keys != set(cited_keys) or len(bounded_entries) != len(cited_keys):
-        return StageResult(
-            stage=Stage.CITATION_VERIFY,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            error="Bounded bibliography does not exactly match final cited keys",
-            decision="retry",
-        )
-
-    s2_api_key = getattr(config.llm, "s2_api_key", "") or ""
-    _n_entries = len(bounded_entries)
-    logger.info(
-        "[citation-verify] Verifying %d references "
-        "(DOI→CrossRef > OpenAlex > arXiv > S2)…",
-        _n_entries,
-    )
-    report = verify_citations(bounded_bib, s2_api_key=s2_api_key)
-    logger.info(
-        "[citation-verify] Done: %d verified, %d suspicious, "
-        "%d hallucinated, %d skipped (integrity: %.0f%%)",
-        report.verified,
-        report.suspicious,
-        report.hallucinated,
-        report.skipped,
-        report.integrity_score * 100,
-    )
-
-    result_keys = {result.cite_key for result in report.results}
-    status_counts = {
-        VerifyStatus.VERIFIED: sum(
-            result.status == VerifyStatus.VERIFIED for result in report.results
-        ),
-        VerifyStatus.SUSPICIOUS: sum(
-            result.status == VerifyStatus.SUSPICIOUS for result in report.results
-        ),
-        VerifyStatus.HALLUCINATED: sum(
-            result.status == VerifyStatus.HALLUCINATED for result in report.results
-        ),
-        VerifyStatus.SKIPPED: sum(
-            result.status == VerifyStatus.SKIPPED for result in report.results
-        ),
-    }
-    if (
-        report.total != len(cited_keys)
-        or len(report.results) != len(cited_keys)
-        or result_keys != set(cited_keys)
-        or report.verified != status_counts[VerifyStatus.VERIFIED]
-        or report.suspicious != status_counts[VerifyStatus.SUSPICIOUS]
-        or report.hallucinated != status_counts[VerifyStatus.HALLUCINATED]
-        or report.skipped != status_counts[VerifyStatus.SKIPPED]
-    ):
-        return StageResult(
-            stage=Stage.CITATION_VERIFY,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            error="Citation verification result closure mismatch",
-            decision="retry",
-        )
-
-    relevance_error = ""
-    if llm is not None and report.results:
-        try:
-            relevance_scores = _check_citation_relevance(
-                llm, config.research.topic, report.results
-            )
-        except (RuntimeError, ValueError) as exc:
-            relevance_error = str(exc)
-        else:
-            for result in report.results:
-                result.relevance_score = relevance_scores[result.cite_key]
-
-    relevance_threshold = 0.5
-    hallucinated_keys = sorted(
-        result.cite_key
-        for result in report.results
-        if result.status == VerifyStatus.HALLUCINATED
-    )
-    suspicious_keys = sorted(
-        result.cite_key
-        for result in report.results
-        if result.status == VerifyStatus.SUSPICIOUS
-    )
-    skipped_keys = sorted(
-        result.cite_key
-        for result in report.results
-        if result.status == VerifyStatus.SKIPPED
-    )
-    unscored_keys = sorted(
-        result.cite_key
-        for result in report.results
-        if result.relevance_score is None
-    )
-    low_relevance_keys = sorted(
-        result.cite_key
-        for result in report.results
-        if result.relevance_score is not None
-        and result.relevance_score < relevance_threshold
-    )
-    strict_scope = config.experiment.claim_scope != "pipeline_validation"
-    fatal = bool(hallucinated_keys) or (
-        strict_scope
-        and bool(
-            suspicious_keys
-            or skipped_keys
-            or unscored_keys
-            or low_relevance_keys
-            or relevance_error
-        )
-    )
-    degraded = not fatal and bool(
-        suspicious_keys
-        or skipped_keys
-        or unscored_keys
-        or low_relevance_keys
-        or relevance_error
-    )
-    report_payload = report.to_dict()
-    summary = report_payload["summary"]
-    if isinstance(summary, dict):
-        summary.update(
-            {
-                "claim_scope": config.experiment.claim_scope,
-                "cited_keys": sorted(cited_keys),
-                "verification_complete": not (
-                    hallucinated_keys or suspicious_keys or skipped_keys
-                ),
-                "relevance_complete": not unscored_keys and not relevance_error,
-                "relevance_threshold": relevance_threshold,
-                "hallucinated_keys": hallucinated_keys,
-                "suspicious_keys": suspicious_keys,
-                "skipped_keys": skipped_keys,
-                "unscored_keys": unscored_keys,
-                "low_relevance_keys": low_relevance_keys,
-                "relevance_error": relevance_error or None,
-                "degraded": degraded,
-                "fatal": fatal,
-            }
-        )
-    (stage_dir / "verification_report.json").write_text(
-        json.dumps(report_payload, indent=2), encoding="utf-8"
-    )
-
-    verified_bib = filter_verified_bibtex(
-        bounded_bib, report, include_suspicious=True
-    )
-
-    # v2 (supersedes BUG-26): NEVER fall back to the unverified original bib.
-    # Restoring bib_text wholesale re-admits every hallucinated/suspicious
-    # entry that verification just removed — the exact fail-open path a
-    # release gate exists to prevent. Heavy stripping (e.g. rate limiting)
-    # is recorded as evidence instead, and the missing-verified-entries gate
-    # in release_check blocks the run.
-    original_count = len(re.findall(r"@\w+\{", bounded_bib))
-    verified_count = len(re.findall(r"@\w+\{", verified_bib))
-    if original_count > 0 and verified_count < original_count * 0.5:
-        logger.warning(
-            "Stage 23: Verification stripped %d→%d entries (>50%% loss). "
-            "NOT restoring the unverified original bib; run is not "
-            "release-eligible until verification succeeds.",
-            original_count, verified_count,
-        )
-        try:
-            (stage_dir / "bib_strip_warning.json").write_text(
-                json.dumps(
-                    {
-                        "original_entries": original_count,
-                        "verified_entries": verified_count,
-                        "strip_ratio": round(
-                            1 - verified_count / max(original_count, 1), 3
-                        ),
-                        "note": (
-                            "More than 50% of bib entries failed verification "
-                            "or were rate-limited. Original bib was NOT restored."
-                        ),
-                        "generated": _utcnow_iso(),
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
-
-    # IMP-1: Also prune uncited entries from verified bib
-    # BUG-182: Also scan LaTeX paper.tex (not just Markdown) for \cite{} keys.
-    # The Markdown version may use [key] notation while LaTeX uses \cite{key}.
-    if paper_text.strip():
-        _vbib_keys = set(re.findall(r"@\w+\{([^,]+),", verified_bib))
-        _cited_in_paper: set[str] = set()
-        _cited_in_paper.update(
-            re.findall(r"\[([a-zA-Z]+\d{4}[a-zA-Z0-9_-]*)\]", paper_text)
-        )
-        for _cm in re.finditer(r"\\cite\{([^}]+)\}", paper_text):
-            _cited_in_paper.update(
-                k.strip() for k in _cm.group(1).split(",")
-            )
-        # BUG-182: Also read stage-22/paper.tex for \cite{} keys
-        _latex_paper = stage_dir.parent / "stage-22" / "paper.tex"
-        if not _latex_paper.is_symlink() and _latex_paper.is_file():
-            try:
-                _latex_text = _latex_paper.read_text(encoding="utf-8")
-                for _cm in re.finditer(r"\\cite[pt]?\{([^}]+)\}", _latex_text):
-                    _cited_in_paper.update(
-                        k.strip() for k in _cm.group(1).split(",")
-                    )
-            except OSError:
-                pass
-        _uncited_vbib = _vbib_keys - _cited_in_paper
-        if _uncited_vbib:
-            verified_bib = _remove_bibtex_entries(verified_bib, _uncited_vbib)
-            logger.info(
-                "Stage 23: Pruned %d uncited entries from verified bib "
-                "(kept %d)",
-                len(_uncited_vbib),
-                len(_vbib_keys) - len(_uncited_vbib),
-            )
-
-    # BUG-100: If all entries were filtered out (low-relevance + uncited pruning),
-    # write a comment instead of an empty file to avoid "Missing or empty output" error.
-    if not verified_bib.strip():
-        verified_bib = "% All citations were filtered out during verification\n"
-        logger.warning(
-            "Stage 23: All BibTeX entries filtered out — writing placeholder"
-        )
-
-    (stage_dir / "references_verified.bib").write_text(verified_bib, encoding="utf-8")
-
-    artifacts = ["verification_report.json", "references_verified.bib"]
-
-    if paper_text.strip():
-        # Stage 23 is an audit boundary, not a manuscript repair stage.  Keep
-        # the exact Stage 22 text so a failed citation cannot be hidden by
-        # deleting its marker or annotating the claim after verification.
-        (stage_dir / "paper_final_verified.md").write_text(
-            paper_text, encoding="utf-8"
-        )
-        artifacts.append("paper_final_verified.md")
-
-    logger.info(
-        "Stage 23 citation verify: %d total, %d verified, %d suspicious, "
-        "%d hallucinated, %d skipped (integrity=%.1f%%)",
-        report.total,
-        report.verified,
-        report.suspicious,
-        report.hallucinated,
-        report.skipped,
-        report.integrity_score * 100,
-    )
-
-    evidence_refs = tuple(f"stage-23/{a}" for a in artifacts)
-    if fatal:
-        blockers = sorted(
-            set(
-                hallucinated_keys
-                + suspicious_keys
-                + skipped_keys
-                + unscored_keys
-                + low_relevance_keys
-            )
-        )
-        detail = relevance_error or ", ".join(blockers[:20]) or "unknown"
-        return StageResult(
-            stage=Stage.CITATION_VERIFY,
-            status=StageStatus.FAILED,
-            artifacts=tuple(artifacts),
-            evidence_refs=evidence_refs,
-            error=f"Citation verification is incomplete or invalid: {detail}",
+            error=str(exc),
             decision="retry",
         )
     return StageResult(
         stage=Stage.CITATION_VERIFY,
         status=StageStatus.DONE,
-        artifacts=tuple(artifacts),
-        evidence_refs=evidence_refs,
-        decision="degraded" if degraded else None,
+        artifacts=outcome.artifacts,
+        evidence_refs=tuple(f"stage-23/{name}" for name in outcome.artifacts),
+        decision="degraded" if outcome.degraded else None,
     )

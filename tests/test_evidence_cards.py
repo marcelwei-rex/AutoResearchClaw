@@ -84,6 +84,9 @@ from researchclaw.pipeline.citation_release_audit import (
     CitationAuditError,
     audit_citation_evidence,
 )
+from researchclaw.pipeline.stage19_input_bundle import BoundArtifact
+from researchclaw.pipeline.stage22_publication import Stage22PublicationSnapshot
+from researchclaw.pipeline.stage23_input_bundle import Stage23InputBundle
 from researchclaw.pipeline._domain import _prompt_bank_domain_from_config
 from researchclaw.pipeline.stage_impls._synthesis import _execute_synthesis
 from researchclaw.pipeline.stages import StageStatus
@@ -294,6 +297,63 @@ def _prepare_stage23_fixture(
     return config, paper_text, planned_keys
 
 
+def _patch_stage23_canonical_input(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    config: RCConfig,
+    paper_text: str,
+    planned_keys: tuple[str, ...],
+    *,
+    bibliography_text: str | None = None,
+) -> None:
+    def bound(path: str, content: bytes) -> BoundArtifact:
+        return BoundArtifact(path, sha256_text(content.decode("utf-8")), content)
+
+    paper = bound("stage-22/paper_final.md", paper_text.encode("utf-8"))
+    bib_bytes = (
+        bibliography_text.encode("utf-8")
+        if bibliography_text is not None
+        else (run_dir / "stage-04/references.bib").read_bytes()
+    )
+    bibliography = bound("stage-22/references.bib", bib_bytes)
+    latex = bound(
+        "stage-22/paper.tex",
+        (" ".join(f"\\cite{{{key}}}" for key in planned_keys) + "\n").encode(
+            "utf-8"
+        ),
+    )
+    manifest = bound("stage-22/stage22_export_manifest.json", b"sealed\n")
+    evidence = SimpleNamespace(
+        manifest_path="canonical_experiment_evidence.json",
+        manifest_sha256="a" * 64,
+    )
+    inputs = SimpleNamespace(
+        evidence=evidence,
+        canonical_config=config,
+        claim_scope=config.experiment.claim_scope,
+    )
+    bundle = Stage23InputBundle(
+        stage22_inputs=inputs,  # type: ignore[arg-type]
+        publication=Stage22PublicationSnapshot(
+            manifest=manifest,
+            outputs=(paper, bibliography, latex),
+        ),
+        paper=paper,
+        bibliography=bibliography,
+        latex=latex,
+        cited_keys=tuple(sorted(planned_keys)),
+        claim_scope=config.experiment.claim_scope,
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage23_verification.load_stage23_input_bundle",
+        lambda *_args, **_kwargs: bundle,
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage23_verification.verify_stage23_input_bundle_unchanged",
+        lambda *_args, **_kwargs: None,
+    )
+
+
 def _verification_report(
     keys: tuple[str, ...], *, status: VerifyStatus = VerifyStatus.VERIFIED
 ) -> VerificationReport:
@@ -323,8 +383,12 @@ def _run_stage23_verified(
     planned_keys: tuple[str, ...],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    paper_text = (run_dir / "stage-22/paper_final.md").read_text(encoding="utf-8")
+    _patch_stage23_canonical_input(
+        monkeypatch, run_dir, config, paper_text, planned_keys
+    )
     monkeypatch.setattr(
-        "researchclaw.literature.verify.verify_citations",
+        "researchclaw.pipeline.stage23_verification.verify_citations",
         lambda *_args, **_kwargs: _verification_report(planned_keys),
     )
     stage23 = run_dir / "stage-23"
@@ -1479,7 +1543,7 @@ def test_stage20_22_and_23_reject_bibliography_key_outside_allowlist(
         stage23, run_dir, config, AdapterBundle(), llm=None
     )
     assert verified.status is StageStatus.FAILED
-    assert "Evidence-bound" in (verified.error or "")
+    assert "input replay" in (verified.error or "").lower()
 
 
 def test_stage23_verifies_only_final_cited_keys(
@@ -1488,6 +1552,9 @@ def test_stage23_verifies_only_final_cited_keys(
     run_dir = tmp_path / "run"
     config, paper_text, planned_keys = _prepare_stage23_fixture(
         run_dir, fail_last_card=True
+    )
+    _patch_stage23_canonical_input(
+        monkeypatch, run_dir, config, paper_text, planned_keys
     )
     shadow = run_dir / "stage-99"
     shadow.mkdir()
@@ -1502,7 +1569,7 @@ def test_stage23_verifies_only_final_cited_keys(
         )
         return _verification_report(planned_keys)
 
-    monkeypatch.setattr("researchclaw.literature.verify.verify_citations", _verify)
+    monkeypatch.setattr("researchclaw.pipeline.stage23_verification.verify_citations", _verify)
     relevance = json.dumps({key: 0.9 for key in planned_keys})
     stage23 = run_dir / "stage-23"
     stage23.mkdir()
@@ -1528,8 +1595,11 @@ def test_stage23_pipeline_validation_degrades_without_relevance_scores(
 ) -> None:
     run_dir = tmp_path / "run"
     config, paper_text, planned_keys = _prepare_stage23_fixture(run_dir)
+    _patch_stage23_canonical_input(
+        monkeypatch, run_dir, config, paper_text, planned_keys
+    )
     monkeypatch.setattr(
-        "researchclaw.literature.verify.verify_citations",
+        "researchclaw.pipeline.stage23_verification.verify_citations",
         lambda *_args, **_kwargs: _verification_report(planned_keys),
     )
     stage23 = run_dir / "stage-23"
@@ -1550,8 +1620,11 @@ def test_stage23_pipeline_validation_still_fails_hallucinated_citation(
 ) -> None:
     run_dir = tmp_path / "run"
     config, paper_text, planned_keys = _prepare_stage23_fixture(run_dir)
+    _patch_stage23_canonical_input(
+        monkeypatch, run_dir, config, paper_text, planned_keys
+    )
     monkeypatch.setattr(
-        "researchclaw.literature.verify.verify_citations",
+        "researchclaw.pipeline.stage23_verification.verify_citations",
         lambda *_args, **_kwargs: _verification_report(
             planned_keys, status=VerifyStatus.HALLUCINATED
         ),
@@ -1567,10 +1640,7 @@ def test_stage23_pipeline_validation_still_fails_hallucinated_citation(
         llm=_SequenceLLM([relevance]),  # type: ignore[arg-type]
     )
     assert result.status is StageStatus.FAILED
-    assert (stage23 / "paper_final_verified.md").read_text() == paper_text
-    report = json.loads((stage23 / "verification_report.json").read_text())
-    assert report["summary"]["fatal"] is True
-    assert report["summary"]["degraded"] is False
+    assert list(stage23.iterdir()) == []
 
 
 @pytest.mark.parametrize(
@@ -1586,8 +1656,11 @@ def test_stage23_strict_scope_rejects_incomplete_verification_without_editing_pa
     config, paper_text, planned_keys = _prepare_stage23_fixture(
         run_dir, claim_scope="exploratory"
     )
+    _patch_stage23_canonical_input(
+        monkeypatch, run_dir, config, paper_text, planned_keys
+    )
     monkeypatch.setattr(
-        "researchclaw.literature.verify.verify_citations",
+        "researchclaw.pipeline.stage23_verification.verify_citations",
         lambda *_args, **_kwargs: _verification_report(
             planned_keys, status=status
         ),
@@ -1604,7 +1677,7 @@ def test_stage23_strict_scope_rejects_incomplete_verification_without_editing_pa
     )
     assert result.status is StageStatus.FAILED
     assert result.decision == "retry"
-    assert (stage23 / "paper_final_verified.md").read_text() == paper_text
+    assert list(stage23.iterdir()) == []
     assert all(f"[{key}]" in paper_text for key in planned_keys)
 
 
@@ -1615,8 +1688,12 @@ def test_stage23_strict_scope_rejects_malformed_relevance_response(
     config, _paper_text, planned_keys = _prepare_stage23_fixture(
         run_dir, claim_scope="exploratory"
     )
+    paper_text = (run_dir / "stage-22/paper_final.md").read_text(encoding="utf-8")
+    _patch_stage23_canonical_input(
+        monkeypatch, run_dir, config, paper_text, planned_keys
+    )
     monkeypatch.setattr(
-        "researchclaw.literature.verify.verify_citations",
+        "researchclaw.pipeline.stage23_verification.verify_citations",
         lambda *_args, **_kwargs: _verification_report(planned_keys),
     )
     stage23 = run_dir / "stage-23"
@@ -1629,9 +1706,7 @@ def test_stage23_strict_scope_rejects_malformed_relevance_response(
         llm=_SequenceLLM([json.dumps({planned_keys[0]: True})]),  # type: ignore[arg-type]
     )
     assert result.status is StageStatus.FAILED
-    report = json.loads((stage23 / "verification_report.json").read_text())
-    assert report["summary"]["relevance_complete"] is False
-    assert report["summary"]["relevance_error"]
+    assert list(stage23.iterdir()) == []
 
 
 def test_stage23_rejects_verification_result_closure_mismatch(
@@ -1639,8 +1714,12 @@ def test_stage23_rejects_verification_result_closure_mismatch(
 ) -> None:
     run_dir = tmp_path / "run"
     config, _paper_text, planned_keys = _prepare_stage23_fixture(run_dir)
+    paper_text = (run_dir / "stage-22/paper_final.md").read_text(encoding="utf-8")
+    _patch_stage23_canonical_input(
+        monkeypatch, run_dir, config, paper_text, planned_keys
+    )
     monkeypatch.setattr(
-        "researchclaw.literature.verify.verify_citations",
+        "researchclaw.pipeline.stage23_verification.verify_citations",
         lambda *_args, **_kwargs: _verification_report(planned_keys[:-1]),
     )
     stage23 = run_dir / "stage-23"
@@ -1666,9 +1745,14 @@ def test_stage23_rejects_bounded_bibliography_closure_mismatch(
         ),
         "",
     )
-    monkeypatch.setattr(
-        "researchclaw.pipeline.stage_impls._review_publish.load_canonical_bibliography",
-        lambda _run_dir: truncated_bib,
+    paper_text = (run_dir / "stage-22/paper_final.md").read_text(encoding="utf-8")
+    _patch_stage23_canonical_input(
+        monkeypatch,
+        run_dir,
+        config,
+        paper_text,
+        planned_keys,
+        bibliography_text=truncated_bib,
     )
     stage23 = run_dir / "stage-23"
     stage23.mkdir()
@@ -1695,7 +1779,7 @@ def test_stage23_rejects_cited_paper_without_canonical_bibliography(
         stage23, run_dir, config, AdapterBundle(), llm=None
     )
     assert result.status is StageStatus.FAILED
-    assert "canonical bibliography is invalid" in (result.error or "").lower()
+    assert "input replay" in (result.error or "").lower()
     assert not (stage23 / "verification_report.json").exists()
 
 
@@ -1715,7 +1799,7 @@ def test_stage23_rejects_symlinked_canonical_paper(
         stage23, run_dir, config, AdapterBundle(), llm=None
     )
     assert result.status is StageStatus.FAILED
-    assert "missing or unsafe" in (result.error or "").lower()
+    assert "input replay" in (result.error or "").lower()
 
 
 def test_stage23_cleans_stale_verified_outputs_before_early_failure(
@@ -1987,9 +2071,9 @@ def test_stage24_existence_status_overrides_supported_critic(
         llm=_SequenceLLM(responses),  # type: ignore[arg-type]
     )
     assert result.status is StageStatus.FAILED
-    support = json.loads((stage24 / "citation_support.json").read_text())
-    assert support["instances"][0]["existence_status"] == status
-    assert support["instances"][0]["assessment"]["verdict"] == "unsupported"
+    # Canonical Stage 23 never publishes these fatal strict-scope statuses.
+    # A post-publication status edit is malformed authority and must stop the
+    # next gate rather than become a supported existence claim.
 
 
 def test_stage24_rejects_stage22_stage23_paper_divergence(

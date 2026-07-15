@@ -139,6 +139,13 @@ SKIP_FORBIDDEN_STAGES: frozenset[Stage] = frozenset(
         Stage.ITERATIVE_REFINE,
         Stage.RESULT_ANALYSIS,
         Stage.PAPER_OUTLINE,
+        Stage.PAPER_DRAFT,
+        Stage.PEER_REVIEW,
+        Stage.PAPER_REVISION,
+        Stage.QUALITY_GATE,
+        Stage.KNOWLEDGE_ARCHIVE,
+        Stage.EXPORT_PUBLISH,
+        Stage.CITATION_VERIFY,
     }
 )
 
