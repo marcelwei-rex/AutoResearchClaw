@@ -2215,7 +2215,7 @@ class TestResultAnalysisDebate:
         )
         assert data["claims"][0]["text"] == "literal ,} in a string"
 
-    def test_truth_audit_falls_back_when_llm_returns_zero_claims(
+    def test_truth_audit_preflight_blocks_legacy_claim_fallback(
         self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -2223,75 +2223,14 @@ class TestResultAnalysisDebate:
         run_dir.mkdir()
         stage23 = run_dir / "stage-23"
         stage23.mkdir(parents=True)
-        (stage23 / "paper_final_verified.md").write_text(
-            "# Paper\n\n## Results\n\nOur method reaches 0.1234 F1 on the synthetic benchmark.",
-            encoding="utf-8",
-        )
+        paper_text = "# Paper\n\n## Results\n\nOur method reaches 0.1234 F1 on the synthetic benchmark."
+        (stage23 / "paper_final_verified.md").write_text(paper_text, encoding="utf-8")
         stage_dir = run_dir / "stage-24"
         stage_dir.mkdir(parents=True)
         llm = FakeLLMClient('{"claims": []}')
         monkeypatch.setattr(
-            "researchclaw.pipeline.stage_impls._release_audit.build_citation_support_closure",
-            lambda *_args, **_kwargs: {
-                "instances": [],
-                "valid": True,
-                "dataset_origin": "synthetic",
-                "dataset_claim_violations": [],
-                "counts": {
-                    "total": 0,
-                    "supported": 0,
-                    "unsupported": 0,
-                    "dataset_claim_violations": 0,
-                },
-            },
-        )
-
-        result = rc_executor._execute_truth_audit(
-            stage_dir, run_dir, rc_config, adapters, llm=llm
-        )
-
-        assert result.status == StageStatus.DONE
-        claims_payload = json.loads((stage_dir / "claims.json").read_text())
-        assert claims_payload["extraction_method"] == "deterministic_fallback"
-        assert claims_payload["counts"]["total"] == 1
-        claim = claims_payload["claims"][0]
-        assert claim["type"] == "quantitative"
-        assert claim["values"] == [0.1234]
-        assert claim["status"] == "unsupported"
-        assert claim["evidence"] == []
-        truth = json.loads((stage_dir / "truth_audit.json").read_text())
-        assert truth["llm_available"] is True
-        assert truth["counts"]["total"] == 1
-
-    def test_truth_audit_fails_closed_when_llm_and_fallback_find_no_claims(
-        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        run_dir = tmp_path / "run"
-        run_dir.mkdir()
-        stage23 = run_dir / "stage-23"
-        stage23.mkdir(parents=True)
-        (stage23 / "paper_final_verified.md").write_text(
-            "# Paper\n\n## Introduction\n\nThis document contains only generic background prose.",
-            encoding="utf-8",
-        )
-        stage_dir = run_dir / "stage-24"
-        stage_dir.mkdir(parents=True)
-        llm = FakeLLMClient("not json")
-        monkeypatch.setattr(
-            "researchclaw.pipeline.stage_impls._release_audit.build_citation_support_closure",
-            lambda *_args, **_kwargs: {
-                "instances": [],
-                "valid": True,
-                "dataset_origin": "synthetic",
-                "dataset_claim_violations": [],
-                "counts": {
-                    "total": 0,
-                    "supported": 0,
-                    "unsupported": 0,
-                    "dataset_claim_violations": 0,
-                },
-            },
+            "researchclaw.pipeline.stage_impls._release_audit.load_stage24_input_bundle",
+            lambda *_args, **_kwargs: object(),
         )
 
         result = rc_executor._execute_truth_audit(
@@ -2299,14 +2238,36 @@ class TestResultAnalysisDebate:
         )
 
         assert result.status == StageStatus.FAILED
-        assert "no claims" in (result.error or "")
-        assert (stage_dir / "claims.json").is_file()
-        assert (stage_dir / "citations.json").is_file()
-        assert (stage_dir / "critique_resolution.json").is_file()
-        assert (stage_dir / "truth_audit.json").is_file()
-        truth = json.loads((stage_dir / "truth_audit.json").read_text())
-        assert truth["llm_available"] is True
-        assert truth["counts"]["total"] == 0
+        assert result.error == "canonical_stage24_mode_not_activated"
+        assert llm.calls == []
+        assert tuple(stage_dir.iterdir()) == ()
+
+    def test_truth_audit_preflight_blocks_legacy_empty_claim_path(
+        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        stage23 = run_dir / "stage-23"
+        stage23.mkdir(parents=True)
+        paper_text = "# Paper\n\n## Introduction\n\nThis document contains only generic background prose."
+        (stage23 / "paper_final_verified.md").write_text(paper_text, encoding="utf-8")
+        stage_dir = run_dir / "stage-24"
+        stage_dir.mkdir(parents=True)
+        llm = FakeLLMClient("not json")
+        monkeypatch.setattr(
+            "researchclaw.pipeline.stage_impls._release_audit.load_stage24_input_bundle",
+            lambda *_args, **_kwargs: object(),
+        )
+
+        result = rc_executor._execute_truth_audit(
+            stage_dir, run_dir, rc_config, adapters, llm=llm
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert result.error == "canonical_stage24_mode_not_activated"
+        assert llm.calls == []
+        assert tuple(stage_dir.iterdir()) == ()
 
 
 class TestParseMetricsFromStdout:

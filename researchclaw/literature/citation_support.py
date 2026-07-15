@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from researchclaw.experiment_runtime.contract import find_stage09_contract, load_contract
@@ -26,6 +28,147 @@ class CitationSupportContractError(ValueError):
 AssessmentFn = Callable[[dict[str, Any]], dict[str, str]]
 
 
+@dataclass(frozen=True)
+class _LegacyCitationSupportReplayInputs:
+    """Filesystem-free citation support authority captured by Stage 24."""
+
+    paper_path: str
+    paper_text: str
+    paper_sha256: str
+    citation_plan_path: str
+    citation_plan_sha256: str
+    citation_plan: Mapping[str, Any]
+    cards_manifest_path: str
+    cards_manifest_sha256: str
+    evidence_cards: tuple[Mapping[str, Any], ...]
+    verification_report_path: str
+    verification_report_sha256: str
+    verification: Mapping[str, Any]
+    experiment_contract_path: str
+    experiment_contract_sha256: str
+    dataset_origin: str
+    critic_model: str
+
+
+def _legacy_citation_support_assessment_inputs(
+    inputs: _LegacyCitationSupportReplayInputs,
+) -> tuple[Mapping[str, Any], ...]:
+    """Derive the exact ordered critic prompts without reading the filesystem."""
+
+    prepared = _prepare_support_instances(inputs)
+    return tuple(
+        MappingProxyType(
+            {
+                "instance_id": row["instance_id"],
+                "cite_key": row["cite_key"],
+                "claim_text": row["claim_text"],
+                "citation_context": row["citation_context"],
+                "planned_claim_id": row["planned_claim_id"],
+                "planned_claim_text": row["planned_claim_text"],
+                "evidence_excerpts": tuple(
+                    MappingProxyType(dict(excerpt))
+                    for excerpt in row["evidence_excerpts"]
+                ),
+            }
+        )
+        for row in prepared
+    )
+
+
+def _replay_legacy_citation_support_closure(
+    inputs: _LegacyCitationSupportReplayInputs,
+    assessment_records: tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """Replay citation support from captured values and raw assessment records."""
+
+    prepared = _prepare_support_instances(inputs)
+    expected_ids = tuple(str(row["instance_id"]) for row in prepared)
+    records_by_id: dict[str, Mapping[str, Any]] = {}
+    for record in assessment_records:
+        if not isinstance(record, Mapping) or set(record) != {
+            "instance_id",
+            "critic_model",
+            "verdict",
+            "reason",
+        }:
+            raise CitationSupportContractError("support assessment fields mismatch")
+        instance_id = _required_string(record, "instance_id")
+        if instance_id in records_by_id:
+            raise CitationSupportContractError("duplicate support assessment instance")
+        if _required_string(record, "critic_model") != inputs.critic_model:
+            raise CitationSupportContractError("support critic model mismatch")
+        verdict = _required_string(record, "verdict")
+        _required_string(record, "reason")
+        if verdict not in SUPPORT_VERDICTS:
+            raise CitationSupportContractError("invalid support assessment verdict")
+        records_by_id[instance_id] = record
+    if tuple(records_by_id) != expected_ids:
+        raise CitationSupportContractError("support assessment instance closure mismatch")
+
+    obligations: list[dict[str, Any]] = []
+    for row in prepared:
+        record = records_by_id[str(row["instance_id"])]
+        verdict = str(record["verdict"])
+        reason = str(record["reason"]).strip()
+        existence_status = str(row["existence_status"])
+        if existence_status != "verified":
+            verdict = "unsupported"
+            reason = f"Citation existence status is {existence_status}."
+        obligations.append(
+            {
+                "instance_id": row["instance_id"],
+                "cite_key": row["cite_key"],
+                "claim_id": f"support-{row['instance_id']}",
+                "claim_text": row["claim_text"],
+                "claim_text_sha256": _sha256(str(row["claim_text"])),
+                "planned_claim_id": row["planned_claim_id"],
+                "existence_status": existence_status,
+                "evidence_excerpts": row["evidence_excerpts"],
+                "assessment": {
+                    "verdict": verdict,
+                    "reason": reason,
+                    "critic_model": inputs.critic_model,
+                    "context_isolated": True,
+                },
+            }
+        )
+
+    dataset_violations = list(
+        find_dataset_claim_violations(inputs.paper_text, inputs.dataset_origin)
+    )
+    payload = {
+        "schema_version": SUPPORT_CLOSURE_SCHEMA_VERSION,
+        "paper_path": inputs.paper_path,
+        "paper_sha256": inputs.paper_sha256,
+        "citation_plan_path": inputs.citation_plan_path,
+        "citation_plan_sha256": inputs.citation_plan_sha256,
+        "cards_manifest_path": inputs.cards_manifest_path,
+        "cards_manifest_sha256": inputs.cards_manifest_sha256,
+        "verification_report_path": inputs.verification_report_path,
+        "verification_report_sha256": inputs.verification_report_sha256,
+        "experiment_contract_path": inputs.experiment_contract_path,
+        "experiment_contract_sha256": inputs.experiment_contract_sha256,
+        "dataset_origin": inputs.dataset_origin,
+        "dataset_claim_violations": dataset_violations,
+        "instances": obligations,
+        "counts": {
+            "total": len(obligations),
+            "supported": sum(
+                row["assessment"]["verdict"] == "supported" for row in obligations
+            ),
+            "unsupported": sum(
+                row["assessment"]["verdict"] == "unsupported" for row in obligations
+            ),
+            "dataset_claim_violations": len(dataset_violations),
+        },
+        "valid": all(
+            row["assessment"]["verdict"] == "supported" for row in obligations
+        )
+        and not dataset_violations,
+    }
+    return parse_citation_support_closure(_canonical_json(payload))
+
+
 def build_citation_support_closure(
     run_dir: Path,
     config: Any,
@@ -34,7 +177,7 @@ def build_citation_support_closure(
     assessor: AssessmentFn | None,
     critic_model: str,
 ) -> dict[str, Any]:
-    """Build one support obligation for every final-paper citation instance."""
+    """Compatibility capture wrapper for independent replay migration."""
 
     stage22_paper = run_dir / "stage-22" / "paper_final.md"
     try:
@@ -46,55 +189,147 @@ def build_citation_support_closure(
         raise CitationSupportContractError(f"cannot bind canonical paper: {exc}") from exc
 
     plan = load_final_citation_plan(run_dir, config)
-    cards = load_validated_cards(run_dir, config)
-    cards_by_key = {str(card["cite_key"]): card for card in cards}
-    plan_by_key: dict[str, dict[str, Any]] = {}
-    for claim in plan["claims"]:
-        for citation in claim["planned_citations"]:
-            key = str(citation["cite_key"])
-            if key in plan_by_key:
-                raise CitationSupportContractError("duplicate key in final citation plan")
-            plan_by_key[key] = {
-                "claim": claim,
-                "citation": citation,
-            }
-
+    cards = tuple(load_validated_cards(run_dir, config))
     verification_path = run_dir / "stage-23" / "verification_report.json"
     verification = _read_object(verification_path, "verification report")
-    verification_results = verification.get("results")
-    if not isinstance(verification_results, list):
+    contract_path = find_stage09_contract(run_dir)
+    if contract_path is None or contract_path.is_symlink() or not contract_path.is_file():
+        raise CitationSupportContractError("canonical experiment contract is missing or unsafe")
+    contract = load_contract(contract_path)
+    contract_text = contract_path.read_text(encoding="utf-8")
+    inputs = _LegacyCitationSupportReplayInputs(
+        paper_path="stage-23/paper_final_verified.md",
+        paper_text=paper_text,
+        paper_sha256=_sha256(paper_text),
+        citation_plan_path="stage-16/citation_plan.json",
+        citation_plan_sha256=_sha256(
+            (run_dir / "stage-16" / "citation_plan.json").read_text(encoding="utf-8")
+        ),
+        citation_plan=plan,
+        cards_manifest_path="stage-06/cards_manifest.json",
+        cards_manifest_sha256=_sha256(
+            (run_dir / "stage-06" / "cards_manifest.json").read_text(encoding="utf-8")
+        ),
+        evidence_cards=cards,
+        verification_report_path="stage-23/verification_report.json",
+        verification_report_sha256=_sha256(
+            verification_path.read_text(encoding="utf-8")
+        ),
+        verification=verification,
+        experiment_contract_path=contract_path.relative_to(run_dir).as_posix(),
+        experiment_contract_sha256=_sha256(contract_text),
+        dataset_origin=contract.dataset_origin,
+        critic_model=critic_model,
+    )
+    records: list[Mapping[str, Any]] = []
+    for prompt in _legacy_citation_support_assessment_inputs(inputs):
+        assessment = assessor(_plain_value(prompt)) if assessor is not None else {
+            "verdict": "unsupported",
+            "reason": "No isolated support critic was available.",
+        }
+        if not isinstance(assessment, dict) or set(assessment) != {"verdict", "reason"}:
+            raise CitationSupportContractError("support assessment fields mismatch")
+        records.append(
+            {
+                "instance_id": prompt["instance_id"],
+                "critic_model": critic_model,
+                "verdict": assessment["verdict"],
+                "reason": assessment["reason"],
+            }
+        )
+    return _replay_legacy_citation_support_closure(inputs, tuple(records))
+
+
+def _prepare_support_instances(
+    inputs: _LegacyCitationSupportReplayInputs,
+) -> list[dict[str, Any]]:
+    if inputs.paper_path != "stage-23/paper_final_verified.md":
+        raise CitationSupportContractError("noncanonical support paper path")
+    if inputs.paper_sha256 != _sha256(inputs.paper_text):
+        raise CitationSupportContractError("support paper hash mismatch")
+    if not inputs.critic_model.strip():
+        raise CitationSupportContractError("support critic model is missing")
+    if inputs.dataset_origin not in {"synthetic", "public", "local_hardware"}:
+        raise CitationSupportContractError("invalid dataset_origin")
+
+    claims = inputs.citation_plan.get("claims")
+    if not isinstance(claims, (list, tuple)):
+        raise CitationSupportContractError("citation plan claims are missing")
+    plan_by_key: dict[str, dict[str, Any]] = {}
+    for claim in claims:
+        if not isinstance(claim, Mapping):
+            raise CitationSupportContractError("invalid citation plan claim")
+        citations = claim.get("planned_citations")
+        if not isinstance(citations, (list, tuple)):
+            raise CitationSupportContractError("planned citations are missing")
+        for citation in citations:
+            if not isinstance(citation, Mapping):
+                raise CitationSupportContractError("invalid planned citation")
+            key = _required_string(citation, "cite_key")
+            if key in plan_by_key:
+                raise CitationSupportContractError(
+                    "duplicate key in final citation plan"
+                )
+            plan_by_key[key] = {"claim": claim, "citation": citation}
+
+    cards_by_key: dict[str, Mapping[str, Any]] = {}
+    for card in inputs.evidence_cards:
+        if not isinstance(card, Mapping):
+            raise CitationSupportContractError("invalid evidence card")
+        key = _required_string(card, "cite_key")
+        if key in cards_by_key:
+            raise CitationSupportContractError("duplicate evidence-card cite_key")
+        cards_by_key[key] = card
+
+    verification_results = inputs.verification.get("results")
+    if not isinstance(verification_results, (list, tuple)):
         raise CitationSupportContractError("verification results are missing")
     existence_by_key: dict[str, str] = {}
+    verification_by_key: dict[str, Mapping[str, Any]] = {}
     for row in verification_results:
-        if not isinstance(row, dict):
+        if not isinstance(row, Mapping):
             raise CitationSupportContractError("invalid verification result")
         key = _required_string(row, "cite_key")
         status = _required_string(row, "status").lower()
         if key in existence_by_key:
             raise CitationSupportContractError("duplicate verification cite_key")
         existence_by_key[key] = status
+        verification_by_key[key] = row
 
-    instances = extract_citation_instances(paper_text)
+    instances = extract_citation_instances(inputs.paper_text)
     cited_keys = {str(instance["cite_key"]) for instance in instances}
     if set(existence_by_key) != cited_keys:
         raise CitationSupportContractError("verification result key closure mismatch")
-    obligations: list[dict[str, Any]] = []
+    prepared: list[dict[str, Any]] = []
     for instance in instances:
         key = str(instance["cite_key"])
         planned = plan_by_key.get(key)
         card = cards_by_key.get(key)
-        if planned is None or card is None or card["extraction_status"] != "success":
+        if (
+            planned is None
+            or card is None
+            or card.get("extraction_status") != "success"
+        ):
             raise CitationSupportContractError(
                 f"citation instance lacks planned retained evidence: {key}"
             )
+        raw_excerpts = card.get("evidence_excerpts")
+        if not isinstance(raw_excerpts, (list, tuple)):
+            raise CitationSupportContractError("card evidence excerpts are missing")
         excerpts_by_id = {
-            str(excerpt["excerpt_id"]): excerpt
-            for excerpt in card["evidence_excerpts"]
+            _required_string(excerpt, "excerpt_id"): excerpt
+            for excerpt in raw_excerpts
+            if isinstance(excerpt, Mapping)
         }
-        planned_ids = tuple(planned["citation"]["evidence_excerpt_ids"])
+        citation = planned["citation"]
+        claim = planned["claim"]
+        planned_ids = citation.get("evidence_excerpt_ids")
+        if not isinstance(planned_ids, (list, tuple)) or not planned_ids:
+            raise CitationSupportContractError("planned excerpt IDs are missing")
         excerpts: list[dict[str, Any]] = []
-        for excerpt_id in planned_ids:
-            excerpt = excerpts_by_id.get(str(excerpt_id))
+        for excerpt_id_value in planned_ids:
+            excerpt_id = str(excerpt_id_value)
+            excerpt = excerpts_by_id.get(excerpt_id)
             if excerpt is None:
                 raise CitationSupportContractError(
                     f"planned excerpt is absent from evidence card: {excerpt_id}"
@@ -112,91 +347,20 @@ def build_citation_support_closure(
                     "excerpt_sha256": excerpt["excerpt_sha256"],
                 }
             )
-        assessment_input = {
-            "instance_id": instance["instance_id"],
-            "cite_key": key,
-            "claim_text": instance["claim_text"],
-            "citation_context": instance["context"],
-            "planned_claim_id": planned["claim"]["claim_id"],
-            "planned_claim_text": planned["claim"]["claim_text"],
-            "evidence_excerpts": excerpts,
-        }
-        assessment = assessor(assessment_input) if assessor is not None else {
-            "verdict": "unsupported",
-            "reason": "No isolated support critic was available.",
-        }
-        if not isinstance(assessment, dict) or set(assessment) != {"verdict", "reason"}:
-            raise CitationSupportContractError("support assessment fields mismatch")
-        verdict = _required_string(assessment, "verdict")
-        reason = _required_string(assessment, "reason")
-        if verdict not in SUPPORT_VERDICTS:
-            raise CitationSupportContractError("invalid support assessment verdict")
-        existence_status = existence_by_key.get(key, "missing")
-        if existence_status != "verified":
-            verdict = "unsupported"
-            reason = f"Citation existence status is {existence_status}."
-        obligations.append(
+        prepared.append(
             {
                 "instance_id": instance["instance_id"],
                 "cite_key": key,
-                "claim_id": f"support-{instance['instance_id']}",
                 "claim_text": instance["claim_text"],
-                "claim_text_sha256": _sha256(instance["claim_text"]),
-                "planned_claim_id": planned["claim"]["claim_id"],
-                "existence_status": existence_status,
+                "citation_context": instance["context"],
+                "planned_claim_id": _required_string(claim, "claim_id"),
+                "planned_claim_text": _required_string(claim, "claim_text"),
                 "evidence_excerpts": excerpts,
-                "assessment": {
-                    "verdict": verdict,
-                    "reason": reason,
-                    "critic_model": critic_model,
-                    "context_isolated": True,
-                },
+                "existence_status": existence_by_key[key],
+                "verification_record": verification_by_key[key],
             }
         )
-
-    contract_path = find_stage09_contract(run_dir)
-    if contract_path is None or contract_path.is_symlink() or not contract_path.is_file():
-        raise CitationSupportContractError("canonical experiment contract is missing or unsafe")
-    contract = load_contract(contract_path)
-    contract_text = contract_path.read_text(encoding="utf-8")
-    dataset_violations = list(
-        find_dataset_claim_violations(paper_text, contract.dataset_origin)
-    )
-    payload = {
-        "schema_version": SUPPORT_CLOSURE_SCHEMA_VERSION,
-        "paper_path": "stage-23/paper_final_verified.md",
-        "paper_sha256": _sha256(paper_text),
-        "citation_plan_path": "stage-16/citation_plan.json",
-        "citation_plan_sha256": _sha256(
-            (run_dir / "stage-16" / "citation_plan.json").read_text(encoding="utf-8")
-        ),
-        "cards_manifest_path": "stage-06/cards_manifest.json",
-        "cards_manifest_sha256": _sha256(
-            (run_dir / "stage-06" / "cards_manifest.json").read_text(encoding="utf-8")
-        ),
-        "verification_report_path": "stage-23/verification_report.json",
-        "verification_report_sha256": _sha256(
-            verification_path.read_text(encoding="utf-8")
-        ),
-        "experiment_contract_path": contract_path.relative_to(run_dir).as_posix(),
-        "experiment_contract_sha256": _sha256(contract_text),
-        "dataset_origin": contract.dataset_origin,
-        "dataset_claim_violations": dataset_violations,
-        "instances": obligations,
-        "counts": {
-            "total": len(obligations),
-            "supported": sum(
-                row["assessment"]["verdict"] == "supported" for row in obligations
-            ),
-            "unsupported": sum(
-                row["assessment"]["verdict"] == "unsupported" for row in obligations
-            ),
-            "dataset_claim_violations": len(dataset_violations),
-        },
-        "valid": all(row["assessment"]["verdict"] == "supported" for row in obligations)
-        and not dataset_violations,
-    }
-    return parse_citation_support_closure(_canonical_json(payload))
+    return prepared
 
 
 def parse_citation_support_closure(text: str) -> dict[str, Any]:
@@ -379,3 +543,11 @@ def _sha256(text: str) -> str:
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+
+
+def _plain_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _plain_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_value(item) for item in value]
+    return value

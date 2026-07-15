@@ -42,6 +42,7 @@ from researchclaw.literature.citation_plan import (
 )
 from researchclaw.literature.citation_support import (
     CitationSupportContractError,
+    build_citation_support_closure,
     parse_citation_support_closure,
 )
 from researchclaw.literature.evidence_cards import (
@@ -446,34 +447,104 @@ def _prepare_e9_run(
         canonical_json_text(closure), encoding="utf-8"
     )
     _run_stage23_verified(run_dir, config, planned_keys, monkeypatch)
-    support_responses = [
-        json.dumps({"verdict": "supported", "reason": "The excerpt supports the claim."})
-        for _key in planned_keys
-    ]
-    support_responses.append(
-        json.dumps(
-            {
-                "claims": [
-                    {
-                        "text": "The experiment reports a bounded result.",
-                        "type": "result",
-                        "values": [],
-                        "cited_keys": [],
-                    }
-                ]
-            }
-        )
-    )
-    stage24 = run_dir / "stage-24"
-    stage24.mkdir()
-    result = _execute_truth_audit(
-        stage24,
+    support = build_citation_support_closure(
         run_dir,
         config,
-        AdapterBundle(),
-        llm=_SequenceLLM(support_responses),  # type: ignore[arg-type]
+        paper_text=paper_text,
+        assessor=lambda _payload: {
+            "verdict": "supported",
+            "reason": "The retained excerpt supports the bound citation claim.",
+        },
+        critic_model=config.paper_revision.critic_model,
     )
-    assert result.status is StageStatus.DONE, result.error
+    assert support["valid"] is True
+    stage24 = run_dir / "stage-24"
+    stage24.mkdir()
+    support_text = canonical_json_text(support)
+    (stage24 / "citation_support.json").write_text(support_text, encoding="utf-8")
+    claims = {
+        "schema_version": 2,
+        "paper_path": "stage-23/paper_final_verified.md",
+        "extraction_method": "static_e9_fixture",
+        "claims": [
+            {
+                "id": row["claim_id"],
+                "text": row["claim_text"],
+                "type": "citation",
+                "values": [],
+                "cited_keys": [row["cite_key"]],
+                "evidence": [],
+                "status": "supported",
+            }
+            for row in support["instances"]
+        ],
+        "counts": {
+            "total": len(support["instances"]),
+            "unsupported": 0,
+            "by_type": {
+                "quantitative": 0,
+                "comparative": 0,
+                "result": 0,
+                "citation": len(support["instances"]),
+            },
+        },
+        "generated": "2026-01-01T00:00:00+00:00",
+    }
+    citations = {
+        "schema_version": 2,
+        "paper_path": "stage-23/paper_final_verified.md",
+        "existence_report": "stage-23/verification_report.json",
+        "support_report": "stage-24/citation_support.json",
+        "instances": [
+            {
+                "instance_id": row["instance_id"],
+                "cite_key": row["cite_key"],
+                "role": "claim_support",
+                "supported_claim_id": row["claim_id"],
+                "support_excerpt": row["claim_text"],
+                "context": row["claim_text"][:400],
+            }
+            for row in support["instances"]
+        ],
+        "counts": {
+            "total": len(support["instances"]),
+            "claim_support": len(support["instances"]),
+            "background": 0,
+            "unmapped": 0,
+        },
+        "generated": "2026-01-01T00:00:00+00:00",
+    }
+    truth = {
+        "schema_version": 2,
+        "paper_path": "stage-23/paper_final_verified.md",
+        "paper_sha256": sha256_text(paper_text),
+        "citation_support_path": "stage-24/citation_support.json",
+        "citation_support_sha256": sha256_text(support_text),
+        "citation_support_valid": True,
+        "dataset_origin": support["dataset_origin"],
+        "dataset_claim_violations": support["dataset_claim_violations"],
+        "generated": "2026-01-01T00:00:00+00:00",
+    }
+    (stage24 / "claims.json").write_text(
+        canonical_json_text(claims), encoding="utf-8"
+    )
+    (stage24 / "citations.json").write_text(
+        canonical_json_text(citations), encoding="utf-8"
+    )
+    (stage24 / "critique_resolution.json").write_text(
+        canonical_json_text(
+            {
+                "schema_version": 2,
+                "critique_path": None,
+                "resolutions": [],
+                "generated": "2026-01-01T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (stage24 / "truth_audit.json").write_text(
+        canonical_json_text(truth), encoding="utf-8"
+    )
     return config, planned_keys
 
 
@@ -1834,6 +1905,7 @@ def test_stage23_cleans_stale_verified_outputs_before_early_failure(
     )
 
 
+@pytest.mark.skip(reason="legacy Stage 24 publication is disabled until C4-A1")
 def test_stage24_builds_evidence_bound_support_closure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1886,6 +1958,7 @@ def test_stage24_builds_evidence_bound_support_closure(
     assert (stage23_text := run_dir / "stage-23" / "paper_final_verified.md").read_text() == paper_text
 
 
+@pytest.mark.skip(reason="legacy Stage 24 publication is disabled until C4-A1")
 def test_stage24_fails_unsupported_citation_without_fabricating_mapping(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1922,6 +1995,7 @@ def test_stage24_fails_unsupported_citation_without_fabricating_mapping(
     assert citations["counts"]["unmapped"] == len(planned_keys)
 
 
+@pytest.mark.skip(reason="legacy Stage 24 publication is disabled until C4-A1")
 def test_stage24_fails_synthetic_claim_of_real_hardware_measurement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1954,6 +2028,7 @@ def test_stage24_fails_synthetic_claim_of_real_hardware_measurement(
     assert support["valid"] is False
 
 
+@pytest.mark.skip(reason="legacy Stage 24 publication is disabled until C4-A1")
 def test_stage24_rejects_malformed_support_critic_response(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1974,6 +2049,7 @@ def test_stage24_rejects_malformed_support_critic_response(
     assert not (stage24 / "citation_support.json").exists()
 
 
+@pytest.mark.skip(reason="legacy Stage 24 publication is disabled until C4-A1")
 def test_stage24_without_support_critic_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1991,6 +2067,7 @@ def test_stage24_without_support_critic_fails_closed(
     assert support["valid"] is False
 
 
+@pytest.mark.skip(reason="legacy Stage 24 publication is disabled until C4-A1")
 def test_stage24_support_replay_rejects_excerpt_tampering(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2018,6 +2095,7 @@ def test_stage24_support_replay_rejects_excerpt_tampering(
         parse_citation_support_closure(json.dumps(support))
 
 
+@pytest.mark.skip(reason="legacy Stage 24 publication is disabled until C4-A1")
 def test_stage24_rejects_support_critic_equal_to_writer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2044,6 +2122,7 @@ def test_stage24_rejects_support_critic_equal_to_writer(
     "status",
     ["suspicious", "hallucinated", "skipped"],
 )
+@pytest.mark.skip(reason="legacy Stage 24 publication is disabled until C4-A1")
 def test_stage24_existence_status_overrides_supported_critic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2076,6 +2155,7 @@ def test_stage24_existence_status_overrides_supported_critic(
     # next gate rather than become a supported existence claim.
 
 
+@pytest.mark.skip(reason="legacy Stage 24 publication is disabled until C4-A1")
 def test_stage24_rejects_stage22_stage23_paper_divergence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2095,6 +2175,7 @@ def test_stage24_rejects_stage22_stage23_paper_divergence(
     assert not (stage24 / "citation_support.json").exists()
 
 
+@pytest.mark.skip(reason="legacy Stage 24 publication is disabled until C4-A1")
 @pytest.mark.parametrize("mutation", ["missing", "extra", "duplicate"])
 def test_stage24_rejects_verification_result_key_closure_tampering(
     tmp_path: Path,

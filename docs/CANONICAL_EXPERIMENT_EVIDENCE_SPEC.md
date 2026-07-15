@@ -1802,9 +1802,15 @@ copy of those values.
   `generic_support_model=config.paper_revision.critic_model`, and
   `resolution_assessment_model=config.llm.critic_model`;
 - load the bundle once before any Stage 24 LLM call. Consumers receive frozen
-  mappings and bytes only and must not reopen diagnostic paths;
-- replace `build_citation_support_closure(run_dir, ...)` in the producer with
-  the pure
+  mappings and bytes only and must not reopen diagnostic paths. During the
+  C4-A0 implementation window the Stage 24 entrypoint performs this preflight,
+  then fails explicitly with `canonical_stage24_mode_not_activated`; it makes
+  no LLM call and writes no success-named Stage 24 output;
+- define the final citation assessment input and source-record schemas in
+  C4-A0, but do not connect a transitional ordinal-, character-offset-, or
+  normalized-text identity to the producer. C4-A1 atomically adds the unified
+  UTF-8-byte obligation inventory and replaces
+  `build_citation_support_closure(run_dir, ...)` with the pure
   `replay_citation_support_closure(inputs, assessment_records)`. Its input
   object contains only bytes and strict parsed values captured by the bundle;
   it performs no run-directory read, selector, glob, or config load;
@@ -1816,6 +1822,14 @@ copy of those values.
 - immediately before publication, rediscover and replay the complete Stage
   04-23 source graph and compare selected paths, namespace, raw bytes, and
   semantic objects without consuming the fresh bytes as producer input.
+
+C4-A0 and C4-A1 are intentionally not runtime-compatible intermediate modes.
+C4-A0 leaves `stage24_release_consumers=0` and the producer fail-closed after
+preflight. C4-A1 must remove that explicit stop in the same reviewed change
+that installs obligation IDs, assessment input hashes, source-record namespace
+closure, staged semantic replay, final source fixpoints, and manifest-last
+publication. Tests must not reactivate the legacy producer through a fixture or
+private compatibility switch.
 
 `Stage24InputBundle` identity is the canonical identity JSON hash of an exact
 ordered array of `{role, normalized_run_relative_path, raw_sha256}` entries plus

@@ -30,10 +30,12 @@ from researchclaw.pipeline.stage23_verification import (
     parse_stage23_verification_manifest,
     parse_stage23_verification_report,
     publish_stage23_verification,
+    load_stage23_verification_publication,
     validate_stage23_verification_publication,
 )
 from researchclaw.pipeline._helpers import StageResult
 from researchclaw.pipeline import executor
+from researchclaw.pipeline import stage23_verification as stage23_module
 from researchclaw.pipeline.stage_impls import _review_publish
 from researchclaw.pipeline.stages import SKIP_FORBIDDEN_STAGES, Stage, StageStatus
 from researchclaw.hitl.intervention import HumanAction, HumanInput
@@ -153,6 +155,109 @@ def test_stage23_publishes_manifest_last_and_replays(
         "stage23_verification_manifest.json",
     }
     assert validate_stage23_verification_publication(run_dir, bundle)
+    snapshot = load_stage23_verification_publication(run_dir, bundle)
+    paper = snapshot.require_output("paper_final_verified.md")
+    assert paper.content == bundle.paper.content
+    assert paper.sha256 == hashlib.sha256(bundle.paper.content).hexdigest()
+
+
+@pytest.mark.parametrize("mutation", ("extra", "delete", "symlink"))
+def test_stage23_snapshot_rejects_namespace_mutation(
+    tmp_path: Path,
+    canonical_config: RCConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-23"
+    stage_dir.mkdir(parents=True)
+    bundle = _bundle(canonical_config)
+    _patch_inputs(monkeypatch, bundle)
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage23_verification.verify_citations",
+        lambda *_args, **_kwargs: _report(),
+    )
+    execute_canonical_stage23(
+        run_dir,
+        stage_dir,
+        canonical_config,
+        relevance_checker=lambda _results: {"smith2024test": Decimal("0.9")},
+    )
+    paper = stage_dir / "paper_final_verified.md"
+    if mutation == "extra":
+        (stage_dir / "shadow.tmp").write_text("shadow", encoding="utf-8")
+    elif mutation == "delete":
+        paper.unlink()
+    else:
+        target = tmp_path / "external-paper.md"
+        target.write_bytes(paper.read_bytes())
+        paper.unlink()
+        paper.symlink_to(target)
+
+    with pytest.raises(Stage23VerificationError):
+        load_stage23_verification_publication(run_dir, bundle)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("manifest", "output", "extra", "delete", "parent"),
+)
+def test_stage23_snapshot_rejects_mutation_after_initial_semantic_replay(
+    tmp_path: Path,
+    canonical_config: RCConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-23"
+    stage_dir.mkdir(parents=True)
+    bundle = _bundle(canonical_config)
+    _patch_inputs(monkeypatch, bundle)
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage23_verification.verify_citations",
+        lambda *_args, **_kwargs: _report(),
+    )
+    execute_canonical_stage23(
+        run_dir,
+        stage_dir,
+        canonical_config,
+        relevance_checker=lambda _results: {"smith2024test": Decimal("0.9")},
+    )
+    original = stage23_module._verify_publication
+    mutated = False
+    external = tmp_path / "external-stage-23"
+
+    def mutate_after_first_replay(namespace, manifest, captured_bundle):
+        nonlocal mutated
+        original(namespace, manifest, captured_bundle)
+        if mutated:
+            return
+        mutated = True
+        if mutation == "manifest":
+            (stage_dir / "stage23_verification_manifest.json").write_text(
+                "{}", encoding="utf-8"
+            )
+        elif mutation == "output":
+            (stage_dir / "paper_final_verified.md").write_text(
+                "changed", encoding="utf-8"
+            )
+        elif mutation == "extra":
+            (stage_dir / "shadow.tmp").write_text("shadow", encoding="utf-8")
+        elif mutation == "delete":
+            (stage_dir / "paper_final_verified.md").unlink()
+        else:
+            moved = run_dir / "stage-23-moved"
+            stage_dir.rename(moved)
+            external.mkdir()
+            (external / "sentinel").write_text("external", encoding="utf-8")
+            stage_dir.symlink_to(external, target_is_directory=True)
+
+    monkeypatch.setattr(stage23_module, "_verify_publication", mutate_after_first_replay)
+
+    with pytest.raises(Stage23VerificationError):
+        load_stage23_verification_publication(run_dir, bundle)
+    if mutation == "parent":
+        assert (external / "sentinel").read_text(encoding="utf-8") == "external"
 
 
 @pytest.mark.parametrize(

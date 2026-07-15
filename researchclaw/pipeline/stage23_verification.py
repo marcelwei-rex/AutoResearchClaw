@@ -28,6 +28,7 @@ from researchclaw.pipeline.stage23_input_bundle import (
     load_stage23_input_bundle,
     verify_stage23_input_bundle_unchanged,
 )
+from researchclaw.pipeline.stage19_input_bundle import BoundArtifact
 
 
 class Stage23VerificationError(ValueError):
@@ -38,6 +39,23 @@ class Stage23VerificationError(ValueError):
 class Stage23VerificationOutcome:
     artifacts: tuple[str, ...]
     degraded: bool
+
+
+@dataclass(frozen=True)
+class Stage23PublicationSnapshot:
+    """Immutable Stage 23 publication captured under one directory fd."""
+
+    manifest: BoundArtifact
+    outputs: tuple[BoundArtifact, ...]
+
+    def require_output(self, name: str) -> BoundArtifact:
+        expected = f"stage-23/{name}"
+        matches = tuple(item for item in self.outputs if item.path == expected)
+        if len(matches) != 1:
+            raise Stage23VerificationError(
+                f"Stage 23 publication does not contain exactly one {name}"
+            )
+        return matches[0]
 
 
 _MANIFEST_NAME = "stage23_verification_manifest.json"
@@ -234,6 +252,30 @@ def validate_stage23_verification_publication(
 ) -> dict[str, object]:
     """Independently replay Stage 23 from disk and captured Stage 22 authority."""
 
+    snapshot = load_stage23_verification_publication(run_dir, bundle)
+    return parse_stage23_verification_manifest(snapshot.manifest.text())
+
+
+def load_stage23_verification_publication(
+    run_dir: Path,
+    bundle: Stage23InputBundle,
+) -> Stage23PublicationSnapshot:
+    try:
+        return _load_stage23_verification_publication(run_dir, bundle)
+    except Stage23VerificationError:
+        raise
+    except OSError as exc:
+        raise Stage23VerificationError(
+            f"cannot replay Stage 23 publication: {exc}"
+        ) from exc
+
+
+def _load_stage23_verification_publication(
+    run_dir: Path,
+    bundle: Stage23InputBundle,
+) -> Stage23PublicationSnapshot:
+    """Replay and capture one committed Stage 23 generation."""
+
     stage_dir = run_dir / "stage-23"
     with BoundOutputNamespace.open(run_dir, stage_dir, "stage-23") as namespace:
         namespace.assert_canonical()
@@ -245,10 +287,35 @@ def validate_stage23_verification_publication(
         except UnicodeDecodeError as exc:
             raise Stage23VerificationError("Stage 23 manifest is not UTF-8") from exc
         _verify_publication(namespace, manifest, bundle)
+        if set(namespace.direct_entries()) != {*_OUTPUT_NAMES, _MANIFEST_NAME}:
+            raise Stage23VerificationError("Stage 23 direct output namespace mismatch")
+        outputs = tuple(
+            BoundArtifact(
+                f"stage-23/{name}",
+                hashlib.sha256(content).hexdigest(),
+                content,
+            )
+            for name in sorted(_OUTPUT_NAMES)
+            for content in (namespace.read_bytes(name),)
+        )
+        _verify_publication(namespace, manifest, bundle)
         namespace.assert_canonical()
         if namespace.read_bytes(_MANIFEST_NAME) != manifest_bytes:
             raise Stage23VerificationError("Stage 23 manifest changed during replay")
-        return manifest
+        for artifact in outputs:
+            if namespace.read_bytes(artifact.path.removeprefix("stage-23/")) != artifact.content:
+                raise Stage23VerificationError(
+                    f"Stage 23 output changed during replay: {artifact.path}"
+                )
+        namespace.assert_canonical()
+        return Stage23PublicationSnapshot(
+            manifest=BoundArtifact(
+                "stage-23/stage23_verification_manifest.json",
+                hashlib.sha256(manifest_bytes).hexdigest(),
+                manifest_bytes,
+            ),
+            outputs=outputs,
+        )
 
 
 def parse_stage23_verification_report(text: str) -> dict[str, object]:
