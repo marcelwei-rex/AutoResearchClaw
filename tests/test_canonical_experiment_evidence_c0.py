@@ -36,7 +36,7 @@ from researchclaw.literature.experiment_fact_closure import (
 )
 from researchclaw.mcp.server import ResearchClawMCPServer
 from researchclaw.memory.experiment_memory import ExperimentMemory
-from researchclaw.evolution import extract_lessons
+from researchclaw.evolution import EvolutionStore, extract_lessons
 from researchclaw.pipeline._helpers import (
     _get_evolution_overlay,
     _get_pipeline_evolution_overlay,
@@ -3144,7 +3144,13 @@ def test_every_partial_map_blocks_all_external_and_persistent_entrypoints(
         lambda: ArtifactSubscriber.__new__(ArtifactSubscriber).find_code_templates("q"),
         lambda: ArtifactSubscriber.__new__(ArtifactSubscriber).import_best_practices("q"),
         lambda: ExperimentMemory.__new__(ExperimentMemory).recall_best_configs("q"),
+        lambda: ExperimentMemory.__new__(ExperimentMemory).record_release(
+            missing, task_type="q"
+        ),
         lambda: extract_lessons([], run_dir=missing),
+        lambda: EvolutionStore(missing / "evolution").append_many([]),
+        lambda: EvolutionStore(missing / "evolution").load_all(),
+        lambda: EvolutionStore(missing / "evolution").build_overlay("topic_init"),
         lambda: _get_evolution_overlay(missing, "topic_init"),
         lambda: _metaclaw_post_pipeline(config, [], [], "blocked", missing),
     )

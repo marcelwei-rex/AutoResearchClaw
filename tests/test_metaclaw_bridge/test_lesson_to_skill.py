@@ -4,11 +4,14 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from researchclaw.metaclaw_bridge.lesson_to_skill import (
     _format_lessons,
     _list_existing_skill_names,
     _parse_skills_response,
     _write_skill,
+    convert_lessons_to_skills,
 )
 from researchclaw.evolution import LessonEntry
 
@@ -94,3 +97,21 @@ def test_write_skill(tmp_path):
     assert "name: arc-test-skill" in content
     assert "category: coding" in content
     assert "# Test" in content
+
+
+def test_conversion_rejects_durable_skills_before_llm_or_write(
+    tmp_path, canonical_evidence_migration_complete
+):
+    class LLM:
+        calls = 0
+
+        def chat(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("LLM must not be called")
+
+    llm = LLM()
+    del canonical_evidence_migration_complete
+    with pytest.raises(PermissionError, match="policy v1"):
+        convert_lessons_to_skills([_make_lesson()], llm, tmp_path)
+    assert llm.calls == 0
+    assert list(tmp_path.iterdir()) == []

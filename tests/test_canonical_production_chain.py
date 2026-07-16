@@ -30,6 +30,8 @@ from researchclaw.literature.verify import (
     parse_bibtex_entries,
 )
 from researchclaw.llm.client import LLMClient, LLMResponse
+from researchclaw.evolution import EvolutionStore, extract_lessons
+from researchclaw.memory.experiment_memory import ExperimentMemory
 from researchclaw.pipeline.executor import execute_stage
 from researchclaw.experiment_runtime.contract import load_contract
 from researchclaw.experiment_runtime.scaffold import render_main_py
@@ -650,6 +652,14 @@ def test_stage04_through_stage25_uses_real_canonical_production_chain(
         for artifact in reconstructed.authority_artifacts
         if artifact.path == "stage-22/paper.tex"
     )
+    lessons = extract_lessons([], run_dir=run_dir)
+    lesson_store = EvolutionStore(run_dir / "evolution")
+    lesson_store.append_many(lessons)
+    assert lesson_store.load_all() == lessons
+    memory = ExperimentMemory()
+    memory.record_release(run_dir, task_type="ignored", run_id="ignored")
+    recalled = memory.recall_best_configs("ignored", run_dir=run_dir)
+    assert external_projection.selected_execution_sha256 in recalled
     report = generate_report(run_dir)
     assert reconstructed.evidence.manifest_sha256 in report
     repository = ResearchRepository(tmp_path / "shared-repository")

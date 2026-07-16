@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
 pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
 
 from researchclaw.evolution import (
+    CanonicalLessonError,
     EvolutionStore,
     LessonCategory,
     LessonEntry,
@@ -30,26 +33,30 @@ from researchclaw.evolution import (
 class TestLessonEntry:
     def test_to_dict_and_from_dict_roundtrip(self) -> None:
         entry = LessonEntry(
-            stage_name="hypothesis_gen",
-            stage_num=8,
-            category="experiment",
-            severity="error",
-            description="Code validation failed",
-            timestamp="2026-03-10T12:00:00+00:00",
-            run_id="run-1",
+            stage_name="citation_verify",
+            stage_num=23,
+            category=LessonCategory.LITERATURE,
+            severity="warning",
+            description=(
+                "Canonical citation verification found unsupported or suspicious citations."
+            ),
+            timestamp="",
+            lesson_kind="citation_verification_warning",
+            canonical_manifest_path="canonical_experiment_evidence.json",
+            canonical_manifest_sha256="a" * 64,
+            source_path="stage-23/verification_report.json",
+            source_sha256="b" * 64,
         )
         data = entry.to_dict()
         restored = LessonEntry.from_dict(data)
-        assert restored.stage_name == "hypothesis_gen"
-        assert restored.stage_num == 8
-        assert restored.category == "experiment"
-        assert restored.severity == "error"
+        assert restored.stage_name == "citation_verify"
+        assert restored.stage_num == 23
+        assert restored.category == LessonCategory.LITERATURE
+        assert restored.severity == "warning"
 
-    def test_from_dict_handles_missing_fields(self) -> None:
-        entry = LessonEntry.from_dict({})
-        assert entry.stage_name == ""
-        assert entry.stage_num == 0
-        assert entry.category == "pipeline"
+    def test_from_dict_rejects_missing_fields(self) -> None:
+        with pytest.raises(ValueError, match="schema mismatch"):
+            LessonEntry.from_dict({})
 
 
 # ── Classification tests ──
@@ -99,236 +106,311 @@ class TestTimeWeight:
 # ── Extract lessons tests ──
 
 
+def _projection(*, manifest_sha256: str = "a" * 64, suspicious: int = 1):
+    return SimpleNamespace(
+        canonical_manifest_path="canonical_experiment_evidence.json",
+        canonical_manifest_sha256=manifest_sha256,
+        verification_report=MappingProxyType(
+            {
+                "summary": MappingProxyType(
+                    {"suspicious": suspicious, "hallucinated": 0}
+                )
+            }
+        ),
+        authority_artifacts=(
+            SimpleNamespace(
+                path="stage-23/verification_report.json", sha256="b" * 64
+            ),
+        ),
+    )
+
+
 class TestExtractLessons:
-    def _make_result(self, stage_num, status, error=None, decision="proceed"):
-        from types import SimpleNamespace
-        from researchclaw.pipeline.stages import Stage, StageStatus
-
-        stage = Stage(stage_num)
-        return SimpleNamespace(
-            stage=stage,
-            status=StageStatus(status),
-            error=error,
-            decision=decision,
+    def test_unbound_stage_results_do_not_create_lessons(self) -> None:
+        poison = SimpleNamespace(
+            stage=15, status="failed", error="SHADOW_POISON", decision="pivot"
         )
+        assert extract_lessons([poison], run_id="test-run") == []
 
-    def test_extracts_lesson_from_failed_stage(self) -> None:
-        results = [self._make_result(4, "failed", error="API rate limited")]
-        lessons = extract_lessons(results, run_id="test-run")
+    def test_derives_only_projection_bound_lesson(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        projection = _projection()
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: projection,
+        )
+        poison = tmp_path / "run/stage-15_v99/decision_structured.json"
+        poison.parent.mkdir(parents=True)
+        poison.write_text('{"rationale":"SHADOW_POISON"}', encoding="utf-8")
+        runtime = tmp_path / "run/stage-99/runs/run-poison.json"
+        runtime.parent.mkdir(parents=True)
+        runtime.write_text('{"stderr":"SHADOW_RUNTIME_POISON"}', encoding="utf-8")
+
+        lessons = extract_lessons([], run_id="run-1", run_dir=tmp_path / "run")
+
         assert len(lessons) == 1
-        assert lessons[0].severity == "error"
-        assert "rate limited" in lessons[0].description
+        assert lessons[0].canonical_manifest_sha256 == "a" * 64
+        assert lessons[0].source_path == "stage-23/verification_report.json"
+        assert "SHADOW" not in lessons[0].description
 
-    def test_extracts_lesson_from_blocked_stage(self) -> None:
-        results = [self._make_result(5, "blocked_approval")]
-        lessons = extract_lessons(results, run_id="test-run")
-        assert len(lessons) == 1
-        assert lessons[0].severity == "warning"
-        assert "blocked" in lessons[0].description
-
-    def test_extracts_lesson_from_pivot_decision(self) -> None:
-        results = [self._make_result(15, "done", decision="pivot")]
-        lessons = extract_lessons(results, run_id="test-run")
-        assert len(lessons) == 1
-        assert "PIVOT" in lessons[0].description
-
-    def test_no_lessons_from_successful_proceed(self) -> None:
-        results = [self._make_result(1, "done", decision="proceed")]
-        lessons = extract_lessons(results)
-        assert len(lessons) == 0
-
-    def test_multiple_results_multiple_lessons(self) -> None:
-        results = [
-            self._make_result(4, "failed", error="timeout"),
-            self._make_result(5, "blocked_approval"),
-            self._make_result(15, "done", decision="refine"),
-        ]
-        lessons = extract_lessons(results)
-        assert len(lessons) == 3
-
-    def test_extracts_decision_rationale(self, tmp_path: Path) -> None:
-        run_dir = tmp_path / "run"
-        stage_dir = run_dir / "stage-15"
-        stage_dir.mkdir(parents=True)
-        (stage_dir / "decision_structured.json").write_text(
-            json.dumps({"decision": "pivot", "rationale": "NaN in metrics"}),
-            encoding="utf-8",
+    def test_clean_projection_produces_no_lesson(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: _projection(suspicious=0),
         )
-        results = [self._make_result(15, "done", decision="pivot")]
-        lessons = extract_lessons(results, run_id="test", run_dir=run_dir)
-        assert any("NaN in metrics" in l.description for l in lessons)
-
-    def test_extracts_rationale_from_raw_text_excerpt(self, tmp_path: Path) -> None:
-        run_dir = tmp_path / "run"
-        stage_dir = run_dir / "stage-15"
-        stage_dir.mkdir(parents=True)
-        (stage_dir / "decision_structured.json").write_text(
-            json.dumps({
-                "decision": "refine",
-                "raw_text_excerpt": (
-                    "## Decision\n**REFINE**\n\n"
-                    "## Justification\n"
-                    "The analysis provides promising evidence but lacks statistical rigor."
-                ),
-                "generated": "2026-03-11T05:15:43+00:00",
-            }),
-            encoding="utf-8",
-        )
-        results = [self._make_result(15, "done", decision="refine")]
-        lessons = extract_lessons(results, run_id="test", run_dir=run_dir)
-        assert any("statistical rigor" in l.description for l in lessons)
-
-    def test_extracts_stderr_runtime_lesson(self, tmp_path: Path) -> None:
-        run_dir = tmp_path / "run"
-        runs_dir = run_dir / "stage-12" / "runs"
-        runs_dir.mkdir(parents=True)
-        (runs_dir / "run-1.json").write_text(
-            json.dumps({
-                "metrics": {"loss": 0.5},
-                "stderr": "RuntimeWarning: invalid value encountered in divide",
-            }),
-            encoding="utf-8",
-        )
-        results = [self._make_result(12, "done")]
-        lessons = extract_lessons(results, run_dir=run_dir)
-        assert any("RuntimeWarning" in l.description for l in lessons)
-
-    def test_extracts_nan_metric_lesson(self, tmp_path: Path) -> None:
-        run_dir = tmp_path / "run"
-        runs_dir = run_dir / "stage-12" / "runs"
-        runs_dir.mkdir(parents=True)
-        (runs_dir / "run-1.json").write_text(
-            json.dumps({"metrics": {"accuracy": "nan"}}),
-            encoding="utf-8",
-        )
-        results = [self._make_result(12, "done")]
-        lessons = extract_lessons(results, run_dir=run_dir)
-        assert any("accuracy" in l.description and "nan" in l.description.lower()
-                    for l in lessons)
-
-    def test_no_runtime_lessons_without_run_dir(self) -> None:
-        results = [self._make_result(12, "done")]
-        lessons = extract_lessons(results)
-        assert len(lessons) == 0
+        assert extract_lessons([], run_dir=tmp_path / "run") == []
 
 
 # ── EvolutionStore tests ──
 
 
 class TestEvolutionStore:
-    def test_append_and_load(self, tmp_path: Path) -> None:
-        store = EvolutionStore(tmp_path / "evo")
-        lesson = LessonEntry(
-            stage_name="hypothesis_gen",
-            stage_num=8,
-            category="pipeline",
-            severity="warning",
-            description="PIVOT triggered",
-            timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    @pytest.fixture(autouse=True)
+    def _canonical_projection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: _projection(),
         )
-        store.append(lesson)
+
+    @staticmethod
+    def _lesson(tmp_path: Path) -> LessonEntry:
+        return extract_lessons([], run_id="run-1", run_dir=tmp_path)[0]
+
+    def test_append_and_load(self, tmp_path: Path) -> None:
+        store = EvolutionStore(tmp_path / "evolution")
+        store.append(self._lesson(tmp_path))
         loaded = store.load_all()
         assert len(loaded) == 1
-        assert loaded[0].stage_name == "hypothesis_gen"
+        assert loaded[0].stage_name == "citation_verify"
+
+    @pytest.mark.parametrize("name", ("stage-15", "shadow-lessons", "evo"))
+    def test_rejects_noncanonical_namespace_before_access(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        wrong = tmp_path / name
+        wrong.mkdir()
+        sentinel = wrong / "sentinel"
+        sentinel.write_text("KEEP", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="run_dir/evolution"):
+            EvolutionStore(wrong)
+
+        assert sentinel.read_text(encoding="utf-8") == "KEEP"
 
     def test_append_many(self, tmp_path: Path) -> None:
-        store = EvolutionStore(tmp_path / "evo")
-        lessons = [
-            LessonEntry("s1", 1, "system", "error", "err1",
-                        datetime.now(timezone.utc).isoformat()),
-            LessonEntry("s2", 2, "pipeline", "info", "info1",
-                        datetime.now(timezone.utc).isoformat()),
-        ]
-        store.append_many(lessons)
-        assert store.count() == 2
+        store = EvolutionStore(tmp_path / "evolution")
+        store.append_many([self._lesson(tmp_path)])
+        assert store.count() == 1
 
-    def test_append_many_empty_is_noop(self, tmp_path: Path) -> None:
-        store = EvolutionStore(tmp_path / "evo")
+    def test_append_many_empty_publishes_generation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: _projection(suspicious=0),
+        )
+        store = EvolutionStore(tmp_path / "evolution")
         store.append_many([])
         assert store.count() == 0
+        assert set(path.name for path in store.lessons_path.parent.iterdir()) == {
+            "lessons.jsonl", "lessons_manifest.json"
+        }
 
-    def test_load_all_empty_store(self, tmp_path: Path) -> None:
-        store = EvolutionStore(tmp_path / "evo")
-        assert store.load_all() == []
+    def test_load_all_missing_publication_fails_closed(self, tmp_path: Path) -> None:
+        store = EvolutionStore(tmp_path / "evolution")
+        with pytest.raises(FileNotFoundError):
+            store.load_all()
 
     def test_query_for_stage_returns_relevant_lessons(self, tmp_path: Path) -> None:
-        store = EvolutionStore(tmp_path / "evo")
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        store.append(LessonEntry("hypothesis_gen", 8, "pipeline", "error",
-                                 "Failed hypothesis", now))
-        store.append(LessonEntry("paper_draft", 17, "writing", "warning",
-                                 "Draft too short", now))
-        result = store.query_for_stage("hypothesis_gen", max_lessons=5)
-        # hypothesis_gen lesson should be boosted
-        assert len(result) >= 1
-        assert result[0].stage_name == "hypothesis_gen"
+        store = EvolutionStore(tmp_path / "evolution")
+        store.append(self._lesson(tmp_path))
+        result = store.query_for_stage("citation_verify", max_lessons=5)
+        assert len(result) == 1
 
     def test_query_respects_max_lessons(self, tmp_path: Path) -> None:
-        store = EvolutionStore(tmp_path / "evo")
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        for i in range(10):
-            store.append(LessonEntry("stage_1", 1, "system", "error",
-                                     f"Error {i}", now))
-        result = store.query_for_stage("stage_1", max_lessons=3)
-        assert len(result) == 3
+        store = EvolutionStore(tmp_path / "evolution")
+        store.append(self._lesson(tmp_path))
+        assert len(store.query_for_stage("citation_verify", max_lessons=1)) == 1
 
     def test_build_overlay_returns_empty_for_no_lessons(self, tmp_path: Path) -> None:
-        store = EvolutionStore(tmp_path / "evo")
+        store = EvolutionStore(tmp_path / "evolution")
         assert store.build_overlay("hypothesis_gen") == ""
 
-    def test_build_overlay_returns_formatted_text(self, tmp_path: Path) -> None:
-        store = EvolutionStore(tmp_path / "evo")
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        store.append(LessonEntry("hypothesis_gen", 8, "experiment", "error",
-                                 "Code syntax error in experiment", now))
-        overlay = store.build_overlay("hypothesis_gen")
-        assert "Lessons from Prior Runs" in overlay
-        assert "Code syntax error" in overlay
-        assert "❌" in overlay
+    def test_persistent_lessons_are_not_a_prompt_overlay(self, tmp_path: Path) -> None:
+        store = EvolutionStore(tmp_path / "evolution")
+        store.append(self._lesson(tmp_path))
+        assert store.build_overlay("citation_verify") == ""
 
-    def test_old_lessons_filtered_by_time_weight(self, tmp_path: Path) -> None:
-        store = EvolutionStore(tmp_path / "evo")
-        old_ts = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()
-        store.append(LessonEntry("stage_1", 1, "system", "error", "Old error", old_ts))
-        result = store.query_for_stage("stage_1")
-        assert len(result) == 0  # Filtered out due to age > 90 days
+    def test_overlay_rejects_stale_generation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = EvolutionStore(tmp_path / "evolution")
+        store.append(self._lesson(tmp_path))
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: _projection(manifest_sha256="c" * 64),
+        )
+        with pytest.raises(CanonicalLessonError, match="manifest replay mismatch"):
+            store.query_for_stage("citation_verify")
+
+    def test_overlay_rejects_tampered_and_duplicate_key_lessons(
+        self, tmp_path: Path
+    ) -> None:
+        store = EvolutionStore(tmp_path / "evolution")
+        store.append(self._lesson(tmp_path))
+        lesson = self._lesson(tmp_path).to_dict()
+        lesson["description"] = "SHADOW_POISON"
+        store.lessons_path.write_text(json.dumps(lesson) + "\n", encoding="utf-8")
+        with pytest.raises(CanonicalLessonError):
+            store.query_for_stage("citation_verify")
+
+        raw = json.dumps(self._lesson(tmp_path).to_dict())
+        store.lessons_path.write_text(
+            raw[:-1] + ',"description":"SHADOW_POISON"}\n', encoding="utf-8"
+        )
+        with pytest.raises(CanonicalLessonError):
+            store.query_for_stage("citation_verify")
+
+    def test_clean_generation_replaces_prior_lesson_with_explicit_empty_publication(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = EvolutionStore(tmp_path / "evolution")
+        store.append(self._lesson(tmp_path))
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: _projection(manifest_sha256="c" * 64, suspicious=0),
+        )
+        store.append_many([])
+        assert store.load_all() == []
+        assert store.lessons_path.read_bytes() == b""
+
+    def test_extra_namespace_entry_is_rejected(self, tmp_path: Path) -> None:
+        store = EvolutionStore(tmp_path / "evolution")
+        store.append(self._lesson(tmp_path))
+        (store.lessons_path.parent / "shadow.json").write_text("{}", encoding="utf-8")
+        with pytest.raises(CanonicalLessonError, match="namespace closure"):
+            store.load_all()
+
+    def test_post_write_mutation_rolls_back_new_lesson_authority(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from researchclaw import evolution
+
+        store = EvolutionStore(tmp_path / "evolution")
+        original = evolution._read_lesson_publication
+        calls = 0
+
+        def mutate_after_first_replay(namespace, projection):
+            nonlocal calls
+            result = original(namespace, projection)
+            calls += 1
+            if calls == 1:
+                store.lessons_path.write_bytes(b"{}\n")
+            return result
+
+        monkeypatch.setattr(evolution, "_read_lesson_publication", mutate_after_first_replay)
+        with pytest.raises(CanonicalLessonError):
+            store.append(self._lesson(tmp_path))
+        assert not store.lessons_path.exists()
+        assert not (store.lessons_path.parent / "lessons_manifest.json").exists()
+
+    def test_metaclaw_skill_directory_is_not_an_overlay_source(
+        self, tmp_path: Path
+    ) -> None:
+        store = EvolutionStore(tmp_path / "evolution")
+        skills = tmp_path / "skills/arc-poison"
+        skills.mkdir(parents=True)
+        (skills / "SKILL.md").write_text("SHADOW_SKILL_POISON", encoding="utf-8")
+        assert "SHADOW_SKILL_POISON" not in store.build_overlay(
+            "citation_verify", skills_dir=str(skills.parent)
+        )
+
+    def test_append_parent_replacement_has_external_zero_write_and_rolls_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        detached = tmp_path / "run-detached"
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "sentinel").write_text("KEEP", encoding="utf-8")
+        lesson = extract_lessons([], run_id="run-1", run_dir=run_dir)[0]
+
+        replaced = False
+
+        def replace_parent(_run_dir: Path):
+            nonlocal replaced
+            if not replaced:
+                run_dir.rename(detached)
+                run_dir.symlink_to(external, target_is_directory=True)
+                replaced = True
+            return _projection()
+
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            replace_parent,
+        )
+        with pytest.raises(OSError, match="directory changed|changed during"):
+            EvolutionStore(run_dir / "evolution").append(lesson)
+
+        assert [path.name for path in external.iterdir()] == ["sentinel"]
+        assert not (detached / "evolution/lessons.jsonl").exists()
+
+    def test_canonical_lesson_timestamp_cannot_be_reweighted(self, tmp_path: Path) -> None:
+        store = EvolutionStore(tmp_path / "evolution")
+        lesson = self._lesson(tmp_path)
+        altered = replace(
+            lesson,
+            timestamp=(datetime.now(timezone.utc) - timedelta(days=100)).isoformat(),
+        )
+        with pytest.raises(CanonicalLessonError, match="not projection-derived"):
+            store.append(altered)
+
+    def test_duplicate_canonical_lesson_cannot_inflate_overlay(
+        self, tmp_path: Path
+    ) -> None:
+        lesson = self._lesson(tmp_path)
+        with pytest.raises(CanonicalLessonError, match="not projection-derived"):
+            EvolutionStore(tmp_path / "evolution").append_many([lesson, lesson])
 
     def test_creates_directory_if_not_exists(self, tmp_path: Path) -> None:
-        store_dir = tmp_path / "nested" / "evo"
-        store = EvolutionStore(store_dir)
-        assert store_dir.exists()
+        store_dir = tmp_path / "nested" / "evolution"
+        EvolutionStore(store_dir)
+        assert not store_dir.exists()
 
 
 class TestTrajectoryStore:
-    def test_record_refine_trajectory_and_signal_detects_plateau(
+    def test_unbound_trajectory_persistence_and_replay_are_disabled(
         self, tmp_path: Path
     ) -> None:
-        log1 = {
+        refinement_log = {
             "metric_key": "loss",
             "metric_direction": "minimize",
             "iterations": [{"metric": 1.0}, {"metric": 0.9}],
         }
-        log2 = {
-            "metric_key": "loss",
-            "metric_direction": "minimize",
-            "iterations": [{"metric": 0.88}, {"metric": 0.87}],
-        }
-        log3 = {
-            "metric_key": "loss",
-            "metric_direction": "minimize",
-            "iterations": [{"metric": 0.86}, {"metric": 0.855}],
-        }
+        poison = tmp_path / "refinement_log.json"
+        poison.write_text(json.dumps(refinement_log), encoding="utf-8")
 
-        points = record_refine_trajectory(tmp_path, "run-a", log1, cycle=1)
-        record_refine_trajectory(tmp_path, "run-a", log2, cycle=2)
-        record_refine_trajectory(tmp_path, "run-a", log3, cycle=3)
+        with pytest.raises(PermissionError, match="trajectory persistence"):
+            record_refine_trajectory(tmp_path, "run-a", refinement_log, cycle=1)
+        with pytest.raises(PermissionError, match="trajectory replay"):
+            get_trajectory_signal(tmp_path, "run-a", current_cycle=1)
+        with pytest.raises(PermissionError, match="trajectory persistence"):
+            TrajectoryStore(tmp_path).append_many([])
+        with pytest.raises(PermissionError, match="trajectory replay"):
+            TrajectoryStore(tmp_path).load_for_run("run-a")
 
-        assert len(points) == 2
-        assert TrajectoryStore(tmp_path).path.exists()
-        signal = get_trajectory_signal(tmp_path, "run-a", current_cycle=3)
-        assert signal["stagnating"] is True
-        assert signal["recommendation"] == "pivot"
-        assert "Cycle 3" in str(signal["summary"])
+        assert not (tmp_path / "trajectory.jsonl").exists()
 
 
 # ── PromptManager evolution overlay integration ──

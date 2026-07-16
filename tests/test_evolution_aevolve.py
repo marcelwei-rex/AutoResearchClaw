@@ -352,48 +352,7 @@ class TestRunAEvolveCycle:
 
 
 class TestLoadProjectSkills:
-    def test_load_project_skills_finds_skill(self, tmp_path: Path, monkeypatch):
+    def test_project_skills_are_not_a_canonical_prompt_source(self):
         from researchclaw import evolution
-
-        # Create a fake .claude/skills/test-skill/SKILL.md
-        skill_dir = tmp_path / ".claude" / "skills" / "test-skill"
-        skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text("# Test Skill\nDo something.")
-
-        # Also create the researchclaw skill (should be skipped)
-        rc_dir = tmp_path / ".claude" / "skills" / "researchclaw"
-        rc_dir.mkdir(parents=True)
-        (rc_dir / "SKILL.md").write_text("# CLI Skill\nShould be skipped.")
-
-        # Patch the root detection
-        monkeypatch.setattr(
-            evolution, "_PROJECT_SKILLS_DIRS", (".claude/skills",)
-        )
-        # Patch Path(__file__).parent.parent to our tmp_path
-        original_func = evolution._load_project_skills
-
-        def patched():
-            from pathlib import Path as _P
-            skills: list[str] = []
-            for rel_dir in evolution._PROJECT_SKILLS_DIRS:
-                sd = tmp_path / rel_dir
-                if not sd.is_dir():
-                    continue
-                for sub in sorted(sd.iterdir()):
-                    if not sub.is_dir() or sub.name == "researchclaw":
-                        continue
-                    sf = sub / "SKILL.md"
-                    if sf.is_file():
-                        try:
-                            text = sf.read_text(encoding="utf-8").strip()
-                            if text:
-                                skills.append(text)
-                        except OSError:
-                            continue
-            return skills
-
-        monkeypatch.setattr(evolution, "_load_project_skills", patched)
-
-        result = evolution._load_project_skills()
-        assert len(result) == 1
-        assert "Test Skill" in result[0]
+        with pytest.raises(PermissionError, match="not a canonical prompt source"):
+            evolution._load_project_skills()

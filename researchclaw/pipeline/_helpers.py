@@ -52,11 +52,6 @@ _SANDBOX_SAFE_PACKAGES = {
     "pandas", "seaborn", "tqdm", "gymnasium", "gym",
 }
 
-_METACLAW_SKILLS_DIR = str(Path.home() / ".metaclaw" / "skills")
-
-# User-level custom skills directory (cross-project)
-_USER_SKILLS_DIR = Path.home() / ".researchclaw" / "skills"
-
 # Lazy-initialized skill registry (singleton for the process)
 _skill_registry: object | None = None
 
@@ -64,12 +59,7 @@ _skill_registry: object | None = None
 def _get_skill_registry(config: object | None = None) -> object:
     """Return the global SkillRegistry, creating it on first call.
 
-    Loads skills from (in priority order):
-    1. Built-in skills shipped with the package
-    2. User-level ``~/.researchclaw/skills/``
-    3. Project-level ``.claude/skills/``
-    4. MetaClaw cross-run skills ``~/.metaclaw/skills/``
-    5. User-configured ``config.yaml → skills.custom_dirs``
+    Canonical policy v1 loads only package-owned builtin skills.
     """
     global _skill_registry  # noqa: PLW0603
     if _skill_registry is not None:
@@ -77,32 +67,8 @@ def _get_skill_registry(config: object | None = None) -> object:
     try:
         from researchclaw.skills.registry import SkillRegistry
 
+        # Canonical policy v1 permits only package-owned builtin skills.
         custom_dirs: list[str] = []
-
-        # User-level skills
-        if _USER_SKILLS_DIR.is_dir():
-            custom_dirs.append(str(_USER_SKILLS_DIR))
-
-        # Project-level .claude/skills/
-        project_skills = Path(__file__).resolve().parent.parent.parent / ".claude" / "skills"
-        if project_skills.is_dir():
-            custom_dirs.append(str(project_skills))
-
-        # MetaClaw skills
-        metaclaw = Path(_METACLAW_SKILLS_DIR)
-        if metaclaw.is_dir():
-            custom_dirs.append(str(metaclaw))
-
-        # Config-specified custom dirs
-        if config is not None:
-            skills_cfg = getattr(config, "skills", None)
-            if skills_cfg:
-                for d in getattr(skills_cfg, "custom_dirs", ()):
-                    if d:
-                        custom_dirs.append(str(d))
-                for d in getattr(skills_cfg, "external_dirs", ()):
-                    if d:
-                        custom_dirs.append(str(d))
 
         _skill_registry = SkillRegistry(
             custom_dirs=custom_dirs,
@@ -810,12 +776,11 @@ def _get_evolution_overlay(
     config: object | None = None,
     topic: str = "",
 ) -> str:
-    """Load evolution lessons + matched skills for prompt injection.
+    """Load matched non-persistent skills for prompt injection.
 
-    Combines three sources:
-    1. Intra-run lessons (from current run's evolution dir)
-    2. Cross-run MetaClaw skills (from ~/.metaclaw/skills/)
-    3. Matched skills from the SkillRegistry (builtin + user + external)
+    Persistent lessons and MetaClaw-generated skills are deliberately excluded:
+    before release publication there is no canonical identity for the generation
+    currently being produced.
 
     The SkillRegistry automatically matches skills to the current stage
     using trigger keywords and stage applicability metadata.
@@ -829,21 +794,9 @@ def _get_evolution_overlay(
     require_canonical_evidence_capabilities("pipeline._get_evolution_overlay")
     parts: list[str] = []
 
-    # --- Section 1: Evolution lessons + MetaClaw arc-* skills ---
-    if run_dir is not None:
-        try:
-            from researchclaw.evolution import EvolutionStore
+    del run_dir
 
-            store = EvolutionStore(run_dir / "evolution")
-            evo_overlay = store.build_overlay(
-                stage_name, max_lessons=5, skills_dir=_METACLAW_SKILLS_DIR
-            )
-            if evo_overlay:
-                parts.append(evo_overlay)
-        except Exception:  # noqa: BLE001
-            pass
-
-    # --- Section 2: Matched skills from SkillRegistry ---
+    # Matched governed skills from SkillRegistry.
     try:
         registry = _get_skill_registry(config)
         context = f"{stage_name} {topic}".strip()
@@ -922,143 +875,29 @@ def _collect_experiment_results(
     metric_key: str = "",
     metric_direction: str = "maximize",
 ) -> dict[str, Any]:
-    """Aggregate experiment metrics from runs/ directory across prior stages.
+    """Return the selected canonical invocation without legacy directory scans."""
+    del metric_key, metric_direction
+    from researchclaw.pipeline.external_release_projection import (
+        external_json_value,
+        load_external_release_projection,
+    )
 
-    Returns a dict with ``runs``, ``metrics_summary``, ``best_run``,
-    ``latex_table``, and optionally ``structured_results``.
-    """
-    runs_data: list[dict[str, Any]] = []
-    structured_results: Any = None
-
-    # Scan all stage dirs for runs/ subdirectory
-    for stage_subdir in sorted(run_dir.glob("stage-*/runs")):
-        # Check for structured results.json first
-        results_json = stage_subdir / "results.json"
-        if results_json.exists() and structured_results is None:
-            try:
-                structured_results = json.loads(
-                    results_json.read_text(encoding="utf-8")
-                )
-            except (json.JSONDecodeError, OSError):
-                pass
-
-        for run_file in sorted(stage_subdir.glob("*.json")):
-            if run_file.name == "results.json":
-                continue  # Already handled above
-            parsed = _safe_json_loads(run_file.read_text(encoding="utf-8"), {})
-            if isinstance(parsed, dict) and "metrics" in parsed:
-                # Also check for structured_results inside run payload
-                if "structured_results" in parsed and structured_results is None:
-                    structured_results = parsed["structured_results"]
-                runs_data.append(parsed)
-            elif isinstance(parsed, dict) and "key_metrics" in parsed:
-                # Simulated mode uses key_metrics
-                parsed["metrics"] = parsed.pop("key_metrics")
-                runs_data.append(parsed)
-
-    if not runs_data:
-        result: dict[str, Any] = {"runs": [], "metrics_summary": {}, "best_run": None, "latex_table": ""}
-        if structured_results is not None:
-            result["structured_results"] = structured_results
-        return result
-
-    # Aggregate metrics across runs
-    all_metric_keys: set[str] = set()
-    for r in runs_data:
-        m = r.get("metrics") or {}
-        if isinstance(m, dict):
-            all_metric_keys.update(m.keys())
-
-    metrics_summary: dict[str, dict[str, float | None]] = {}
-    for key in sorted(all_metric_keys):
-        values = []
-        for r in runs_data:
-            m = r.get("metrics") or {}
-            if isinstance(m, dict) and key in m:
-                try:
-                    _fv = float(m[key])
-                    if _fv == _fv and abs(_fv) != float("inf"):  # filter NaN/Inf
-                        values.append(_fv)
-                except (ValueError, TypeError):
-                    pass
-        if values:
-            metrics_summary[key] = {
-                "min": round(min(values), 6),
-                "max": round(max(values), 6),
-                "mean": round(sum(values) / len(values), 6),
-                "count": len(values),
-            }
-
-    # Find best run using metric_key and metric_direction
-    best_run: dict[str, Any] | None = None
-    if runs_data:
-
-        def _primary_metric(r: dict[str, Any]) -> float:
-            m = r.get("metrics") or {}
-            if isinstance(m, dict):
-                # Try specific metric_key first
-                if metric_key and metric_key in m:
-                    try:
-                        return float(m[metric_key])
-                    except (ValueError, TypeError):
-                        pass
-                # Fallback to first metric
-                for v in m.values():
-                    try:
-                        return float(v)
-                    except (ValueError, TypeError):
-                        pass
-            return 0.0
-
-        _cmp = min if metric_direction == "minimize" else max
-        best_run = _cmp(runs_data, key=_primary_metric)
-
-    # Build LaTeX table
-    latex_lines = [
-        r"\begin{table}[h]",
-        r"\centering",
-        r"\caption{Experiment Results}",
-    ]
-    if metrics_summary:
-        cols = sorted(metrics_summary.keys())
-        header = "Metric & Min & Max & Mean & N \\\\"
-        latex_lines.append(r"\begin{tabular}{l" + "r" * 4 + "}")
-        latex_lines.append(r"\hline")
-        latex_lines.append(header)
-        latex_lines.append(r"\hline")
-        for col in cols:
-            s = metrics_summary[col]
-            row = f"{col} & {s['min']:.4f} & {s['max']:.4f} & {s['mean']:.4f} & {s['count']} \\\\"
-            latex_lines.append(row)
-        latex_lines.append(r"\hline")
-        latex_lines.append(r"\end{tabular}")
-    else:
-        latex_lines.append(r"\begin{tabular}{l}")
-        latex_lines.append("No experiment data available \\\\")
-        latex_lines.append(r"\end{tabular}")
-    latex_lines.append(r"\end{table}")
-
-    # R18-1: Extract paired statistical comparisons from stdout
-    from researchclaw.experiment.sandbox import extract_paired_comparisons
-
-    paired_comparisons: list[dict[str, object]] = []
-    for r in runs_data:
-        stdout = r.get("stdout", "")
-        if stdout:
-            paired_comparisons.extend(extract_paired_comparisons(stdout))
-
-    collected: dict[str, Any] = {
-        "runs": runs_data,
-        "metrics_summary": metrics_summary,
-        "best_run": best_run,
-        "latex_table": "\n".join(latex_lines),
+    projection = load_external_release_projection(run_dir)
+    selected = {
+        "manifest_path": projection.selected_result_manifest_path,
+        "manifest_sha256": projection.selected_result_manifest_sha256,
+        "execution_path": projection.selected_execution_path,
+        "execution_sha256": projection.selected_execution_sha256,
+        "metric_observations": external_json_value(projection.metric_observations),
+        "structured_results": external_json_value(projection.structured_results),
     }
-    if paired_comparisons:
-        collected["paired_comparisons"] = paired_comparisons
-    if structured_results is not None:
-        collected["structured_results"] = structured_results
-    return collected
-
+    return {
+        "runs": [selected],
+        "metrics_summary": {},
+        "best_run": selected,
+        "latex_table": "",
+        "structured_results": selected["structured_results"],
+    }
 
 def _build_context_preamble(
     config: RCConfig,

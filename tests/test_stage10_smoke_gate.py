@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -146,7 +147,6 @@ def test_stage10_smoke_gate_writes_quarantined_results(tmp_path: Path) -> None:
 
     smoke_results = stage_dir / "smoke" / "smoke_results.json"
     payload = json.loads(smoke_results.read_text(encoding="utf-8"))
-    collected = _collect_experiment_results(run_dir, metric_key="detection_f1")
     assert blockers == []
     assert artifacts == ["smoke/smoke_results.json"]
     assert payload["status"] == "passed"
@@ -154,12 +154,11 @@ def test_stage10_smoke_gate_writes_quarantined_results(tmp_path: Path) -> None:
     assert payload["metrics"]["detection_f1"] == 0.75
     assert not (stage_dir / "runs").exists()
     assert not (stage_dir / ".smoke_sandbox").exists()
-    assert collected["runs"] == []
-    assert collected["metrics_summary"] == {}
 
 
 def test_smoke_results_and_residual_sandbox_are_not_collected(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run_dir = tmp_path / "run"
     smoke_dir = run_dir / "stage-10" / "smoke"
@@ -175,11 +174,30 @@ def test_smoke_results_and_residual_sandbox_are_not_collected(
         encoding="utf-8",
     )
 
+    from types import MappingProxyType, SimpleNamespace
+
+    projection = SimpleNamespace(
+        selected_result_manifest_path="stage-12/result_set_manifest.json",
+        selected_result_manifest_sha256="a" * 64,
+        selected_execution_path="stage-12/evidence-v1/run-1.json",
+        selected_execution_sha256="b" * 64,
+        metric_observations=MappingProxyType({"detection_f1": ("0.75",)}),
+        structured_results=MappingProxyType({"conditions": ()}),
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.external_release_projection."
+        "load_external_release_projection",
+        lambda _run_dir: projection,
+    )
+
     collected = _collect_experiment_results(run_dir, metric_key="detection_f1")
 
-    assert collected["runs"] == []
+    assert collected["runs"][0]["metric_observations"] == {
+        "detection_f1": ["0.75"]
+    }
     assert collected["metrics_summary"] == {}
-    assert collected["best_run"] is None
+    assert "0.99" not in json.dumps(collected)
+    assert "0.88" not in json.dumps(collected)
 
 
 def test_stage10_selected_candidate_is_python_only(tmp_path: Path) -> None:
@@ -592,3 +610,26 @@ def test_stage10_repairs_harness_elapsed_before_smoke(tmp_path: Path) -> None:
     assert result.status is StageStatus.DONE
     assert "harness.elapsed()" not in repaired_main
     assert "harness.elapsed" in repaired_main
+def test_user_skill_symlink_cannot_reintroduce_metaclaw_prompt_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from researchclaw.pipeline import _helpers
+
+    metaclaw = tmp_path / "metaclaw/skills"
+    poison = metaclaw / "poison"
+    poison.mkdir(parents=True)
+    (poison / "SKILL.md").write_text(
+        "---\nname: poison\ndescription: SHADOW_SKILL_POISON\n---\nbody\n",
+        encoding="utf-8",
+    )
+    user_root = tmp_path / "researchclaw-skills"
+    user_root.symlink_to(metaclaw, target_is_directory=True)
+    monkeypatch.setattr(_helpers, "_skill_registry", None)
+
+    config = SimpleNamespace(
+        skills=SimpleNamespace(
+            custom_dirs=[str(user_root)], external_dirs=[], max_skills_per_stage=3
+        )
+    )
+    registry = _helpers._get_skill_registry(config)
+    assert registry.get("poison") is None

@@ -141,8 +141,9 @@ def convert_lessons_to_skills(
     *,
     min_severity: str = "warning",
     max_skills: int = 3,
+    run_dir: Path | None = None,
 ) -> list[str]:
-    """Convert failure lessons into MetaClaw skills.
+    """Reject durable lesson-to-skill conversion in canonical policy v1.
 
     Args:
         lessons: Lessons to convert (will be filtered by severity).
@@ -154,63 +155,12 @@ def convert_lessons_to_skills(
     Returns:
         List of created skill names.
     """
-    if not lessons:
-        return []
-
-    # Filter by severity threshold (>= min_severity)
-    filtered = [
-        l for l in lessons
-        if _severity_at_least(getattr(l, "severity", ""), min_severity)
-    ]
-    if not filtered:
-        logger.info(
-            "No lessons at severity >= %s (total lessons: %d)", min_severity, len(lessons)
-        )
-        return []
-
-    logger.info(
-        "Converting %d lessons (severity >= %s) to skills", len(filtered), min_severity
+    del lessons, llm, skills_dir, min_severity, max_skills, run_dir
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
     )
 
-    skills_path = Path(skills_dir).expanduser()
-    skills_path.mkdir(parents=True, exist_ok=True)
-
-    categories = ", ".join(sorted(set(LESSON_CATEGORY_TO_SKILL_CATEGORY.values())))
-    existing = _list_existing_skill_names(skills_path)
-
-    system = _CONVERSION_PROMPT_SYSTEM.format(categories=categories)
-    user = _CONVERSION_PROMPT_USER.format(
-        max_skills=max_skills,
-        lessons_text=_format_lessons(filtered),
-        existing_skills=", ".join(existing[:50]) if existing else "(none)",
+    require_canonical_evidence_capabilities("metaclaw.lesson_to_skill")
+    raise PermissionError(
+        "durable MetaClaw skills cannot be derived from release lessons in policy v1"
     )
-
-    try:
-        resp = llm.chat(
-            [{"role": "user", "content": user}],
-            system=system,
-            json_mode=True,
-            max_tokens=3000,
-        )
-    except Exception:
-        logger.warning("LLM call for lesson-to-skill conversion failed", exc_info=True)
-        return []
-
-    parsed = _parse_skills_response(resp.content)
-    if not parsed:
-        logger.warning("No valid skills parsed from LLM response")
-        return []
-
-    created: list[str] = []
-    for skill in parsed[:max_skills]:
-        # Map category using our mapping if needed
-        if skill["category"] not in LESSON_CATEGORY_TO_SKILL_CATEGORY.values():
-            lesson_cat = skill.get("category", "pipeline")
-            skill["category"] = LESSON_CATEGORY_TO_SKILL_CATEGORY.get(
-                lesson_cat, "research"
-            )
-        path = _write_skill(skills_path, skill)
-        if path is not None:
-            created.append(skill["name"])
-
-    return created

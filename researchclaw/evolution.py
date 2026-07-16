@@ -1,16 +1,15 @@
 """Self-evolution system for the ResearchClaw pipeline.
 
-Records lessons from each pipeline run (failures, slow stages, quality issues)
-and injects them into future runs as prompt overlays.  Inspired by Sibyl's
-time-weighted evolution mechanism.
+Publishes deterministic, canonical-release-bound diagnostic lessons. Policy v1
+does not inject persistent lessons into production prompts.
 
 Architecture
 ------------
 * ``LessonCategory`` — 6 issue categories for classification.
 * ``LessonEntry`` — single lesson (stage, category, severity, description, ts).
-* ``EvolutionStore`` — JSONL-backed persistent store with append + query.
-* ``extract_lessons()`` — auto-extract lessons from ``StageResult`` lists.
-* ``build_overlay()`` — generate per-stage prompt overlay text.
+* ``EvolutionStore`` — manifest-bound current-generation lesson publication.
+* ``extract_lessons()`` — deterministic derivation from release projection.
+* ``build_overlay()`` — deny-only compatibility entrypoint.
 
 Usage
 -----
@@ -21,14 +20,15 @@ Usage
     store = EvolutionStore(Path("evolution"))
     lessons = extract_lessons(results)
     store.append_many(lessons)
-    overlay = store.build_overlay("hypothesis_gen", max_lessons=5)
 """
 
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -36,42 +36,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Skills directories to scan (project-level .claude/skills/ and repo root)
-_PROJECT_SKILLS_DIRS: tuple[str, ...] = (
-    ".claude/skills",
-)
-
-
 def _load_project_skills() -> list[str]:
-    """Load skill content from project-level ``.claude/skills/`` directories.
-
-    Scans for SKILL.md files in subdirectories (excluding the main
-    ``researchclaw`` skill which is a CLI usage guide, not a pipeline skill).
-    Only loads skills that contain pipeline-relevant content (indicated by
-    ``metadata`` frontmatter or ``arc-`` / ``a-evolve`` in the name).
-    """
-    skills: list[str] = []
-    # Walk up from this file to find project root (contains .claude/)
-    root = Path(__file__).resolve().parent.parent
-    for rel_dir in _PROJECT_SKILLS_DIRS:
-        skills_dir = root / rel_dir
-        if not skills_dir.is_dir():
-            continue
-        for skill_sub in sorted(skills_dir.iterdir()):
-            if not skill_sub.is_dir():
-                continue
-            # Skip the main researchclaw CLI skill — it's not a pipeline overlay
-            if skill_sub.name == "researchclaw":
-                continue
-            skill_file = skill_sub / "SKILL.md"
-            if skill_file.is_file():
-                try:
-                    text = skill_file.read_text(encoding="utf-8").strip()
-                    if text:
-                        skills.append(text)
-                except OSError:
-                    continue
-    return skills
+    """Reject the legacy project-skill reader retained for API compatibility."""
+    raise PermissionError("project skills are not a canonical prompt source")
 
 
 class LessonCategory(str, Enum):
@@ -85,7 +52,7 @@ class LessonCategory(str, Enum):
     PIPELINE = "pipeline"      # Stage orchestration issues
 
 
-@dataclass
+@dataclass(frozen=True)
 class LessonEntry:
     """A single lesson extracted from a pipeline run."""
 
@@ -96,21 +63,141 @@ class LessonEntry:
     description: str
     timestamp: str  # ISO 8601
     run_id: str = ""
+    schema_version: int = 1
+    lesson_kind: str = ""
+    canonical_manifest_path: str = ""
+    canonical_manifest_sha256: str = ""
+    source_path: str = ""
+    source_sha256: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> LessonEntry:
+        expected = {
+            "stage_name", "stage_num", "category", "severity", "description",
+            "timestamp", "run_id", "schema_version", "lesson_kind",
+            "canonical_manifest_path", "canonical_manifest_sha256", "source_path",
+            "source_sha256",
+        }
+        if set(data) != expected:
+            raise ValueError("lesson schema mismatch")
+        if type(data.get("schema_version")) is not int or data["schema_version"] != 1:
+            raise ValueError("lesson schema version mismatch")
+        if type(data.get("stage_num")) is not int:
+            raise ValueError("lesson stage_num must be an integer")
+        for field in expected - {"schema_version", "stage_num"}:
+            if not isinstance(data.get(field), str):
+                raise ValueError(f"lesson {field} must be a string")
+        if (
+            data["stage_name"] != "citation_verify"
+            or data["stage_num"] != 23
+            or data["category"] != LessonCategory.LITERATURE
+            or data["severity"] != "warning"
+            or data["description"] != _CANONICAL_CITATION_LESSON
+            or data["timestamp"] != ""
+            or data["run_id"] != ""
+            or data["lesson_kind"] != "citation_verification_warning"
+            or data["source_path"] != "stage-23/verification_report.json"
+            or not data["canonical_manifest_path"]
+            or not _SHA256_RE.fullmatch(data["canonical_manifest_sha256"])
+            or not _SHA256_RE.fullmatch(data["source_sha256"])
+        ):
+            raise ValueError("lesson authority fields are invalid")
         return cls(
-            stage_name=str(data.get("stage_name", "")),
-            stage_num=int(data.get("stage_num", 0)),
-            category=str(data.get("category", "pipeline")),
-            severity=str(data.get("severity", "info")),
-            description=str(data.get("description", "")),
-            timestamp=str(data.get("timestamp", "")),
-            run_id=str(data.get("run_id", "")),
+            stage_name=data["stage_name"],
+            stage_num=data["stage_num"],
+            category=data["category"],
+            severity=data["severity"],
+            description=data["description"],
+            timestamp=data["timestamp"],
+            run_id=data["run_id"],
+            schema_version=data["schema_version"],
+            lesson_kind=data["lesson_kind"],
+            canonical_manifest_path=data["canonical_manifest_path"],
+            canonical_manifest_sha256=data["canonical_manifest_sha256"],
+            source_path=data["source_path"],
+            source_sha256=data["source_sha256"],
         )
+
+
+class CanonicalLessonError(ValueError):
+    """Raised when persistent lesson provenance cannot be replayed."""
+
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_CANONICAL_CITATION_LESSON = (
+    "Canonical citation verification found unsupported or suspicious citations."
+)
+
+
+def _derive_canonical_lessons(
+    projection: object,
+    *,
+    run_id: str,
+    timestamp: str,
+) -> list[LessonEntry]:
+    """Derive the complete v1 lesson set from one immutable release projection."""
+    del run_id, timestamp
+    manifest_path = getattr(projection, "canonical_manifest_path", "")
+    manifest_sha256 = getattr(projection, "canonical_manifest_sha256", "")
+    if not isinstance(manifest_path, str) or not manifest_path:
+        raise CanonicalLessonError("canonical lesson manifest path is invalid")
+    if not isinstance(manifest_sha256, str) or not _SHA256_RE.fullmatch(manifest_sha256):
+        raise CanonicalLessonError("canonical lesson manifest hash is invalid")
+
+    verification = getattr(projection, "verification_report", None)
+    if not isinstance(verification, dict) and not hasattr(verification, "get"):
+        raise CanonicalLessonError("canonical verification report is invalid")
+    summary = verification.get("summary")
+    if not isinstance(summary, dict) and not hasattr(summary, "get"):
+        raise CanonicalLessonError("canonical verification summary is invalid")
+    suspicious = summary.get("suspicious")
+    hallucinated = summary.get("hallucinated")
+    if type(suspicious) is not int or type(hallucinated) is not int:
+        raise CanonicalLessonError("canonical verification counts are invalid")
+    if suspicious < 0 or hallucinated < 0:
+        raise CanonicalLessonError("canonical verification counts are invalid")
+    if suspicious == 0 and hallucinated == 0:
+        return []
+
+    artifacts = getattr(projection, "authority_artifacts", ())
+    matches = [
+        artifact
+        for artifact in artifacts
+        if getattr(artifact, "path", "") == "stage-23/verification_report.json"
+    ]
+    if len(matches) != 1:
+        raise CanonicalLessonError("Stage 23 verification authority is not unique")
+    source_sha256 = getattr(matches[0], "sha256", "")
+    if not isinstance(source_sha256, str) or not _SHA256_RE.fullmatch(source_sha256):
+        raise CanonicalLessonError("Stage 23 verification authority hash is invalid")
+    return [
+        LessonEntry(
+            stage_name="citation_verify",
+            stage_num=23,
+            category=LessonCategory.LITERATURE,
+            severity="warning",
+            description=_CANONICAL_CITATION_LESSON,
+            timestamp="",
+            run_id="",
+            lesson_kind="citation_verification_warning",
+            canonical_manifest_path=manifest_path,
+            canonical_manifest_sha256=manifest_sha256,
+            source_path="stage-23/verification_report.json",
+            source_sha256=source_sha256,
+        )
+    ]
+
+
+def validate_canonical_lessons(
+    lessons: list[LessonEntry], projection: object
+) -> None:
+    """Require the complete lesson set to equal deterministic projection output."""
+    expected = _derive_canonical_lessons(projection, run_id="", timestamp="")
+    if lessons != expected:
+        raise CanonicalLessonError("persistent lesson set is not projection-derived")
 
 
 # ---------------------------------------------------------------------------
@@ -157,209 +244,23 @@ def _classify_error(stage_name: str, error_text: str) -> str:
 # Lesson extraction from pipeline results
 # ---------------------------------------------------------------------------
 
-# Stage name mapping (import-free to avoid circular deps)
-_STAGE_NAMES: dict[int, str] = {
-    1: "topic_init", 2: "problem_decompose", 3: "search_strategy",
-    4: "literature_collect", 5: "literature_screen", 6: "knowledge_extract",
-    7: "synthesis", 8: "hypothesis_gen", 9: "experiment_design",
-    10: "code_generation", 11: "resource_planning", 12: "experiment_run",
-    13: "iterative_refine", 14: "result_analysis", 15: "research_decision",
-    16: "paper_outline", 17: "paper_draft", 18: "peer_review",
-    19: "paper_revision", 20: "quality_gate", 21: "knowledge_archive",
-    22: "export_publish", 23: "citation_verify",
-}
-
-
 def extract_lessons(
     results: list[object],
     run_id: str = "",
     run_dir: Path | None = None,
 ) -> list[LessonEntry]:
-    """Extract lessons from a list of StageResult objects.
-
-    Detects:
-    - Failed stages → error lesson
-    - Blocked stages → pipeline lesson
-    - Decision pivots/refines → pipeline lesson (with rationale if available)
-    - Runtime warnings from experiment stderr → code_bug lesson
-    - Metric anomalies (NaN, identical convergence) → metric_anomaly lesson
-    """
-    from researchclaw.pipeline.canonical_evidence_capabilities import (
-        require_canonical_evidence_capabilities,
+    """Derive persistent lessons only from immutable canonical release authority."""
+    _require_evolution_capability("extract_lessons")
+    del results
+    if run_dir is None:
+        return []
+    from researchclaw.pipeline.external_release_projection import (
+        load_external_release_projection,
     )
 
-    require_canonical_evidence_capabilities("evolution.extract_lessons")
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    lessons: list[LessonEntry] = []
-
-    for result in results:
-        stage_num = int(getattr(result, "stage", 0))
-        stage_name = _STAGE_NAMES.get(stage_num, f"stage_{stage_num}")
-        status = str(getattr(result, "status", ""))
-        error = getattr(result, "error", None)
-        decision = str(getattr(result, "decision", "proceed"))
-
-        # Failed stages
-        if "failed" in status.lower() and error:
-            category = _classify_error(stage_name, str(error))
-            lessons.append(LessonEntry(
-                stage_name=stage_name,
-                stage_num=stage_num,
-                category=category,
-                severity="error",
-                description=f"Stage {stage_name} failed: {str(error)[:300]}",
-                timestamp=now,
-                run_id=run_id,
-            ))
-
-        # Blocked stages
-        if "blocked" in status.lower():
-            lessons.append(LessonEntry(
-                stage_name=stage_name,
-                stage_num=stage_num,
-                category=LessonCategory.PIPELINE,
-                severity="warning",
-                description=f"Stage {stage_name} blocked awaiting approval",
-                timestamp=now,
-                run_id=run_id,
-            ))
-
-        # PIVOT / REFINE decisions — extract rationale if available
-        if decision in ("pivot", "refine"):
-            rationale = _extract_decision_rationale(run_dir) if run_dir else ""
-            desc = f"Research decision was {decision.upper()}"
-            if rationale:
-                desc += f": {rationale[:200]}"
-            else:
-                desc += " — prior hypotheses/experiments were insufficient"
-            lessons.append(LessonEntry(
-                stage_name=stage_name,
-                stage_num=stage_num,
-                category=LessonCategory.PIPELINE,
-                severity="warning",
-                description=desc,
-                timestamp=now,
-                run_id=run_id,
-            ))
-
-    # --- Extract lessons from experiment artifacts ---
-    if run_dir is not None:
-        lessons.extend(_extract_runtime_lessons(run_dir, now, run_id))
-
-    return lessons
-
-
-def _extract_decision_rationale(run_dir: Path) -> str:
-    """Extract rationale from the most recent decision_structured.json.
-
-    Supports multiple field formats:
-    - ``rationale`` or ``reason`` key (direct)
-    - ``raw_text_excerpt`` containing ``## Justification`` section (LLM output)
-    """
-    for stage_dir in sorted(run_dir.glob("stage-15*"), reverse=True):
-        decision_file = stage_dir / "decision_structured.json"
-        if decision_file.exists():
-            try:
-                data = json.loads(decision_file.read_text(encoding="utf-8"))
-                if not isinstance(data, dict):
-                    continue
-                # Try direct rationale/reason keys first
-                direct = data.get("rationale", "") or data.get("reason", "")
-                if direct:
-                    return str(direct)
-                # Parse raw_text_excerpt for Justification section
-                raw = data.get("raw_text_excerpt", "")
-                if raw:
-                    return _parse_justification_from_excerpt(str(raw))
-            except (json.JSONDecodeError, OSError):
-                pass
-    return ""
-
-
-def _parse_justification_from_excerpt(text: str) -> str:
-    """Extract the Justification/Rationale section from LLM decision text."""
-    import re
-
-    # Match ## Justification, ## Rationale, or similar headings
-    pattern = re.compile(
-        r"##\s*(?:Justification|Rationale|Reason)\s*\n(.*?)(?=\n##|\Z)",
-        re.DOTALL | re.IGNORECASE,
-    )
-    match = pattern.search(text)
-    if match:
-        return match.group(1).strip()[:300]
-    # Fallback: skip the first line (## Decision / **REFINE**) and return the rest
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    # Skip heading lines starting with ## or **
-    content_lines = [
-        l for l in lines
-        if not l.startswith("##") and not (l.startswith("**") and l.endswith("**"))
-    ]
-    if content_lines:
-        return " ".join(content_lines)[:300]
-    return ""
-
-
-def _extract_runtime_lessons(
-    run_dir: Path, timestamp: str, run_id: str
-) -> list[LessonEntry]:
-    """Extract fine-grained lessons from experiment run artifacts."""
-    from researchclaw.pipeline.canonical_evidence_capabilities import (
-        require_canonical_evidence_capabilities,
-    )
-
-    require_canonical_evidence_capabilities("evolution._extract_runtime_lessons")
-    import math
-
-    lessons: list[LessonEntry] = []
-
-    # Check sandbox run results for stderr warnings and NaN
-    for runs_dir in run_dir.glob("stage-*/runs"):
-        for run_file in runs_dir.glob("*.json"):
-            if run_file.name == "results.json":
-                continue
-            try:
-                payload = json.loads(run_file.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                continue
-            if not isinstance(payload, dict):
-                continue
-
-            # Check stderr for runtime warnings
-            stderr = payload.get("stderr", "")
-            if stderr and any(
-                kw in stderr for kw in ("Warning", "Error", "divide", "overflow", "invalid value")
-            ):
-                lessons.append(LessonEntry(
-                    stage_name="experiment_run",
-                    stage_num=12,
-                    category=LessonCategory.EXPERIMENT,
-                    severity="warning",
-                    description=f"Runtime warning in experiment: {stderr[:200]}",
-                    timestamp=timestamp,
-                    run_id=run_id,
-                ))
-
-            # Check metrics for NaN/Inf
-            metrics = payload.get("metrics", {})
-            if isinstance(metrics, dict):
-                for key, val in metrics.items():
-                    try:
-                        fval = float(val)
-                        if math.isnan(fval) or math.isinf(fval):
-                            lessons.append(LessonEntry(
-                                stage_name="experiment_run",
-                                stage_num=12,
-                                category=LessonCategory.EXPERIMENT,
-                                severity="error",
-                                description=f"Metric '{key}' was {val} — code bug (division by zero or overflow)",
-                                timestamp=timestamp,
-                                run_id=run_id,
-                            ))
-                    except (TypeError, ValueError):
-                        pass
-
-    return lessons
+    projection = load_external_release_projection(run_dir)
+    return _derive_canonical_lessons(projection, run_id=run_id, timestamp=now)
 
 
 # ---------------------------------------------------------------------------
@@ -398,8 +299,9 @@ class EvolutionStore:
     """JSONL-backed store for pipeline lessons."""
 
     def __init__(self, store_dir: Path) -> None:
+        if store_dir.name != "evolution":
+            raise ValueError("canonical evolution namespace must be run_dir/evolution")
         self._dir = store_dir
-        self._dir.mkdir(parents=True, exist_ok=True)
         self._lessons_path = self._dir / "lessons.jsonl"
 
     @property
@@ -408,57 +310,95 @@ class EvolutionStore:
 
     def append(self, lesson: LessonEntry) -> None:
         """Append a single lesson to the store."""
-        with self._lessons_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(lesson.to_dict(), ensure_ascii=False) + "\n")
+        self.append_many([lesson])
 
     def append_many(self, lessons: list[LessonEntry]) -> None:
-        """Append multiple lessons atomically."""
-        if not lessons:
-            return
-        with self._lessons_path.open("a", encoding="utf-8") as f:
-            for lesson in lessons:
-                f.write(json.dumps(lesson.to_dict(), ensure_ascii=False) + "\n")
-        logger.info("Appended %d lessons to evolution store", len(lessons))
+        """Publish the exact current-generation lesson set atomically."""
+        _require_evolution_capability("append_many")
+        from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
+        from researchclaw.pipeline.external_release_projection import (
+            load_external_release_projection,
+        )
+
+        with ReleaseGraphLock.acquire(
+            self._dir.parent, "EvolutionStore.append_many", mode="write"
+        ) as release_lock:
+            projection = load_external_release_projection(self._dir.parent)
+            validate_canonical_lessons(lessons, projection)
+            publication = _serialize_lessons(lessons)
+            manifest = _serialize_lesson_manifest(projection, publication, len(lessons))
+            release_lock.ensure_run_directory(self._dir.name)
+            with release_lock.open_stage_namespace(self._dir.name) as namespace:
+                previous: dict[str, bytes] = {}
+                if set(namespace.direct_entries()) == {
+                    "lessons.jsonl", "lessons_manifest.json"
+                }:
+                    previous = {
+                        name: namespace.read_bytes(name)
+                        for name in ("lessons.jsonl", "lessons_manifest.json")
+                    }
+                try:
+                    namespace.invalidate(("lessons_manifest.json",))
+                    namespace.reset_flat_namespace()
+                    namespace.write_bytes_atomic("lessons.jsonl", publication)
+                    namespace.write_bytes_atomic("lessons_manifest.json", manifest)
+                    _read_lesson_publication(namespace, projection)
+                    fresh_projection = load_external_release_projection(self._dir.parent)
+                    if fresh_projection != projection:
+                        raise CanonicalLessonError(
+                            "canonical release changed during lesson publication"
+                        )
+                    _read_lesson_publication(namespace, fresh_projection)
+                    namespace.assert_canonical()
+                    release_lock.assert_canonical()
+                except Exception as exc:
+                    try:
+                        namespace.invalidate(("lessons_manifest.json",))
+                        namespace.reset_flat_namespace()
+                        for name in ("lessons.jsonl", "lessons_manifest.json"):
+                            if name in previous:
+                                namespace.write_bytes_atomic(name, previous[name])
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        exc.add_note(f"lesson publication rollback failed: {cleanup_exc}")
+                    raise
+        logger.info("Published %d canonical lessons", len(lessons))
 
     def load_all(self) -> list[LessonEntry]:
         """Load all lessons from disk."""
-        if not self._lessons_path.exists():
-            return []
-        lessons: list[LessonEntry] = []
-        for line in self._lessons_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                lessons.append(LessonEntry.from_dict(data))
-            except (json.JSONDecodeError, TypeError):
-                continue
-        return lessons
+        _require_evolution_capability("load_all")
+        from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
+        from researchclaw.pipeline.external_release_projection import (
+            load_external_release_projection,
+        )
+
+        with ReleaseGraphLock.acquire(
+            self._dir.parent, "EvolutionStore.load_all", mode="read"
+        ) as release_lock:
+            projection = load_external_release_projection(self._dir.parent)
+            with release_lock.open_stage_namespace(self._dir.name) as namespace:
+                lessons = _read_lesson_publication(namespace, projection)
+                fresh_projection = load_external_release_projection(self._dir.parent)
+                if fresh_projection != projection:
+                    raise CanonicalLessonError(
+                        "canonical release changed during lesson replay"
+                    )
+                if _read_lesson_publication(namespace, fresh_projection) != lessons:
+                    raise CanonicalLessonError("lesson publication changed during replay")
+                namespace.assert_canonical()
+            release_lock.assert_canonical()
+            return lessons
 
     def query_for_stage(
         self, stage_name: str, *, max_lessons: int = 5
     ) -> list[LessonEntry]:
-        """Return the most relevant lessons for a stage, weighted by recency.
+        """Return the current canonical lessons relevant to a stage.
 
         Includes lessons that directly match the stage, plus high-severity
         lessons from related stages.
         """
+        _require_evolution_capability("query_for_stage")
         all_lessons = self.load_all()
-        scored: list[tuple[float, LessonEntry]] = []
-        for lesson in all_lessons:
-            weight = _time_weight(lesson.timestamp)
-            if weight <= 0.0:
-                continue
-            # Boost direct stage matches
-            if lesson.stage_name == stage_name:
-                weight *= 2.0
-            # Boost errors over warnings/info
-            if lesson.severity == "error":
-                weight *= 1.5
-            scored.append((weight, lesson))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [entry for _, entry in scored[:max_lessons]]
+        return all_lessons[:max_lessons] if stage_name else []
 
     def build_overlay(
         self,
@@ -467,109 +407,21 @@ class EvolutionStore:
         max_lessons: int = 5,
         skills_dir: str = "",
     ) -> str:
-        """Generate a prompt overlay string for a given stage.
-
-        Combines two sources:
-        1. Current-run lessons from ``lessons.jsonl`` (intra-run learning).
-        2. Cross-run MetaClaw ``arc-*`` skills from *skills_dir* (inter-run
-           learning via the MetaClaw skill-generation feedback loop).
-
-        Project-level and user-level skills are handled separately by the
-        SkillRegistry in ``_helpers._get_skill_registry()``.
-
-        Returns empty string if no relevant lessons or skills exist.
-        """
-        parts: list[str] = []
-
-        # --- Section 1: intra-run lessons ---
-        lessons = self.query_for_stage(stage_name, max_lessons=max_lessons)
-        if lessons:
-            parts.append("## Lessons from Prior Runs")
-            for i, lesson in enumerate(lessons, 1):
-                severity_icon = {"error": "❌", "warning": "⚠️", "info": "ℹ️"}.get(
-                    lesson.severity, "•"
-                )
-                parts.append(
-                    f"{i}. {severity_icon} [{lesson.category}] {lesson.description}"
-                )
-            parts.append(
-                "\nUse these lessons to avoid repeating past mistakes."
-            )
-
-        # --- Section 2: cross-run MetaClaw arc-* skills ---
-        arc_skills: list[str] = []
-        if skills_dir:
-            from pathlib import Path as _Path
-
-            sd = _Path(skills_dir).expanduser()
-            if sd.is_dir():
-                for skill_dir in sorted(sd.iterdir()):
-                    if skill_dir.is_dir() and skill_dir.name.startswith("arc-"):
-                        skill_file = skill_dir / "SKILL.md"
-                        if skill_file.is_file():
-                            try:
-                                text = skill_file.read_text(encoding="utf-8").strip()
-                                if text:
-                                    arc_skills.append(text)
-                            except OSError:
-                                continue
-
-        if arc_skills:
-            parts.append("\n## Learned Skills from Prior Runs")
-            for skill_text in arc_skills[:5]:
-                parts.append(skill_text)
-            parts.append(
-                "\nApply these skills proactively to improve quality."
-            )
-
-        return "\n".join(parts)
+        """Return no prompt overlay; v1 persistent lessons are audit-only."""
+        _require_evolution_capability("build_overlay")
+        del stage_name, max_lessons, skills_dir
+        return ""
 
     def count(self) -> int:
         """Return total number of stored lessons."""
+        _require_evolution_capability("count")
         return len(self.load_all())
 
     def export_to_memory(self, memory_store: object) -> int:
-        """Export lessons to a memory store (duck-typed to avoid circular imports).
-
-        The *memory_store* must expose an ``add(content, category, metadata)`` method
-        (compatible with ``researchclaw.memory.store.MemoryStore``).
-
-        Returns the number of lessons exported.
-        """
-        add_fn = getattr(memory_store, "add", None)
-        if add_fn is None or not callable(add_fn):
-            logger.warning("export_to_memory: memory_store has no add() method")
-            return 0
-        lessons = self.load_all()
-        exported = 0
-        for lesson in lessons:
-            weight = _time_weight(lesson.timestamp)
-            if weight <= 0.0:
-                continue
-            try:
-                # Map lesson categories to valid MemoryStore categories
-                _CAT_MAP = {
-                    "system": "experiment", "analysis": "experiment",
-                    "literature": "ideation", "pipeline": "experiment",
-                    "experiment": "experiment", "writing": "writing",
-                    "ideation": "ideation",
-                }
-                _mem_cat = _CAT_MAP.get(lesson.category, "experiment")
-                add_fn(
-                    content=lesson.description,
-                    category=_mem_cat,
-                    metadata={
-                        "source": "evolution",
-                        "stage": lesson.stage_name,
-                        "severity": lesson.severity,
-                        "run_id": lesson.run_id,
-                        "timestamp": lesson.timestamp,
-                    },
-                )
-                exported += 1
-            except Exception:
-                logger.debug("Failed to export lesson: %s", lesson.description[:80])
-        return exported
+        """Reject the legacy binding-losing memory export."""
+        _require_evolution_capability("export_to_memory")
+        del memory_store
+        raise PermissionError("evolution lessons cannot be exported without bindings")
 
     def get_lessons_for_stage_with_memory(
         self,
@@ -583,26 +435,119 @@ class EvolutionStore:
         *memory_store* must expose a ``recall(query, category, max_results)`` method
         returning objects with a ``.content`` attribute.
         """
-        overlay = self.build_overlay(stage_name, max_lessons=max_lessons)
-        recall_fn = getattr(memory_store, "recall", None)
-        if recall_fn is None or not callable(recall_fn):
-            return overlay
-        try:
-            memories = recall_fn(
-                query=stage_name,
-                category=None,
-                max_results=max_lessons,
+        _require_evolution_capability("get_lessons_for_stage_with_memory")
+        del stage_name, memory_store, max_lessons
+        return ""
+
+
+def _require_evolution_capability(operation: str) -> None:
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities(f"EvolutionStore.{operation}")
+
+
+def _serialize_lessons(lessons: list[LessonEntry]) -> bytes:
+    return b"".join(
+        (
+            json.dumps(
+                lesson.to_dict(), sort_keys=True, ensure_ascii=False,
+                allow_nan=False, separators=(",", ":"),
             )
-            if memories:
-                parts = ["\n## Recalled Memories"]
-                for i, mem in enumerate(memories, 1):
-                    content = getattr(mem, "content", str(mem))
-                    parts.append(f"{i}. {content}")
-                memory_text = "\n".join(parts)
-                return f"{overlay}\n{memory_text}" if overlay else memory_text
-        except Exception:
-            logger.debug("Failed to recall memories for stage %s", stage_name)
-        return overlay
+            + "\n"
+        ).encode("utf-8")
+        for lesson in lessons
+    )
+
+
+def _serialize_lesson_manifest(
+    projection: object, publication: bytes, count: int
+) -> bytes:
+    payload = {
+        "schema_version": 1,
+        "canonical_manifest_path": projection.canonical_manifest_path,
+        "canonical_manifest_sha256": projection.canonical_manifest_sha256,
+        "lessons_path": "evolution/lessons.jsonl",
+        "lessons_sha256": hashlib.sha256(publication).hexdigest(),
+        "lesson_count": count,
+    }
+    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _read_lesson_publication(namespace: object, projection: object) -> list[LessonEntry]:
+    expected_entries = ("lessons.jsonl", "lessons_manifest.json")
+    if namespace.direct_entries() != expected_entries:
+        raise CanonicalLessonError("lesson namespace closure mismatch")
+    raw = namespace.read_bytes("lessons.jsonl")
+    manifest_raw = namespace.read_bytes("lessons_manifest.json")
+    try:
+        manifest = json.loads(
+            manifest_raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_lesson_keys,
+            parse_constant=_reject_lesson_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CanonicalLessonError("lesson manifest is invalid") from exc
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "schema_version", "canonical_manifest_path", "canonical_manifest_sha256",
+        "lessons_path", "lessons_sha256", "lesson_count",
+    }:
+        raise CanonicalLessonError("lesson manifest schema mismatch")
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1:
+        raise CanonicalLessonError("lesson manifest version mismatch")
+    if type(manifest["lesson_count"]) is not int or manifest["lesson_count"] < 0:
+        raise CanonicalLessonError("lesson manifest count is invalid")
+    expected_manifest = _serialize_lesson_manifest(
+        projection, raw, manifest["lesson_count"]
+    )
+    if manifest_raw != expected_manifest:
+        raise CanonicalLessonError("lesson manifest replay mismatch")
+    lessons = _parse_canonical_lessons(raw)
+    if len(lessons) != manifest["lesson_count"]:
+        raise CanonicalLessonError("lesson manifest count mismatch")
+    validate_canonical_lessons(lessons, projection)
+    return lessons
+
+
+def _parse_canonical_lessons(raw: bytes) -> list[LessonEntry]:
+    if raw and not raw.endswith(b"\n"):
+        raise CanonicalLessonError("lesson JSONL is not canonical")
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise CanonicalLessonError("persistent lesson store is not UTF-8") from exc
+    if any(not line for line in lines):
+        raise CanonicalLessonError("lesson JSONL contains a blank line")
+    lessons: list[LessonEntry] = []
+    for line in lines:
+        try:
+            data = json.loads(
+                line,
+                object_pairs_hook=_reject_duplicate_lesson_keys,
+                parse_constant=_reject_lesson_constant,
+            )
+            if not isinstance(data, dict):
+                raise ValueError("lesson entry must be an object")
+            lessons.append(LessonEntry.from_dict(data))
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise CanonicalLessonError("persistent lesson store is invalid") from exc
+    if _serialize_lessons(lessons) != raw:
+        raise CanonicalLessonError("lesson JSONL bytes are not canonical")
+    return lessons
+
+
+def _reject_duplicate_lesson_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate lesson key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_lesson_constant(value: str) -> object:
+    raise ValueError(f"non-finite lesson value is forbidden: {value}")
 
 
 # ---------------------------------------------------------------------------
@@ -640,11 +585,10 @@ class RefinePoint:
 
 
 class TrajectoryStore:
-    """JSONL-backed store for per-iteration refinement metrics."""
+    """Disabled legacy store for unbound refinement metrics."""
 
     def __init__(self, store_dir: Path) -> None:
         self._dir = store_dir
-        self._dir.mkdir(parents=True, exist_ok=True)
         self._path = self._dir / "trajectory.jsonl"
 
     @property
@@ -652,28 +596,12 @@ class TrajectoryStore:
         return self._path
 
     def append_many(self, points: list[RefinePoint]) -> None:
-        if not points:
-            return
-        with self._path.open("a", encoding="utf-8") as f:
-            for pt in points:
-                f.write(json.dumps(pt.to_dict(), ensure_ascii=False) + "\n")
-        logger.info("Trajectory: appended %d points", len(points))
+        del points
+        raise PermissionError("unbound refinement trajectory persistence is disabled")
 
     def load_for_run(self, run_id: str) -> list[RefinePoint]:
-        if not self._path.exists():
-            return []
-        points: list[RefinePoint] = []
-        for line in self._path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                if data.get("run_id") == run_id:
-                    points.append(RefinePoint.from_dict(data))
-            except (json.JSONDecodeError, TypeError, KeyError, ValueError):
-                continue
-        return points
+        del run_id
+        raise PermissionError("unbound refinement trajectory replay is disabled")
 
 
 def record_refine_trajectory(
@@ -682,40 +610,9 @@ def record_refine_trajectory(
     refinement_log: dict[str, object],
     cycle: int = 1,
 ) -> list[RefinePoint]:
-    """Parse a refinement log and persist trajectory points."""
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    metric_key = str(refinement_log.get("metric_key", "primary_metric"))
-    metric_direction = str(refinement_log.get("metric_direction", "minimize"))
-    iterations = refinement_log.get("iterations", [])
-    if not isinstance(iterations, list):
-        return []
-
-    points: list[RefinePoint] = []
-    for i, entry in enumerate(iterations):
-        if not isinstance(entry, dict):
-            continue
-        raw = entry.get("metric")
-        try:
-            metric_val: float | None = float(raw) if raw is not None else None
-        except (TypeError, ValueError):
-            metric_val = None
-        points.append(
-            RefinePoint(
-                run_id=run_id,
-                cycle=cycle,
-                iteration=i,
-                metric=metric_val,
-                metric_key=metric_key,
-                metric_direction=metric_direction,
-                timestamp=now,
-            )
-        )
-
-    TrajectoryStore(store_dir).append_many(points)
-    return points
-
-
-_PLATEAU_THRESHOLD: float = 0.05
+    """Reject the legacy unbound refinement-log persistence path."""
+    del store_dir, run_id, refinement_log, cycle
+    raise PermissionError("unbound refinement trajectory persistence is disabled")
 
 
 def get_trajectory_signal(
@@ -723,79 +620,6 @@ def get_trajectory_signal(
     run_id: str,
     current_cycle: int,
 ) -> dict[str, object]:
-    """Analyze trajectory data and return an actionable signal."""
-    points = TrajectoryStore(store_dir).load_for_run(run_id)
-    if not points:
-        return {
-            "stagnating": False,
-            "plateau_rounds": 0,
-            "best_gain_pct": None,
-            "recommendation": "proceed",
-            "summary": "",
-        }
-
-    maximize = points[0].metric_direction == "maximize"
-
-    def _cycle_best(pts: list[RefinePoint]) -> float | None:
-        vals = [p.metric for p in pts if p.metric is not None]
-        if not vals:
-            return None
-        return max(vals) if maximize else min(vals)
-
-    cycle_map: dict[int, list[RefinePoint]] = {}
-    for pt in points:
-        cycle_map.setdefault(pt.cycle, []).append(pt)
-
-    cycle_bests: list[tuple[int, float | None]] = sorted(
-        [(cycle, _cycle_best(pts)) for cycle, pts in cycle_map.items()],
-        key=lambda item: item[0],
-    )
-
-    gains: list[float] = []
-    for idx in range(1, len(cycle_bests)):
-        prev = cycle_bests[idx - 1][1]
-        curr = cycle_bests[idx][1]
-        if prev is None or curr is None or prev == 0.0:
-            continue
-        raw = (curr - prev) / abs(prev)
-        gains.append(raw if maximize else -raw)
-
-    plateau_rounds = 0
-    for gain in reversed(gains):
-        if gain < _PLATEAU_THRESHOLD:
-            plateau_rounds += 1
-        else:
-            break
-
-    stagnating = plateau_rounds >= 2
-    best_gain_pct: float | None = max(gains) * 100 if gains else None
-    if stagnating:
-        recommendation = "pivot"
-    elif gains and gains[-1] < _PLATEAU_THRESHOLD:
-        recommendation = "refine"
-    else:
-        recommendation = "proceed"
-
-    metric_key_label = points[0].metric_key
-    lines = [f"Improvement trajectory ({current_cycle} REFINE cycle(s) recorded):"]
-    for cycle_num, best in cycle_bests:
-        lines.append(f"  Cycle {cycle_num}: best_{metric_key_label}={best}")
-    if gains:
-        lines.append(f"  Inter-cycle gains: {[f'{g * 100:.1f}%' for g in gains]}")
-    if stagnating:
-        lines.append(
-            f"  WARNING: {plateau_rounds} consecutive cycles with <5% gain "
-            "-- PIVOT strongly recommended."
-        )
-    elif recommendation == "refine":
-        lines.append("  Last cycle showed marginal gain -- one more REFINE may help.")
-    else:
-        lines.append("  Healthy improvement -- PROCEED recommended.")
-
-    return {
-        "stagnating": stagnating,
-        "plateau_rounds": plateau_rounds,
-        "best_gain_pct": best_gain_pct,
-        "recommendation": recommendation,
-        "summary": "\n".join(lines),
-    }
+    """Reject the legacy unbound trajectory signal path."""
+    del store_dir, run_id, current_cycle
+    raise PermissionError("unbound refinement trajectory replay is disabled")

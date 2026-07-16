@@ -83,6 +83,30 @@ def _blocked(stage: Stage) -> StageResult:
     )
 
 
+def test_legacy_experiment_diagnosis_and_repair_are_mechanically_disabled(
+    tmp_path: Path, rc_config: RCConfig
+) -> None:
+    with pytest.raises(PermissionError, match="diagnosis is disabled"):
+        rc_runner._run_experiment_diagnosis(tmp_path, rc_config, "run")
+    with pytest.raises(PermissionError, match="repair is disabled"):
+        rc_runner._run_experiment_repair(tmp_path, rc_config, "run")
+
+    import inspect
+
+    pipeline_source = inspect.getsource(rc_runner.execute_pipeline)
+    assert "_run_experiment_diagnosis" not in pipeline_source
+    assert "_run_experiment_repair" not in pipeline_source
+
+    shadow_summary = tmp_path / "stage-14_v99/experiment_summary.json"
+    shadow_run = tmp_path / "stage-13_v99/runs/run-poison.json"
+    shadow_summary.parent.mkdir(parents=True)
+    shadow_run.parent.mkdir(parents=True)
+    shadow_summary.write_text('{"quality":"SHADOW_POISON"}', encoding="utf-8")
+    shadow_run.write_text('{"stderr":"SHADOW_RUNTIME_POISON"}', encoding="utf-8")
+    assert not (tmp_path / "experiment_diagnosis.json").exists()
+    assert not (tmp_path / "repair_prompt.txt").exists()
+
+
 def test_execute_pipeline_runs_stages_in_sequence(
     monkeypatch: pytest.MonkeyPatch,
     run_dir: Path,
@@ -377,7 +401,7 @@ def test_generic_skip_writer_rejects_stage24_without_creating_artifacts(
     assert not (run_dir / "stage-24").exists()
 
 
-def test_execute_pipeline_records_and_writes_trajectory_signal(
+def test_execute_pipeline_does_not_consume_raw_refinement_trajectory(
     monkeypatch: pytest.MonkeyPatch,
     run_dir: Path,
     rc_config: RCConfig,
@@ -411,9 +435,8 @@ def test_execute_pipeline_records_and_writes_trajectory_signal(
         to_stage=Stage.RESEARCH_DECISION,
     )
 
-    assert (run_dir / "evolution" / "trajectory.jsonl").exists()
-    signal = json.loads((run_dir / "trajectory_signal.json").read_text(encoding="utf-8"))
-    assert signal["recommendation"] == "proceed"
+    assert not (run_dir / "evolution" / "trajectory.jsonl").exists()
+    assert not (run_dir / "trajectory_signal.json").exists()
 
 
 def test_execute_pipeline_continues_after_gate_when_stop_on_gate_disabled(

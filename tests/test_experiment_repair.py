@@ -399,10 +399,8 @@ class TestRunRepairLoop:
             class llm:
                 pass
 
-        result = run_repair_loop(tmp_path, FakeConfig(), "test")
-        assert result.success is True
-        assert result.total_cycles == 0
-        assert result.final_mode == PaperMode.FULL_PAPER
+        with pytest.raises(PermissionError, match="disabled by canonical policy"):
+            run_repair_loop(tmp_path, FakeConfig(), "test")
 
     def test_returns_failure_when_no_code(self, tmp_path):
         """If no experiment code found, return failure."""
@@ -423,9 +421,8 @@ class TestRunRepairLoop:
             class llm:
                 pass
 
-        result = run_repair_loop(tmp_path, FakeConfig(), "test")
-        assert result.success is False
-        assert result.total_cycles == 0
+        with pytest.raises(PermissionError, match="disabled by canonical policy"):
+            run_repair_loop(tmp_path, FakeConfig(), "test")
 
     def test_repair_loop_with_mocked_llm(self, tmp_path):
         """Test full repair loop with mocked LLM and sandbox."""
@@ -489,17 +486,12 @@ print("condition=Ablation metric=85.0")
             mock_create_llm.return_value = mock_llm
             mock_create_sb.return_value = mock_sandbox
 
-            result = run_repair_loop(run_dir, FakeConfig(), "test-mock")
+            with pytest.raises(PermissionError, match="disabled by canonical policy"):
+                run_repair_loop(run_dir, FakeConfig(), "test-mock")
 
-        assert result.total_cycles == 1
-        assert len(result.cycle_history) == 1
-        assert result.cycle_history[0].repair_applied is True
-
-        # Check that repair files were saved
-        repair_dir = run_dir / "stage-14_repair_v1"
-        assert repair_dir.exists()
-        assert (repair_dir / "experiment" / "main.py").exists()
-        assert (repair_dir / "experiment_summary.json").exists()
+        mock_create_llm.assert_not_called()
+        mock_create_sb.assert_not_called()
+        assert not (run_dir / "stage-14_repair_v1").exists()
 
     def test_simulated_mode_skips_repair(self, tmp_path):
         """Simulated mode has no sandbox-executable experiment to repair.
@@ -524,22 +516,12 @@ print("condition=Ablation metric=85.0")
 
         with patch("researchclaw.llm.create_llm_client") as mock_create_llm, \
              patch("researchclaw.experiment.factory.create_sandbox") as mock_create_sb:
-            result = run_repair_loop(run_dir, FakeConfig(), "test-sim")
+            with pytest.raises(PermissionError, match="disabled by canonical policy"):
+                run_repair_loop(run_dir, FakeConfig(), "test-sim")
 
-        assert result.success is False
-        assert result.total_cycles == 0
-        assert result.skipped_reason == "simulated_mode"
-        assert result.cycle_history == []
-        assert result.final_assessment is not None
-        assert result.best_experiment_summary is not None
         # Guard must fire before the LLM client and sandbox would be created.
         mock_create_llm.assert_not_called()
         mock_create_sb.assert_not_called()
-        # to_dict() must include skipped_reason so the persisted
-        # experiment_repair_result.json can surface the skip.
-        d = result.to_dict()
-        assert d["skipped_reason"] == "simulated_mode"
-        assert d["total_cycles"] == 0
 
 
 # ---------------------------------------------------------------------------

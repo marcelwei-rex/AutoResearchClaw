@@ -13,7 +13,10 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import socket
+import tempfile
 
 import pytest
 
@@ -247,6 +250,108 @@ class TestSkillLoader:
     def test_load_missing_directory(self, tmp_path: Path) -> None:
         skills = load_skills_from_directory(tmp_path / "nonexistent")
         assert skills == []
+
+    def test_rejects_symlink_root_and_descendant(self, tmp_path: Path) -> None:
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "poison.json").write_text("{}", encoding="utf-8")
+        root_link = tmp_path / "root-link"
+        root_link.symlink_to(external, target_is_directory=True)
+        with pytest.raises(OSError, match="regular directory"):
+            load_skills_from_directory(root_link)
+
+        root = tmp_path / "root"
+        root.mkdir()
+        (root / "poison-link").symlink_to(external, target_is_directory=True)
+        with pytest.raises(OSError, match="unsafe entry"):
+            load_skills_from_directory(root)
+
+    def test_root_replacement_during_read_cannot_load_shadow_skill(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from researchclaw.skills import loader
+
+        root = tmp_path / "skills"
+        root.mkdir()
+        (root / "safe.json").write_text(
+            json.dumps({"name": "safe", "description": "SAFE"}), encoding="utf-8"
+        )
+        poison = tmp_path / "poison"
+        poison.mkdir()
+        (poison / "shadow.json").write_text(
+            json.dumps({"name": "shadow", "description": "SHADOW"}), encoding="utf-8"
+        )
+        detached = tmp_path / "skills-detached"
+        original = loader._read_regular_fd
+        replaced = False
+
+        def replace_after_read(parent_fd: int, name: str, display_path: Path) -> bytes:
+            nonlocal replaced
+            raw = original(parent_fd, name, display_path)
+            if not replaced:
+                root.rename(detached)
+                root.symlink_to(poison, target_is_directory=True)
+                replaced = True
+            return raw
+
+        monkeypatch.setattr(loader, "_read_regular_fd", replace_after_read)
+        with pytest.raises(OSError, match="root changed"):
+            load_skills_from_directory(root)
+
+    def test_parent_directory_replacement_during_read_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from researchclaw.skills import loader
+
+        root = tmp_path / "skills"
+        parent = root / "safe"
+        parent.mkdir(parents=True)
+        (parent / "skill.json").write_text(
+            json.dumps({"name": "safe", "description": "SAFE"}), encoding="utf-8"
+        )
+        poison = tmp_path / "poison"
+        poison.mkdir()
+        (poison / "skill.json").write_text(
+            json.dumps({"name": "shadow", "description": "SHADOW"}), encoding="utf-8"
+        )
+        detached = root / "safe-detached"
+        original = loader._read_regular_fd
+        replaced = False
+
+        def replace_parent(parent_fd: int, name: str, display_path: Path) -> bytes:
+            nonlocal replaced
+            raw = original(parent_fd, name, display_path)
+            if not replaced:
+                parent.rename(detached)
+                parent.symlink_to(poison, target_is_directory=True)
+                replaced = True
+            return raw
+
+        monkeypatch.setattr(loader, "_read_regular_fd", replace_parent)
+        with pytest.raises(OSError, match="directory changed"):
+            load_skills_from_directory(root)
+
+    def test_rejects_fifo_and_socket_without_blocking(self, tmp_path: Path) -> None:
+        fifo_root = tmp_path / "fifo-skills"
+        fifo_root.mkdir()
+        os.mkfifo(fifo_root / "poison.json")
+        with pytest.raises(OSError, match="unsafe entry"):
+            load_skills_from_directory(fifo_root)
+
+        socket_root = Path(tempfile.mkdtemp(prefix="rcskill-", dir="/tmp"))
+        socket_path = socket_root / "poison.json"
+        sock = socket.socket(socket.AF_UNIX)
+        try:
+            try:
+                sock.bind(str(socket_path))
+            except PermissionError:
+                pytest.skip("AF_UNIX socket creation is blocked by the sandbox")
+            with pytest.raises(OSError, match="unsafe entry"):
+                load_skills_from_directory(socket_root)
+        finally:
+            sock.close()
+            socket_path.unlink(missing_ok=True)
+            socket_root.rmdir()
 
 
 class TestSkillMdLoader:

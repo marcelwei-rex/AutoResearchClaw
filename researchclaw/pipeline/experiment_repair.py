@@ -278,34 +278,16 @@ def run_repair_loop(
     config: Any,
     run_id: str = "",
 ) -> ExperimentRepairResult:
-    """Execute the full experiment repair loop.
-
-    After Stage 14 diagnosis finds quality issues:
-    1. Load current experiment code
-    2. For each cycle: diagnose → LLM/OpenCode fix → re-run in sandbox → re-assess
-    3. Select best results across all cycles
-    4. Return structured result
-
-    Parameters
-    ----------
-    run_dir:
-        Path to the pipeline run directory (contains stage-* subdirs).
-    config:
-        RCConfig instance with experiment and LLM settings.
-    run_id:
-        Pipeline run ID for logging.
-
-    Returns
-    -------
-    ExperimentRepairResult
-    """
+    """Reject the legacy shadow-scanning repair producer."""
     from researchclaw.pipeline.canonical_evidence_capabilities import (
         require_canonical_evidence_capabilities,
     )
 
     require_canonical_evidence_capabilities("experiment_repair.run_repair_loop")
+    del run_dir, config, run_id
+    raise PermissionError("legacy experiment repair loop is disabled by canonical policy")
 
-    repair_cfg = config.experiment.repair
+    repair_cfg = config.experiment.repair  # pragma: no cover - legacy reference only
 
     # Load initial experiment summary
     summary = _load_experiment_summary(run_dir)

@@ -16,8 +16,6 @@ from researchclaw.config import RCConfig
 from researchclaw.evolution import (
     EvolutionStore,
     extract_lessons,
-    get_trajectory_signal,
-    record_refine_trajectory,
 )
 from researchclaw.knowledge.base import write_stage_to_kb
 from researchclaw.pipeline.contracts import CONTRACTS
@@ -324,225 +322,15 @@ logger = logging.getLogger(__name__)
 
 
 def _run_experiment_diagnosis(run_dir: Path, config: RCConfig, run_id: str) -> None:
-    """Run experiment diagnosis after Stage 14 and save reports.
-
-    Produces:
-    - ``run_dir/experiment_diagnosis.json`` — structured diagnosis + quality assessment
-    - ``run_dir/repair_prompt.txt`` — repair instructions (if quality is insufficient)
-    """
-    try:
-        from researchclaw.pipeline.experiment_diagnosis import (
-            diagnose_experiment,
-            assess_experiment_quality,
-        )
-
-        # Find the most recent stage-14 experiment_summary.json
-        summary_path = None
-        for candidate in sorted(run_dir.glob("stage-14*/experiment_summary.json")):
-            summary_path = candidate
-        if not summary_path or not summary_path.exists():
-            return
-
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
-
-        # Collect stdout/stderr from experiment runs
-        # Look in stage-12 (EXPERIMENT_RUN) and stage-13 (ITERATIVE_REFINE), not stage-14
-        stdout, stderr = "", ""
-        runs_dir = None
-        for _candidate_runs in sorted(run_dir.glob("stage-1[23]*/runs"), reverse=True):
-            if _candidate_runs.is_dir():
-                runs_dir = _candidate_runs
-                break
-        if runs_dir is None:
-            runs_dir = summary_path.parent / "runs"
-        if runs_dir.is_dir():
-            for run_file in sorted(runs_dir.glob("*.json"))[:5]:
-                try:
-                    run_data = json.loads(run_file.read_text(encoding="utf-8"))
-                    if isinstance(run_data, dict):
-                        stdout += run_data.get("stdout", "") + "\n"
-                        stderr += run_data.get("stderr", "") + "\n"
-                except (json.JSONDecodeError, OSError):
-                    continue
-
-        # Load experiment plan from stage-09
-        plan = None
-        for candidate in sorted(run_dir.glob("stage-09*/exp_plan.yaml")):
-            try:
-                import yaml as _yaml_diag
-                plan = _yaml_diag.safe_load(candidate.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        if plan is None:
-            for candidate in sorted(run_dir.glob("stage-09*/experiment_design.json")):
-                try:
-                    plan = json.loads(candidate.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    pass
-
-        # Load refinement log if available
-        ref_log = None
-        for candidate in sorted(run_dir.glob("stage-13*/refinement_log.json")):
-            try:
-                ref_log = json.loads(candidate.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
-
-        # Run diagnosis
-        diag = diagnose_experiment(
-            experiment_summary=summary,
-            experiment_plan=plan,
-            refinement_log=ref_log,
-            stdout=stdout.strip(),
-            stderr=stderr.strip(),
-        )
-
-        # Run quality assessment
-        qa = assess_experiment_quality(summary, ref_log)
-
-        # Save diagnosis report
-        diag_report = {
-            "diagnosis": diag.to_dict(),
-            "quality_assessment": {
-                "mode": qa.mode.value,
-                "sufficient": qa.sufficient,
-                "repair_possible": qa.repair_possible,
-                "deficiency_types": [d.type.value for d in qa.deficiencies],
-            },
-            "repair_needed": not qa.sufficient,
-            "generated": _utcnow_iso(),
-        }
-        (run_dir / "experiment_diagnosis.json").write_text(
-            json.dumps(diag_report, indent=2), encoding="utf-8"
-        )
-
-        if not qa.sufficient:
-            # Generate repair prompt for the REFINE loop
-            from researchclaw.pipeline.experiment_repair import build_repair_prompt
-
-            code: dict[str, str] = {}
-            # Try refined code first, then stage-10 experiment dir, then raw stage-10
-            for _glob_pat in (
-                "stage-13*/experiment_final/*.py",
-                "stage-10*/experiment/*.py",
-                "stage-10*/*.py",
-            ):
-                for candidate in sorted(run_dir.glob(_glob_pat)):
-                    try:
-                        code[candidate.name] = candidate.read_text(encoding="utf-8")
-                    except (OSError, UnicodeDecodeError):
-                        pass
-                if code:
-                    break
-
-            repair_prompt = build_repair_prompt(
-                diag, code, time_budget_sec=config.experiment.time_budget_sec
-            )
-            (run_dir / "repair_prompt.txt").write_text(
-                repair_prompt, encoding="utf-8"
-            )
-            logger.info(
-                "[%s] Experiment diagnosis: mode=%s, deficiencies=%d — repair prompt saved",
-                run_id, qa.mode.value, len(diag.deficiencies),
-            )
-            print(
-                f"[{run_id}] Experiment diagnosis: {qa.mode.value} "
-                f"({len(diag.deficiencies)} issues found, repair needed)"
-            )
-        else:
-            logger.info(
-                "[%s] Experiment diagnosis: mode=%s, sufficient=True — quality OK",
-                run_id, qa.mode.value,
-            )
-            print(f"[{run_id}] Experiment diagnosis: {qa.mode.value} — quality OK")
-
-    except Exception as exc:
-        logger.warning("Experiment diagnosis failed: %s", exc)
+    """Reject the legacy shadow-scanning diagnosis path."""
+    del run_dir, config, run_id
+    raise PermissionError("legacy experiment diagnosis is disabled by canonical policy")
 
 
 def _run_experiment_repair(run_dir: Path, config: RCConfig, run_id: str) -> None:
-    """Execute the experiment repair loop when diagnosis finds quality issues.
-
-    Calls the repair loop from ``experiment_repair.py`` which:
-    1. Loads experiment code and diagnosis
-    2. Gets fixes from LLM or OpenCode
-    3. Re-runs experiment in sandbox
-    4. Re-assesses quality
-    5. Repeats up to max_cycles
-    """
-    try:
-        from researchclaw.pipeline.experiment_repair import run_repair_loop
-
-        repair_result = run_repair_loop(
-            run_dir=run_dir,
-            config=config,
-            run_id=run_id,
-        )
-
-        # Save repair result
-        (run_dir / "experiment_repair_result.json").write_text(
-            json.dumps(repair_result.to_dict(), indent=2), encoding="utf-8"
-        )
-
-        # BUG-186: Promote best experiment summary to stage-14/ so
-        # downstream stages (sanitizer, paper_verifier) see it.
-        # BUG-198: Only promote if the repair summary is RICHER than
-        # the existing stage-14 summary.  The repair loop can produce
-        # empty summaries (metrics: {}, 0 conditions) which would
-        # overwrite enriched data from the analysis stage.
-        if repair_result.best_experiment_summary:
-            from researchclaw.pipeline.experiment_repair import (
-                _summary_quality_score,
-            )
-
-            best_path = run_dir / "stage-14" / "experiment_summary.json"
-            existing_score = 0.0
-            if best_path.exists():
-                try:
-                    existing = json.loads(
-                        best_path.read_text(encoding="utf-8")
-                    )
-                    existing_score = _summary_quality_score(existing)
-                except (json.JSONDecodeError, OSError):
-                    pass
-
-            repair_score = _summary_quality_score(
-                repair_result.best_experiment_summary
-            )
-
-            if repair_score > existing_score:
-                best_path.write_text(
-                    json.dumps(
-                        repair_result.best_experiment_summary, indent=2
-                    ),
-                    encoding="utf-8",
-                )
-                logger.info(
-                    "[%s] Promoted repair results to stage-14 "
-                    "(score %.1f > %.1f, success=%s)",
-                    run_id, repair_score, existing_score,
-                    repair_result.success,
-                )
-            else:
-                logger.info(
-                    "[%s] Kept existing stage-14 summary (score %.1f >= "
-                    "repair score %.1f)",
-                    run_id, existing_score, repair_score,
-                )
-
-        if repair_result.success:
-            # Re-run diagnosis with updated results
-            _run_experiment_diagnosis(run_dir, config, run_id)
-        else:
-            logger.info(
-                "[%s] Repair loop completed without reaching full_paper quality "
-                "(best mode: %s, %d cycles)",
-                run_id, repair_result.final_mode.value, repair_result.total_cycles,
-            )
-
-    except Exception as exc:
-        logger.warning("[%s] Experiment repair failed: %s", run_id, exc)
-        print(f"[{run_id}] Experiment repair failed: {exc}")
+    """Reject the legacy shadow-scanning repair path."""
+    del run_dir, config, run_id
+    raise PermissionError("legacy experiment repair is disabled by canonical policy")
 
 
 def execute_pipeline(
@@ -596,7 +384,7 @@ def execute_pipeline(
     except Exception:  # noqa: BLE001
         pass
 
-    # ── Integration hooks: EventLog, ExperimentMemory, CostTracker ──
+    # ── Integration hooks: EventLog, CostTracker ──
     event_log = None
     try:
         from researchclaw.pipeline.event_log import EventLog, EventType, create_event
@@ -607,15 +395,6 @@ def execute_pipeline(
         ))
     except Exception:
         logger.debug("Event log initialisation skipped")
-
-    exp_memory = None
-    try:
-        from researchclaw.memory.experiment_memory import ExperimentMemory
-        _mem_dir = run_dir / "experiment_memory"
-        _mem_dir.mkdir(parents=True, exist_ok=True)
-        exp_memory = ExperimentMemory(store_dir=str(_mem_dir))
-    except Exception:
-        logger.debug("Experiment memory initialisation skipped")
 
     cost_budget = getattr(config.experiment.cli_agent, "max_budget_usd", 0.0) or 0.0
 
@@ -711,17 +490,6 @@ def execute_pipeline(
         if stage == Stage.PAPER_OUTLINE:
             _promote_best_stage14(run_dir, config)
 
-        if stage == Stage.RESEARCH_DECISION:
-            try:
-                cycle = _read_pivot_count(run_dir) + 1
-                signal = get_trajectory_signal(run_dir / "evolution", run_id, cycle)
-                (run_dir / "trajectory_signal.json").write_text(
-                    json.dumps(signal, indent=2),
-                    encoding="utf-8",
-                )
-            except Exception:  # noqa: BLE001
-                logger.warning("Trajectory signal computation failed", exc_info=True)
-
         t0 = _time.monotonic()
 
         result = execute_stage(
@@ -801,25 +569,6 @@ def execute_pipeline(
             except Exception:
                 logger.debug("Experiment spec generation skipped")
 
-        if stage == Stage.RESULT_ANALYSIS and result.status == StageStatus.DONE:
-            try:
-                from researchclaw.pipeline.experiment_spec import parse_spec, validate_results_against_spec
-                spec_path = run_dir / "stage-09" / "experiment_spec.md"
-                if spec_path.exists():
-                    spec = parse_spec(spec_path.read_text(encoding="utf-8"))
-                    results_path = run_dir / "results.json"
-                    exp_results = {}
-                    if results_path.exists():
-                        exp_results = json.loads(results_path.read_text(encoding="utf-8"))
-                    violations = validate_results_against_spec(spec, exp_results)
-                    if violations:
-                        logger.warning("Spec violations: %s", violations)
-                        (run_dir / f"stage-{int(stage):02d}" / "spec_violations.json").write_text(
-                            json.dumps(violations, indent=2), encoding="utf-8"
-                        )
-            except Exception:
-                logger.debug("Experiment spec validation skipped")
-
         # ── Pitfall detection after code generation / experiment run ──
         if stage in (Stage.CODE_GENERATION, Stage.EXPERIMENT_RUN) and result.status == StageStatus.DONE:
             try:
@@ -839,45 +588,6 @@ def execute_pipeline(
                     )
             except Exception:
                 logger.debug("Pitfall detection skipped")
-
-        # ── Experiment memory: record outcome after experiment stages ──
-        if stage in (Stage.EXPERIMENT_RUN, Stage.ITERATIVE_REFINE) and result.status == StageStatus.DONE and exp_memory:
-            try:
-                from researchclaw.memory.experiment_memory import ExperimentOutcome
-                import time as _time_mod
-                results_path = run_dir / "results.json"
-                metric_val = 0.0
-                if results_path.exists():
-                    rdata = json.loads(results_path.read_text(encoding="utf-8"))
-                    metric_val = rdata.get(config.experiment.metric_key, 0.0)
-                exp_memory.record_outcome(ExperimentOutcome(
-                    run_id=run_id, stage=stage.name,
-                    hypothesis=config.research.topic, config={},
-                    metric_name=config.experiment.metric_key,
-                    metric_value=float(metric_val) if metric_val else 0.0,
-                    baseline_value=0.0, improvement=0.0,
-                    success=result.status == StageStatus.DONE,
-                    failure_mode=result.error,
-                    packages_used=[], hyperparameters={},
-                    timestamp=_time_mod.time(), duration_sec=elapsed,
-                ))
-            except Exception:
-                logger.debug("Experiment memory recording skipped")
-
-        if stage == Stage.ITERATIVE_REFINE and result.status == StageStatus.DONE:
-            try:
-                log_path = run_dir / "stage-13" / "refinement_log.json"
-                if log_path.exists():
-                    refine_log = json.loads(log_path.read_text(encoding="utf-8"))
-                    if isinstance(refine_log, dict):
-                        record_refine_trajectory(
-                            run_dir / "evolution",
-                            run_id,
-                            refine_log,
-                            cycle=_read_pivot_count(run_dir) + 1,
-                        )
-            except Exception:  # noqa: BLE001
-                logger.warning("Trajectory recording failed", exc_info=True)
 
         if result.status == StageStatus.DONE:
             arts = ", ".join(result.artifacts) if result.artifacts else "none"
@@ -922,32 +632,6 @@ def execute_pipeline(
             logger.info("[%s] Reached --to-stage %s, stopping.", run_id, stage.name)
             print(f"[{run_id}] Reached --to-stage {stage.name}, stopping pipeline.")
             break
-
-        # --- Experiment diagnosis + repair after Stage 14 (result_analysis) ---
-        if (
-            stage == Stage.RESULT_ANALYSIS
-            and result.status == StageStatus.DONE
-            and config.experiment.repair.enabled
-            # Agent-based sandboxes (collider_agent / biology_agent / stat_agent)
-            # write a canonical results.json atomically in stage 12.  Stage-14
-            # repair would just iterate on python source files that the agent
-            # never executed, then call sandbox.run_project() — which for agent
-            # sandboxes redundantly re-spawns the whole agent.  Skip the
-            # python-code repair loop entirely; the proceed-or-reject decision
-            # belongs in stage 15 RESEARCH_DECISION.
-            and config.experiment.mode not in ("collider_agent", "biology_agent", "stat_agent")
-        ):
-            _run_experiment_diagnosis(run_dir, config, run_id)
-
-            # Check if repair loop should run
-            _diag_path = run_dir / "experiment_diagnosis.json"
-            if _diag_path.exists():
-                try:
-                    _diag_data = json.loads(_diag_path.read_text(encoding="utf-8"))
-                    if _diag_data.get("repair_needed"):
-                        _run_experiment_repair(run_dir, config, run_id)
-                except (json.JSONDecodeError, OSError):
-                    pass
 
         # --- Heartbeat for sentinel watchdog ---
         if result.status == StageStatus.DONE:
@@ -1195,12 +879,24 @@ def execute_pipeline(
     lessons: list[object] = []
     try:
         lessons = extract_lessons(results, run_id=run_id, run_dir=run_dir)
+        store = EvolutionStore(run_dir / "evolution")
+        store.append_many(lessons)
         if lessons:
-            store = EvolutionStore(run_dir / "evolution")
-            store.append_many(lessons)
             logger.info("Extracted %d lessons from pipeline run", len(lessons))
     except Exception:  # noqa: BLE001
         logger.warning("Evolution lesson extraction failed (non-blocking)")
+
+    # Experiment memory is published only after complete release reconstruction.
+    try:
+        from researchclaw.memory.experiment_memory import ExperimentMemory
+
+        ExperimentMemory().record_release(
+            run_dir,
+            task_type=config.research.topic,
+            run_id=run_id,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("Canonical experiment memory recording failed (non-blocking)")
 
     # --- MetaClaw bridge: convert high-severity lessons to skills ---
     try:
@@ -1980,9 +1676,8 @@ def _metaclaw_post_pipeline(
 ) -> None:
     """MetaClaw bridge: post-pipeline hook.
 
-    1. Convert high-severity lessons into MetaClaw skills.
-    2. Record skill effectiveness feedback.
-    3. Signal session end to MetaClaw proxy.
+    Canonical policy v1 permits only a session-end notification. Durable lesson
+    conversion and StageResult-derived skill feedback are not authoritative.
     """
     from researchclaw.pipeline.canonical_evidence_capabilities import (
         require_canonical_evidence_capabilities,
@@ -1993,75 +1688,9 @@ def _metaclaw_post_pipeline(
     if not bridge or not getattr(bridge, "enabled", False):
         return
 
-    from researchclaw.llm.client import LLMClient
+    del results, lessons, run_dir
 
-    # 1. Lesson-to-skill conversion
-    l2s = getattr(bridge, "lesson_to_skill", None)
-    if l2s and getattr(l2s, "enabled", False) and lessons:
-        try:
-            from researchclaw.metaclaw_bridge.lesson_to_skill import (
-                convert_lessons_to_skills,
-            )
-
-            min_sev = getattr(l2s, "min_severity", "warning")
-            llm = LLMClient.from_rc_config(config)
-            new_skills = convert_lessons_to_skills(
-                lessons,
-                llm,
-                getattr(bridge, "skills_dir", "~/.metaclaw/skills"),
-                min_severity=min_sev,
-                max_skills=getattr(l2s, "max_skills_per_run", 3),
-            )
-            if new_skills:
-                logger.info(
-                    "MetaClaw: generated %d new skills from lessons: %s",
-                    len(new_skills),
-                    new_skills,
-                )
-        except Exception:  # noqa: BLE001
-            logger.warning("MetaClaw lesson-to-skill conversion failed", exc_info=True)
-
-    # 2. Skill effectiveness feedback
-    try:
-        from researchclaw.metaclaw_bridge.skill_feedback import (
-            SkillFeedbackStore,
-            record_stage_skills,
-        )
-        from researchclaw.metaclaw_bridge.stage_skill_map import get_stage_config
-
-        feedback_store = SkillFeedbackStore(run_dir / "evolution" / "skill_effectiveness.jsonl")
-        for result in results:
-            stage_num = int(getattr(result, "stage", 0))
-            stage_name = {
-                1: "topic_init", 2: "problem_decompose", 3: "search_strategy",
-                4: "literature_collect", 5: "literature_screen", 6: "knowledge_extract",
-                7: "synthesis", 8: "hypothesis_gen", 9: "experiment_design",
-                10: "code_generation", 11: "resource_planning", 12: "experiment_run",
-                13: "iterative_refine", 14: "result_analysis", 15: "research_decision",
-                16: "paper_outline", 17: "paper_draft", 18: "peer_review",
-                19: "paper_revision", 20: "quality_gate", 21: "knowledge_archive",
-                22: "export_publish", 23: "citation_verify",
-            }.get(stage_num, "")
-            if not stage_name:
-                continue
-
-            stage_config = get_stage_config(stage_name)
-            active_skills = stage_config.get("skills", [])
-            status = str(getattr(result, "status", ""))
-            success = "done" in status.lower()
-
-            if active_skills:
-                record_stage_skills(
-                    feedback_store,
-                    stage_name,
-                    run_id,
-                    success,
-                    active_skills,
-                )
-    except Exception:  # noqa: BLE001
-        logger.warning("MetaClaw skill feedback recording failed")
-
-    # 3. Signal session end (fire-and-forget)
+    # Signal session end (fire-and-forget).
     try:
         from researchclaw.metaclaw_bridge.session import MetaClawSession
         import json as _json

@@ -454,31 +454,195 @@ class TestIdeationMemory:
 
 
 class TestExperimentMemory:
-    def test_record_hyperparams(self, store: MemoryStore) -> None:
-        retriever = MemoryRetriever(store)
-        em = ExperimentMemory(store, retriever)
-        em.record_hyperparams("image_cls", {"lr": 0.001, "bs": 32}, 0.95)
-        assert store.count("experiment") == 1
+    @staticmethod
+    def _projection(manifest_hash: str = "a" * 64):
+        from types import MappingProxyType, SimpleNamespace
 
-    def test_record_architecture(self, store: MemoryStore) -> None:
-        retriever = MemoryRetriever(store)
-        em = ExperimentMemory(store, retriever)
-        em.record_architecture("image_cls", "ResNet-18", 0.96)
-        entry = store.get_all("experiment")[0]
-        assert "ResNet" in entry.content
+        return SimpleNamespace(
+            canonical_manifest_path="canonical_experiment_evidence.json",
+            canonical_manifest_sha256=manifest_hash,
+            selected_result_manifest_path="stage-13/refinement_result_set.json",
+            selected_result_manifest_sha256="b" * 64,
+            selected_execution_path="stage-13/evidence-v1/execution.json",
+            selected_execution_sha256="d" * 64,
+            metric_observations=MappingProxyType({"accuracy": ("0.95",)}),
+        )
 
-    def test_record_training_trick(self, store: MemoryStore) -> None:
+    def test_rejects_caller_supplied_hyperparams(self, store: MemoryStore) -> None:
         retriever = MemoryRetriever(store)
         em = ExperimentMemory(store, retriever)
-        em.record_training_trick("CosineAnnealing", 0.03, "CIFAR-10 training")
-        entry = store.get_all("experiment")[0]
-        assert "CosineAnnealing" in entry.content
+        with pytest.raises(PermissionError, match="caller-supplied"):
+            em.record_hyperparams("image_cls", {"lr": 0.001}, 0.95)
 
-    def test_recall_best_configs_empty(self, store: MemoryStore) -> None:
+    def test_rejects_caller_supplied_architecture(self, store: MemoryStore) -> None:
         retriever = MemoryRetriever(store)
         em = ExperimentMemory(store, retriever)
-        result = em.recall_best_configs("anything")
-        assert result == ""
+        with pytest.raises(PermissionError, match="caller-supplied"):
+            em.record_architecture("image_cls", "ResNet-18", 0.96)
+
+    def test_rejects_caller_supplied_training_trick(self, store: MemoryStore) -> None:
+        retriever = MemoryRetriever(store)
+        em = ExperimentMemory(store, retriever)
+        with pytest.raises(PermissionError, match="caller-supplied"):
+            em.record_training_trick("CosineAnnealing", 0.03, "CIFAR-10 training")
+
+    def test_record_release_binds_projection(
+        self, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        projection = self._projection()
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: projection,
+        )
+        retriever = MemoryRetriever(store)
+        em = ExperimentMemory(store, retriever)
+        em.record_release(tmp_path, task_type="image_cls", run_id="run-1")
+        assert store.get_all("experiment") == []
+        payload = json.loads(
+            (tmp_path / "experiment_memory/canonical_release.json").read_text()
+        )
+        assert payload["binding"]["canonical_manifest_sha256"] == "a" * 64
+        assert payload["binding"]["selected_execution_sha256"] == "d" * 64
+        assert payload["metric_observations"] == {"accuracy": ["0.95"]}
+
+    def test_recall_rejects_other_generation(
+        self,
+        store: MemoryStore,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        embedding_fn: object,
+    ) -> None:
+        projection = self._projection()
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: projection,
+        )
+        retriever = MemoryRetriever(store)
+        em = ExperimentMemory(store, retriever, embed_fn=embedding_fn)
+        em.record_release(tmp_path, task_type="image_cls")
+        projection.canonical_manifest_sha256 = "c" * 64
+        with pytest.raises(ValueError, match="manifest mismatch|replay mismatch"):
+            em.recall_best_configs("image_cls", run_dir=tmp_path)
+
+    def test_recall_rejects_selected_execution_tamper(
+        self, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        projection = self._projection()
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: projection,
+        )
+        em = ExperimentMemory(store, MemoryRetriever(store))
+        em.record_release(tmp_path, task_type="ignored")
+        projection.selected_execution_sha256 = "e" * 64
+        with pytest.raises(ValueError, match="manifest mismatch|replay mismatch"):
+            em.recall_best_configs("ignored", run_dir=tmp_path)
+
+    def test_memory_extra_entry_is_rejected(
+        self, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        projection = self._projection()
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: projection,
+        )
+        em = ExperimentMemory(store, MemoryRetriever(store))
+        em.record_release(tmp_path, task_type="ignored")
+        (tmp_path / "experiment_memory/shadow.json").write_text("{}", encoding="utf-8")
+        with pytest.raises(ValueError, match="namespace mismatch"):
+            em.recall_best_configs("ignored", run_dir=tmp_path)
+
+    def test_post_write_mutation_rolls_back_new_memory_authority(
+        self, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from researchclaw.memory import experiment_memory
+
+        projection = self._projection()
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: projection,
+        )
+        original = experiment_memory._read_memory_publication
+        calls = 0
+
+        def mutate_after_first_replay(namespace, current_projection):
+            nonlocal calls
+            result = original(namespace, current_projection)
+            calls += 1
+            if calls == 1:
+                (tmp_path / "experiment_memory/canonical_release.json").write_bytes(b"{}\n")
+            return result
+
+        monkeypatch.setattr(
+            experiment_memory, "_read_memory_publication", mutate_after_first_replay
+        )
+        with pytest.raises(ValueError):
+            ExperimentMemory(store, MemoryRetriever(store)).record_release(
+                tmp_path, task_type="ignored"
+            )
+        assert not (tmp_path / "experiment_memory/canonical_release.json").exists()
+        assert not (
+            tmp_path / "experiment_memory/canonical_release_manifest.json"
+        ).exists()
+
+    def test_record_release_never_calls_embedding_or_generic_store(
+        self, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        projection = self._projection()
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: projection,
+        )
+        monkeypatch.setattr(
+            store, "add", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("generic store must not be called")
+            )
+        )
+        em = ExperimentMemory(
+            store, MemoryRetriever(store),
+            embed_fn=lambda _text: (_ for _ in ()).throw(
+                AssertionError("embedding callback must not be called")
+            ),
+        )
+        em.record_release(tmp_path, task_type="ignored", run_id="ignored")
+
+    def test_record_release_parent_replacement_is_external_zero_write(
+        self, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        detached = tmp_path / "run-detached"
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "sentinel").write_text("KEEP", encoding="utf-8")
+
+        replaced = False
+
+        def replace_parent(_run_dir: Path):
+            nonlocal replaced
+            if not replaced:
+                run_dir.rename(detached)
+                run_dir.symlink_to(external, target_is_directory=True)
+                replaced = True
+            return self._projection()
+
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            replace_parent,
+        )
+        em = ExperimentMemory(store, MemoryRetriever(store))
+        with pytest.raises(OSError, match="directory changed"):
+            em.record_release(run_dir, task_type="image_cls")
+
+        assert [path.name for path in external.iterdir()] == ["sentinel"]
+        assert not (detached / "experiment_memory/canonical_release.json").exists()
 
 
 # ── Writing Memory ───────────────────────────────────────────────────

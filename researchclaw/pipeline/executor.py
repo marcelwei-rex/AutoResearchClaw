@@ -81,7 +81,6 @@ from researchclaw.pipeline._domain import (  # noqa: E402
 # ---------------------------------------------------------------------------
 from researchclaw.pipeline._helpers import (  # noqa: E402
     StageResult,
-    _METACLAW_SKILLS_DIR,
     _SANDBOX_SAFE_PACKAGES,
     _STOP_WORDS,
     _build_context_preamble,
