@@ -54,6 +54,8 @@ from researchclaw.pipeline.canonical_execution_controller import (
     CanonicalRefinementController,
     require_controller_lease,
 )
+from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
+from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
 from researchclaw.pipeline.experiment_repair import (
     _run_experiment_in_sandbox,
     run_repair_loop,
@@ -710,7 +712,11 @@ def test_release_reconstruction_rejects_active_config_switch_after_final_evidenc
             raw = yaml.safe_load((run_dir / "config.yaml").read_text(encoding="utf-8"))
             raw["research"]["quality_threshold"] = 9.0
             resumed.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-            write_active_config_binding(run_dir, resumed)
+            from researchclaw.literature.citation_policy import (
+                _write_active_config_binding_under_lock,
+            )
+
+            _write_active_config_binding_under_lock(run_dir, resumed)
         return evidence
 
     monkeypatch.setattr(
@@ -2144,27 +2150,20 @@ def test_stage14_candidate_publication_rejects_cross_device_rename(
     run_dir = tmp_path / "run"
     config = _prepare_stage14_upstream(run_dir)
     stage_dir = run_dir / "stage-14"
-    real_replace = os.replace
+    def fail_candidate_publication(
+        _self: BoundOutputNamespace, _parent: str, _name: str, _source: Path
+    ) -> None:
+        raise OSError("forced fd-bound candidate publication interruption")
 
-    def cross_device_replace(source: object, destination: object) -> None:
-        source_path = Path(source)  # type: ignore[arg-type]
-        destination_path = Path(destination)  # type: ignore[arg-type]
-        if (
-            source_path.name.startswith(".candidate-staging-")
-            and destination_path.parent == stage_dir / "evidence_candidates"
-        ):
-            raise OSError(errno.EXDEV, "forced cross-device publication")
-        real_replace(source, destination)
-
-    monkeypatch.setattr(os, "replace", cross_device_replace)
+    monkeypatch.setattr(
+        BoundOutputNamespace, "publish_tree_child", fail_candidate_publication
+    )
     result = _execute_result_analysis(
         stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
     )
 
     assert result.status is StageStatus.FAILED
-    assert "cross-device Stage 14 candidate publication is forbidden" in (
-        result.error or ""
-    )
+    assert "forced fd-bound candidate publication interruption" in (result.error or "")
     assert not list((stage_dir / "evidence_candidates").iterdir())
     assert not list(stage_dir.glob(".candidate-staging-*"))
     assert not (run_dir / "canonical_experiment_evidence.json").exists()
@@ -2178,15 +2177,18 @@ def test_stage14_root_publication_interruption_leaves_no_manifest_authority(
     run_dir = tmp_path / "run"
     config = _prepare_stage14_upstream(run_dir)
     stage_dir = run_dir / "stage-14"
-    real_replace = os.replace
+    real_write = ReleaseGraphLock.write_run_bytes_atomic
 
-    def interrupt_analysis_copy(source: object, destination: object) -> None:
-        destination_path = Path(destination)  # type: ignore[arg-type]
-        if destination_path == run_dir / "analysis_best.md":
+    def interrupt_analysis_copy(
+        self: ReleaseGraphLock, name: str, content: bytes
+    ) -> None:
+        if name == "analysis_best.md":
             raise OSError("forced compatibility-copy interruption")
-        real_replace(source, destination)
+        real_write(self, name, content)
 
-    monkeypatch.setattr(os, "replace", interrupt_analysis_copy)
+    monkeypatch.setattr(
+        ReleaseGraphLock, "write_run_bytes_atomic", interrupt_analysis_copy
+    )
     result = _execute_result_analysis(
         stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
     )
@@ -2209,20 +2211,24 @@ def test_stage14_candidate_post_rename_replay_reads_disk_manifest(
     run_dir = tmp_path / "run"
     config = _prepare_stage14_upstream(run_dir)
     stage_dir = run_dir / "stage-14"
-    real_replace = os.replace
+    real_publish = BoundOutputNamespace.publish_tree_child
     corrupt_once = True
 
-    def corrupt_published_candidate(source: object, destination: object) -> None:
+    def corrupt_published_candidate(
+        self: BoundOutputNamespace, parent: str, name: str, source: Path
+    ) -> None:
         nonlocal corrupt_once
-        destination_path = Path(destination)  # type: ignore[arg-type]
-        real_replace(source, destination)
-        if corrupt_once and destination_path.parent == stage_dir / "evidence_candidates":
+        real_publish(self, parent, name, source)
+        destination_path = self.stage_dir / parent / name
+        if corrupt_once:
             corrupt_once = False
             (destination_path / "experiment_evidence_candidate.json").write_text(
                 "{}\n", encoding="utf-8"
             )
 
-    monkeypatch.setattr(os, "replace", corrupt_published_candidate)
+    monkeypatch.setattr(
+        BoundOutputNamespace, "publish_tree_child", corrupt_published_candidate
+    )
     result = _execute_result_analysis(
         stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
     )
@@ -2260,7 +2266,7 @@ def test_stage14_candidate_pre_rename_replay_reads_disk_manifest(
         written = real_write_text(path, data, *args, **kwargs)  # type: ignore[arg-type]
         if (
             path.name == "experiment_evidence_candidate.json"
-            and path.parent.name.startswith(".candidate-staging-")
+            and path.parent.name.startswith("researchclaw-stage14-candidate-")
         ):
             real_write_text(path, "{}\n", encoding="utf-8")
         return written
@@ -2284,15 +2290,18 @@ def test_stage14_root_post_replace_replay_reads_disk_manifest(
     run_dir = tmp_path / "run"
     config = _prepare_stage14_upstream(run_dir)
     stage_dir = run_dir / "stage-14"
-    real_replace = os.replace
+    real_write = ReleaseGraphLock.write_run_bytes_atomic
 
-    def corrupt_published_root(source: object, destination: object) -> None:
-        destination_path = Path(destination)  # type: ignore[arg-type]
-        real_replace(source, destination)
-        if destination_path == run_dir / "canonical_experiment_evidence.json":
-            destination_path.write_text("{}\n", encoding="utf-8")
+    def corrupt_published_root(
+        self: ReleaseGraphLock, name: str, content: bytes
+    ) -> None:
+        real_write(self, name, content)
+        if name == "canonical_experiment_evidence.json":
+            (run_dir / name).write_text("{}\n", encoding="utf-8")
 
-    monkeypatch.setattr(os, "replace", corrupt_published_root)
+    monkeypatch.setattr(
+        ReleaseGraphLock, "write_run_bytes_atomic", corrupt_published_root
+    )
     result = _execute_result_analysis(
         stage_dir, run_dir, config, None, llm=None  # type: ignore[arg-type]
     )
@@ -3258,7 +3267,7 @@ def test_stage12_guard_precedes_sandbox_import_and_artifact_reads() -> None:
     assert source.index(
         "validate_experiment_result_set(run_dir, config, result_set_text)"
     ) < source.index(
-        '_atomic_write_text(stage_dir / "experiment_result_set.json", result_set_text)'
+        'controller.write_text_atomic("experiment_result_set.json", result_set_text)'
     )
     assert "def _latest_sandbox_project_results" not in inspect.getsource(execution_impl)
     legacy = inspect.getsource(execution_impl._execute_legacy_experiment_run)

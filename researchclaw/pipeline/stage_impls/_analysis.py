@@ -33,6 +33,7 @@ from researchclaw.pipeline.stage15_critique import (
     publish_external_critique_or_request,
     publish_model_or_none_critique,
 )
+from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
 from researchclaw.pipeline.canonical_execution_controller import CanonicalAnalysisController
 from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidence,
@@ -79,6 +80,7 @@ def _execute_result_analysis(
         candidate_root, _candidate_text, candidate = publish_experiment_evidence_candidate(
             run_dir, stage_dir, staging, config
         )
+        shutil.rmtree(staging)
         staging = None
         publish_canonical_experiment_manifest(run_dir, config)
         candidate_manifest = (
@@ -1013,7 +1015,9 @@ def _execute_research_decision(
     prompts: PromptManager | None = None,
 ) -> StageResult:
     try:
-        with BoundOutputNamespace.open(
+        with ReleaseGraphLock.acquire(
+            run_dir, "execute_research_decision"
+        ) as release_lock, BoundOutputNamespace.open(
             run_dir, stage_dir, "stage-15"
         ) as namespace:
             prepare_stage15_critique_namespace(namespace)
@@ -1048,6 +1052,7 @@ def _execute_research_decision(
                         prompts=prompts,
                     )
                 namespace.assert_canonical()
+                release_lock.assert_canonical()
                 return result
             except Exception as exc:  # noqa: BLE001
                 cleanup_errors: list[str] = []

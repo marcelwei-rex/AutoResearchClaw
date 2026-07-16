@@ -180,6 +180,16 @@ def validate_citation_allowlist(
 
 def write_active_config_binding(run_dir: Path, snapshot_path: Path) -> None:
     """Bind the exact run-local config snapshot selected by the CLI."""
+    from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
+
+    with ReleaseGraphLock.acquire(run_dir, "write_active_config_binding") as lock:
+        _write_active_config_binding_under_lock(run_dir, snapshot_path)
+        lock.assert_canonical()
+
+
+def _write_active_config_binding_under_lock(
+    run_dir: Path, snapshot_path: Path
+) -> None:
     try:
         relative = snapshot_path.relative_to(run_dir).as_posix()
     except ValueError as exc:

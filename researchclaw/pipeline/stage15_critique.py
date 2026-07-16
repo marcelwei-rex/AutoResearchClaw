@@ -14,6 +14,10 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidence,
     load_canonical_experiment_evidence,
 )
+from researchclaw.pipeline.release_graph_lock import (
+    ReleaseGraphLock,
+    require_active_writer_epoch,
+)
 
 
 CRITIQUE_SCHEMA_VERSION = 2
@@ -86,6 +90,22 @@ def sha256_bytes(value: bytes) -> str:
 def prepare_stage15_critique_namespace(namespace: BoundOutputNamespace) -> None:
     """Invalidate old critique authority before any Stage 15 input is read."""
 
+    with ReleaseGraphLock.acquire(
+        namespace.run_dir, "prepare_stage15_critique_namespace"
+    ) as release_lock:
+        _prepare_stage15_critique_namespace_under_lock(
+            namespace, writer_lease=release_lock
+        )
+        release_lock.assert_canonical()
+
+
+def _prepare_stage15_critique_namespace_under_lock(
+    namespace: BoundOutputNamespace,
+    *,
+    writer_lease: object,
+) -> None:
+    require_active_writer_epoch(namespace.run_dir, writer_lease)
+
     errors: list[str] = []
     for name in _OWNED_ROOT_NAMES:
         try:
@@ -137,6 +157,35 @@ def publish_model_or_none_critique(
     findings: list[Mapping[str, Any]] | None,
     unavailability_reason: str | None,
 ) -> Stage15CritiquePublication:
+    with ReleaseGraphLock.acquire(
+        namespace.run_dir, "publish_model_or_none_critique"
+    ) as release_lock:
+        result = _publish_model_or_none_critique_under_lock(
+            namespace=namespace,
+            canonical_evidence=canonical_evidence,
+            decision=decision,
+            writer_model=writer_model,
+            critic_model=critic_model,
+            findings=findings,
+            unavailability_reason=unavailability_reason,
+            writer_lease=release_lock,
+        )
+        release_lock.assert_canonical()
+        return result
+
+
+def _publish_model_or_none_critique_under_lock(
+    *,
+    namespace: BoundOutputNamespace,
+    canonical_evidence: Mapping[str, str],
+    decision: Mapping[str, str],
+    writer_model: str,
+    critic_model: str,
+    findings: list[Mapping[str, Any]] | None,
+    unavailability_reason: str | None,
+    writer_lease: object,
+) -> Stage15CritiquePublication:
+    require_active_writer_epoch(namespace.run_dir, writer_lease)
     if findings is not None:
         critique: dict[str, Any] = {
             "schema_version": CRITIQUE_SCHEMA_VERSION,
@@ -173,6 +222,29 @@ def publish_external_critique_or_request(
     decision: Mapping[str, str],
     writer_model: str,
 ) -> Stage15CritiquePublication:
+    with ReleaseGraphLock.acquire(
+        namespace.run_dir, "publish_external_critique_or_request"
+    ) as release_lock:
+        result = _publish_external_critique_or_request_under_lock(
+            namespace=namespace,
+            canonical_evidence=canonical_evidence,
+            decision=decision,
+            writer_model=writer_model,
+            writer_lease=release_lock,
+        )
+        release_lock.assert_canonical()
+        return result
+
+
+def _publish_external_critique_or_request_under_lock(
+    *,
+    namespace: BoundOutputNamespace,
+    canonical_evidence: Mapping[str, str],
+    decision: Mapping[str, str],
+    writer_model: str,
+    writer_lease: object,
+) -> Stage15CritiquePublication:
+    require_active_writer_epoch(namespace.run_dir, writer_lease)
     try:
         files = namespace.read_flat_directory("external-review")
     except FileNotFoundError:
@@ -375,31 +447,115 @@ def load_stage15_critique_publication(run_dir: Path) -> Stage15CritiquePublicati
     return publication
 
 
+def _reconstruct_stage15_critique_from_verified_context(
+    run_dir: Path,
+    *,
+    evidence: CanonicalExperimentEvidence,
+    writer_model: str,
+    critic_model: str,
+    critic_source: str,
+) -> Stage15CritiquePublication:
+    """Rebuild Stage 15 after the caller independently verifies all authority."""
+    stage_dir = run_dir / "stage-15"
+    try:
+        with BoundOutputNamespace.open(run_dir, stage_dir, "stage-15") as namespace:
+            critique_bytes = namespace.read_bytes("critique.json")
+            critique = parse_critique(
+                _parse_json_object(critique_bytes, "critique.json")
+            )
+            canonical, decision = capture_decision_binding(namespace, evidence)
+            _validate_reconstruction_config(
+                critique,
+                canonical=canonical,
+                decision=decision,
+                writer_model=writer_model,
+                critic_model=critic_model,
+                critic_source=critic_source,
+            )
+            expected_manifest = _build_expected_manifest(critique, critique_bytes)
+
+            manifest_bytes = namespace.read_bytes("stage15_critique_manifest.json")
+            manifest = _parse_manifest(manifest_bytes)
+            if manifest != expected_manifest:
+                raise Stage15CritiqueError(
+                    "stored critique manifest differs from expected reconstruction"
+                )
+            _validate_actual_output_namespace(namespace, critique)
+            if capture_decision_binding(namespace, evidence) != (canonical, decision):
+                raise Stage15CritiqueError(
+                    "critique decision inputs changed during reconstruction"
+                )
+            if namespace.read_bytes("critique.json") != critique_bytes:
+                raise Stage15CritiqueError(
+                    "critique source record changed during reconstruction"
+                )
+            if namespace.read_bytes("stage15_critique_manifest.json") != manifest_bytes:
+                raise Stage15CritiqueError(
+                    "critique manifest changed during reconstruction"
+                )
+            namespace.assert_canonical()
+    except Stage15CritiqueError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise Stage15CritiqueError(
+            f"Stage 15 independent reconstruction failed: {exc}"
+        ) from exc
+    return Stage15CritiquePublication(
+        state=critique["state"],
+        critique=_freeze(critique),
+        manifest=_freeze(expected_manifest),
+        artifacts=(CRITIQUE_PATH, CRITIQUE_MANIFEST_PATH),
+    )
+
+
+def _validate_reconstruction_config(
+    critique: Mapping[str, Any],
+    *,
+    canonical: Mapping[str, str],
+    decision: Mapping[str, str],
+    writer_model: str,
+    critic_model: str,
+    critic_source: str,
+) -> None:
+    if critique["canonical_evidence"] != canonical:
+        raise Stage15CritiqueError("critique canonical evidence mismatch")
+    if critique["decision"] != decision:
+        raise Stage15CritiqueError("critique decision binding mismatch")
+    if critique["writer_model"] != writer_model or not writer_model:
+        raise Stage15CritiqueError("critique writer model differs from active config")
+    if critic_source == "external":
+        if critique["state"] != "external_final":
+            raise Stage15CritiqueError(
+                "external critic config requires an external final source record"
+            )
+        return
+    if critic_source not in {"", "model"}:
+        raise Stage15CritiqueError("critique source is unsupported")
+    if critique["state"] not in {"model_final", "none_final"}:
+        raise Stage15CritiqueError("model critic config has incompatible critique state")
+    if critique["state"] == "model_final":
+        if not critic_model or critic_model == writer_model:
+            raise Stage15CritiqueError("model critique is not independently configured")
+        if critique["critic_model"] != critic_model:
+            raise Stage15CritiqueError("critique model differs from active config")
+        return
+    expected_reason = (
+        "critic_not_configured"
+        if not critic_model
+        else "critic_not_isolated"
+        if critic_model == writer_model
+        else "critic_call_failed"
+    )
+    if critique["unavailability_reason"] != expected_reason:
+        raise Stage15CritiqueError("critique unavailability reason is not reproducible")
+
+
 def _publish_final(
     namespace: BoundOutputNamespace, critique: Mapping[str, Any]
 ) -> Stage15CritiquePublication:
     critique_payload = dict(critique)
     critique_bytes = canonical_identity_bytes(critique_payload) + b"\n"
-    findings = critique_payload["findings"]
-    findings_sha = sha256_bytes(canonical_identity_bytes({"findings": findings}))
-    external_inputs: list[dict[str, str]] = []
-    if critique_payload["state"] == "external_final":
-        external_inputs.append(dict(critique_payload["external_structured"]))
-        if critique_payload["external_prose"] is not None:
-            external_inputs.append(dict(critique_payload["external_prose"]))
-    manifest = {
-        "schema_version": CRITIQUE_MANIFEST_SCHEMA_VERSION,
-        "policy_version": CRITIQUE_POLICY_VERSION,
-        "state": critique_payload["state"],
-        "critique_path": CRITIQUE_PATH,
-        "critique_sha256": sha256_bytes(critique_bytes),
-        "canonical_evidence": dict(critique_payload["canonical_evidence"]),
-        "decision": dict(critique_payload["decision"]),
-        "external_inputs": external_inputs,
-        "findings_sha256": findings_sha,
-        "finding_count": len(findings),
-        "output_namespace": list(_FINAL_ROOT_NAMES),
-    }
+    manifest = _build_expected_manifest(critique_payload, critique_bytes)
     parsed_manifest = _parse_manifest(canonical_identity_bytes(manifest))
     try:
         namespace.remove_flat_entries(("critique-pending",))
@@ -417,6 +573,32 @@ def _publish_final(
         except Stage15CritiqueError as cleanup_exc:
             exc.add_note(f"critique cleanup also failed: {cleanup_exc}")
         raise
+
+
+def _build_expected_manifest(
+    critique: Mapping[str, Any], critique_bytes: bytes
+) -> dict[str, Any]:
+    findings = critique["findings"]
+    external_inputs: list[dict[str, str]] = []
+    if critique["state"] == "external_final":
+        external_inputs.append(dict(critique["external_structured"]))
+        if critique["external_prose"] is not None:
+            external_inputs.append(dict(critique["external_prose"]))
+    return {
+        "schema_version": CRITIQUE_MANIFEST_SCHEMA_VERSION,
+        "policy_version": CRITIQUE_POLICY_VERSION,
+        "state": critique["state"],
+        "critique_path": CRITIQUE_PATH,
+        "critique_sha256": sha256_bytes(critique_bytes),
+        "canonical_evidence": dict(critique["canonical_evidence"]),
+        "decision": dict(critique["decision"]),
+        "external_inputs": external_inputs,
+        "findings_sha256": sha256_bytes(
+            canonical_identity_bytes({"findings": findings})
+        ),
+        "finding_count": len(findings),
+        "output_namespace": list(_FINAL_ROOT_NAMES),
+    }
 
 
 def load_stage15_critique_publication_from_namespace(

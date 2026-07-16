@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +24,10 @@ from researchclaw.literature.verify import (
 )
 from researchclaw.llm.client import LLMClient, LLMResponse
 from researchclaw.pipeline.executor import execute_stage
+from researchclaw.pipeline import independent_release_reconstruction as reconstruction_module
+from researchclaw.pipeline.independent_release_reconstruction import (
+    reconstruct_expected_release_publications,
+)
 from researchclaw.pipeline.stage23_input_bundle import load_stage23_input_bundle
 from researchclaw.pipeline.stage23_verification import (
     load_stage23_verification_publication,
@@ -29,7 +35,9 @@ from researchclaw.pipeline.stage23_verification import (
 from researchclaw.pipeline.stage24_publication import (
     load_stage24_publication_snapshot,
 )
+from researchclaw.pipeline.stage24_input_bundle import load_stage24_input_bundle
 from researchclaw.pipeline.stage25_publication import (
+    execute_stage25_deai,
     load_stage25_publication,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
@@ -386,6 +394,36 @@ def test_stage04_through_stage25_uses_real_canonical_production_chain(
     stage23 = load_stage23_verification_publication(run_dir, stage23_inputs)
     stage24 = load_stage24_publication_snapshot(run_dir, config)
     stage25 = load_stage25_publication(run_dir, config)
+    original_capture = reconstruction_module._capture_expected_release_publications
+    capture_count = 0
+    blocked_writes: list[str] = []
+    stage25_manifest_before = (run_dir / "stage-25/stage25_deai_manifest.json").read_bytes()
+
+    def capture_with_late_writer(path: Path):
+        nonlocal capture_count
+        captured = original_capture(path)
+        capture_count += 1
+        if capture_count == 2:
+            with pytest.raises(RuntimeError, match="release_graph.*locked"):
+                execute_stage25_deai(
+                    run_dir,
+                    run_dir / "stage-25",
+                    runtime_config=config,
+                    llm=None,
+                )
+            blocked_writes.append("stage25")
+        return captured
+
+    monkeypatch.setattr(
+        reconstruction_module,
+        "_capture_expected_release_publications",
+        capture_with_late_writer,
+    )
+    reconstructed = reconstruct_expected_release_publications(run_dir)
+    assert blocked_writes == ["stage25"]
+    assert (run_dir / "stage-25/stage25_deai_manifest.json").read_bytes() == (
+        stage25_manifest_before
+    )
 
     stage20 = stage23_inputs.stage22_inputs.stage21_inputs
     fabrication = json.loads(stage20.fabrication_flags.content)
@@ -398,6 +436,35 @@ def test_stage04_through_stage25_uses_real_canonical_production_chain(
     assert stage23.manifest.path == "stage-23/stage23_verification_manifest.json"
     assert stage24.manifest.path == "stage-24/stage24_truth_manifest.json"
     assert stage25.manifest.path == "stage-25/stage25_deai_manifest.json"
+    assert reconstructed.evidence.manifest_path == "canonical_experiment_evidence.json"
+    assert reconstructed.critique.state == "model_final"
+    assert reconstructed.stage23.manifest.path == (
+        "stage-23/stage23_verification_manifest.json"
+    )
+    assert reconstructed.stage24 == stage24
+    assert reconstructed.stage25 == stage25
+    mixed_manifest = json.loads(stage24.manifest.content)
+    mixed_manifest["stage23_publication"]["sha256"] = "0" * 64
+    mixed_bytes = json.dumps(mixed_manifest, sort_keys=True).encode("utf-8")
+    mixed_stage24 = replace(
+        stage24,
+        manifest=replace(
+            stage24.manifest,
+            content=mixed_bytes,
+            sha256=hashlib.sha256(mixed_bytes).hexdigest(),
+        ),
+    )
+    with pytest.raises(
+        reconstruction_module.IndependentReleaseReconstructionError,
+        match="different stage23_publication generation",
+    ):
+        reconstruction_module._require_release_generation_bindings(
+            evidence=reconstructed.evidence,
+            stage24_inputs=load_stage24_input_bundle(run_dir, config),
+            stage23=stage23,
+            stage24=mixed_stage24,
+            stage25=stage25,
+        )
     stage25_manifest = json.loads(stage25.manifest.content)
     assert stage25_manifest["stage24_manifest_path"] == stage24.manifest.path
     assert stage25_manifest["stage24_manifest_sha256"] == stage24.manifest.sha256

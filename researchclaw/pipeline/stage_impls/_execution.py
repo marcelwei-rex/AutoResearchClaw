@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -216,8 +217,11 @@ def _execute_experiment_run(
     from researchclaw.experiment.factory import create_sandbox
 
     controller: CanonicalExecutionController | None = None
+    publication_workspace: Path | None = None
 
     def finish(result: StageResult) -> StageResult:
+        if publication_workspace is not None:
+            shutil.rmtree(publication_workspace, ignore_errors=True)
         if controller is not None:
             controller.close()
         return result
@@ -285,8 +289,8 @@ def _execute_experiment_run(
             error=f"Canonical Stage 12 setup failed: {exc}",
         ))
     lease: InvocationLease | None = None
-    evidence_dir = stage_dir / "evidence-v1"
-    evidence_staging = stage_dir / ".evidence-v1.staging"
+    publication_workspace = Path(tempfile.mkdtemp(prefix="researchclaw-stage12-publish-"))
+    evidence_staging = publication_workspace / "evidence-v1"
     try:
         lease = controller.acquire(
             generation_binding_sha256=generation_binding,
@@ -298,7 +302,7 @@ def _execute_experiment_run(
         sandbox = create_sandbox(
             config.experiment,
             sandbox_root,
-            metadata_dir=stage_dir,
+            metadata_dir=controller.metadata_dir,
         )
         expected_backend = "subprocess" if mode == "sandbox" else "docker"
         if getattr(sandbox, "backend_kind", None) != expected_backend:
@@ -345,21 +349,15 @@ def _execute_experiment_run(
         aggregate_path = evidence_staging / "results.json"
         _atomic_write_text(run_path, invocation_text)
         _atomic_write_text(aggregate_path, aggregate_text)
-        if evidence_dir.exists() or evidence_dir.is_symlink():
-            raise CanonicalExperimentEvidenceError(
-                "canonical Stage 12 evidence namespace already exists"
-            )
-        os.replace(evidence_staging, evidence_dir)
+        controller.publish_directory_tree("evidence-v1", evidence_staging)
         controller.complete(lease, result_sha256=sha256_text(invocation_text))
         lease = None
     except Exception as exc:  # noqa: BLE001
         cleanup_error = ""
         try:
-            for path in (evidence_staging, evidence_dir):
-                if path.is_symlink():
-                    path.unlink()
-                elif path.exists():
-                    shutil.rmtree(path)
+            if evidence_staging.exists():
+                shutil.rmtree(evidence_staging)
+            controller.remove_tree_entries(("evidence-v1",))
         except OSError as cleanup_exc:
             cleanup_error = f"; partial evidence cleanup failed: {cleanup_exc}"
         if lease is not None:
@@ -375,7 +373,7 @@ def _execute_experiment_run(
             error=f"Canonical Stage 12 publication failed: {exc}{cleanup_error}",
         ))
 
-    journal_text = controller.journal_path.read_text(encoding="utf-8")
+    journal_text = controller.read_text("execution_invocation_journal.jsonl")
     result_set = {
         "schema_version": 1,
         "result_set_policy_version": 1,
@@ -418,16 +416,15 @@ def _execute_experiment_run(
     try:
         parse_experiment_result_set(result_set_text)
         validate_experiment_result_set(run_dir, config, result_set_text)
-        _atomic_write_text(stage_dir / "experiment_result_set.json", result_set_text)
+        controller.write_text_atomic("experiment_result_set.json", result_set_text)
+        controller.assert_canonical()
         validate_experiment_result_set(run_dir, config)
     except Exception as exc:  # noqa: BLE001
-        (stage_dir / "experiment_result_set.json").unlink(missing_ok=True)
         cleanup_error = ""
         try:
-            if evidence_dir.is_symlink():
-                evidence_dir.unlink()
-            elif evidence_dir.exists():
-                shutil.rmtree(evidence_dir)
+            controller.remove_tree_entries(
+                ("experiment_result_set.json", "evidence-v1")
+            )
         except OSError as cleanup_exc:
             cleanup_error = f"; canonical evidence cleanup failed: {cleanup_exc}"
         return finish(StageResult(
@@ -469,8 +466,11 @@ def _execute_iterative_refine(
     from researchclaw.experiment.factory import create_sandbox
 
     controller: CanonicalRefinementController | None = None
+    publication_workspace: Path | None = None
 
     def finish(result: StageResult) -> StageResult:
+        if publication_workspace is not None:
+            shutil.rmtree(publication_workspace, ignore_errors=True)
         if controller is not None:
             controller.close()
         return result
@@ -486,7 +486,11 @@ def _execute_iterative_refine(
             error=f"Canonical Stage 13 generation preparation failed: {exc}",
         ))
 
-    manifest_path = stage_dir / "refinement_result_set.json"
+    publication_workspace = Path(
+        tempfile.mkdtemp(prefix="researchclaw-stage13-publish-")
+    ).resolve()
+    stage_dir = publication_workspace
+
     evidence_dir = stage_dir / "evidence-v1"
     evidence_staging = stage_dir / ".evidence-v1.staging"
     diagnostics_dir = stage_dir / "diagnostics"
@@ -495,15 +499,17 @@ def _execute_iterative_refine(
     final_staging = stage_dir / ".experiment_final.staging"
 
     def fail(message: str) -> StageResult:
-        manifest_path.unlink(missing_ok=True)
         cleanup_error = ""
         try:
-            for path in (evidence_staging, evidence_dir, final_staging, final_dir):
-                if path.is_symlink():
-                    path.unlink()
-                elif path.exists():
-                    shutil.rmtree(path)
-            (stage_dir / "experiment_final.py").unlink(missing_ok=True)
+            controller.remove_tree_entries(
+                (
+                    "refinement_result_set.json",
+                    "evidence-v1",
+                    "experiment_final",
+                    "experiment_final.py",
+                    "refinement_log.json",
+                )
+            )
         except OSError as exc:
             cleanup_error = f"; canonical cleanup failed: {exc}"
         failure_text = canonical_json_text({
@@ -512,17 +518,13 @@ def _execute_iterative_refine(
             "result_set_published": False,
         })
         try:
-            _atomic_write_text(stage_dir / "refinement_failure.json", failure_text)
+            controller.write_text_atomic("refinement_failure.json", failure_text)
         except OSError as exc:
             cleanup_error += f"; diagnostic write failed: {exc}"
-        artifacts = tuple(
-            name for name in ("diagnostics/", "refinement_failure.json")
-            if (stage_dir / name.rstrip("/")).exists()
-        )
         return finish(StageResult(
             stage=Stage.ITERATIVE_REFINE,
             status=StageStatus.FAILED,
-            artifacts=artifacts,
+            artifacts=("refinement_failure.json",),
             evidence_refs=(),
             error=f"{message}{cleanup_error}",
         ))
@@ -852,8 +854,21 @@ def _execute_iterative_refine(
         }
         result_set_text = canonical_authority_json_text(result_set)
         parse_refinement_result_set(result_set_text)
+        controller.publish_directory_tree("evidence-v1", evidence_dir)
+        controller.publish_directory_tree("experiment_final", final_dir)
+        controller.publish_directory_tree("diagnostics", diagnostics_dir)
+        controller.write_text_atomic(
+            "refinement_log.json", refinement_log_path.read_text(encoding="utf-8")
+        )
+        final_py = stage_dir / "experiment_final.py"
+        if final_py.exists():
+            controller.write_text_atomic(
+                "experiment_final.py", final_py.read_text(encoding="utf-8")
+            )
+        controller.assert_canonical()
         validate_refinement_result_set(run_dir, config, result_set_text)
-        _atomic_write_text(manifest_path, result_set_text)
+        controller.write_text_atomic("refinement_result_set.json", result_set_text)
+        controller.assert_canonical()
         validate_refinement_result_set(run_dir, config)
     except Exception as exc:  # noqa: BLE001
         return fail(f"Canonical Stage 13 publication failed: {exc}")

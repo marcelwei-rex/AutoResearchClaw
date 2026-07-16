@@ -827,6 +827,49 @@ def execute_stage(
     adapters: AdapterBundle,
     auto_approve_gates: bool = False,
 ) -> StageResult:
+    """Execute a stage inside the release writer epoch when it can alter authority."""
+
+    if int(stage) < int(Stage.LITERATURE_COLLECT):
+        return _execute_stage_under_release_scope(
+            stage,
+            run_dir=run_dir,
+            run_id=run_id,
+            config=config,
+            adapters=adapters,
+            auto_approve_gates=auto_approve_gates,
+        )
+    from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
+
+    if int(stage) >= int(Stage.EXPERIMENT_RUN):
+        from researchclaw.pipeline.canonical_evidence_capabilities import (
+            require_canonical_evidence_capabilities,
+        )
+
+        require_canonical_evidence_capabilities(f"execute_stage.{stage.name}")
+    with ReleaseGraphLock.acquire(
+        run_dir, f"execute_stage.{stage.name}", mode="write"
+    ) as release_lock:
+        result = _execute_stage_under_release_scope(
+            stage,
+            run_dir=run_dir,
+            run_id=run_id,
+            config=config,
+            adapters=adapters,
+            auto_approve_gates=auto_approve_gates,
+        )
+        release_lock.assert_canonical()
+        return result
+
+
+def _execute_stage_under_release_scope(
+    stage: Stage,
+    *,
+    run_dir: Path,
+    run_id: str,
+    config: RCConfig,
+    adapters: AdapterBundle,
+    auto_approve_gates: bool = False,
+) -> StageResult:
     """Execute one pipeline stage, validate outputs, and apply gate logic."""
 
     if int(stage) >= int(Stage.EXPERIMENT_RUN):

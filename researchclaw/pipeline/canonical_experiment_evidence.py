@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import errno
 import json
 import math
 import os
 import re
 import shutil
-import tempfile
 import tokenize
-import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
 from io import BytesIO
@@ -44,6 +41,8 @@ from researchclaw.literature.evidence_cards import canonical_json_text
 from researchclaw.pipeline.canonical_evidence_capabilities import (
     require_canonical_evidence_capabilities,
 )
+from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
+from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
 
 
 STAGE10_SEAL_SCHEMA_VERSION = 2
@@ -1199,10 +1198,24 @@ def publish_experiment_evidence_candidate(
     config: RCConfig,
 ) -> tuple[Path, str, dict[str, Any]]:
     """Seal, replay, and atomically publish one complete Stage 14 candidate."""
+    with ReleaseGraphLock.acquire(
+        run_dir, "publish_experiment_evidence_candidate", mode="write"
+    ) as release_lock:
+        with release_lock.open_stage_namespace("stage-14") as namespace:
+            return _publish_experiment_evidence_candidate_under_lock(
+                run_dir, stage_dir, staging_root, config, namespace
+            )
+
+
+def _publish_experiment_evidence_candidate_under_lock(
+    run_dir: Path,
+    stage_dir: Path,
+    staging_root: Path,
+    config: RCConfig,
+    namespace: BoundOutputNamespace,
+) -> tuple[Path, str, dict[str, Any]]:
     if stage_dir != run_dir / "stage-14":
         raise CanonicalExperimentEvidenceError("canonical Stage 14 directory mismatch")
-    if staging_root.parent != stage_dir or not staging_root.name.startswith(".candidate-staging-"):
-        raise CanonicalExperimentEvidenceError("noncanonical Stage 14 staging directory")
     if staging_root.is_symlink() or not staging_root.is_dir():
         raise CanonicalExperimentEvidenceError("Stage 14 staging directory is unsafe")
 
@@ -1303,32 +1316,18 @@ def publish_experiment_evidence_candidate(
             or _candidate_directory_digest(destination) != _candidate_directory_digest(staging_root)
         ):
             raise CanonicalExperimentEvidenceError("candidate ID collision during publication")
-        shutil.rmtree(staging_root)
         return destination, existing_text, payload
     try:
-        os.replace(staging_root, destination)
-    except OSError as exc:
-        if exc.errno == errno.EXDEV:
-            raise CanonicalExperimentEvidenceError(
-                "cross-device Stage 14 candidate publication is forbidden"
-            ) from exc
-        raise
-    try:
+        namespace.publish_tree_child("evidence_candidates", candidate_id, staging_root)
+        namespace.assert_canonical()
         published = validate_experiment_evidence_candidate(destination)
     except Exception:
-        quarantine = stage_dir / f".candidate-rejected-{uuid.uuid4().hex}"
         try:
-            os.replace(destination, quarantine)
+            namespace.remove_tree_child("evidence_candidates", candidate_id)
         except OSError as cleanup_error:
             raise CanonicalExperimentEvidenceError(
-                "failed to quarantine invalid published Stage 14 candidate"
+                "failed to remove invalid published Stage 14 candidate"
             ) from cleanup_error
-        try:
-            shutil.rmtree(quarantine)
-        except OSError:
-            # The atomic move already removed the candidate from the authoritative
-            # collection. A later generation cleans non-authoritative quarantine.
-            pass
         raise
     return destination, candidate_text, published
 
@@ -2261,75 +2260,36 @@ def publish_canonical_experiment_manifest(
     config: RCConfig,
 ) -> dict[str, Any]:
     """Deterministically select Stage 14 evidence and publish the root pointer last."""
-
-    root_manifest = run_dir / "canonical_experiment_evidence.json"
-    if root_manifest.exists() or root_manifest.is_symlink():
-        if root_manifest.is_symlink() or root_manifest.is_file():
-            root_manifest.unlink()
-        else:
+    with ReleaseGraphLock.acquire(
+        run_dir, "publish_canonical_experiment_manifest", mode="write"
+    ) as release_lock:
+        owned = (
+            "canonical_experiment_evidence.json",
+            "experiment_summary_best.json",
+            "analysis_best.md",
+        )
+        release_lock.remove_run_files(owned)
+        plan = _build_canonical_publication_plan(run_dir, config)
+        if _build_canonical_publication_plan(run_dir, config) != plan:
             raise CanonicalExperimentEvidenceError(
-                "canonical publication destination is unsafe"
+                "canonical publication sources changed before write"
             )
-    plan = _build_canonical_publication_plan(run_dir, config)
-    if _build_canonical_publication_plan(run_dir, config) != plan:
-        raise CanonicalExperimentEvidenceError(
-            "canonical publication sources changed before write"
+        payload = _thaw_authority_value(plan.manifest)
+        manifest_text = canonical_json_text(payload)
+        release_lock.assert_canonical()
+        release_lock.write_run_bytes_atomic(
+            "experiment_summary_best.json", plan.summary_bytes
         )
-    payload = _thaw_authority_value(plan.manifest)
-    manifest_text = canonical_json_text(payload)
-
-    destinations = {
-        "summary": run_dir / "experiment_summary_best.json",
-        "analysis": run_dir / "analysis_best.md",
-        "manifest": run_dir / "canonical_experiment_evidence.json",
-    }
-    for path in destinations.values():
-        if path.exists() and not path.is_symlink() and not path.is_file():
-            raise CanonicalExperimentEvidenceError("canonical publication destination is unsafe")
-    temporary: dict[str, Path] = {}
-    try:
-        temporary["summary"] = _write_publication_temp(
-            run_dir, ".experiment-summary-", plan.summary_bytes
+        release_lock.write_run_bytes_atomic("analysis_best.md", plan.analysis_bytes)
+        release_lock.write_run_bytes_atomic(
+            "canonical_experiment_evidence.json", manifest_text.encode("utf-8")
         )
-        temporary["analysis"] = _write_publication_temp(
-            run_dir, ".analysis-", plan.analysis_bytes
-        )
-        temporary["manifest"] = _write_publication_temp(
-            run_dir, ".canonical-manifest-", manifest_text.encode("utf-8")
-        )
-        os.replace(temporary.pop("summary"), destinations["summary"])
-        os.replace(temporary.pop("analysis"), destinations["analysis"])
-        os.replace(temporary.pop("manifest"), root_manifest)
         try:
+            release_lock.assert_canonical()
             return validate_canonical_experiment_manifest(run_dir, config)
         except Exception:
-            if root_manifest.exists() or root_manifest.is_symlink():
-                root_manifest.unlink()
+            release_lock.remove_run_files(owned)
             raise
-    finally:
-        for path in temporary.values():
-            if path.exists() or path.is_symlink():
-                path.unlink()
-
-
-def _write_publication_temp(run_dir: Path, prefix: str, payload: bytes) -> Path:
-    descriptor, raw_path = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=run_dir)
-    path = Path(raw_path)
-    try:
-        offset = 0
-        while offset < len(payload):
-            written = os.write(descriptor, payload[offset:])
-            if written <= 0:
-                raise OSError("canonical publication write made no progress")
-            offset += written
-        os.fsync(descriptor)
-    except Exception:
-        os.close(descriptor)
-        if path.exists():
-            path.unlink()
-        raise
-    os.close(descriptor)
-    return path
 
 
 def _resolve_full_config_identity(run_dir: Path, config: RCConfig) -> tuple[str, str, str]:

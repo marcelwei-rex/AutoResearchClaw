@@ -28,6 +28,10 @@ from researchclaw.pipeline.stage23_input_bundle import (
     load_stage23_input_bundle,
     verify_stage23_input_bundle_unchanged,
 )
+from researchclaw.pipeline.release_graph_lock import (
+    ReleaseGraphLock,
+    require_active_writer_epoch,
+)
 from researchclaw.pipeline.stage19_input_bundle import BoundArtifact
 
 
@@ -104,6 +108,31 @@ def execute_canonical_stage23(
     | None,
 ) -> Stage23VerificationOutcome:
     """Verify only captured Stage 22 citations and publish a replayable result."""
+
+    with ReleaseGraphLock.acquire(
+        run_dir, "execute_canonical_stage23"
+    ) as release_lock:
+        result = _execute_canonical_stage23_under_lock(
+            run_dir,
+            stage_dir,
+            runtime_config,
+            relevance_checker=relevance_checker,
+            writer_lease=release_lock,
+        )
+        release_lock.assert_canonical()
+        return result
+
+
+def _execute_canonical_stage23_under_lock(
+    run_dir: Path,
+    stage_dir: Path,
+    runtime_config: RCConfig,
+    *,
+    relevance_checker: Callable[[Sequence[CitationResult]], Mapping[str, Decimal]]
+    | None,
+    writer_lease: object,
+) -> Stage23VerificationOutcome:
+    require_active_writer_epoch(run_dir, writer_lease)
 
     _reset_stage23_namespace(run_dir, stage_dir)
     try:
@@ -210,7 +239,11 @@ def publish_stage23_verification(
 ) -> dict[str, object]:
     """Publish Stage 23 outputs and write their strict commit manifest last."""
 
-    with BoundOutputNamespace.open(run_dir, stage_dir, "stage-23") as namespace:
+    with ReleaseGraphLock.acquire(
+        run_dir, "publish_stage23_verification"
+    ) as release_lock, BoundOutputNamespace.open(
+        run_dir, stage_dir, "stage-23"
+    ) as namespace:
         try:
             namespace.invalidate((_MANIFEST_NAME,))
             namespace.reset_flat_namespace()
@@ -230,6 +263,7 @@ def publish_stage23_verification(
             if parsed != expected:
                 raise Stage23VerificationError("stored Stage 23 manifest differs")
             _verify_publication(namespace, parsed, bundle)
+            release_lock.assert_canonical()
             precommit_check()
             namespace.assert_canonical()
             if namespace.read_bytes(_MANIFEST_NAME) != stored:

@@ -19,6 +19,11 @@ from researchclaw.pipeline.stage15_critique import (
     prepare_stage15_critique_namespace,
     publish_external_critique_or_request,
     publish_model_or_none_critique,
+    _reconstruct_stage15_critique_from_verified_context,
+)
+from researchclaw.pipeline.canonical_evidence_capabilities import (
+    CAPABILITY_SCHEMA_VERSION,
+    REQUIRED_CAPABILITIES,
 )
 
 
@@ -93,6 +98,46 @@ def test_model_final_is_manifest_last_and_strictly_replayable(tmp_path: Path) ->
             "decision_structured.json",
             "stage15_critique_manifest.json",
         }
+
+
+def test_verified_context_helper_rejects_manifest_count_as_oracle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from researchclaw.pipeline import canonical_evidence_capabilities as capabilities
+
+    monkeypatch.setattr(
+        capabilities,
+        "CANONICAL_EVIDENCE_CAPABILITIES",
+        {name: CAPABILITY_SCHEMA_VERSION for name in REQUIRED_CAPABILITIES},
+    )
+    with _namespace(tmp_path) as namespace:
+        publish_model_or_none_critique(
+            namespace=namespace,
+            canonical_evidence=CANONICAL,
+            decision=DECISION,
+            writer_model="writer",
+            critic_model="critic",
+            findings=[FINDING],
+            unavailability_reason=None,
+        )
+        manifest_path = tmp_path / "stage-15/stage15_critique_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["finding_count"] = 99
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+    evidence = SimpleNamespace(
+        manifest_path=CANONICAL["path"],
+        manifest_sha256=CANONICAL["sha256"],
+    )
+    with pytest.raises(Stage15CritiqueError, match="differs from expected"):
+        _reconstruct_stage15_critique_from_verified_context(
+            tmp_path,
+            evidence=evidence,  # type: ignore[arg-type]
+            writer_model="writer",
+            critic_model="critic",
+            critic_source="model",
+        )
 
 
 def test_manifest_write_failure_removes_success_named_critique(

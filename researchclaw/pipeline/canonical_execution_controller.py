@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import fcntl
 import os
-import re
 import secrets
 import shutil
 import stat
@@ -14,9 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 from researchclaw.pipeline.canonical_evidence_capabilities import (
     require_canonical_evidence_capabilities,
 )
+from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
 
 
 @dataclass(frozen=True)
@@ -28,16 +29,75 @@ class InvocationLease:
     generation_binding_sha256: str
 
 
+def _acquire_canonical_lock(release_lock: ReleaseGraphLock) -> int:
+    run_fd = release_lock.duplicate_run_fd()
+    try:
+        try:
+            descriptor = os.open(
+                ".canonical_experiment_evidence.lock",
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=run_fd,
+            )
+        except OSError as exc:
+            raise RuntimeError("canonical_evidence_lock_unsafe") from exc
+    finally:
+        os.close(run_fd)
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise RuntimeError("canonical_evidence_lock_unsafe")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(descriptor)
+        raise RuntimeError("canonical_evidence_generation_locked") from exc
+    return descriptor
+
+
+def _close_controller_locks(
+    descriptor: int | None,
+    release_lock: ReleaseGraphLock | None,
+) -> None:
+    identity_error: Exception | None = None
+    if release_lock is not None:
+        try:
+            release_lock.assert_canonical()
+        except Exception as exc:  # noqa: BLE001
+            identity_error = exc
+            try:
+                release_lock.invalidate_experiment_commit_points()
+            except Exception as cleanup_exc:  # noqa: BLE001
+                exc.add_note(
+                    f"detached experiment authority cleanup also failed: {cleanup_exc}"
+                )
+    if descriptor is not None:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+    if release_lock is not None:
+        release_lock.close()
+    if identity_error is not None:
+        raise RuntimeError("canonical_generation_run_identity_changed") from identity_error
+
+
 class CanonicalExecutionController:
     """Own generation rollover, one-acquire enforcement, and journal writes."""
 
-    def __init__(self, stage_dir: Path, lock_descriptor: int | None = None) -> None:
+    def __init__(
+        self,
+        stage_dir: Path,
+        lock_descriptor: int | None = None,
+        release_lock: ReleaseGraphLock | None = None,
+    ) -> None:
         self.stage_dir = stage_dir
         self.journal_path = stage_dir / "execution_invocation_journal.jsonl"
         self._lease: InvocationLease | None = None
         self._invocation_consumed = False
         self._sandbox_root: Path | None = None
+        self._workspace_parent: Path | None = None
+        self._diagnostics_published = False
         self._lock_descriptor = lock_descriptor
+        self._release_lock = release_lock
+        self._namespace: BoundOutputNamespace | None = None
 
     @classmethod
     def prepare_generation(cls, run_dir: Path, stage_dir: Path) -> CanonicalExecutionController:
@@ -45,65 +105,64 @@ class CanonicalExecutionController:
         require_canonical_evidence_capabilities("CanonicalExecutionController.acquire")
         if stage_dir != run_dir / "stage-12":
             raise RuntimeError("canonical_stage12_directory_mismatch")
-        lock_path = run_dir / ".canonical_experiment_evidence.lock"
-        if lock_path.is_symlink():
-            raise RuntimeError("canonical_evidence_lock_unsafe")
-        lock_descriptor = os.open(
-            lock_path,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
+        release_lock = ReleaseGraphLock.acquire(
+            run_dir, "CanonicalExecutionController.prepare"
         )
-        if not stat.S_ISREG(os.fstat(lock_descriptor).st_mode):
-            os.close(lock_descriptor)
-            raise RuntimeError("canonical_evidence_lock_unsafe")
         try:
-            fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            os.close(lock_descriptor)
-            raise RuntimeError("canonical_evidence_generation_locked") from exc
-        controller = cls(stage_dir, lock_descriptor)
+            lock_descriptor = _acquire_canonical_lock(release_lock)
+        except Exception:
+            release_lock.close()
+            raise
+        controller = cls(stage_dir, lock_descriptor, release_lock)
         try:
-            if stage_dir.is_symlink():
-                raise RuntimeError("canonical_stage12_directory_unsafe")
-            invalidation_unsafe = False
-            for path in (
-                run_dir / "canonical_experiment_evidence.json",
-                stage_dir / "experiment_result_set.json",
-                run_dir / "experiment_summary_best.json",
-                run_dir / "analysis_best.md",
-                run_dir / "stage-13/refinement_result_set.json",
-            ):
-                if path.is_symlink():
-                    path.unlink()
-                elif path.exists():
-                    if not path.is_file():
-                        invalidation_unsafe = True
-                    else:
-                        path.unlink()
-            if invalidation_unsafe:
-                raise RuntimeError("canonical_evidence_invalidation_unsafe")
-            if stage_dir.exists() and any(stage_dir.iterdir()):
-                versions = []
-                for path in run_dir.iterdir():
-                    match = re.fullmatch(r"stage-12_v([1-9]\d*)", path.name)
-                    if match:
-                        if path.is_symlink() or not path.is_dir():
-                            raise RuntimeError("canonical_stage12_history_unsafe")
-                        versions.append(int(match.group(1)))
-                archive = run_dir / f"stage-12_v{max(versions, default=0) + 1}"
-                os.replace(stage_dir, archive)
-            stage_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                release_lock.ensure_run_directory("stage-12")
+            except OSError as exc:
+                raise RuntimeError("canonical_stage12_directory_unsafe") from exc
+            release_lock.invalidate_experiment_commit_points()
+            release_lock.roll_stage_generation("stage-12")
+            controller._namespace = release_lock.open_stage_namespace("stage-12")
+            controller.assert_canonical()
             return controller
         except Exception:
             controller.close()
             raise
 
     def close(self) -> None:
-        if self._lock_descriptor is None:
-            return
-        fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
-        os.close(self._lock_descriptor)
-        self._lock_descriptor = None
+        workspace_parent, self._workspace_parent = self._workspace_parent, None
+        if workspace_parent is not None:
+            shutil.rmtree(workspace_parent, ignore_errors=True)
+        namespace, self._namespace = self._namespace, None
+        if namespace is not None:
+            namespace.close()
+        descriptor, self._lock_descriptor = self._lock_descriptor, None
+        release_lock, self._release_lock = self._release_lock, None
+        _close_controller_locks(descriptor, release_lock)
+
+    def assert_canonical(self) -> None:
+        if self._release_lock is None or self._namespace is None:
+            raise RuntimeError("canonical_stage12_controller_closed")
+        self._release_lock.assert_canonical()
+        self._namespace.assert_canonical()
+
+    def read_text(self, name: str) -> str:
+        self.assert_canonical()
+        assert self._namespace is not None
+        return self._namespace.read_bytes(name).decode("utf-8")
+
+    def write_text_atomic(self, name: str, text: str) -> None:
+        self.assert_canonical()
+        assert self._namespace is not None
+        self._namespace.write_text_atomic(name, text)
+
+    def publish_directory_tree(self, name: str, source: Path) -> None:
+        self.assert_canonical()
+        assert self._namespace is not None
+        self._namespace.publish_directory_tree(name, source)
+
+    def remove_tree_entries(self, names: tuple[str, ...]) -> None:
+        assert self._namespace is not None
+        self._namespace.remove_tree_entries(names)
 
     def acquire(
         self,
@@ -114,7 +173,11 @@ class CanonicalExecutionController:
         config_semantic_sha256: str,
     ) -> InvocationLease:
         require_canonical_evidence_capabilities("CanonicalExecutionController.acquire")
-        if self._lease is not None or self.journal_path.exists():
+        self.assert_canonical()
+        if self._lease is not None:
+            raise RuntimeError("canonical_stage12_invocation_already_acquired")
+        assert self._namespace is not None
+        if "execution_invocation_journal.jsonl" in self._namespace.direct_entries():
             raise RuntimeError("canonical_stage12_invocation_already_acquired")
         lease = InvocationLease(
             ordinal=1,
@@ -138,20 +201,25 @@ class CanonicalExecutionController:
     def prepare_invocation_workspace(self, lease: InvocationLease) -> Path:
         """Create the empty controller-owned sandbox root for this lease."""
         self._require_active_lease(lease)
+        self.assert_canonical()
         if self._invocation_consumed or self._sandbox_root is not None:
             raise RuntimeError("canonical_stage12_invocation_workspace_already_prepared")
-        diagnostics = self.stage_dir / "diagnostics"
+        workspace_parent = Path(
+            tempfile.mkdtemp(prefix="researchclaw-stage12-invocation-")
+        ).resolve()
+        diagnostics = workspace_parent / "diagnostics"
         invocation_root = diagnostics / "invocation-1"
         sandbox_root = invocation_root / "sandbox"
-        if (
-            diagnostics.is_symlink()
-            or invocation_root.is_symlink()
-            or sandbox_root.is_symlink()
-        ):
-            raise RuntimeError("canonical_stage12_invocation_workspace_unsafe")
         sandbox_root.mkdir(parents=True, exist_ok=False)
+        self._workspace_parent = workspace_parent
         self._sandbox_root = sandbox_root
         return sandbox_root
+
+    @property
+    def metadata_dir(self) -> Path:
+        if self._workspace_parent is None:
+            raise RuntimeError("canonical_stage12_invocation_workspace_not_prepared")
+        return self._workspace_parent
 
     def run_project(
         self,
@@ -163,6 +231,7 @@ class CanonicalExecutionController:
     ) -> Any:
         """Invoke the mode-specific sandbox exactly once under the active lease."""
         self._require_active_lease(lease)
+        self.assert_canonical()
         if self._invocation_consumed:
             raise RuntimeError("canonical_stage12_invocation_already_consumed")
         if (
@@ -173,6 +242,7 @@ class CanonicalExecutionController:
             raise RuntimeError("canonical_stage12_invocation_workspace_invalid")
         self._invocation_consumed = True
         result = sandbox.run_project(project_dir, timeout_sec=timeout_sec)
+        self.assert_canonical()
         output_dir = getattr(result, "output_dir", None)
         if (
             not self._workspace_paths_safe()
@@ -193,16 +263,18 @@ class CanonicalExecutionController:
         return all(
             path.is_dir() and not path.is_symlink()
             for path in (
-                self.stage_dir / "diagnostics",
-                self.stage_dir / "diagnostics/invocation-1",
+                self._workspace_parent / "diagnostics",
+                self._workspace_parent / "diagnostics/invocation-1",
                 self._sandbox_root,
             )
         )
 
     def complete(self, lease: InvocationLease, *, result_sha256: str) -> None:
         self._require_active_lease(lease)
+        self.assert_canonical()
         if not self._invocation_consumed:
             raise RuntimeError("canonical_stage12_invocation_not_consumed")
+        self._publish_diagnostics()
         self._append_terminal(
             {
                 "schema_version": 1,
@@ -218,8 +290,10 @@ class CanonicalExecutionController:
 
     def fail(self, lease: InvocationLease, *, failure_code: str) -> None:
         self._require_active_lease(lease)
+        self.assert_canonical()
         if not failure_code:
             raise ValueError("canonical failure code must be nonempty")
+        self._publish_diagnostics()
         self._append_terminal(
             {
                 "schema_version": 1,
@@ -234,6 +308,7 @@ class CanonicalExecutionController:
         )
 
     def _require_active_lease(self, lease: InvocationLease) -> None:
+        self.assert_canonical()
         require_controller_lease(lease)
         if lease is not self._lease:
             raise PermissionError("canonical_stage12_invocation_lease_mismatch")
@@ -242,39 +317,31 @@ class CanonicalExecutionController:
         )
 
         records = parse_execution_invocation_journal(
-            self.journal_path.read_text(encoding="utf-8")
+            self.read_text("execution_invocation_journal.jsonl")
         )
         if len(records) != 1 or records[0]["invocation_token"] != lease.invocation_token:
             raise PermissionError("canonical_stage12_invocation_lease_not_active")
 
     def _write_started(self, record: dict[str, object]) -> None:
         text = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        descriptor = os.open(self.journal_path, flags, 0o600)
-        try:
-            self._write_all(descriptor, text.encode("utf-8"))
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        self.write_text_atomic("execution_invocation_journal.jsonl", text)
 
     def _append_terminal(self, record: dict[str, object]) -> None:
         text = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-        descriptor = os.open(self.journal_path, os.O_WRONLY | os.O_APPEND)
-        try:
-            self._write_all(descriptor, text.encode("utf-8"))
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        assert self._namespace is not None
+        self._namespace.append_bytes(
+            "execution_invocation_journal.jsonl", text.encode("utf-8")
+        )
         self._lease = None
 
-    @staticmethod
-    def _write_all(descriptor: int, payload: bytes) -> None:
-        offset = 0
-        while offset < len(payload):
-            written = os.write(descriptor, payload[offset:])
-            if written <= 0:
-                raise OSError("canonical invocation journal write made no progress")
-            offset += written
+    def _publish_diagnostics(self) -> None:
+        if self._diagnostics_published:
+            return
+        if self._workspace_parent is None:
+            raise RuntimeError("canonical_stage12_diagnostics_missing")
+        source = self._workspace_parent / "diagnostics"
+        self.publish_directory_tree("diagnostics", source)
+        self._diagnostics_published = True
 
 
 def require_controller_lease(lease: object) -> InvocationLease:
@@ -289,9 +356,16 @@ def require_controller_lease(lease: object) -> InvocationLease:
 class CanonicalRefinementController:
     """Own the Stage 13 generation lock, rollover, and authority invalidation."""
 
-    def __init__(self, stage_dir: Path, lock_descriptor: int) -> None:
+    def __init__(
+        self,
+        stage_dir: Path,
+        lock_descriptor: int,
+        release_lock: ReleaseGraphLock,
+    ) -> None:
         self.stage_dir = stage_dir
         self._lock_descriptor: int | None = lock_descriptor
+        self._release_lock: ReleaseGraphLock | None = release_lock
+        self._namespace: BoundOutputNamespace | None = None
 
     @classmethod
     def prepare_generation(
@@ -302,76 +376,74 @@ class CanonicalRefinementController:
         require_canonical_evidence_capabilities("CanonicalRefinementController.prepare")
         if stage_dir != run_dir / "stage-13":
             raise RuntimeError("canonical_stage13_directory_mismatch")
-        lock_path = run_dir / ".canonical_experiment_evidence.lock"
-        if lock_path.is_symlink():
-            raise RuntimeError("canonical_evidence_lock_unsafe")
-        descriptor = os.open(
-            lock_path,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
+        release_lock = ReleaseGraphLock.acquire(
+            run_dir, "CanonicalRefinementController.prepare"
         )
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            os.close(descriptor)
-            raise RuntimeError("canonical_evidence_lock_unsafe")
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            os.close(descriptor)
-            raise RuntimeError("canonical_evidence_generation_locked") from exc
+            descriptor = _acquire_canonical_lock(release_lock)
+        except Exception:
+            release_lock.close()
+            raise
 
-        controller = cls(stage_dir, descriptor)
+        controller = cls(stage_dir, descriptor, release_lock)
         try:
-            if stage_dir.is_symlink():
-                raise RuntimeError("canonical_stage13_directory_unsafe")
-            if stage_dir.exists() and not stage_dir.is_dir():
-                raise RuntimeError("canonical_stage13_directory_unsafe")
-            invalidation_unsafe = False
-            for path in (
-                run_dir / "canonical_experiment_evidence.json",
-                run_dir / "experiment_summary_best.json",
-                run_dir / "analysis_best.md",
-                run_dir / "stage-13/refinement_result_set.json",
-            ):
-                if path.is_symlink():
-                    path.unlink()
-                elif path.exists():
-                    if not path.is_file():
-                        invalidation_unsafe = True
-                    else:
-                        path.unlink()
-            if invalidation_unsafe:
-                raise RuntimeError("canonical_evidence_invalidation_unsafe")
-            if stage_dir.exists() and any(stage_dir.iterdir()):
-                versions: list[int] = []
-                for path in run_dir.iterdir():
-                    match = re.fullmatch(r"stage-13_v([1-9]\d*)", path.name)
-                    if match:
-                        if path.is_symlink() or not path.is_dir():
-                            raise RuntimeError("canonical_stage13_history_unsafe")
-                        versions.append(int(match.group(1)))
-                archive = run_dir / f"stage-13_v{max(versions, default=0) + 1}"
-                os.replace(stage_dir, archive)
-            stage_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                release_lock.ensure_run_directory("stage-13")
+            except OSError as exc:
+                raise RuntimeError("canonical_stage13_directory_unsafe") from exc
+            release_lock.invalidate_experiment_commit_points(include_stage12=False)
+            release_lock.roll_stage_generation("stage-13")
+            controller._namespace = release_lock.open_stage_namespace("stage-13")
+            controller.assert_canonical()
             return controller
         except Exception:
             controller.close()
             raise
 
     def close(self) -> None:
-        if self._lock_descriptor is None:
-            return
-        fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
-        os.close(self._lock_descriptor)
-        self._lock_descriptor = None
+        namespace, self._namespace = self._namespace, None
+        if namespace is not None:
+            namespace.close()
+        descriptor, self._lock_descriptor = self._lock_descriptor, None
+        release_lock, self._release_lock = self._release_lock, None
+        _close_controller_locks(descriptor, release_lock)
+
+    def assert_canonical(self) -> None:
+        if self._release_lock is None or self._namespace is None:
+            raise RuntimeError("canonical_stage13_controller_closed")
+        self._release_lock.assert_canonical()
+        self._namespace.assert_canonical()
+
+    def write_text_atomic(self, name: str, text: str) -> None:
+        self.assert_canonical()
+        assert self._namespace is not None
+        self._namespace.write_text_atomic(name, text)
+
+    def publish_directory_tree(self, name: str, source: Path) -> None:
+        self.assert_canonical()
+        assert self._namespace is not None
+        self._namespace.publish_directory_tree(name, source)
+
+    def remove_tree_entries(self, names: tuple[str, ...]) -> None:
+        assert self._namespace is not None
+        self._namespace.remove_tree_entries(names)
 
 
 class CanonicalAnalysisController:
     """Own Stage 14 invalidation, candidate staging, and promotion locking."""
 
-    def __init__(self, run_dir: Path, stage_dir: Path, lock_descriptor: int) -> None:
+    def __init__(
+        self,
+        run_dir: Path,
+        stage_dir: Path,
+        lock_descriptor: int,
+        release_lock: ReleaseGraphLock | None,
+    ) -> None:
         self.run_dir = run_dir
         self.stage_dir = stage_dir
         self._lock_descriptor: int | None = lock_descriptor
+        self._release_lock: ReleaseGraphLock | None = release_lock
+        self._namespace: BoundOutputNamespace | None = None
 
     @classmethod
     def prepare_generation(
@@ -379,15 +451,19 @@ class CanonicalAnalysisController:
         run_dir: Path,
         stage_dir: Path,
     ) -> CanonicalAnalysisController:
-        controller = cls._acquire(run_dir, stage_dir, "CanonicalAnalysisController.prepare")
+        controller = cls._acquire(
+            run_dir,
+            stage_dir,
+            "CanonicalAnalysisController.prepare",
+            release_mode="write",
+            create_stage=True,
+        )
         try:
             if stage_dir != run_dir / "stage-14":
                 raise RuntimeError("canonical_stage14_directory_mismatch")
-            if stage_dir.is_symlink() or (stage_dir.exists() and not stage_dir.is_dir()):
-                raise RuntimeError("canonical_stage14_directory_unsafe")
-            stage_dir.mkdir(parents=True, exist_ok=True)
             controller._invalidate_root_authority()
-            for name in (
+            assert controller._namespace is not None
+            controller._namespace.remove_tree_entries((
                 "analysis.md",
                 "experiment_summary.json",
                 "results_table.tex",
@@ -395,15 +471,15 @@ class CanonicalAnalysisController:
                 "figure_plan_final.json",
                 "charts",
                 "perspectives",
-            ):
-                controller._remove_owned_path(stage_dir / name)
-            for path in stage_dir.iterdir():
-                if path.name.startswith((".candidate-staging-", ".candidate-rejected-")):
-                    controller._remove_owned_path(path)
-            candidates = stage_dir / "evidence_candidates"
-            if candidates.is_symlink() or (candidates.exists() and not candidates.is_dir()):
-                raise RuntimeError("canonical_stage14_candidate_collection_unsafe")
-            candidates.mkdir(exist_ok=True)
+            ))
+            transient = tuple(
+                name
+                for name in controller._namespace.direct_entries()
+                if name.startswith((".candidate-staging-", ".candidate-rejected-"))
+            )
+            controller._namespace.remove_tree_entries(transient)
+            controller._namespace.ensure_directory("evidence_candidates")
+            controller.assert_canonical()
             return controller
         except Exception:
             controller.close()
@@ -415,6 +491,7 @@ class CanonicalAnalysisController:
             run_dir,
             run_dir / "stage-14",
             "CanonicalAnalysisController.promote",
+            release_mode="write",
         )
 
     @classmethod
@@ -424,6 +501,8 @@ class CanonicalAnalysisController:
             run_dir,
             run_dir / "stage-14",
             "load_canonical_experiment_evidence",
+            release_mode="read",
+            open_namespace=False,
         )
 
     @classmethod
@@ -432,59 +511,79 @@ class CanonicalAnalysisController:
         run_dir: Path,
         stage_dir: Path,
         entrypoint: str,
+        *,
+        release_mode: str,
+        create_stage: bool = False,
+        open_namespace: bool = True,
     ) -> CanonicalAnalysisController:
         require_canonical_evidence_capabilities(entrypoint)
-        lock_path = run_dir / ".canonical_experiment_evidence.lock"
-        if lock_path.is_symlink():
-            raise RuntimeError("canonical_evidence_lock_unsafe")
-        descriptor = os.open(
-            lock_path,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
+        release_lock = ReleaseGraphLock.acquire(
+            run_dir, entrypoint, mode=release_mode
         )
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            os.close(descriptor)
-            raise RuntimeError("canonical_evidence_lock_unsafe")
+        descriptor: int | None = None
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            os.close(descriptor)
-            raise RuntimeError("canonical_evidence_generation_locked") from exc
-        return cls(run_dir, stage_dir, descriptor)
+            descriptor = _acquire_canonical_lock(release_lock)
+            namespace = (
+                release_lock.open_stage_namespace(
+                    "stage-14", create_stage=create_stage
+                )
+                if open_namespace
+                else None
+            )
+        except Exception as exc:
+            if descriptor is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+            release_lock.close()
+            if create_stage:
+                raise RuntimeError("canonical_stage14_directory_unsafe") from exc
+            raise
+        controller = cls(run_dir, stage_dir, descriptor, release_lock)
+        controller._namespace = namespace
+        return controller
 
     def create_candidate_staging(self) -> Path:
+        self.assert_canonical()
         if self._lock_descriptor is None:
             raise RuntimeError("canonical_stage14_controller_closed")
-        raw = tempfile.mkdtemp(prefix=".candidate-staging-", dir=self.stage_dir)
-        staging = Path(raw)
-        if staging.parent != self.stage_dir or staging.is_symlink() or not staging.is_dir():
+        staging = Path(
+            tempfile.mkdtemp(prefix="researchclaw-stage14-candidate-")
+        ).resolve()
+        if staging.is_symlink() or not staging.is_dir():
             raise RuntimeError("canonical_stage14_staging_unsafe")
         return staging
 
-    def _invalidate_root_authority(self) -> None:
-        for path in (
-            self.run_dir / "canonical_experiment_evidence.json",
-            self.run_dir / "experiment_summary_best.json",
-            self.run_dir / "analysis_best.md",
-        ):
-            self._remove_owned_path(path, files_only=True)
+    def assert_canonical(self) -> None:
+        if self._release_lock is None or self._lock_descriptor is None:
+            raise RuntimeError("canonical_stage14_controller_closed")
+        self._release_lock.assert_canonical()
+        if self._namespace is not None:
+            self._namespace.assert_canonical()
 
-    @staticmethod
-    def _remove_owned_path(path: Path, *, files_only: bool = False) -> None:
-        if path.is_symlink():
-            path.unlink()
-        elif not path.exists():
-            return
-        elif path.is_file():
-            path.unlink()
-        elif path.is_dir() and not files_only:
-            shutil.rmtree(path)
-        else:
-            raise RuntimeError("canonical_evidence_invalidation_unsafe")
+    def publish_candidate_tree(self, candidate_id: str, source: Path) -> None:
+        self.assert_canonical()
+        assert self._namespace is not None
+        self._namespace.publish_tree_child("evidence_candidates", candidate_id, source)
+
+    def remove_candidate_tree(self, candidate_id: str) -> None:
+        assert self._namespace is not None
+        self._namespace.remove_tree_child("evidence_candidates", candidate_id)
+
+    def _invalidate_root_authority(self) -> None:
+        if self._release_lock is None:
+            raise RuntimeError("canonical_stage14_controller_closed")
+        self._release_lock.remove_run_files(
+            (
+                "canonical_experiment_evidence.json",
+                "experiment_summary_best.json",
+                "analysis_best.md",
+            )
+        )
 
     def close(self) -> None:
-        if self._lock_descriptor is None:
-            return
-        fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
-        os.close(self._lock_descriptor)
-        self._lock_descriptor = None
+        namespace, self._namespace = self._namespace, None
+        if namespace is not None:
+            namespace.close()
+        descriptor, self._lock_descriptor = self._lock_descriptor, None
+        release_lock, self._release_lock = self._release_lock, None
+        _close_controller_locks(descriptor, release_lock)

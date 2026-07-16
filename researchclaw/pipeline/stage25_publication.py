@@ -23,6 +23,10 @@ from researchclaw.pipeline.stage24_publication import (
     Stage24PublicationSnapshot,
     load_stage24_publication_snapshot,
 )
+from researchclaw.pipeline.release_graph_lock import (
+    ReleaseGraphLock,
+    require_active_writer_epoch,
+)
 
 
 STAGE25_PUBLICATION_POLICY_VERSION = "stage25_deai_v1"
@@ -62,7 +66,11 @@ def execute_stage25_deai(
     """Invalidate old authority, capture Stage 24, and publish Stage 25."""
 
     require_canonical_evidence_capabilities("execute_stage25_deai")
-    with BoundOutputNamespace.open(run_dir, stage_dir, "stage-25") as namespace:
+    with ReleaseGraphLock.acquire(
+        run_dir, "execute_stage25_deai"
+    ) as release_lock, BoundOutputNamespace.open(
+        run_dir, stage_dir, "stage-25"
+    ) as namespace:
         try:
             _reset_namespace(namespace)
             source = load_stage24_publication_snapshot(run_dir, runtime_config)
@@ -71,6 +79,7 @@ def execute_stage25_deai(
                 source=source,
                 runtime_config=runtime_config,
                 llm=llm,
+                release_lock=release_lock,
             )
         except Exception as exc:
             try:
@@ -91,7 +100,11 @@ def _publish_stage25_deai(
     """Testable producer entry accepting only an immutable Stage 24 snapshot."""
 
     require_canonical_evidence_capabilities("_publish_stage25_deai_test_fixture")
-    with BoundOutputNamespace.open(run_dir, stage_dir, "stage-25") as namespace:
+    with ReleaseGraphLock.acquire(
+        run_dir, "_publish_stage25_deai_test_fixture"
+    ) as release_lock, BoundOutputNamespace.open(
+        run_dir, stage_dir, "stage-25"
+    ) as namespace:
         try:
             _reset_namespace(namespace)
             return _publish_after_invalidation(
@@ -99,6 +112,7 @@ def _publish_stage25_deai(
                 source=source,
                 runtime_config=runtime_config,
                 llm=llm,
+                release_lock=release_lock,
             )
         except Exception as exc:
             try:
@@ -114,8 +128,15 @@ def _publish_after_invalidation(
     source: Stage24PublicationSnapshot,
     runtime_config: RCConfig,
     llm: LLMClient | None,
+    release_lock: ReleaseGraphLock | None = None,
 ) -> Stage25PublicationSnapshot:
     require_canonical_evidence_capabilities("_stage25_publish_after_invalidation")
+    try:
+        require_active_writer_epoch(namespace.run_dir, release_lock)
+    except RuntimeError as exc:
+        raise Stage25PublicationError(
+            "Stage 25 publication requires an active release writer lease"
+        ) from exc
     del llm
     output = _derive_audit(source)
     _replay_output(source, output)
@@ -144,6 +165,7 @@ def _publish_after_invalidation(
     if final != snapshot:
         raise Stage25PublicationError("Stage 25 publication changed after fixpoint")
     _verify_stage24_unchanged(namespace.run_dir, runtime_config, source)
+    release_lock.assert_canonical()
     return snapshot
 
 

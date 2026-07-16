@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 import researchclaw.pipeline.canonical_execution_controller as controller_module
+import researchclaw.pipeline.release_graph_lock as release_graph_lock_module
 from researchclaw.pipeline.stage_impls import _execution
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
@@ -540,7 +541,7 @@ def test_stage12_partial_evidence_write_never_enters_canonical_namespace(
     original_write = _execution._atomic_write_text
 
     def fail_second_evidence_write(path: Path, text: str) -> None:
-        if path.name == "results.json" and path.parent.name == ".evidence-v1.staging":
+        if path.name == "results.json" and path.parent.name == "evidence-v1":
             raise OSError("simulated aggregate write interruption")
         original_write(path, text)
 
@@ -657,14 +658,18 @@ def test_canonical_stage12_manifest_write_failure_leaves_no_manifest(
     assert _execute_code_generation(
         run / "stage-10", run, cfg, AdapterBundle(), llm=None
     ).status == StageStatus.DONE
-    original_write = _execution._atomic_write_text
+    original_write = CanonicalExecutionController.write_text_atomic
 
-    def fail_manifest_write(path: Path, text: str) -> None:
-        if path.name == "experiment_result_set.json":
+    def fail_manifest_write(
+        self: CanonicalExecutionController, name: str, text: str
+    ) -> None:
+        if name == "experiment_result_set.json":
             raise OSError("simulated manifest publication failure")
-        original_write(path, text)
+        original_write(self, name, text)
 
-    monkeypatch.setattr(_execution, "_atomic_write_text", fail_manifest_write)
+    monkeypatch.setattr(
+        CanonicalExecutionController, "write_text_atomic", fail_manifest_write
+    )
 
     result = _execute_experiment_run(
         run / "stage-12", run, cfg, AdapterBundle()
@@ -693,11 +698,17 @@ def test_stage12_archive_interruption_invalidates_manifest_before_rollover(
     root_manifest = run / "canonical_experiment_evidence.json"
     root_manifest.write_text("stale\n", encoding="utf-8")
 
-    def fail_rollover(source: Path, destination: Path) -> None:
-        del source, destination
+    def fail_rollover(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int,
+        dst_dir_fd: int,
+    ) -> None:
+        del source, destination, src_dir_fd, dst_dir_fd
         raise OSError("simulated archive interruption")
 
-    monkeypatch.setattr(controller_module.os, "replace", fail_rollover)
+    monkeypatch.setattr(release_graph_lock_module.os, "rename", fail_rollover)
 
     with pytest.raises(OSError, match="archive interruption"):
         CanonicalExecutionController.prepare_generation(run, stage12)

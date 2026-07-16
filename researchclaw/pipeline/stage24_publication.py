@@ -45,6 +45,10 @@ from researchclaw.pipeline.stage24_input_bundle import (
     load_stage24_input_bundle,
     verify_stage24_input_bundle_unchanged,
 )
+from researchclaw.pipeline.release_graph_lock import (
+    ReleaseGraphLock,
+    require_active_writer_epoch,
+)
 from researchclaw.pipeline.stage24_obligations import (
     ClaimObligation,
     build_claim_obligation_inventory,
@@ -104,7 +108,11 @@ def _publish_stage24_truth(
     """Build, stage, replay, and commit one canonical Stage 24 generation."""
 
     require_canonical_evidence_capabilities("_publish_stage24_truth_test_fixture")
-    with BoundOutputNamespace.open(run_dir, stage_dir, "stage-24") as namespace:
+    with ReleaseGraphLock.acquire(
+        run_dir, "_publish_stage24_truth_test_fixture"
+    ) as release_lock, BoundOutputNamespace.open(
+        run_dir, stage_dir, "stage-24"
+    ) as namespace:
         try:
             _reset_namespace(namespace)
             return _publish_after_invalidation(
@@ -112,6 +120,7 @@ def _publish_stage24_truth(
                 bundle=bundle,
                 runtime_config=runtime_config,
                 llm=llm,
+                release_lock=release_lock,
             )
         except Exception as exc:
             try:
@@ -131,7 +140,11 @@ def execute_stage24_truth(
     """Invalidate old authority before capturing any canonical source input."""
 
     require_canonical_evidence_capabilities("execute_stage24_truth")
-    with BoundOutputNamespace.open(run_dir, stage_dir, "stage-24") as namespace:
+    with ReleaseGraphLock.acquire(
+        run_dir, "execute_stage24_truth"
+    ) as release_lock, BoundOutputNamespace.open(
+        run_dir, stage_dir, "stage-24"
+    ) as namespace:
         try:
             _reset_namespace(namespace)
             bundle = load_stage24_input_bundle(run_dir, runtime_config)
@@ -140,6 +153,7 @@ def execute_stage24_truth(
                 bundle=bundle,
                 runtime_config=runtime_config,
                 llm=llm,
+                release_lock=release_lock,
             )
         except Exception as exc:
             try:
@@ -155,8 +169,15 @@ def _publish_after_invalidation(
     bundle: Stage24InputBundle,
     runtime_config: RCConfig,
     llm: LLMClient | None,
+    release_lock: ReleaseGraphLock | None = None,
 ) -> Stage24PublicationSnapshot:
     require_canonical_evidence_capabilities("_publish_after_invalidation")
+    try:
+        require_active_writer_epoch(namespace.run_dir, release_lock)
+    except RuntimeError as exc:
+        raise Stage24PublicationError(
+            "Stage 24 publication requires an active release writer lease"
+        ) from exc
     run_dir = namespace.run_dir
     obligations = build_claim_obligation_inventory(bundle.paper.content)
     if _has_audited_prose(bundle.paper.content) and not obligations:
@@ -195,6 +216,7 @@ def _publish_after_invalidation(
             "Stage 24 publication changed after final source fixpoint"
         )
     verify_stage24_input_bundle_unchanged(run_dir, runtime_config, bundle)
+    release_lock.assert_canonical()
     return snapshot
 
 
