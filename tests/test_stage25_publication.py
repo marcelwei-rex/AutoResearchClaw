@@ -107,7 +107,7 @@ def test_stage25_direct_entries_guard_before_namespace_or_source_access(
 ) -> None:
     monkeypatch.setattr(
         "researchclaw.pipeline.canonical_evidence_capabilities.CANONICAL_EVIDENCE_CAPABILITIES",
-        dict(CANONICAL_EVIDENCE_CAPABILITIES),
+        {**CANONICAL_EVIDENCE_CAPABILITIES, "independent_release_reconstruction": 0},
     )
     run_dir = tmp_path / "missing-run"
     source = _source()

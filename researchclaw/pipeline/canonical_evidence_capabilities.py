@@ -44,7 +44,9 @@ CANONICAL_EVIDENCE_CAPABILITIES: dict[str, int] = {
     # experiment memory, and MetaClaw integration now consume only replayed
     # canonical release projections. Persistent prompt feedback remains disabled.
     "external_and_persistent_consumers": CAPABILITY_SCHEMA_VERSION,
-    "independent_release_reconstruction": 0,
+    # Release checks independently reconstruct Stage 09-25 authority twice
+    # under one reader epoch and compare the complete generation graph.
+    "independent_release_reconstruction": CAPABILITY_SCHEMA_VERSION,
 }
 
 

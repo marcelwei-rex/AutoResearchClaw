@@ -26,6 +26,19 @@ def canonical_evidence_migration_complete(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.fixture
+def canonical_evidence_migration_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise fail-closed entrypoints with one explicit missing capability."""
+    from researchclaw.pipeline import canonical_evidence_capabilities as capabilities
+
+    partial = {
+        name: capabilities.CAPABILITY_SCHEMA_VERSION
+        for name in capabilities.REQUIRED_CAPABILITIES
+    }
+    partial["independent_release_reconstruction"] = 0
+    monkeypatch.setattr(capabilities, "CANONICAL_EVIDENCE_CAPABILITIES", partial)
+
+
+@pytest.fixture
 def consumer_evidence_fixture(monkeypatch: pytest.MonkeyPatch):
     """Adapt legacy unit fixtures to the immutable consumer interface.
 

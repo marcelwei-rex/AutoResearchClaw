@@ -246,7 +246,7 @@ def test_stage24_public_entrypoints_guard_before_namespace_access(
 ) -> None:
     monkeypatch.setattr(
         "researchclaw.pipeline.canonical_evidence_capabilities.CANONICAL_EVIDENCE_CAPABILITIES",
-        dict(CANONICAL_EVIDENCE_CAPABILITIES),
+        {**CANONICAL_EVIDENCE_CAPABILITIES, "independent_release_reconstruction": 0},
     )
     run_dir = tmp_path / "run"
     stage_dir = run_dir / "stage-24"
@@ -284,7 +284,7 @@ def test_stage24_internal_entrypoints_guard_before_namespace_use(
 ) -> None:
     monkeypatch.setattr(
         "researchclaw.pipeline.canonical_evidence_capabilities.CANONICAL_EVIDENCE_CAPABILITIES",
-        dict(CANONICAL_EVIDENCE_CAPABILITIES),
+        {**CANONICAL_EVIDENCE_CAPABILITIES, "independent_release_reconstruction": 0},
     )
 
     class NamespaceSpy:
@@ -320,7 +320,7 @@ def test_execute_stage24_guard_precedes_hitl_directory_and_producer(
 ) -> None:
     monkeypatch.setattr(
         "researchclaw.pipeline.canonical_evidence_capabilities.CANONICAL_EVIDENCE_CAPABILITIES",
-        dict(CANONICAL_EVIDENCE_CAPABILITIES),
+        {**CANONICAL_EVIDENCE_CAPABILITIES, "independent_release_reconstruction": 0},
     )
     calls = {"hitl": 0, "producer": 0}
 

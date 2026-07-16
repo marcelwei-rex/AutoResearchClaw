@@ -113,7 +113,9 @@ def _write_selected_candidate(run: Path, cfg: RCConfig) -> Path:
     return run / "stage-10" / "selected_candidate"
 
 
-def test_stage12_rejects_when_manifest_missing(tmp_path: Path) -> None:
+def test_stage12_rejects_when_manifest_missing(
+    tmp_path: Path, canonical_evidence_migration_incomplete: None
+) -> None:
     run = tmp_path / "run"
     cfg = _cfg(tmp_path)
     _write_contract(run, cfg)
@@ -253,7 +255,9 @@ def test_stage12_rejects_invalid_scaffold_owner(tmp_path: Path) -> None:
         _load_sealed_candidate(run, cfg)
 
 
-def test_stage10_scaffold_candidate_runs_in_stage12(tmp_path: Path) -> None:
+def test_stage10_scaffold_candidate_runs_in_stage12(
+    tmp_path: Path, canonical_evidence_migration_incomplete: None
+) -> None:
     run = tmp_path / "run"
     cfg = _cfg(tmp_path)
     _write_contract(run, cfg)

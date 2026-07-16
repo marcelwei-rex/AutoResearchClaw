@@ -52,7 +52,7 @@ def test_stage24_bundle_guard_precedes_stage23_read(
 ) -> None:
     monkeypatch.setattr(
         "researchclaw.pipeline.canonical_evidence_capabilities.CANONICAL_EVIDENCE_CAPABILITIES",
-        dict(CANONICAL_EVIDENCE_CAPABILITIES),
+        {**CANONICAL_EVIDENCE_CAPABILITIES, "independent_release_reconstruction": 0},
     )
     calls = 0
 

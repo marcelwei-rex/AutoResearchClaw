@@ -537,6 +537,7 @@ def test_release_reconstruction_rejects_stored_root_as_selection_oracle(
 def test_release_reconstruction_capability_guard_precedes_all_artifact_reads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_incomplete: None,
 ) -> None:
     run_dir = tmp_path / "missing-run"
     from researchclaw.pipeline import canonical_experiment_evidence as evidence_impl
@@ -3118,7 +3119,7 @@ def test_every_partial_capability_map_is_blocked() -> None:
         partial = dict(complete)
         partial[name] = 0
         assert name in incomplete_canonical_evidence_capabilities(partial)
-    assert incomplete_canonical_evidence_capabilities(CANONICAL_EVIDENCE_CAPABILITIES)
+    assert incomplete_canonical_evidence_capabilities(CANONICAL_EVIDENCE_CAPABILITIES) == ()
 
 
 @pytest.mark.parametrize("missing_component", REQUIRED_CAPABILITIES)
@@ -3173,7 +3174,9 @@ def test_every_partial_map_blocks_all_external_and_persistent_entrypoints(
     assert not missing.exists()
 
 
-def test_python_pipeline_blocks_before_creating_run_directory(tmp_path: Path) -> None:
+def test_python_pipeline_blocks_before_creating_run_directory(
+    tmp_path: Path, canonical_evidence_migration_incomplete: None
+) -> None:
     run_dir = tmp_path / "not-created"
     config = _config(tmp_path / "config-run")
     with pytest.raises(CanonicalEvidenceMigrationIncomplete):
@@ -3191,6 +3194,7 @@ def test_python_pipeline_blocks_before_creating_run_directory(tmp_path: Path) ->
 def test_cli_blocks_before_preflight_or_run_directory_creation(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    canonical_evidence_migration_incomplete: None,
 ) -> None:
     output = tmp_path / "blocked-cli-run"
     code = rc_cli.main(
@@ -3247,7 +3251,9 @@ def test_pre_stage12_overlay_adapter_returns_empty_without_reading_legacy_lesson
     assert _get_pipeline_evolution_overlay(run_dir, "topic_init") == ""
 
 
-def test_external_and_direct_stage12_entrypoints_block_before_reads(tmp_path: Path) -> None:
+def test_external_and_direct_stage12_entrypoints_block_before_reads(
+    tmp_path: Path, canonical_evidence_migration_incomplete: None
+) -> None:
     missing = tmp_path / "missing-run"
     with pytest.raises(CanonicalEvidenceMigrationIncomplete):
         load_external_release_projection(missing)
@@ -3308,6 +3314,7 @@ def test_stage12_guard_precedes_sandbox_import_and_artifact_reads() -> None:
 
 def test_stage13_and_repair_guards_precede_sandbox_or_artifact_access(
     tmp_path: Path,
+    canonical_evidence_migration_incomplete: None,
 ) -> None:
     config = _config(tmp_path / "config-run")
     missing = tmp_path / "missing-run"
@@ -3342,7 +3349,9 @@ def test_stage13_and_repair_guards_precede_sandbox_or_artifact_access(
     ) < sandbox_source.index("sandbox_dir = work_dir")
 
 
-def test_mcp_returns_structured_migration_error_without_reading_run(tmp_path: Path) -> None:
+def test_mcp_returns_structured_migration_error_without_reading_run(
+    tmp_path: Path, canonical_evidence_migration_incomplete: None
+) -> None:
     server = ResearchClawMCPServer.__new__(ResearchClawMCPServer)
     payload = asyncio.run(server._handle_get_results({"run_id": "does-not-exist"}))
     assert payload["success"] is False

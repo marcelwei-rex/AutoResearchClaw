@@ -87,6 +87,7 @@ def test_release_authority_artifacts_reject_duplicate_path_even_for_same_bytes()
 def test_reconstruction_capability_guard_precedes_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_incomplete: None,
 ) -> None:
     run_dir = tmp_path / "missing-run"
     calls: list[str] = []
