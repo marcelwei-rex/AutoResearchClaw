@@ -34,7 +34,7 @@ from researchclaw.pipeline.stages import StageStatus
 from researchclaw.literature.citation_policy import write_active_config_binding
 
 
-def _cfg(tmp_path: Path) -> RCConfig:
+def _cfg(tmp_path: Path, *, allow_legacy: bool = False) -> RCConfig:
     return RCConfig.from_dict(
         {
             "project": {"name": "rc-test", "mode": "docs-first"},
@@ -67,6 +67,7 @@ def _cfg(tmp_path: Path) -> RCConfig:
                 "time_budget_sec": 60,
                 "metric_key": "detection_f1",
                 "metric_direction": "maximize",
+                "allow_legacy_experiment_path": allow_legacy,
                 "sandbox": {
                     "python_path": sys.executable,
                     "gpu_required": False,
@@ -461,7 +462,7 @@ def test_smoke_blocker_propagates_to_stage_failed(
     run_dir = tmp_path / "run"
     stage_dir = run_dir / "stage-10"
     stage_dir.mkdir(parents=True)
-    cfg = _cfg(tmp_path)
+    cfg = _cfg(tmp_path, allow_legacy=True)
     _write_stage9_contract(
         run_dir, cfg, claim_scope="research_release", dataset_origin="public"
     )
@@ -506,7 +507,7 @@ def test_stage10_repairs_missing_dataset_origin_and_reruns_smoke(
     run_dir = tmp_path / "run"
     stage_dir = run_dir / "stage-10"
     stage_dir.mkdir(parents=True)
-    cfg = _cfg(tmp_path)
+    cfg = _cfg(tmp_path, allow_legacy=True)
     _write_stage9_contract(
         run_dir, cfg, claim_scope="research_release", dataset_origin="public"
     )
@@ -551,7 +552,7 @@ def test_stage10_repairs_harness_elapsed_before_smoke(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     stage_dir = run_dir / "stage-10"
     stage_dir.mkdir(parents=True)
-    cfg = _cfg(tmp_path)
+    cfg = _cfg(tmp_path, allow_legacy=True)
     _write_stage9_contract(
         run_dir, cfg, claim_scope="research_release", dataset_origin="public"
     )

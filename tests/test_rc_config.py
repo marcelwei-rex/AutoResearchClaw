@@ -13,6 +13,7 @@ from researchclaw.config import (
     SecurityConfig,
     ValidationResult,
     _parse_citation_policy_config,
+    _parse_experiment_config,
     _parse_paper_revision_config,
     load_config,
     validate_config,
@@ -214,6 +215,28 @@ def test_sectional_dry_run_config_is_explicitly_non_release() -> None:
 def test_private_paper_revision_parser_does_not_coerce_non_boolean_flag() -> None:
     with pytest.raises(ValueError, match="sectional_enabled must be a boolean"):
         _parse_paper_revision_config({"sectional_enabled": "yes"})
+
+
+@pytest.mark.parametrize("value", ("false", "true", 1, 0, None))
+def test_legacy_experiment_path_requires_explicit_boolean(
+    tmp_path: Path, value: object
+) -> None:
+    data = _valid_config_data()
+    experiment = cast(dict[str, object], data["experiment"])
+    experiment["allow_legacy_experiment_path"] = value
+
+    result = validate_config(data, project_root=tmp_path, check_paths=False)
+
+    assert result.ok is False
+    assert any(
+        "experiment.allow_legacy_experiment_path must be a boolean" in error
+        for error in result.errors
+    )
+    with pytest.raises(
+        ValueError,
+        match="experiment.allow_legacy_experiment_path must be a boolean",
+    ):
+        _parse_experiment_config(experiment)
 
 
 def test_validate_config_missing_required_fields_returns_errors(tmp_path: Path):

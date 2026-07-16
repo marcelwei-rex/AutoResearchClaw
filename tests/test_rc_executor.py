@@ -2845,6 +2845,7 @@ class TestPartialTimeoutStatus:
             "experiment": {
                 "mode": "sandbox",
                 "time_budget_sec": 2,
+                "allow_legacy_experiment_path": True,
                 "metric_key": "detection_f1",
                 "metric_direction": "maximize",
                 "sandbox": {
@@ -3875,6 +3876,7 @@ class TestStdoutFailureDetection:
             "experiment": {
                 "mode": "sandbox",
                 "time_budget_sec": 30,
+                "allow_legacy_experiment_path": True,
                 "max_iterations": 1,
                 "metric_key": "detection_f1",
                 "metric_direction": "maximize",
@@ -3937,6 +3939,7 @@ class TestStdoutFailureDetection:
             "experiment": {
                 "mode": "sandbox",
                 "time_budget_sec": 30,
+                "allow_legacy_experiment_path": True,
                 "max_iterations": 1,
                 "metric_key": "detection_f1",
                 "metric_direction": "maximize",

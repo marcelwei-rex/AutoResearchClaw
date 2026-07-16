@@ -246,7 +246,11 @@ def _seal_selected_candidate_impl(
     scaffold_files: dict[str, dict[str, str]] = {}
     plugin_files: dict[str, dict[str, str]] = {}
     contract = load_contract(contract_path)
-    scaffold_owned_files = {"main.py"} if contract.claim_scope == "pipeline_validation" else set()
+    canonical_scaffold = (
+        contract.claim_scope == "pipeline_validation"
+        or not config.experiment.allow_legacy_experiment_path
+    )
+    scaffold_owned_files = {"main.py"} if canonical_scaffold else set()
     for src in sorted(exp_dir.glob("*.py")):
         if not src.is_file():
             continue
@@ -261,11 +265,10 @@ def _seal_selected_candidate_impl(
         raise RuntimeError("selected_candidate contains no Python files")
     if "main.py" not in manifest_files:
         raise RuntimeError("selected_candidate missing required main.py")
-    if contract.claim_scope == "pipeline_validation":
+    if canonical_scaffold:
         if set(manifest_files) != {"main.py", "detector_plugin.py"}:
             raise RuntimeError(
-                "pipeline_validation selected_candidate must contain exactly "
-                "main.py and detector_plugin.py"
+                "selected_candidate must contain exactly main.py and detector_plugin.py"
             )
         expected_main = render_main_py(contract).encode("utf-8")
         if (selected_dir / "main.py").read_bytes() != expected_main:
@@ -920,7 +923,10 @@ def _execute_code_generation(
     # --- Detect available packages for sandbox ---
     _pm = prompts or PromptManager()
 
-    if contract.claim_scope == "pipeline_validation":
+    if (
+        contract.claim_scope == "pipeline_validation"
+        or not config.experiment.allow_legacy_experiment_path
+    ):
         return _execute_pipeline_validation_plugin_generation(
             stage_dir,
             run_dir,

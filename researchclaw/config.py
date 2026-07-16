@@ -1237,6 +1237,14 @@ def validate_config(
     if not _is_blank(exp_direction) and exp_direction not in ("minimize", "maximize"):
         errors.append(f"Invalid experiment.metric_direction: {exp_direction}")
 
+    experiment_data = data.get("experiment")
+    if (
+        isinstance(experiment_data, dict)
+        and "allow_legacy_experiment_path" in experiment_data
+        and type(experiment_data["allow_legacy_experiment_path"]) is not bool
+    ):
+        errors.append("experiment.allow_legacy_experiment_path must be a boolean")
+
     citation_policy = data.get("citation_policy")
     if citation_policy is not None:
         if not isinstance(citation_policy, dict):
@@ -1549,6 +1557,11 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
     docker_data = data.get("docker") or {}
     ssh_data = data.get("ssh_remote") or {}
     colab_data = data.get("colab_drive") or {}
+    allow_legacy_experiment_path = data.get("allow_legacy_experiment_path", False)
+    if type(allow_legacy_experiment_path) is not bool:
+        raise ValueError(
+            "experiment.allow_legacy_experiment_path must be a boolean"
+        )
     return ExperimentConfig(
         mode=data.get("mode", "simulated"),
         time_budget_sec=_safe_int(data.get("time_budget_sec"), 300),
@@ -1558,9 +1571,7 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
         metric_direction=data.get("metric_direction", "minimize"),
         claim_scope=data.get("claim_scope", "pipeline_validation"),
         dataset_origin=data.get("dataset_origin", "synthetic"),
-        allow_legacy_experiment_path=bool(
-            data.get("allow_legacy_experiment_path", False)
-        ),
+        allow_legacy_experiment_path=allow_legacy_experiment_path,
         keep_threshold=_safe_float(data.get("keep_threshold"), 0.0),
         sandbox=SandboxConfig(
             python_path=sandbox_data.get("python_path", DEFAULT_PYTHON_PATH),

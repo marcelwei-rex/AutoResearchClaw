@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import re
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -11,6 +12,9 @@ from typing import Any
 
 import pytest
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import release_check  # noqa: E402
 
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
@@ -24,8 +28,11 @@ from researchclaw.literature.verify import (
 )
 from researchclaw.llm.client import LLMClient, LLMResponse
 from researchclaw.pipeline.executor import execute_stage
+from researchclaw.experiment_runtime.contract import load_contract
+from researchclaw.experiment_runtime.scaffold import render_main_py
 from researchclaw.pipeline import independent_release_reconstruction as reconstruction_module
 from researchclaw.pipeline.independent_release_reconstruction import (
+    IndependentReleaseReconstruction,
     reconstruct_expected_release_publications,
 )
 from researchclaw.pipeline.stage23_input_bundle import load_stage23_input_bundle
@@ -48,9 +55,11 @@ _LLM_STAGES = frozenset(
     {
         Stage.LITERATURE_SCREEN,
         Stage.KNOWLEDGE_EXTRACT,
+        Stage.CODE_GENERATION,
         Stage.ITERATIVE_REFINE,
         Stage.RESEARCH_DECISION,
         Stage.PAPER_DRAFT,
+        Stage.QUALITY_GATE,
         Stage.CITATION_VERIFY,
         Stage.TRUTH_AUDIT,
     }
@@ -66,6 +75,9 @@ class _ProductionChainLLM:
 
     config = SimpleNamespace(base_url="test://production-chain", api_key="test-key")
 
+    def __init__(self, run_dir: Path) -> None:
+        self.run_dir = run_dir
+
     def chat(
         self,
         messages: list[dict[str, str]],
@@ -78,6 +90,8 @@ class _ProductionChainLLM:
             response = self._screening_response(user)
         elif user.startswith("Extract structured summaries only"):
             response = self._card_response(user)
+        elif user.startswith("Generate exactly one Python file named detector_plugin.py"):
+            response = self._research_release_experiment()
         elif "You improve only the model-owned files" in system:
             response = self._non_improving_plugin()
         elif "independent Socratic critic" in system:
@@ -93,6 +107,17 @@ class _ProductionChainLLM:
         elif "You assess citation relevance" in system:
             keys = re.findall(r"^- \[([^]]+)]", user, flags=re.MULTILINE)
             response = json.dumps({key: 1 for key in keys}, sort_keys=True)
+        elif system == "You are a final quality gate evaluator.":
+            response = json.dumps(
+                {
+                    "score_1_to_10": 10,
+                    "verdict": "proceed",
+                    "strengths": ["Canonical evidence closure is complete."],
+                    "weaknesses": [],
+                    "required_actions": [],
+                },
+                sort_keys=True,
+            )
         elif "response_schema" in user:
             request = json.loads(user)
             response_payload = dict(request["response_schema"])
@@ -173,51 +198,51 @@ class _ProductionChainLLM:
             r"  Required citation key: \[([^]]+)]",
             user,
         )
+        assert claims
+        support_key = claims[0][2]
         by_section: dict[str, list[str]] = {"Introduction": [], "Related Work": []}
-        supported_sentences: list[str] = []
         for section, wording, cite_key in claims:
             sentence = f"{wording.rstrip('.')} [{cite_key}]."
             by_section.setdefault(section, []).append(sentence)
-            supported_sentences.append(sentence)
 
         if "Start DIRECTLY with '## Title'" in user:
             return "\n\n".join(
                 (
                     "## Title\nCounterGuard: Runtime Detection from Hardware Events",
-                    "## Abstract\n" + cls._prose("abstract", 28),
+                    "## Abstract\n" + cls._prose("abstract", 28, support_key),
                     "## Introduction\n"
                     + " ".join(by_section["Introduction"])
                     + " "
-                    + cls._prose("introduction", 90),
+                    + cls._prose("introduction", 90, support_key),
                     "## Related Work\n"
                     + " ".join(by_section["Related Work"])
                     + " "
-                    + cls._prose("related work", 70),
+                    + cls._prose("related work", 70, support_key),
                 )
             )
         if "Now write the next sections" in user:
             return "\n\n".join(
                 (
-                    "## Method\n" + cls._prose("method", 100),
-                    "## Experiments\n" + cls._prose("experiments", 85),
+                    "## Method\n" + cls._prose("method", 100, support_key),
+                    "## Experiments\n" + cls._prose("experiments", 85, support_key),
                 )
             )
         return "\n\n".join(
             (
-                "## Results\n" + " ".join(supported_sentences[:2]),
-                "## Discussion\n" + " ".join(supported_sentences[2:]),
-                "## Limitations\n" + cls._prose("limitations", 28),
-                "## Conclusion\n" + cls._prose("conclusion", 18),
+                "## Results\n" + cls._prose("results", 38, support_key),
+                "## Discussion\n" + cls._prose("discussion", 28, support_key),
+                "## Limitations\n" + cls._prose("limitations", 28, support_key),
+                "## Conclusion\n" + cls._prose("conclusion", 18, support_key),
             )
         )
 
     @staticmethod
-    def _prose(label: str, count: int) -> str:
-        sentence = (
+    def _prose(label: str, count: int, cite_key: str) -> str:
+        phrase = (
             f"The {label} narrative describes the bounded workflow with careful "
-            "scope, deterministic evidence ownership, and explicit limitations."
+            "scope, deterministic evidence ownership, and explicit limitations"
         )
-        return " ".join(sentence for _ in range(count))
+        return " ".join(phrase for _ in range(count)) + f" [{cite_key}]."
 
     @staticmethod
     def _non_improving_plugin() -> str:
@@ -244,8 +269,37 @@ class DetectorPlugin:
         }
 ```'''
 
+    def _research_release_experiment(self) -> str:
+        contract = load_contract(self.run_dir / "stage-09/experiment_contract.yaml")
+        return (
+            "```filename:main.py\n"
+            + render_main_py(contract)
+            + "\n```\n"
+            + '''```filename:detector_plugin.py
+import numpy as np
 
-def _config(run_dir: Path) -> RCConfig:
+
+class DetectorPlugin:
+    name = "mean_threshold"
+
+    def fit(self, X_train, y_train):
+        del y_train
+        self.threshold = float(np.mean(X_train[:, 0]))
+        return self
+
+    def predict(self, X_test):
+        return (X_test[:, 0] >= self.threshold).astype(int)
+
+    def describe(self):
+        return {
+            "method": "deterministic mean threshold",
+            "assumptions": ["bounded canonical production-chain fixture"],
+        }
+```'''
+        )
+
+
+def _config(run_dir: Path, *, claim_scope: str) -> RCConfig:
     raw = yaml.safe_load(Path("config.deepseek.sectional-dry-run.yaml").read_text())
     raw["project"]["name"] = "canonical-production-chain"
     raw["research"]["quality_threshold"] = 1.0
@@ -256,6 +310,11 @@ def _config(run_dir: Path) -> RCConfig:
     raw["llm"]["critic_model"] = "resolution-critic-model"
     raw["llm"]["critic_source"] = "model"
     raw["experiment"]["time_budget_sec"] = 30
+    raw["experiment"]["code_agent"]["enabled"] = False
+    raw["experiment"]["claim_scope"] = claim_scope
+    raw["experiment"]["dataset_origin"] = (
+        "public" if claim_scope == "research_release" else "synthetic"
+    )
     raw["experiment"]["sandbox"]["python_path"] = sys.executable
     raw["paper_revision"]["sectional_enabled"] = False
     raw["paper_revision"]["critic_model"] = "support-critic-model"
@@ -272,7 +331,13 @@ def _config(run_dir: Path) -> RCConfig:
     return config
 
 
-def _papers() -> list[Paper]:
+def _papers(count: int = 3) -> list[Paper]:
+    family_names = (
+        "Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf",
+        "Hotel", "India", "Juliet", "Kilo", "Lima", "Mike", "November",
+        "Oscar",
+    )
+    assert count <= len(family_names)
     abstracts = (
         "Hardware performance counters reveal repeatable transient attack activity "
         "and support bounded runtime anomaly monitoring on controlled workloads.",
@@ -284,8 +349,8 @@ def _papers() -> list[Paper]:
     return [
         Paper(
             paper_id=f"paper-{index}",
-            title=f"Hardware Counter Detection Study {word}",
-            authors=(Author(f"Researcher {word}"),),
+            title=f"Hardware Counter Detection Study {index}",
+            authors=(Author(f"Researcher {family_names[index - 1]}"),),
             year=2020 + index,
             abstract=abstract,
             venue="Security Conference",
@@ -294,9 +359,8 @@ def _papers() -> list[Paper]:
             url=f"https://example.test/paper-{index}",
             source="openalex",
         )
-        for index, (word, abstract) in enumerate(
-            zip(("Alpha", "Beta", "Gamma"), abstracts, strict=True), start=1
-        )
+        for index in range(1, count + 1)
+        for abstract in (abstracts[(index - 1) % len(abstracts)],)
     ]
 
 
@@ -322,12 +386,83 @@ def _verified_report(cited_keys: tuple[str, ...]) -> VerificationReport:
     )
 
 
+def _expected_release_authority_paths(
+    run_dir: Path, reconstructed: IndependentReleaseReconstruction
+) -> set[str]:
+    expected = {
+        entry.artifact.path for entry in reconstructed.stage24_inputs.entries
+    }
+    expected.update(artifact.path for artifact in reconstructed.stage24.outputs)
+    expected.update(
+        artifact.path for artifact in reconstructed.stage24.assessment_files
+    )
+    expected.update(
+        {
+            reconstructed.stage24.manifest.path,
+            reconstructed.stage25.audit.path,
+            reconstructed.stage25.manifest.path,
+            reconstructed.evidence.manifest["selected_summary"]["canonical_path"],
+            reconstructed.evidence.manifest["selected_analysis"]["canonical_path"],
+            "stage-09/experiment_contract.sha256",
+            "stage-09/domain_selector_policy.json",
+            "stage-09/domain_profile.json",
+            "stage-09/metric_authority_index.json",
+            "stage-09/metric_authority.json",
+            "stage-10/selected_candidate_manifest.json",
+            "stage-12/experiment_result_set.json",
+        }
+    )
+    expected.update(
+        path.relative_to(run_dir).as_posix()
+        for path in (run_dir / "stage-10/selected_candidate").iterdir()
+    )
+    baseline = json.loads(
+        (run_dir / "stage-12/experiment_result_set.json").read_text(encoding="utf-8")
+    )
+    expected.add(baseline["invocation_journal"]["path"])
+    expected.update(ref["path"] for ref in baseline["evidence_files"])
+    if reconstructed.evidence.selected_result_manifest_path.startswith("stage-13/"):
+        expected.add(reconstructed.evidence.selected_result_manifest_path)
+        refinement = json.loads(
+            (run_dir / reconstructed.evidence.selected_result_manifest_path).read_text(
+                encoding="utf-8"
+            )
+        )
+        expected.add(refinement["refinement_log"]["path"])
+        for iteration in refinement["iterations"]:
+            for ref in (
+                *iteration["project_files"],
+                iteration["validation_report"],
+                iteration["initial_execution"],
+            ):
+                expected.add(ref["path"])
+        expected.add("stage-13/experiment_final.py")
+        expected.update(
+            path.relative_to(run_dir).as_posix()
+            for path in (run_dir / "stage-13/experiment_final").iterdir()
+        )
+    for stage_root in run_dir.iterdir():
+        if re.fullmatch(r"stage-14(?:_v[1-9][0-9]*)?", stage_root.name) is None:
+            continue
+        candidates = stage_root / "evidence_candidates"
+        if not candidates.exists():
+            continue
+        expected.update(
+            path.relative_to(run_dir).as_posix()
+            for candidate in candidates.iterdir()
+            for path in candidate.iterdir()
+        )
+    return expected
+
+
+@pytest.mark.parametrize("claim_scope", ("pipeline_validation", "research_release"))
 def test_stage04_through_stage25_uses_real_canonical_production_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    claim_scope: str,
 ) -> None:
     run_dir = tmp_path / "run"
-    config = _config(run_dir)
+    config = _config(run_dir, claim_scope=claim_scope)
     stage3 = run_dir / "stage-03"
     stage3.mkdir()
     (stage3 / "search_plan.yaml").write_text(
@@ -345,7 +480,7 @@ def test_stage04_through_stage25_uses_real_canonical_production_chain(
     )
 
     current_stage: list[Stage] = [Stage.LITERATURE_COLLECT]
-    llm = _ProductionChainLLM()
+    llm = _ProductionChainLLM(run_dir)
 
     def llm_factory(_config: RCConfig) -> object:
         return llm if current_stage[0] in _LLM_STAGES else _NoLLM()
@@ -353,7 +488,9 @@ def test_stage04_through_stage25_uses_real_canonical_production_chain(
     monkeypatch.setattr(LLMClient, "from_rc_config", staticmethod(llm_factory))
     monkeypatch.setattr(
         "researchclaw.literature.search.search_papers_multi_query",
-        lambda *_args, **_kwargs: _papers(),
+        lambda *_args, **_kwargs: _papers(
+            15 if claim_scope == "research_release" else 3
+        ),
     )
     monkeypatch.setattr("researchclaw.data.load_seminal_papers", lambda *_args: [])
     monkeypatch.setattr(
@@ -370,6 +507,32 @@ def test_stage04_through_stage25_uses_real_canonical_production_chain(
             tuple(str(entry["key"]) for entry in parse_bibtex_entries(bib))
         ),
     )
+    if claim_scope == "research_release":
+        def compile_export(
+            tex_bytes: bytes,
+            _bibliography: bytes,
+            _style_files: dict[str, bytes],
+            *,
+            generated: str,
+        ) -> tuple[dict[str, bytes], bytes, dict[str, object]]:
+            return (
+                    {"paper.pdf": b"%PDF-1.4\n% canonical test fixture\n%%EOF\n"},
+                tex_bytes,
+                {
+                    "schema_version": 1,
+                    "success": True,
+                    "attempts": 1,
+                    "errors": [],
+                    "status": "success",
+                    "tooling_available": True,
+                    "generated": generated,
+                },
+            )
+
+        monkeypatch.setattr(
+            "researchclaw.pipeline.stage22_export._compile_export",
+            compile_export,
+        )
 
     results = []
     for stage in Stage:
@@ -394,6 +557,16 @@ def test_stage04_through_stage25_uses_real_canonical_production_chain(
     stage23 = load_stage23_verification_publication(run_dir, stage23_inputs)
     stage24 = load_stage24_publication_snapshot(run_dir, config)
     stage25 = load_stage25_publication(run_dir, config)
+    if claim_scope == "research_release":
+        candidates = sorted((run_dir / "stage-14/evidence_candidates").iterdir())
+        assert len(candidates) == 1
+        duplicate = (
+            run_dir
+            / "stage-14_v1/evidence_candidates"
+            / candidates[0].name
+        )
+        duplicate.parent.mkdir(parents=True)
+        shutil.copytree(candidates[0], duplicate)
     original_capture = reconstruction_module._capture_expected_release_publications
     capture_count = 0
     blocked_writes: list[str] = []
@@ -443,6 +616,68 @@ def test_stage04_through_stage25_uses_real_canonical_production_chain(
     )
     assert reconstructed.stage24 == stage24
     assert reconstructed.stage25 == stage25
+    authority_paths = {
+        artifact.path for artifact in reconstructed.authority_artifacts
+    }
+    assert authority_paths == _expected_release_authority_paths(
+        run_dir, reconstructed
+    )
+    monkeypatch.setattr(
+        reconstruction_module,
+        "_capture_expected_release_publications",
+        original_capture,
+    )
+    checker = release_check.ReleaseChecker(
+        run_dir, quality_threshold=1.0, allow_suspicious=False
+    )
+    assert checker._load_independent_release_reconstruction() is True
+    assert not checker.findings
+    captured_truth = checker.read_json("stage-24/truth_audit.json", required=True)
+    assert captured_truth is not None
+    checker.check_canonical_source()
+    findings_before_shadow = tuple(checker.findings)
+    root_source = run_dir / "canonical_source.json"
+    root_source.write_text('{"shadow": true}\n', encoding="utf-8")
+    try:
+        checker.check_canonical_source()
+        assert tuple(checker.findings) == findings_before_shadow
+    finally:
+        root_source.unlink()
+
+    tamper_paths = (
+        "stage-15/critique.json",
+        "stage-23/verification_report.json",
+        "stage-24/truth_audit.json",
+        "stage-25/deai_audit.json",
+        "config.yaml",
+        "canonical_experiment_evidence.json",
+    )
+    for relative in tamper_paths:
+        path = run_dir / relative
+        original = path.read_bytes()
+        path.write_bytes(original + b"\n")
+        try:
+            tampered = release_check.ReleaseChecker(
+                run_dir, quality_threshold=1.0, allow_suspicious=False
+            )
+            assert tampered._load_independent_release_reconstruction() is False
+            assert {
+                finding.code
+                for finding in tampered.findings
+                if finding.severity == release_check.SEVERITY_ERROR
+            } == {"independent_release_reconstruction_failed"}
+        finally:
+            path.write_bytes(original)
+
+    truth_path = run_dir / "stage-24/truth_audit.json"
+    original_truth = truth_path.read_bytes()
+    truth_path.write_text("{}\n", encoding="utf-8")
+    try:
+        assert checker.read_json("stage-24/truth_audit.json", required=True) == (
+            captured_truth
+        )
+    finally:
+        truth_path.write_bytes(original_truth)
     mixed_manifest = json.loads(stage24.manifest.content)
     mixed_manifest["stage23_publication"]["sha256"] = "0" * 64
     mixed_bytes = json.dumps(mixed_manifest, sort_keys=True).encode("utf-8")
@@ -478,3 +713,51 @@ def test_stage04_through_stage25_uses_real_canonical_production_chain(
         stage_dir = run_dir / f"stage-{stage_number:02d}"
         assert not (stage_dir / "decision.json").exists()
         assert not (stage_dir / "stage_health.json").exists()
+
+    if claim_scope == "research_release":
+        (run_dir / "pipeline_summary.json").write_text(
+            json.dumps(
+                {
+                    "final_stage": 25,
+                    "final_status": "done",
+                    "stages_failed": 0,
+                    "degraded": False,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (run_dir / "run_manifest.json").write_text(
+            json.dumps({"expected_final_stage": 25}) + "\n",
+            encoding="utf-8",
+        )
+        deliverables = run_dir / "deliverables"
+        deliverables.mkdir()
+        (deliverables / "manifest.json").write_text(
+            json.dumps({"release_ready": True}) + "\n",
+            encoding="utf-8",
+        )
+
+    release_checker = release_check.ReleaseChecker(
+        run_dir, quality_threshold=1.0, allow_suspicious=False
+    )
+    expected_exit = (
+        release_check.EXIT_PASS
+        if claim_scope == "research_release"
+        else release_check.EXIT_FAIL
+    )
+    assert release_checker.run() == expected_exit
+    release_codes = {
+        finding.code
+        for finding in release_checker.findings
+        if finding.severity == release_check.SEVERITY_ERROR
+    }
+    assert "independent_release_reconstruction_failed" not in release_codes
+    assert "sandbox_backend_mismatch" not in release_codes
+    assert "unsafe_environment_policy" not in release_codes
+    assert "claims_digest_invariance_broken" not in release_codes
+    assert "citation_support_unmapped" not in release_codes
+    if claim_scope == "research_release":
+        assert not release_codes
+    else:
+        assert "non_release_claim_scope" in release_codes

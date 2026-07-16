@@ -570,6 +570,19 @@ def good_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
             },
         },
     )
+    def load_legacy_fixture(checker: release_check.ReleaseChecker) -> bool:
+        checker._authority_bytes = {
+            path.relative_to(run).as_posix(): path.read_bytes()
+            for path in run.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        return True
+
+    monkeypatch.setattr(
+        release_check.ReleaseChecker,
+        "_load_independent_release_reconstruction",
+        load_legacy_fixture,
+    )
     return run
 
 
@@ -583,6 +596,82 @@ def _check(run: Path) -> release_check.ReleaseChecker:
 
 def _codes(checker: release_check.ReleaseChecker) -> set[str]:
     return {f.code for f in checker.findings if f.severity == "error"}
+
+
+def test_independent_reconstruction_guard_precedes_run_directory_read(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "missing-run"
+    checker = release_check.ReleaseChecker(
+        run, quality_threshold=5.0, allow_suspicious=False
+    )
+
+    assert checker.run() == release_check.EXIT_FAIL
+    assert _codes(checker) == {"independent_release_reconstruction_failed"}
+    assert not run.exists()
+
+
+def test_reconstructed_checker_never_falls_back_to_live_canonical_path(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "run"
+    path = run / "stage-24" / "truth_audit.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"shadow": true}\n', encoding="utf-8")
+    checker = release_check.ReleaseChecker(
+        run, quality_threshold=5.0, allow_suspicious=False
+    )
+    checker._release_reconstruction = object()
+
+    assert checker.read_json("stage-24/truth_audit.json", required=True) is None
+    assert _codes(checker) == {"missing_artifact"}
+
+
+def test_reconstructed_checker_does_not_accept_live_no_data_waiver(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "run"
+    waiver = run / "waivers" / "no_real_data.json"
+    waiver.parent.mkdir(parents=True)
+    waiver.write_text(
+        '{"reason": "manual override", "approved_by": "reviewer"}\n',
+        encoding="utf-8",
+    )
+    checker = release_check.ReleaseChecker(
+        run, quality_threshold=5.0, allow_suspicious=False
+    )
+    checker._release_reconstruction = object()
+
+    checker.check_fabrication_flags({"has_real_data": False})
+
+    assert _codes(checker) == {"no_real_data"}
+    assert not any(
+        finding.code == "no_real_data_waived" for finding in checker.findings
+    )
+
+
+def test_reconstructed_checker_uses_stage24_25_bindings_not_legacy_digest_schema(
+    tmp_path: Path,
+) -> None:
+    checker = release_check.ReleaseChecker(
+        tmp_path / "run", quality_threshold=5.0, allow_suspicious=False
+    )
+    checker._release_reconstruction = object()
+    truth = {
+        "paper_path": "stage-23/paper_final_verified.md",
+        "paper_sha256": "a" * 64,
+        "stage24_success": True,
+    }
+    deai = {
+        "paper_path": "stage-23/paper_final_verified.md",
+        "paper_sha256": "a" * 64,
+        "recommend_only": True,
+        "applied": False,
+    }
+
+    checker.check_digest_invariance(truth, deai, None)
+
+    assert not checker.findings
 
 
 def _stage19_manifest(run: Path) -> dict:
@@ -1928,3 +2017,14 @@ def test_citation_instance_extraction() -> None:
 def test_final_stage_is_25() -> None:
     assert int(FINAL_STAGE) == 25
     assert Stage.TRUTH_AUDIT == 24 and Stage.DEAI_AUDIT == 25
+
+@pytest.mark.parametrize("value", (True, False, 1.0, "1", None))
+def test_release_check_int_value_rejects_non_integer_types(value: object) -> None:
+    assert release_check.int_value(value) is None
+
+
+@pytest.mark.parametrize("value", (True, False, "1.0", float("nan"), float("inf")))
+def test_release_check_float_value_rejects_ambiguous_or_nonfinite_types(
+    value: object,
+) -> None:
+    assert release_check.float_value(value) is None

@@ -26,12 +26,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+import yaml
 
 
 EXIT_PASS = 0
@@ -78,8 +81,12 @@ class ReleaseChecker:
         self._experiment_contract_loaded = False
         self._experiment_contract_path: Path | None = None
         self._experiment_contract: Any = None
+        self._release_reconstruction: Any = None
+        self._authority_bytes: dict[str, bytes] = {}
 
     def run(self) -> int:
+        if not self._load_independent_release_reconstruction():
+            return self.exit_code()
         if not self.run_dir.exists() or not self.run_dir.is_dir():
             self.error("run_dir_missing", f"Run directory does not exist: {self.run_dir}")
             return self.exit_code()
@@ -121,6 +128,38 @@ class ReleaseChecker:
         self.check_cost_log()
 
         return self.exit_code()
+
+    def _load_independent_release_reconstruction(self) -> bool:
+        """Capture the sole experiment/release authority before any run read."""
+
+        try:
+            from researchclaw.pipeline.independent_release_reconstruction import (
+                reconstruct_expected_release_publications,
+                validate_release_authority_path,
+            )
+
+            reconstruction = reconstruct_expected_release_publications(self.run_dir)
+            authority: dict[str, bytes] = {}
+
+            def bind(path: str, content: bytes) -> None:
+                path = validate_release_authority_path(path)
+                previous = authority.get(path)
+                if previous is not None:
+                    raise ValueError(f"duplicate reconstructed authority path: {path}")
+                authority[path] = content
+
+            for artifact in reconstruction.authority_artifacts:
+                bind(artifact.path, artifact.content)
+        except Exception as exc:  # noqa: BLE001 - release boundary reports fail-closed
+            self.error(
+                "independent_release_reconstruction_failed",
+                f"Independent release reconstruction failed: {type(exc).__name__}: {exc}",
+                "canonical_experiment_evidence.json",
+            )
+            return False
+        self._release_reconstruction = reconstruction
+        self._authority_bytes = authority
+        return True
 
     def expected_final_stage(self, manifest: dict[str, Any] | None) -> int | None:
         """Manifest-driven final stage (v2). No hardcoded stage number:
@@ -229,6 +268,35 @@ class ReleaseChecker:
                 return None
             return self._experiment_contract_path, self._experiment_contract
         self._experiment_contract_loaded = True
+        if self._release_reconstruction is not None:
+            try:
+                from researchclaw.experiment_runtime.contract import (
+                    ContractValidationError,
+                    validate_contract_dict,
+                )
+
+                raw = yaml.safe_load(
+                    self._release_reconstruction.evidence.experiment_contract_bytes
+                )
+                if not isinstance(raw, dict):
+                    raise ContractValidationError(
+                        "canonical experiment contract root is not a mapping"
+                    )
+                contract = validate_contract_dict(raw)
+            except (UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
+                self.error(
+                    "experiment_contract_invalid",
+                    f"Reconstructed experiment contract is invalid: {exc}",
+                    self._release_reconstruction.evidence.experiment_contract_path,
+                )
+                return None
+            contract_path = (
+                self.run_dir
+                / self._release_reconstruction.evidence.experiment_contract_path
+            )
+            self._experiment_contract_path = contract_path
+            self._experiment_contract = contract
+            return contract_path, contract
         try:
             from researchclaw.experiment_runtime import (
                 ContractValidationError,
@@ -265,6 +333,8 @@ class ReleaseChecker:
         return contract_path, contract
 
     def check_sectional_revision(self, manifest: dict[str, Any] | None) -> None:
+        if self._release_reconstruction is not None:
+            return
         loaded = self._load_experiment_contract()
         if loaded is None:
             self.error(
@@ -303,6 +373,8 @@ class ReleaseChecker:
             )
 
     def check_citation_evidence_replay(self) -> None:
+        if self._release_reconstruction is not None:
+            return
         loaded = self._load_experiment_contract()
         if loaded is None:
             self.error(
@@ -349,6 +421,14 @@ class ReleaseChecker:
                 "stage-20/fabrication_flags.json",
             )
         if fabrication.get("has_real_data") is False:
+            if self._release_reconstruction is not None:
+                self.error(
+                    "no_real_data",
+                    "Canonical fabrication evidence reports has_real_data=false. "
+                    "Independent reconstruction v1 does not authorize external waivers.",
+                    "stage-20/fabrication_flags.json",
+                )
+                return
             # v2: upgraded from warning to error. A paper with no real
             # experiment data must not silently pass release. A simulation-
             # only or theory run can be released via an explicit, signed,
@@ -452,6 +532,21 @@ class ReleaseChecker:
                 )
 
     def check_sandbox_metadata(self) -> None:
+        if self._release_reconstruction is not None:
+            evidence = self._release_reconstruction.evidence
+            mode = str(
+                self._release_reconstruction.stage24_inputs
+                .stage23_inputs.stage22_inputs.canonical_config.experiment.mode
+                or ""
+            )
+            if mode not in {"sandbox", "docker"}:
+                self.error(
+                    "sandbox_backend_mismatch",
+                    "Canonical experiment evidence does not bind a supported "
+                    "sandbox backend through the active config and Stage 12 result set.",
+                    evidence.manifest_path,
+                )
+            return
         metadata = self.find_metadata(("sandbox_metadata.json", "runtime_safety.json", "release_safety.json", "stage-12/sandbox_metadata.json", "stage-13/sandbox_metadata.json"))
         if metadata is None:
             self.error(
@@ -471,6 +566,19 @@ class ReleaseChecker:
             self.error("unsafe_sandbox_fallback", "Sandbox metadata reports fallback_used=true.", metadata_path(metadata))
 
     def check_environment_metadata(self) -> None:
+        if self._release_reconstruction is not None:
+            sandbox = (
+                self._release_reconstruction.stage24_inputs
+                .stage23_inputs.stage22_inputs.canonical_config.experiment.sandbox
+            )
+            policy = lower_str(sandbox.env_policy)
+            if policy != "allowlist":
+                self.error(
+                    "unsafe_environment_policy",
+                    f"Unsafe canonical environment policy: {policy!r}.",
+                    self._release_reconstruction.evidence.run_config_path,
+                )
+            return
         metadata = self.find_metadata(("environment_policy.json", "runtime_safety.json", "release_safety.json", "stage-12/environment_policy.json", "stage-13/environment_policy.json"))
         if metadata is None:
             self.error(
@@ -541,7 +649,7 @@ class ReleaseChecker:
 
     def check_compile_status(self) -> None:
         has_tex = any(
-            (self.run_dir / rel).exists()
+            self._artifact_exists(rel)
             for rel in ("stage-22/paper.tex", "deliverables/paper.tex")
         )
         if not has_tex:
@@ -575,7 +683,12 @@ class ReleaseChecker:
         )
 
     def check_canonical_source(self) -> None:
-        metadata = self.find_metadata(("canonical_source.json", "stage-23/canonical_source.json", "stage-22/canonical_source.json"))
+        if self._release_reconstruction is not None:
+            metadata = self.read_json(
+                "stage-22/canonical_source.json", required=True
+            )
+        else:
+            metadata = self.find_metadata(("canonical_source.json", "stage-23/canonical_source.json", "stage-22/canonical_source.json"))
         if metadata is None:
             self.error(
                 "canonical_source_metadata_missing",
@@ -588,7 +701,7 @@ class ReleaseChecker:
         if source_id and md_source and tex_source and (md_source != source_id or tex_source != source_id):
             self.error("mixed_canonical_sources", "Markdown and LaTeX provenance do not point to the same canonical source.", metadata_path(metadata))
         has_tex = any(
-            (self.run_dir / rel).exists()
+            self._artifact_exists(rel)
             for rel in ("stage-22/paper.tex", "deliverables/paper.tex")
         )
         for path_key, hash_key, label in (
@@ -613,8 +726,8 @@ class ReleaseChecker:
                     metadata_path(metadata),
                 )
                 continue
-            actual_path = self.run_dir / rel
-            if not actual_path.is_file() or sha256_of_file(actual_path) != expected:
+            content = self._artifact_bytes(rel)
+            if content is None or hashlib.sha256(content).hexdigest() != expected:
                 self.error(
                     "canonical_source_hash_mismatch",
                     f"{label} canonical source hash does not match {rel}.",
@@ -629,6 +742,10 @@ class ReleaseChecker:
         """Two-model review is only meaningful with real isolation:
         different model (or an external reviewer with its own artifact),
         and no shared conversational context with the writer."""
+        if self._release_reconstruction is not None:
+            # Stage 15 replay has already bound critic source and model identity
+            # to the captured active config. run_manifest is not an authority.
+            return
         if not manifest:
             return
         reviewer = nested_dict(manifest, "reviewer") or {}
@@ -695,6 +812,8 @@ class ReleaseChecker:
     def check_claims_provenance(self, claims_data: dict[str, Any] | None) -> None:
         """Clean-room closure: every release-scoped claim must point at
         evidence produced by THIS run (existing path, matching sha256)."""
+        if self._release_reconstruction is not None:
+            return
         if not claims_data:
             return
         claims = claims_data.get("claims")
@@ -747,13 +866,16 @@ class ReleaseChecker:
                 if not is_allowed_claim_evidence_path(rel, ctype):
                     disallowed_evidence += 1
                     continue
-                target = self.run_dir / rel
-                if not target.is_file():
+                content = self._authority_bytes.get(rel)
+                if content is None:
                     orphans += 1
                     continue
                 recorded = str(ev.get("sha256") or "")
                 # sha256 is mandatory: an unpinned pointer is not verifiable.
-                if not recorded or sha256_of_file(target) != recorded:
+                if (
+                    not recorded
+                    or hashlib.sha256(content).hexdigest() != recorded
+                ):
                     orphans += 1
                     continue
                 valid_pointers += 1
@@ -763,7 +885,9 @@ class ReleaseChecker:
                     # in the evidence artifact's real content (deterministic
                     # extraction), not just in claims.json.
                     if rel not in artifact_numbers_cache:
-                        artifact_numbers_cache[rel] = numbers_in_artifact(target)
+                        artifact_numbers_cache[rel] = numbers_in_artifact_bytes(
+                            content
+                        )
                     art_numbers = artifact_numbers_cache[rel]
                     if any(numbers_close(float(mv), an) for an in art_numbers):
                         evidence_backed_values.append(float(mv))
@@ -851,6 +975,8 @@ class ReleaseChecker:
         """Citation existence != citation support. Existence is checked by
         stage-23 verification; THIS gate checks that each in-text citation
         instance is mapped to the claim it supports (or declared background)."""
+        if self._release_reconstruction is not None:
+            return
         if not citations_data:
             return
         instances = citations_data.get("instances")
@@ -983,6 +1109,10 @@ class ReleaseChecker:
         """Truth-before-prose invariant: the paper frozen by the truth audit
         must be byte-identical (modulo whitespace) after the de-AI audit,
         and the claims digest must match the ledger on disk."""
+        if self._release_reconstruction is not None:
+            # Independent reconstruction has already replayed the canonical
+            # Stage 24/25 manifests and their exact paper path/hash bindings.
+            return
         if not truth or not deai:
             return
         frozen = str(truth.get("paper_sha256") or "")
@@ -1026,11 +1156,11 @@ class ReleaseChecker:
                 "stage-24/truth_audit.json",
             )
         else:
-            target = self.run_dir / paper_rel
-            if not target.is_file() or target.stat().st_size == 0:
+            content = self._authority_bytes.get(paper_rel)
+            if content is None or not content:
                 self.error(
                     "truth_audit_paper_missing",
-                    f"truth_audit.paper_path {paper_rel!r} does not exist or is empty in the run directory.",
+                    f"truth_audit.paper_path {paper_rel!r} is absent from the reconstructed authority or empty.",
                     paper_rel,
                 )
             else:
@@ -1053,6 +1183,8 @@ class ReleaseChecker:
                 )
 
     def check_critique_resolution(self) -> None:
+        if self._release_reconstruction is not None:
+            return
         critique = self.read_json("stage-15/critique.json", required=False)
         if not critique:
             return  # reviewer_isolation already errors on missing critique
@@ -1121,14 +1253,20 @@ class ReleaseChecker:
         return keys
 
     def read_json(self, rel: str, *, required: bool) -> dict[str, Any] | None:
-        path = self.run_dir / rel
-        if not path.exists():
+        content = self._artifact_bytes(rel)
+        if content is None:
             if required:
                 self.error("missing_artifact", f"Required artifact is missing: {rel}.", rel)
             return None
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            text = content.decode("utf-8")
+            data = json.loads(
+                text,
+                object_pairs_hook=_reject_duplicate_json_keys,
+                parse_float=_parse_finite_json_float,
+                parse_constant=_reject_nonfinite_json_number,
+            )
+        except (UnicodeDecodeError, ValueError) as exc:
             self.error("invalid_json", f"Could not read JSON artifact {rel}: {exc}.", rel)
             return None
         if not isinstance(data, dict):
@@ -1138,14 +1276,32 @@ class ReleaseChecker:
         return data
 
     def read_text(self, rel: str) -> str:
+        content = self._artifact_bytes(rel)
+        if content is not None:
+            try:
+                return content.decode("utf-8")
+            except UnicodeDecodeError:
+                self.error("unreadable_artifact", f"Artifact is not UTF-8: {rel}.", rel)
+                return ""
+        return ""
+
+    def _artifact_exists(self, rel: str) -> bool:
+        return self._artifact_bytes(rel) is not None
+
+    def _artifact_bytes(self, rel: str) -> bytes | None:
+        content = self._authority_bytes.get(rel)
+        if content is not None:
+            return content
+        if self._release_reconstruction is not None and _is_canonical_authority_path(rel):
+            return None
         path = self.run_dir / rel
-        if not path.exists() or not path.is_file():
-            return ""
+        if not path.exists() or not path.is_file() or path.is_symlink():
+            return None
         try:
-            return path.read_text(encoding="utf-8")
+            return path.read_bytes()
         except OSError:
             self.error("unreadable_artifact", f"Could not read artifact: {rel}.", rel)
-            return ""
+            return None
 
     def find_metadata(self, candidates: tuple[str, ...]) -> dict[str, Any] | None:
         for rel in candidates:
@@ -1208,11 +1364,7 @@ try:  # pragma: no cover - exercised implicitly
         paper_sha256 as paper_hash_of,
         extract_numbers as numbers_from_text,
         numbers_match as numbers_close,
-        numbers_in_artifact as _numbers_in_artifact_pkg,
     )
-
-    def numbers_in_artifact(path: Path) -> list:
-        return _numbers_in_artifact_pkg(path)
 
 except Exception:  # noqa: BLE001
 
@@ -1239,33 +1391,6 @@ except Exception:  # noqa: BLE001
             return True
         denom = max(abs(a), abs(b), 1e-12)
         return abs(a - b) / denom <= rel_tol
-
-    def _collect_numeric_leaves(data, depth=0):
-        out = []
-        if depth > 8 or isinstance(data, bool):
-            return out
-        if isinstance(data, (int, float)):
-            out.append(round(float(data), 4))
-        elif isinstance(data, dict):
-            for v in data.values():
-                out.extend(_collect_numeric_leaves(v, depth + 1))
-        elif isinstance(data, list):
-            for v in data[:200]:
-                out.extend(_collect_numeric_leaves(v, depth + 1))
-        return out
-
-    def numbers_in_artifact(path: Path) -> list:
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError:
-            return []
-        try:
-            data = json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            return numbers_from_text(raw)
-        nums = _collect_numeric_leaves(data)
-        nums.extend(numbers_from_text(raw))
-        return nums
 
     def paper_hash_of(text: str) -> str:
         return hashlib.sha256(_normalize_text(text).encode("utf-8")).hexdigest()
@@ -1296,6 +1421,76 @@ def normalize_for_substr(text: str) -> str:
     so a support_excerpt can be matched against context/claim text regardless
     of cosmetic differences — but NOT regardless of content."""
     return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+def _is_canonical_authority_path(path: str) -> bool:
+    return bool(re.fullmatch(r"stage-(?:0[4-9]|1\d|2[0-5])(?:/.*)?", path)) or path in {
+        "analysis_best.md",
+        "canonical_experiment_evidence.json",
+        "canonical_source.json",
+        "config.active.json",
+        "config.history.jsonl",
+        "config.yaml",
+        "experiment_summary_best.json",
+    } or path.startswith("config.resumed-")
+
+
+def numbers_in_artifact_bytes(content: bytes) -> list[float]:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    numbers = numbers_from_text(text)
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_float=_parse_finite_json_float,
+            parse_constant=_reject_nonfinite_json_number,
+        )
+    except (ValueError, json.JSONDecodeError):
+        return numbers
+
+    def collect(item: Any, depth: int = 0) -> list[float]:
+        if depth > 8 or isinstance(item, bool):
+            return []
+        if isinstance(item, (int, float)):
+            return [float(item)]
+        if isinstance(item, dict):
+            return [
+                number
+                for child in item.values()
+                for number in collect(child, depth + 1)
+            ]
+        if isinstance(item, list):
+            return [
+                number
+                for child in item[:200]
+                for number in collect(child, depth + 1)
+            ]
+        return []
+
+    return collect(value) + numbers
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_json_number(value: str) -> Any:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number: {value}")
+    return parsed
 
 
 def is_allowed_claim_evidence_path(rel: str, claim_type: str) -> bool:
@@ -1335,17 +1530,6 @@ def relpath(path: Path, root: Path) -> str:
         return str(path.relative_to(root))
     except ValueError:
         return str(path)
-
-
-def sha256_of_file(path: Path) -> str | None:
-    try:
-        h = hashlib.sha256()
-        with path.open("rb") as fh:
-            for chunk in iter(lambda: fh.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except OSError:
-        return None
 
 
 def extract_markdown_citations(text: str) -> set[str]:
@@ -1399,31 +1583,14 @@ def parse_time(value: Any) -> datetime | None:
 
 
 def int_value(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError:
-            return None
-    return None
+    return value if type(value) is int else None
 
 
 def float_value(value: Any) -> float | None:
-    if isinstance(value, bool):
-        return float(value)
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError:
-            return None
-    return None
+    if type(value) not in (int, float):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
 
 
 def nested_dict(data: dict[str, Any], key: str) -> dict[str, Any] | None:

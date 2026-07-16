@@ -45,10 +45,43 @@ from researchclaw.pipeline.stage25_publication import (
 )
 from researchclaw.pipeline.independent_release_reconstruction import (
     IndependentReleaseReconstructionError,
+    _build_exact_release_authority_artifacts,
     reconstruct_expected_release_publications,
+    validate_release_authority_path,
 )
 from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
 from researchclaw.pipeline.stages import Stage
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        r"stage-24\shadow.json",
+        "./stage-24/output.json",
+        "stage-24//output.json",
+        "stage-24/%2e%2e/output.json",
+        "stage-24/e\u0301.json",
+    ),
+)
+def test_release_authority_path_rejects_noncanonical_forms(path: str) -> None:
+    with pytest.raises(
+        IndependentReleaseReconstructionError,
+        match="noncanonical release authority path",
+    ):
+        validate_release_authority_path(path)
+
+
+def test_release_authority_artifacts_reject_duplicate_path_even_for_same_bytes() -> None:
+    with pytest.raises(
+        IndependentReleaseReconstructionError,
+        match="duplicate release authority path: stage-09/experiment_contract.yaml",
+    ):
+        _build_exact_release_authority_artifacts(
+            [
+                ("contract", "stage-09/experiment_contract.yaml", b"same"),
+                ("shadow_role", "stage-09/experiment_contract.yaml", b"same"),
+            ]
+        )
 
 
 def test_reconstruction_capability_guard_precedes_capture(

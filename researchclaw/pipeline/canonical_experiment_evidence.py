@@ -627,14 +627,18 @@ def validate_selected_candidate_manifest(
     for name, metadata in payload["files"].items():
         if sha256_file(selected_dir / name) != metadata["sha256"]:
             raise CanonicalExperimentEvidenceError(f"selected candidate hash mismatch: {name}")
-    expected_scaffold = {"main.py"} if contract.claim_scope == "pipeline_validation" else set()
+    canonical_scaffold = (
+        contract.claim_scope == "pipeline_validation"
+        or not config.experiment.allow_legacy_experiment_path
+    )
+    expected_scaffold = {"main.py"} if canonical_scaffold else set()
     if set(payload["scaffold_files"]) != expected_scaffold:
         raise CanonicalExperimentEvidenceError("scaffold ownership differs from producer policy")
     if set(payload["plugin_files"]) != set(payload["files"]) - expected_scaffold:
         raise CanonicalExperimentEvidenceError("plugin ownership differs from producer policy")
-    if contract.claim_scope == "pipeline_validation":
+    if canonical_scaffold:
         if set(payload["files"]) != {"main.py", "detector_plugin.py"}:
-            raise CanonicalExperimentEvidenceError("invalid pipeline_validation file closure")
+            raise CanonicalExperimentEvidenceError("invalid selected candidate file closure")
         if (selected_dir / "main.py").read_bytes() != render_main_py(contract).encode("utf-8"):
             raise CanonicalExperimentEvidenceError("scaffold-owned main.py replay mismatch")
     return payload
