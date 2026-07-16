@@ -1025,14 +1025,17 @@ def cmd_report(args: argparse.Namespace) -> int:
     output = cast(str | None, args.output)
 
     try:
-        report = generate_report(run_dir)
-    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        report = (
+            write_report(run_dir, Path(output))
+            if output
+            else generate_report(run_dir)
+        )
+    except (FileNotFoundError, OSError, ValueError, RuntimeError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
     print(report)
     if output:
-        write_report(run_dir, Path(output))
         print(f"\nReport written to {output}")
     return 0
 

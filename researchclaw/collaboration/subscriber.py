@@ -34,6 +34,7 @@ class ArtifactSubscriber:
         Returns:
             List of matching literature artifacts.
         """
+        _require_subscriber_capability("find_relevant_literature")
         return self._repo.search(
             topic, artifact_type="literature_summary", max_results=max_results
         )
@@ -52,13 +53,7 @@ class ArtifactSubscriber:
         Returns:
             List of matching experiment artifacts.
         """
-        from researchclaw.pipeline.canonical_evidence_capabilities import (
-            require_canonical_evidence_capabilities,
-        )
-
-        require_canonical_evidence_capabilities(
-            "ArtifactSubscriber.find_similar_experiments"
-        )
+        _require_subscriber_capability("find_similar_experiments")
         return self._repo.search(
             query, artifact_type="experiment_results", max_results=max_results
         )
@@ -77,6 +72,7 @@ class ArtifactSubscriber:
         Returns:
             List of matching code template artifacts.
         """
+        _require_subscriber_capability("find_code_templates")
         return self._repo.search(
             query, artifact_type="code_template", max_results=max_results
         )
@@ -93,6 +89,7 @@ class ArtifactSubscriber:
         Returns:
             Formatted string of best practices for prompt injection.
         """
+        _require_subscriber_capability("import_best_practices")
         parts: list[str] = []
 
         # Literature insights
@@ -118,3 +115,11 @@ class ArtifactSubscriber:
             return ""
 
         return "\n".join(parts)
+
+
+def _require_subscriber_capability(operation: str) -> None:
+    from researchclaw.pipeline.canonical_evidence_capabilities import (
+        require_canonical_evidence_capabilities,
+    )
+
+    require_canonical_evidence_capabilities(f"ArtifactSubscriber.{operation}")

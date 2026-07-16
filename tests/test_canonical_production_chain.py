@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import re
@@ -17,6 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import release_check  # noqa: E402
 
 from researchclaw.adapters import AdapterBundle
+from researchclaw.collaboration.publisher import ArtifactPublisher
+from researchclaw.collaboration.repository import ResearchRepository
 from researchclaw.config import RCConfig
 from researchclaw.literature.citation_policy import write_active_config_binding
 from researchclaw.literature.models import Author, Paper
@@ -35,6 +38,9 @@ from researchclaw.pipeline.independent_release_reconstruction import (
     IndependentReleaseReconstruction,
     reconstruct_expected_release_publications,
 )
+from researchclaw.pipeline.external_release_projection import (
+    load_external_release_projection,
+)
 from researchclaw.pipeline.stage23_input_bundle import load_stage23_input_bundle
 from researchclaw.pipeline.stage23_verification import (
     load_stage23_verification_publication,
@@ -48,6 +54,9 @@ from researchclaw.pipeline.stage25_publication import (
     load_stage25_publication,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
+from researchclaw.report import generate_report
+from researchclaw.mcp import server as mcp_server_module
+from researchclaw.mcp.server import ResearchClawMCPServer
 pytestmark = pytest.mark.usefixtures("canonical_evidence_migration_complete")
 
 
@@ -622,6 +631,47 @@ def test_stage04_through_stage25_uses_real_canonical_production_chain(
     assert authority_paths == _expected_release_authority_paths(
         run_dir, reconstructed
     )
+    external_projection = load_external_release_projection(run_dir)
+    assert external_projection.canonical_manifest_sha256 == (
+        reconstructed.evidence.manifest_sha256
+    )
+    assert external_projection.selected_execution_sha256 == (
+        reconstructed.evidence.selected_execution_artifact.sha256
+    )
+    assert external_projection.metric_observations == (
+        reconstructed.evidence.metric_observations
+    )
+    assert external_projection.paper_text == (
+        reconstructed.stage24_inputs.paper.content.decode("utf-8")
+    )
+    assert external_projection.verification_report["summary"]["total"] >= 1
+    assert external_projection.latex_text == next(
+        artifact.content.decode("utf-8")
+        for artifact in reconstructed.authority_artifacts
+        if artifact.path == "stage-22/paper.tex"
+    )
+    report = generate_report(run_dir)
+    assert reconstructed.evidence.manifest_sha256 in report
+    repository = ResearchRepository(tmp_path / "shared-repository")
+    assert ArtifactPublisher(repository).publish_from_run_dir(
+        "canonical-run", run_dir
+    ) >= 1
+    published = repository.get_run_artifacts("canonical-run")
+    assert published["experiment_results"]["canonical_manifest_sha256"] == (
+        reconstructed.evidence.manifest_sha256
+    )
+    monkeypatch.setattr(mcp_server_module, "_validated_run_dir", lambda _run_id: run_dir)
+    mcp = ResearchClawMCPServer()
+    mcp_results = asyncio.run(
+        mcp._handle_get_results({"run_id": "canonical-run"})
+    )
+    mcp_paper = asyncio.run(
+        mcp._handle_get_paper({"run_id": "canonical-run", "format": "latex"})
+    )
+    assert mcp_results["canonical_manifest"]["sha256"] == (
+        reconstructed.evidence.manifest_sha256
+    )
+    assert mcp_paper["content"] == external_projection.latex_text
     monkeypatch.setattr(
         reconstruction_module,
         "_capture_expected_release_publications",

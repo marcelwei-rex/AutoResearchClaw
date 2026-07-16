@@ -3,13 +3,11 @@
 # pyright: basic
 from __future__ import annotations
 
-import json
-import logging
-import re
+import os
+import stat
+import uuid
 from pathlib import Path
 from typing import Any
-
-logger = logging.getLogger(__name__)
 
 
 def generate_report(run_dir: Path) -> str:
@@ -22,197 +20,262 @@ def generate_report(run_dir: Path) -> str:
         Markdown string with the report content.
 
     Raises:
-        FileNotFoundError: If run_dir doesn't exist.
-        ValueError: If run_dir has no pipeline_summary.json.
+        ValueError: If the canonical release graph cannot be reconstructed.
     """
     from researchclaw.pipeline.canonical_evidence_capabilities import (
         require_canonical_evidence_capabilities,
     )
 
     require_canonical_evidence_capabilities("report.generate_report")
-    if not run_dir.exists():
-        raise FileNotFoundError(f"Run directory not found: {run_dir}")
+    from researchclaw.pipeline.external_release_projection import (
+        load_external_release_projection,
+    )
 
-    summary_path = run_dir / "pipeline_summary.json"
-    if not summary_path.exists():
-        raise ValueError(f"No pipeline_summary.json found in {run_dir}")
+    projection = load_external_release_projection(run_dir)
 
-    loaded = json.loads(summary_path.read_text(encoding="utf-8"))
-    summary = loaded if isinstance(loaded, dict) else {}
+    return render_report(projection, run_dir)
+
+
+def render_report(projection: Any, run_dir: Path) -> str:
+    """Render one already reconstructed immutable projection."""
 
     sections = []
-    sections.append(_header(summary, run_dir))
-    sections.append(_paper_section(run_dir))
-    sections.append(_experiment_section(run_dir))
-    sections.append(_citation_section(run_dir))
-    sections.append(_warnings_section(summary))
+    sections.append(_header(projection, run_dir))
+    sections.append(_paper_section(projection))
+    sections.append(_experiment_section(projection))
+    sections.append(_citation_section(projection))
 
     return "\n\n".join(section for section in sections if section)
 
 
-def _header(summary: dict[str, Any], run_dir: Path) -> str:
-    run_id = summary.get("run_id", "unknown")
-    stages_done = summary.get("stages_done", 0)
-    stages_total = summary.get("stages_executed", 0)
-    status = summary.get("final_status", "unknown")
-    generated = summary.get("generated", "unknown")
-
-    status_icon = "✅" if status == "done" else "❌" if status == "failed" else "⚠️"
-
+def _header(projection: Any, run_dir: Path) -> str:
     lines = [
         "# ResearchClaw Run Report",
         "",
-        f"**Run ID**: {run_id}",
-        f"**Date**: {generated}",
-        f"**Status**: {status_icon} {status} ({stages_done}/{stages_total} stages done)",
+        f"**Run ID**: {run_dir.name}",
+        "**Status**: canonical release reconstructed",
         f"**Artifacts**: `{run_dir}`",
+        f"**Canonical manifest**: `{projection.canonical_manifest_path}`",
+        f"**Canonical SHA-256**: `{projection.canonical_manifest_sha256}`",
     ]
     return "\n".join(lines)
 
 
-def _paper_section(run_dir: Path) -> str:
-    lines = ["## Paper"]
-
-    draft_path = run_dir / "stage-17" / "paper_draft.md"
-    if draft_path.exists():
-        text = draft_path.read_text(encoding="utf-8")
-        word_count = len(text.split())
-        lines.append(
-            f"- Draft: `{draft_path.relative_to(run_dir)}` (~{word_count} words)"
-        )
-    else:
-        lines.append("- Draft: not generated")
-
-    final_path = run_dir / "stage-22" / "paper_final.md"
-    if final_path.exists():
-        lines.append(f"- Final: `{final_path.relative_to(run_dir)}`")
-
-    tex_path = run_dir / "stage-22" / "paper.tex"
-    if tex_path.exists():
-        lines.append(f"- LaTeX: `{tex_path.relative_to(run_dir)}`")
-
-    rev_path = run_dir / "stage-19" / "paper_revised.md"
-    if rev_path.exists():
-        lines.append(f"- Revised: `{rev_path.relative_to(run_dir)}`")
-
-    return "\n".join(lines)
-
-
-def _experiment_section(run_dir: Path) -> str:
-    from researchclaw.pipeline.canonical_evidence_capabilities import (
-        require_canonical_evidence_capabilities,
+def _paper_section(projection: Any) -> str:
+    word_count = len(projection.paper_text.split())
+    return "\n".join(
+        [
+            "## Paper",
+            f"- Final: canonical verified paper (~{word_count} words)",
+            f"- Candidate: `{projection.candidate_id}`",
+        ]
     )
 
-    require_canonical_evidence_capabilities("report._experiment_section")
+
+def _experiment_section(projection: Any) -> str:
     lines = ["## Experiments"]
-
-    code_path = run_dir / "stage-10" / "experiment_code.py"
-    if code_path.exists():
-        lines.append(f"- Code: `{code_path.relative_to(run_dir)}`")
-
-    results_path = run_dir / "stage-12" / "experiment_results.json"
-    if results_path.exists():
-        try:
-            loaded = json.loads(results_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-                runs_default: list[Any] = []
-                iterations = data.get("iterations", data.get("runs", runs_default))
-                if isinstance(iterations, list):
-                    lines.append(f"- Runs: {len(iterations)} iterations")
-                best = data.get("best_metric") or data.get("best_result")
-                if best is not None:
-                    lines.append(f"- Best metric: {best}")
-        except (json.JSONDecodeError, TypeError):
-            lines.append("- Results: present (parse error)")
-    else:
-        lines.append("- Results: not available")
-
-    # BUG-215: Also search stage-14* versioned dirs when stage-14/ is missing.
-    analysis_path = run_dir / "stage-14" / "analysis.md"
-    if not analysis_path.exists():
-        for _s14 in sorted(run_dir.glob("stage-14*"), reverse=True):
-            _alt = _s14 / "analysis.md"
-            if _alt.exists():
-                analysis_path = _alt
-                break
-    if analysis_path.exists():
-        lines.append(f"- Analysis: `{analysis_path.relative_to(run_dir)}`")
+    lines.append(
+        f"- Selected result: `{projection.selected_result_manifest_path}`"
+    )
+    lines.append(f"- Selected execution: `{projection.selected_execution_path}`")
+    lines.append(f"- Metric observations: {len(projection.metric_observations)}")
+    lines.append("- Analysis: canonical selected candidate")
 
     return "\n".join(lines)
 
 
-def _citation_section(run_dir: Path) -> str:
+def _citation_section(projection: Any) -> str:
     lines = ["## Citations"]
-
-    bib_path = run_dir / "stage-22" / "references.bib"
-    if not bib_path.exists():
-        bib_path = run_dir / "stage-04" / "references.bib"
-
-    if bib_path.exists():
-        text = bib_path.read_text(encoding="utf-8")
-        entries = re.findall(r"@\w+\{", text)
-        lines.append(f"- References: {len(entries)} BibTeX entries")
-    else:
-        lines.append("- References: not available")
-
-    verify_path = run_dir / "stage-23" / "verification_report.json"
-    if verify_path.exists():
-        try:
-            loaded = json.loads(verify_path.read_text(encoding="utf-8"))
-            vdata = loaded if isinstance(loaded, dict) else {}
-            total = int(vdata.get("total_references", 0))
-            verified = int(vdata.get("verified_count", 0))
-            suspicious = int(vdata.get("suspicious_count", 0))
-            hallucinated = int(vdata.get("hallucinated_count", 0))
-            pct = f"{verified / total * 100:.1f}%" if total > 0 else "N/A"
-            lines.append(f"- Verified: {verified}/{total} ({pct})")
-            if suspicious:
-                lines.append(f"- Suspicious: {suspicious}")
-            if hallucinated:
-                lines.append(f"- Hallucinated: {hallucinated}")
-        except (json.JSONDecodeError, TypeError, ZeroDivisionError):
-            lines.append("- Verification: present (parse error)")
-    else:
-        lines.append("- Verification: not run")
+    summary = projection.verification_report["summary"]
+    total = summary["total"]
+    verified = summary["verified"]
+    pct = f"{verified / total * 100:.1f}%" if total else "N/A"
+    lines.append(f"- Verified: {verified}/{total} ({pct})")
+    lines.append(f"- Suspicious: {summary['suspicious']}")
+    lines.append(f"- Hallucinated: {summary['hallucinated']}")
 
     return "\n".join(lines)
-
-
-def _warnings_section(summary: dict[str, Any]) -> str:
-    warnings: list[str] = []
-
-    stages_failed = summary.get("stages_failed", 0)
-    if stages_failed:
-        warnings.append(f"- ⚠️ {stages_failed} stage(s) failed during execution")
-
-    content_metrics = summary.get("content_metrics", {})
-    if isinstance(content_metrics, dict):
-        template_ratio = content_metrics.get("template_ratio")
-        if isinstance(template_ratio, (int, float)) and template_ratio > 0.1:
-            warnings.append(
-                f"- ⚠️ Template content detected: {template_ratio:.1%} of paper may be template text"
-            )
-
-        degraded = content_metrics.get("degraded_sources", [])
-        if isinstance(degraded, list) and degraded:
-            warnings.append(f"- ⚠️ Degraded sources: {', '.join(degraded)}")
-
-    if not warnings:
-        return ""
-
-    return "## Warnings\n" + "\n".join(warnings)
 
 
 def print_report(run_dir: Path) -> None:
     print(generate_report(run_dir))
 
 
-def write_report(run_dir: Path, output_path: Path) -> None:
+def write_report(run_dir: Path, output_path: Path) -> str:
     from researchclaw.pipeline.canonical_evidence_capabilities import (
         require_canonical_evidence_capabilities,
     )
 
     require_canonical_evidence_capabilities("report.write_report")
-    report = generate_report(run_dir)
-    _ = output_path.write_text(report, encoding="utf-8")
+    from researchclaw.pipeline.external_release_projection import (
+        load_external_release_projection,
+    )
+
+    projection = load_external_release_projection(run_dir)
+    report = render_report(projection, run_dir)
+    _write_external_report(run_dir, output_path, report.encode("utf-8"))
+    return report
+
+
+def _write_external_report(run_dir: Path, output_path: Path, content: bytes) -> None:
+    if output_path.name in {"", ".", ".."}:
+        raise ValueError("report output path is invalid")
+    run_root = run_dir.resolve(strict=True)
+    parent = output_path.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise ValueError("report output parent must be a safe existing directory")
+    parent_root = parent.resolve(strict=True)
+    if parent_root == run_root or parent_root.is_relative_to(run_root):
+        raise ValueError("report output must be outside the run directory")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    parent_fd = os.open(parent, directory_flags)
+    temporary = f".{output_path.name}.{uuid.uuid4().hex}.tmp"
+    backup = f".{output_path.name}.{uuid.uuid4().hex}.bak"
+    temporary_active = False
+    backup_active = False
+    published = False
+    try:
+        opened_parent = os.fstat(parent_fd)
+        live_parent = os.stat(parent, follow_symlinks=False)
+        if (opened_parent.st_dev, opened_parent.st_ino) != (
+            live_parent.st_dev,
+            live_parent.st_ino,
+        ):
+            raise ValueError("report output parent changed before write")
+        try:
+            existing = os.stat(
+                output_path.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (
+            not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1
+        ):
+            raise ValueError("report output must be a singly linked regular file")
+
+        temporary_active = True
+        _write_report_temp(parent_fd, temporary, content)
+        if _read_report_file(parent_fd, temporary) != content:
+            raise OSError("report temporary output replay mismatch")
+        if existing is not None:
+            os.rename(
+                output_path.name,
+                backup,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            backup_active = True
+        os.rename(
+            temporary,
+            output_path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        temporary_active = False
+        published = True
+        os.fsync(parent_fd)
+        if _read_report_file(parent_fd, output_path.name) != content:
+            raise OSError("report output replay mismatch")
+        final_parent = os.stat(parent, follow_symlinks=False)
+        if (opened_parent.st_dev, opened_parent.st_ino) != (
+            final_parent.st_dev,
+            final_parent.st_ino,
+        ):
+            raise ValueError("report output parent changed during write")
+        if backup_active:
+            _unlink_report_entry(parent_fd, backup)
+            backup_active = False
+    except Exception as exc:
+        cleanup_errors: list[BaseException] = []
+        if backup_active:
+            try:
+                os.rename(
+                    backup,
+                    output_path.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                backup_active = False
+                published = False
+            except BaseException as cleanup_exc:  # pragma: no cover - OS failure
+                cleanup_errors.append(cleanup_exc)
+        elif published:
+            try:
+                _unlink_report_entry(parent_fd, output_path.name)
+                published = False
+            except BaseException as cleanup_exc:  # pragma: no cover - OS failure
+                cleanup_errors.append(cleanup_exc)
+        if temporary_active:
+            try:
+                _unlink_report_entry(parent_fd, temporary)
+                temporary_active = False
+            except BaseException as cleanup_exc:  # pragma: no cover - OS failure
+                cleanup_errors.append(cleanup_exc)
+        for cleanup_exc in cleanup_errors:
+            exc.add_note(f"report cleanup failed: {cleanup_exc}")
+        raise
+    finally:
+        if temporary_active:
+            try:
+                _unlink_report_entry(parent_fd, temporary)
+            except OSError:
+                pass
+        os.close(parent_fd)
+
+
+def _write_report_temp(directory_fd: int, name: str, content: bytes) -> None:
+    file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    file_flags |= getattr(os, "O_CLOEXEC", 0)
+    output_fd = os.open(name, file_flags, 0o600, dir_fd=directory_fd)
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(output_fd, view)
+            if written < 1:
+                raise OSError("report output write made no progress")
+            view = view[written:]
+        os.fsync(output_fd)
+        output_stat = os.fstat(output_fd)
+        if not stat.S_ISREG(output_stat.st_mode) or output_stat.st_nlink != 1:
+            raise ValueError("report output must be a singly linked regular file")
+    finally:
+        os.close(output_fd)
+
+
+def _read_report_file(directory_fd: int, name: str) -> bytes:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    file_fd = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError("report output must be a singly linked regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(file_fd)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise OSError("report output changed during replay")
+        return b"".join(chunks)
+    finally:
+        os.close(file_fd)
+
+
+def _unlink_report_entry(directory_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass

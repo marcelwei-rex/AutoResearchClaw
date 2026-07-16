@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -113,10 +114,74 @@ class TestMCPServer:
         result = asyncio.run(server.handle_tool_call("get_experiment_results", {"run_id": "missing"}))
         assert result["success"] is False
 
+    def test_handle_get_results_returns_canonical_identity(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        canonical_evidence_migration_complete: None,
+    ) -> None:
+        projection = SimpleNamespace(
+            canonical_manifest_path="canonical_experiment_evidence.json",
+            canonical_manifest_sha256="a" * 64,
+            selected_result_manifest_path="stage-12/experiment_result_set.json",
+            selected_result_manifest_sha256="b" * 64,
+            selected_execution_path="stage-12/evidence-v1/run-1.json",
+            selected_execution_sha256="c" * 64,
+            candidate_id="cand-" + "d" * 64,
+            metric_observations={"accuracy": ("0.95",)},
+            structured_results={"conditions": ()},
+        )
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: projection,
+        )
+        server = ResearchClawMCPServer()
+        result = asyncio.run(
+            server.handle_tool_call(
+                "get_experiment_results", {"run_id": "canonical-run"}
+            )
+        )
+        assert result["success"] is True
+        assert result["canonical_manifest"]["sha256"] == "a" * 64
+        assert result["selected_execution"]["sha256"] == "c" * 64
+        assert result["metric_observations"] == {"accuracy": ["0.95"]}
+
     def test_handle_get_paper_missing(self) -> None:
         server = ResearchClawMCPServer()
         result = asyncio.run(server.handle_tool_call("get_paper", {"run_id": "missing"}))
         assert result["success"] is False
+
+    @pytest.mark.parametrize(
+        ("fmt", "expected"),
+        (("markdown", "VERIFIED PAPER"), ("latex", "CANONICAL LATEX")),
+    )
+    def test_handle_get_paper_uses_canonical_projection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        canonical_evidence_migration_complete: None,
+        fmt: str,
+        expected: str,
+    ) -> None:
+        projection = SimpleNamespace(
+            paper_text="VERIFIED PAPER",
+            latex_text="CANONICAL LATEX",
+            canonical_manifest_path="canonical_experiment_evidence.json",
+            canonical_manifest_sha256="a" * 64,
+        )
+        monkeypatch.setattr(
+            "researchclaw.pipeline.external_release_projection."
+            "load_external_release_projection",
+            lambda _run_dir: projection,
+        )
+        server = ResearchClawMCPServer()
+        result = asyncio.run(
+            server.handle_tool_call(
+                "get_paper", {"run_id": "canonical-run", "format": fmt}
+            )
+        )
+        assert result["success"] is True
+        assert result["content"] == expected
+        assert result["canonical_manifest"]["sha256"] == "a" * 64
 
 
 # ══════════════════════════════════════════════════════════════════

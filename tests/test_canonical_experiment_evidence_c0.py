@@ -88,6 +88,9 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     publish_canonical_experiment_manifest,
     _stage12_primary_metric,
 )
+from researchclaw.pipeline.external_release_projection import (
+    load_external_release_projection,
+)
 from researchclaw.pipeline.stage_impls._analysis import _execute_research_decision
 from researchclaw.pipeline.stage_impls._paper_writing import (
     _collect_grounded_metric_whitelist,
@@ -3133,9 +3136,13 @@ def test_every_partial_map_blocks_all_external_and_persistent_entrypoints(
     missing = tmp_path / "missing-run"
 
     calls = (
+        lambda: load_external_release_projection(missing),
         lambda: generate_report(missing),
         lambda: ArtifactPublisher.__new__(ArtifactPublisher)._extract_experiments(missing),
         lambda: ArtifactSubscriber.__new__(ArtifactSubscriber).find_similar_experiments("q"),
+        lambda: ArtifactSubscriber.__new__(ArtifactSubscriber).find_relevant_literature("q"),
+        lambda: ArtifactSubscriber.__new__(ArtifactSubscriber).find_code_templates("q"),
+        lambda: ArtifactSubscriber.__new__(ArtifactSubscriber).import_best_practices("q"),
         lambda: ExperimentMemory.__new__(ExperimentMemory).recall_best_configs("q"),
         lambda: extract_lessons([], run_dir=missing),
         lambda: _get_evolution_overlay(missing, "topic_init"),
@@ -3144,9 +3151,19 @@ def test_every_partial_map_blocks_all_external_and_persistent_entrypoints(
     for call in calls:
         with pytest.raises(CanonicalEvidenceMigrationIncomplete):
             call()
+    monkeypatch.setattr(
+        "researchclaw.mcp.server._validated_run_dir",
+        lambda _run_id: (_ for _ in ()).throw(
+            AssertionError("MCP resolved a run path before capability guard")
+        ),
+    )
     server = ResearchClawMCPServer.__new__(ResearchClawMCPServer)
     payload = asyncio.run(server._handle_get_results({"run_id": "missing"}))
     assert payload["error_code"] == "canonical_evidence_migration_incomplete"
+    paper_payload = asyncio.run(
+        server._handle_get_paper({"run_id": "missing", "format": "markdown"})
+    )
+    assert paper_payload["error_code"] == "canonical_evidence_migration_incomplete"
     assert not missing.exists()
 
 
@@ -3227,6 +3244,8 @@ def test_pre_stage12_overlay_adapter_returns_empty_without_reading_legacy_lesson
 def test_external_and_direct_stage12_entrypoints_block_before_reads(tmp_path: Path) -> None:
     missing = tmp_path / "missing-run"
     with pytest.raises(CanonicalEvidenceMigrationIncomplete):
+        load_external_release_projection(missing)
+    with pytest.raises(CanonicalEvidenceMigrationIncomplete):
         generate_report(missing)
     publisher = ArtifactPublisher.__new__(ArtifactPublisher)
     with pytest.raises(CanonicalEvidenceMigrationIncomplete):
@@ -3234,6 +3253,12 @@ def test_external_and_direct_stage12_entrypoints_block_before_reads(tmp_path: Pa
     subscriber = ArtifactSubscriber.__new__(ArtifactSubscriber)
     with pytest.raises(CanonicalEvidenceMigrationIncomplete):
         subscriber.find_similar_experiments("query")
+    with pytest.raises(CanonicalEvidenceMigrationIncomplete):
+        subscriber.find_relevant_literature("query")
+    with pytest.raises(CanonicalEvidenceMigrationIncomplete):
+        subscriber.find_code_templates("query")
+    with pytest.raises(CanonicalEvidenceMigrationIncomplete):
+        subscriber.import_best_practices("query")
     memory = ExperimentMemory.__new__(ExperimentMemory)
     with pytest.raises(CanonicalEvidenceMigrationIncomplete):
         memory.recall_best_configs("task")
@@ -3316,6 +3341,12 @@ def test_mcp_returns_structured_migration_error_without_reading_run(tmp_path: Pa
     payload = asyncio.run(server._handle_get_results({"run_id": "does-not-exist"}))
     assert payload["success"] is False
     assert payload["error_code"] == "canonical_evidence_migration_incomplete"
+    paper_payload = asyncio.run(
+        server._handle_get_paper(
+            {"run_id": "does-not-exist", "format": "markdown"}
+        )
+    )
+    assert paper_payload["error_code"] == "canonical_evidence_migration_incomplete"
     assert not tmp_path.joinpath("does-not-exist").exists()
 
 

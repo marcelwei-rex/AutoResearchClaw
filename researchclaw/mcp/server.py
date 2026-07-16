@@ -108,11 +108,39 @@ class ResearchClawMCPServer:
             }
         run_id = args["run_id"]
         run_dir = _validated_run_dir(run_id)
-        results_file = run_dir / "experiment_results.json"
-        if results_file.exists():
-            data = json.loads(results_file.read_text(encoding="utf-8"))
-            return {"success": True, "results": data}
-        return {"success": False, "error": "No results found"}
+        from researchclaw.pipeline.external_release_projection import (
+            external_json_value,
+            load_external_release_projection,
+        )
+
+        try:
+            projection = load_external_release_projection(run_dir)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "success": False,
+                "error": f"Canonical experiment results are unavailable: {exc}",
+                "error_code": "canonical_release_invalid",
+            }
+        return {
+            "success": True,
+            "canonical_manifest": {
+                "path": projection.canonical_manifest_path,
+                "sha256": projection.canonical_manifest_sha256,
+            },
+            "selected_result_manifest": {
+                "path": projection.selected_result_manifest_path,
+                "sha256": projection.selected_result_manifest_sha256,
+            },
+            "selected_execution": {
+                "path": projection.selected_execution_path,
+                "sha256": projection.selected_execution_sha256,
+            },
+            "candidate_id": projection.candidate_id,
+            "metric_observations": external_json_value(
+                projection.metric_observations
+            ),
+            "structured_results": external_json_value(projection.structured_results),
+        }
 
     async def _handle_search_literature(self, args: dict[str, Any]) -> dict[str, Any]:
         """Search literature (stub — real implementation would use literature/ module)."""
@@ -133,16 +161,51 @@ class ResearchClawMCPServer:
 
     async def _handle_get_paper(self, args: dict[str, Any]) -> dict[str, Any]:
         """Get generated paper."""
+        from researchclaw.pipeline.canonical_evidence_capabilities import (
+            CanonicalEvidenceMigrationIncomplete,
+            require_canonical_evidence_capabilities,
+        )
+
+        try:
+            require_canonical_evidence_capabilities("mcp.get_paper")
+        except CanonicalEvidenceMigrationIncomplete as exc:
+            return {
+                "success": False,
+                "error": str(exc),
+                "error_code": exc.code,
+            }
         run_id = args["run_id"]
         fmt = args.get("format", "markdown")
+        if fmt not in {"markdown", "latex"}:
+            return {
+                "success": False,
+                "error": "Paper format must be markdown or latex",
+                "error_code": "invalid_paper_format",
+            }
         run_dir = _validated_run_dir(run_id)
-        if fmt == "latex":
-            paper_file = run_dir / "paper.tex"
-        else:
-            paper_file = run_dir / "paper_draft.md"
-        if paper_file.exists():
-            return {"success": True, "content": paper_file.read_text(encoding="utf-8")}
-        return {"success": False, "error": f"Paper not found in {run_dir}"}
+        from researchclaw.pipeline.external_release_projection import (
+            load_external_release_projection,
+        )
+
+        try:
+            projection = load_external_release_projection(run_dir)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "success": False,
+                "error": f"Canonical paper is unavailable: {exc}",
+                "error_code": "canonical_release_invalid",
+            }
+        return {
+            "success": True,
+            "format": fmt,
+            "content": (
+                projection.latex_text if fmt == "latex" else projection.paper_text
+            ),
+            "canonical_manifest": {
+                "path": projection.canonical_manifest_path,
+                "sha256": projection.canonical_manifest_sha256,
+            },
+        }
 
     # ── server lifecycle ──────────────────────────────────────────
 
