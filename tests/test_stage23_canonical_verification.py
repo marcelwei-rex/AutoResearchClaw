@@ -903,7 +903,6 @@ def test_stage18_23_authority_functions_have_no_legacy_selectors() -> None:
         == CAPABILITY_SCHEMA_VERSION
     )
     assert incomplete_canonical_evidence_capabilities() == (
-        "external_and_persistent_consumers",
         "independent_release_reconstruction",
     )
     assert {
