@@ -56,6 +56,14 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
 )
 from researchclaw.literature.citation_policy import resolve_active_config_snapshot
 from researchclaw.pipeline.stages import Stage, StageStatus
+from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
+from researchclaw.pipeline.stage10_evaluator_capture import (
+    Stage10EvaluatorCaptureError,
+    clear_stage10_candidate_authority,
+    invalidate_stage10_candidate_authority,
+    load_stage10_contract,
+    publish_domain_evaluator_candidate,
+)
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
@@ -886,6 +894,56 @@ def _execute_code_generation(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    with ReleaseGraphLock.acquire(
+        run_dir, "stage10.code_generation", mode="write"
+    ) as release_lock:
+        result = _execute_code_generation_under_lock(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=llm,
+            prompts=prompts,
+        )
+        try:
+            release_lock.assert_canonical()
+        except Exception as exc:  # noqa: BLE001
+            try:
+                with release_lock.open_stage_namespace(
+                    "stage-10", create_stage=True
+                ) as namespace:
+                    clear_stage10_candidate_authority(namespace)
+            except Exception as cleanup_exc:  # noqa: BLE001
+                exc.add_note(f"Stage 10 authority cleanup also failed: {cleanup_exc}")
+            return StageResult(
+                stage=Stage.CODE_GENERATION,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                evidence_refs=(),
+                error=f"Stage 10 run identity changed: {exc}",
+            )
+        return result
+
+
+def _execute_code_generation_under_lock(
+    stage_dir: Path,
+    run_dir: Path,
+    config: RCConfig,
+    adapters: AdapterBundle,
+    *,
+    llm: LLMClient | None = None,
+    prompts: PromptManager | None = None,
+) -> StageResult:
+    try:
+        invalidate_stage10_candidate_authority(run_dir)
+    except Exception as exc:  # noqa: BLE001
+        return StageResult(
+            stage=Stage.CODE_GENERATION,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error=f"Stage 10 authority invalidation failed: {exc}",
+        )
     # ── ColliderAgent mode: generate a physics prompt instead of Python code ─
     if config.experiment.mode == "collider_agent":
         return _execute_collider_plan_generation(
@@ -894,19 +952,9 @@ def _execute_code_generation(
     # ── End ColliderAgent bypass ──────────────────────────────────────────────
 
     exp_plan = _read_prior_artifact(run_dir, "exp_plan.yaml") or ""
-    contract_path = find_stage09_contract(run_dir)
-    if contract_path is None:
-        error = "Experiment contract missing: stage-09/experiment_contract.yaml"
-        return StageResult(
-            stage=Stage.CODE_GENERATION,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            evidence_refs=(),
-            error=error,
-        )
     try:
-        contract = load_contract(contract_path)
-    except ContractValidationError as exc:
+        contract_path, contract = load_stage10_contract(run_dir)
+    except (ContractValidationError, Stage10EvaluatorCaptureError) as exc:
         error = f"Experiment contract invalid: {exc}"
         return StageResult(
             stage=Stage.CODE_GENERATION,
@@ -914,6 +962,29 @@ def _execute_code_generation(
             artifacts=(),
             evidence_refs=(),
             error=error,
+        )
+    if contract.schema_version == 3:
+        try:
+            capture_artifact, manifest_artifact = publish_domain_evaluator_candidate(
+                run_dir=run_dir,
+                config=config,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return StageResult(
+                stage=Stage.CODE_GENERATION,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                evidence_refs=(),
+                error=f"Stage 10 evaluator capture failed: {exc}",
+            )
+        return StageResult(
+            stage=Stage.CODE_GENERATION,
+            status=StageStatus.DONE,
+            artifacts=(capture_artifact, manifest_artifact),
+            evidence_refs=(
+                f"stage-10/{capture_artifact}",
+                f"stage-10/{manifest_artifact}",
+            ),
         )
     metric = config.experiment.metric_key
     max_repair = 5  # BUG-14: Increased from 3 to give more chances for critical bugs

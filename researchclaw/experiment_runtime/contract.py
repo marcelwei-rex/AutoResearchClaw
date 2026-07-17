@@ -14,6 +14,7 @@ from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 
 from researchclaw.experiment_runtime.metric_authority import (
     MetricAuthorityError,
+    MetricAuthoritySelection,
     publish_metric_authority_snapshots,
     select_metric_authority,
 )
@@ -123,7 +124,11 @@ def contract_sha256(
     return hashlib.sha256(_read_contract_bytes(path, namespace=namespace)).hexdigest()
 
 
-def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
+def validate_contract_dict(
+    data: dict[str, Any],
+    *,
+    authority_selection: MetricAuthoritySelection | None = None,
+) -> ExperimentContract:
     errors: list[str] = []
 
     schema_version = data.get("schema_version")
@@ -299,7 +304,9 @@ def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
     if not errors:
         try:
             experiment_mode = metric_authority.get("experiment_mode")
-            selected = select_metric_authority(topic, experiment_mode)
+            selected = authority_selection or select_metric_authority(
+                topic, experiment_mode
+            )
             if metric_authority != selected.contract_identity():
                 errors.append("metric_authority does not match trusted selector result")
             if metric_units != selected.metric_units:
@@ -376,15 +383,35 @@ def load_contract(
     path: Path, *, namespace: BoundOutputNamespace | None = None
 ) -> ExperimentContract:
     try:
-        raw = yaml.load(
-            _read_contract_bytes(path, namespace=namespace).decode("utf-8"),
-            Loader=_StrictLoader,
-        )
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        content = _read_contract_bytes(path, namespace=namespace)
+    except OSError as exc:
+        raise ContractValidationError(f"cannot read contract: {exc}") from exc
+    return load_contract_bytes(content)
+
+
+def parse_contract_bytes(content: bytes) -> dict[str, Any]:
+    """Strictly parse captured contract bytes without applying authority policy."""
+
+    try:
+        raw = yaml.load(content.decode("utf-8"), Loader=_StrictLoader)
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
         raise ContractValidationError(f"cannot read contract: {exc}") from exc
     if not isinstance(raw, dict):
         raise ContractValidationError("contract root must be an object")
-    return validate_contract_dict(raw)
+    return raw
+
+
+def load_contract_bytes(
+    content: bytes,
+    *,
+    authority_selection: MetricAuthoritySelection | None = None,
+) -> ExperimentContract:
+    """Strictly load captured contract bytes without reopening their path."""
+
+    return validate_contract_dict(
+        parse_contract_bytes(content),
+        authority_selection=authority_selection,
+    )
 
 
 def dump_contract(
@@ -422,6 +449,7 @@ def derive_contract(
     *,
     stage_dir: Path | None = None,
     namespace: BoundOutputNamespace | None = None,
+    authority_selection: MetricAuthoritySelection | None = None,
 ) -> ExperimentContract:
     experiment = getattr(config, "experiment", None)
     claim_scope = str(getattr(experiment, "claim_scope", "pipeline_validation") or "pipeline_validation")
@@ -433,7 +461,9 @@ def derive_contract(
     topic = str(getattr(getattr(config, "research", None), "topic", "") or "")
     experiment_mode = str(getattr(experiment, "mode", "") or "")
     try:
-        authority = select_metric_authority(topic, experiment_mode)
+        authority = authority_selection or select_metric_authority(
+            topic, experiment_mode
+        )
         if stage_dir is not None:
             publish_metric_authority_snapshots(
                 stage_dir, authority, namespace=namespace
@@ -498,7 +528,9 @@ def derive_contract(
         metric_display_labels=authority.metric_display_labels,
         evaluator_authority=authority.evaluator_authority,
     )
-    return validate_contract_dict(contract.to_dict())
+    return validate_contract_dict(
+        contract.to_dict(), authority_selection=authority
+    )
 
 
 def find_stage09_contract(run_dir: Path) -> Path | None:

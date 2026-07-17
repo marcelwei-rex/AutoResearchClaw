@@ -116,6 +116,280 @@ class MetricAuthoritySelection:
         }
 
 
+@dataclass(frozen=True)
+class DomainEvaluatorCapturePlan:
+    selection: MetricAuthoritySelection
+    package_manifest_bytes: bytes
+    execution_policy_bytes: bytes
+    source_namespace_sha256: str
+    files: tuple[dict[str, Any], ...]
+    contents: Mapping[str, bytes]
+
+
+def build_domain_evaluator_capture_plan(
+    topic: str, experiment_mode: str
+) -> DomainEvaluatorCapturePlan:
+    """Capture one exact trusted package plan without authorizing live paths."""
+
+    selection = select_metric_authority(topic, experiment_mode)
+    if selection.schema_version != 2 or selection.evaluator_authority is None:
+        raise MetricAuthorityError("selected authority is not a domain evaluator")
+    manifest_path = TRUSTED_SOURCE_BASE / TROJNET_PACKAGE_MANIFEST_PATH
+    manifest_bytes = _read_regular_bytes(
+        manifest_path, "domain evaluator package manifest"
+    )
+    if (
+        _sha256_bytes(manifest_bytes)
+        != selection.evaluator_authority["package_manifest_package_sha256"]
+    ):
+        raise MetricAuthorityError("domain evaluator package manifest hash mismatch")
+    manifest, sources = _load_package_manifest_and_sources(manifest_bytes)
+    execution_policy_bytes = sources[("package", manifest["execution_policy_path"])]
+    _load_execution_policy_bytes(execution_policy_bytes)
+    if (
+        _sha256_bytes(execution_policy_bytes)
+        != selection.evaluator_authority["execution_policy_package_sha256"]
+    ):
+        raise MetricAuthorityError("domain evaluator execution policy hash mismatch")
+
+    ordered_entries: list[dict[str, Any]] = []
+    contents: dict[str, bytes] = {}
+    namespace_rows: list[dict[str, Any]] = []
+    for item in manifest["files"]:
+        package_entry = {
+            "source_root": item["source_root"],
+            "source_path": item["source_path"],
+            "capture_path": item["capture_path"],
+            "role": item["role"],
+            "sha256": item["sha256"],
+            "size": item["size"],
+        }
+        ordered_entries.append(
+            {
+                "role": item["role"],
+                "path": item["capture_path"],
+                "sha256": item["sha256"],
+                "size": item["size"],
+                "package_entry_sha256": _sha256_bytes(
+                    _canonical_json_bytes(package_entry)
+                ),
+            }
+        )
+        contents[item["capture_path"]] = sources[
+            (item["source_root"], item["source_path"])
+        ]
+        namespace_rows.append(
+            {
+                "source_root": item["source_root"],
+                "source_path": item["source_path"],
+                "role": item["role"],
+                "sha256": item["sha256"],
+                "size": item["size"],
+            }
+        )
+    return DomainEvaluatorCapturePlan(
+        selection=selection,
+        package_manifest_bytes=manifest_bytes,
+        execution_policy_bytes=execution_policy_bytes,
+        source_namespace_sha256=_sha256_bytes(
+            _canonical_json_bytes(namespace_rows)
+        ),
+        files=tuple(ordered_entries),
+        contents=deepcopy(contents),
+    )
+
+
+def replay_captured_domain_evaluator_authority(
+    *,
+    topic: str,
+    experiment_mode: str,
+    package_manifest_bytes: bytes,
+    execution_policy_bytes: bytes,
+    stored_identity: Mapping[str, Any],
+    metric_units: Mapping[str, str],
+    metric_display_labels: Mapping[str, list[str]],
+    evaluator_authority: Mapping[str, Any],
+) -> MetricAuthoritySelection:
+    """Replay trusted selector metadata without reopening captured source roots."""
+
+    policy_bytes, policy = _load_domain_selector_policy_v2(
+        DOMAIN_SELECTOR_PACKAGE_PATH_V2
+    )
+    normalized_topic = normalize_topic(topic)
+    domain_id = _select_domain_id(normalized_topic, policy)
+    if domain_id != TROJNET_DOMAIN_ID:
+        raise MetricAuthorityError("captured evaluator domain selection mismatch")
+    profile_path = PACKAGE_ROOT / "profiles" / f"{domain_id}-v2.json"
+    profile_bytes, profile = _load_domain_profile_v2(profile_path, domain_id)
+    if experiment_mode not in profile["supported_experiment_modes"]:
+        raise MetricAuthorityError("captured evaluator experiment mode mismatch")
+    index_bytes, index = _load_selector_index_v2(METRIC_SELECTOR_INDEX_PATH_V2)
+    matches = [
+        item
+        for item in index["entries"]
+        if item["domain_id"] == domain_id
+        and item["experiment_mode"] == experiment_mode
+        and item["evaluator_kind"] == "domain_evaluator"
+    ]
+    if len(matches) != 1:
+        raise MetricAuthorityError("captured evaluator selector match mismatch")
+    entry = matches[0]
+    if (
+        entry["evaluator_id"] != TROJNET_EVALUATOR_ID
+        or entry["package_manifest_path"] != TROJNET_PACKAGE_MANIFEST_PATH.as_posix()
+        or entry["metric_registry_path"] != TROJNET_REGISTRY_PATH.as_posix()
+        or _sha256_bytes(package_manifest_bytes) != entry["package_manifest_sha256"]
+    ):
+        raise MetricAuthorityError("captured evaluator package authority mismatch")
+    manifest = _parse_package_manifest_metadata_bytes(package_manifest_bytes)
+    if (
+        _sha256_bytes(execution_policy_bytes) != manifest["execution_policy_sha256"]
+    ):
+        raise MetricAuthorityError("captured execution policy authority mismatch")
+    _load_execution_policy_bytes(execution_policy_bytes)
+    registry_path = Path(__file__).parents[2] / entry["metric_registry_path"]
+    registry_bytes = _read_regular_bytes(registry_path, "domain evaluator registry")
+    if _sha256_bytes(registry_bytes) != entry["metric_registry_sha256"]:
+        raise MetricAuthorityError("captured evaluator registry hash mismatch")
+    registry = _load_metric_registry_v2_bytes(
+        registry_bytes, domain_id=domain_id, evaluator_id=entry["evaluator_id"]
+    )
+
+    policy_sha = _sha256_bytes(policy_bytes)
+    profile_sha = _sha256_bytes(profile_bytes)
+    index_sha = _sha256_bytes(index_bytes)
+    registry_sha = _sha256_bytes(registry_bytes)
+    manifest_sha = _sha256_bytes(package_manifest_bytes)
+    execution_sha = _sha256_bytes(execution_policy_bytes)
+    selector_input = {
+        "domain_id": domain_id,
+        "domain_profile_sha256": profile_sha,
+        "domain_selector_package_sha256": policy_sha,
+        "evaluator_kind": "domain_evaluator",
+        "experiment_mode": experiment_mode,
+        "package_manifest_sha256": manifest_sha,
+        "registry_sha256": registry_sha,
+        "selector_index_sha256": index_sha,
+        "selector_policy_version": METRIC_SELECTOR_POLICY_VERSION_V2,
+        "topic_normalized_sha256": _sha256_bytes(normalized_topic.encode("utf-8")),
+        "topic_raw_sha256": _sha256_bytes(topic.encode("utf-8")),
+    }
+    expected_identity = {
+        "schema_version": 2,
+        "policy_version": 2,
+        "domain_id": domain_id,
+        "evaluator_id": entry["evaluator_id"],
+        "experiment_mode": experiment_mode,
+        "evaluator_kind": "domain_evaluator",
+        "selector_policy_version": 2,
+        "selector_input_sha256": _sha256_bytes(_canonical_json_bytes(selector_input)),
+        "domain_selector_package": {
+            "path": _repo_relative(DOMAIN_SELECTOR_PACKAGE_PATH_V2),
+            "sha256": policy_sha,
+        },
+        "domain_selector_snapshot": {
+            "path": DOMAIN_SELECTOR_SNAPSHOT_PATH,
+            "sha256": policy_sha,
+        },
+        "domain_profile_snapshot": {
+            "path": DOMAIN_PROFILE_SNAPSHOT_PATH,
+            "sha256": profile_sha,
+        },
+        "selector_index_package": {
+            "path": _repo_relative(METRIC_SELECTOR_INDEX_PATH_V2),
+            "sha256": index_sha,
+        },
+        "selector_index_snapshot": {
+            "path": METRIC_SELECTOR_INDEX_SNAPSHOT_PATH,
+            "sha256": index_sha,
+        },
+        "registry_snapshot": {
+            "path": METRIC_AUTHORITY_SNAPSHOT_PATH,
+            "sha256": registry_sha,
+        },
+    }
+    expected_evaluator_authority = {
+        "kind": "domain_evaluator",
+        "domain_id": domain_id,
+        "evaluator_id": entry["evaluator_id"],
+        "evaluator_schema": manifest["evaluator_schema"],
+        "package_manifest_package_path": entry["package_manifest_path"],
+        "package_manifest_package_sha256": manifest_sha,
+        "package_manifest_snapshot_path": DOMAIN_EVALUATOR_PACKAGE_MANIFEST_SNAPSHOT_PATH,
+        "package_manifest_snapshot_sha256": manifest_sha,
+        "execution_policy_package_path": (
+            Path(entry["package_manifest_path"]).parent
+            / manifest["execution_policy_path"]
+        ).as_posix(),
+        "execution_policy_package_sha256": execution_sha,
+        "execution_policy_snapshot_path": DOMAIN_EVALUATOR_EXECUTION_POLICY_SNAPSHOT_PATH,
+        "execution_policy_snapshot_sha256": execution_sha,
+        "input_capture_policy_version": 1,
+        "result_set_policy_version": 2,
+        "observation_replay_policy_version": 1,
+    }
+    expected_units = {item["key"]: item["unit"] for item in registry["metrics"]}
+    expected_labels = {
+        item["key"]: list(item["display_labels"]) for item in registry["metrics"]
+    }
+    if dict(stored_identity) != expected_identity:
+        raise MetricAuthorityError("captured metric authority identity mismatch")
+    if dict(evaluator_authority) != expected_evaluator_authority:
+        raise MetricAuthorityError("captured evaluator authority identity mismatch")
+    if dict(metric_units) != expected_units or dict(metric_display_labels) != expected_labels:
+        raise MetricAuthorityError("captured metric registry projection mismatch")
+    return MetricAuthoritySelection(
+        domain_id=domain_id,
+        evaluator_id=entry["evaluator_id"],
+        experiment_mode=experiment_mode,
+        evaluator_kind="domain_evaluator",
+        domain_selector_package_path=_repo_relative(DOMAIN_SELECTOR_PACKAGE_PATH_V2),
+        domain_selector_package_sha256=policy_sha,
+        domain_selector_snapshot_path=DOMAIN_SELECTOR_SNAPSHOT_PATH,
+        domain_selector_snapshot_sha256=policy_sha,
+        domain_profile_path=DOMAIN_PROFILE_SNAPSHOT_PATH,
+        domain_profile_sha256=profile_sha,
+        selector_index_path=METRIC_SELECTOR_INDEX_SNAPSHOT_PATH,
+        selector_index_sha256=index_sha,
+        authority_path=METRIC_AUTHORITY_SNAPSHOT_PATH,
+        authority_sha256=registry_sha,
+        selector_input_sha256=expected_identity["selector_input_sha256"],
+        selector_policy_version=2,
+        metric_units=expected_units,
+        metric_display_labels=expected_labels,
+        schema_version=2,
+        identity_v2=expected_identity,
+        evaluator_authority=expected_evaluator_authority,
+    )
+
+
+def _parse_package_manifest_metadata_bytes(data: bytes) -> dict[str, Any]:
+    value = _parse_json_object_bytes(data, "captured domain evaluator package manifest")
+    _exact_keys(
+        value,
+        {
+            "schema_version", "package_policy_version", "domain_id", "evaluator_id",
+            "evaluator_schema", "execution_policy_path", "execution_policy_sha256",
+            "source_roots", "files",
+        },
+        "captured domain evaluator package manifest",
+    )
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or type(value["package_policy_version"]) is not int
+        or value["package_policy_version"] != 1
+        or value["domain_id"] != TROJNET_DOMAIN_ID
+        or value["evaluator_id"] != TROJNET_EVALUATOR_ID
+        or value["evaluator_schema"] != TROJNET_EVALUATOR_SCHEMA
+        or value["execution_policy_path"] != "execution-policy-v1.json"
+        or not isinstance(value["execution_policy_sha256"], str)
+        or _SHA256_RE.fullmatch(value["execution_policy_sha256"]) is None
+    ):
+        raise MetricAuthorityError("captured package manifest identity mismatch")
+    return value
+
+
 def normalize_topic(topic: str) -> str:
     if not isinstance(topic, str):
         raise MetricAuthorityError("research topic must be a string")
@@ -728,6 +1002,13 @@ def _load_metric_registry_v2_bytes(
 
 
 def _load_package_manifest_bytes(data: bytes) -> dict[str, Any]:
+    value, _sources = _load_package_manifest_and_sources(data)
+    return value
+
+
+def _load_package_manifest_and_sources(
+    data: bytes,
+) -> tuple[dict[str, Any], dict[tuple[str, str], bytes]]:
     value = _parse_json_object_bytes(data, "domain evaluator package manifest")
     _exact_keys(
         value,
@@ -843,7 +1124,7 @@ def _load_package_manifest_bytes(data: bytes) -> dict[str, Any]:
     reserved_manifest = source_bytes[("package", "package-manifest-v1.json")]
     if reserved_manifest != data:
         raise MetricAuthorityError("domain evaluator package manifest source mismatch")
-    return value
+    return value, source_bytes
 
 
 def _capture_exact_package_sources(

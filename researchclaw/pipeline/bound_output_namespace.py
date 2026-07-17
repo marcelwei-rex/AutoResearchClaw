@@ -199,6 +199,28 @@ class BoundOutputNamespace:
         for name in names:
             _remove_tree_at(self._stage_fd, name)
 
+    def quarantine_tree_entry(self, name: str) -> None:
+        """Remove a tree name from authority before best-effort recursive cleanup."""
+
+        _require_child_name(name)
+        try:
+            os.stat(name, dir_fd=self._stage_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        quarantine = f".{name}.rejected-{uuid.uuid4().hex}"
+        os.rename(
+            name,
+            quarantine,
+            src_dir_fd=self._stage_fd,
+            dst_dir_fd=self._stage_fd,
+        )
+        try:
+            _remove_tree_at(self._stage_fd, quarantine)
+        except OSError as exc:
+            raise OSError(
+                f"quarantined tree cleanup failed: {quarantine}: {exc}"
+            ) from exc
+
     def ensure_directory(self, name: str) -> None:
         """Create or validate one direct directory without reopening its path."""
 
@@ -623,6 +645,45 @@ class BoundOutputNamespace:
         finally:
             os.close(descriptor)
 
+    def read_run_file(self, relative_path: str) -> bytes:
+        """Read one regular run-relative file through the held run fd."""
+
+        parts = _relative_parts(relative_path)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.dup(self._run_fd)
+        opened = [descriptor]
+        try:
+            for part in parts[:-1]:
+                descriptor = os.open(part, flags, dir_fd=descriptor)
+                opened.append(descriptor)
+            return _read_regular_file(descriptor, parts[-1])
+        finally:
+            for opened_fd in reversed(opened):
+                os.close(opened_fd)
+
+    def run_entries(self) -> tuple[str, ...]:
+        """List direct entries of the held run directory."""
+
+        return tuple(sorted(os.listdir(self._run_fd)))
+
+    def read_run_directory_entries(self, relative_path: str) -> tuple[str, ...]:
+        """List a held run-relative directory without following symlinks."""
+
+        parts = _relative_parts(relative_path)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.dup(self._run_fd)
+        opened = [descriptor]
+        try:
+            for part in parts:
+                descriptor = os.open(part, flags, dir_fd=descriptor)
+                opened.append(descriptor)
+            return tuple(sorted(os.listdir(descriptor)))
+        finally:
+            for opened_fd in reversed(opened):
+                os.close(opened_fd)
+
     def direct_entries(self) -> tuple[str, ...]:
         return tuple(sorted(os.listdir(self._stage_fd)))
 
@@ -656,6 +717,55 @@ class BoundOutputNamespace:
         finally:
             os.close(descriptor)
 
+    def read_directory_tree(self, name: str) -> dict[str, bytes]:
+        """Read an exact regular-file tree relative to the held stage fd."""
+
+        _require_child_name(name)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(name, flags, dir_fd=self._stage_fd)
+        try:
+            return _read_directory_tree(descriptor, prefix="")
+        finally:
+            os.close(descriptor)
+
+    def write_tree_file_atomic(
+        self, tree: str, relative_path: str, content: bytes
+    ) -> None:
+        """Write a nested tree commit point without reopening the live path."""
+
+        _require_child_name(tree)
+        parts = _relative_parts(relative_path)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(tree, flags, dir_fd=self._stage_fd)
+        opened = [descriptor]
+        temporary: str | None = None
+        try:
+            for part in parts[:-1]:
+                descriptor = os.open(part, flags, dir_fd=descriptor)
+                opened.append(descriptor)
+            temporary = f".{parts[-1]}.tmp-{uuid.uuid4().hex}"
+            _write_new_file(descriptor, temporary, content)
+            os.replace(
+                temporary,
+                parts[-1],
+                src_dir_fd=descriptor,
+                dst_dir_fd=descriptor,
+            )
+            os.fsync(descriptor)
+            self.assert_canonical()
+        except Exception:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary, dir_fd=descriptor)
+                except FileNotFoundError:
+                    pass
+            raise
+        finally:
+            for opened_fd in reversed(opened):
+                os.close(opened_fd)
+
 
 def _identity(info: os.stat_result) -> tuple[int, int]:
     return info.st_dev, info.st_ino
@@ -685,7 +795,8 @@ def _write_new_file(directory_fd: int, name: str, content: bytes) -> None:
 
 
 def _read_regular_file(directory_fd: int, name: str) -> bytes:
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags |= getattr(os, "O_CLOEXEC", 0)
     descriptor = os.open(name, flags, dir_fd=directory_fd)
     try:
         info = os.fstat(descriptor)
@@ -699,6 +810,39 @@ def _read_regular_file(directory_fd: int, name: str) -> bytes:
             chunks.append(chunk)
     finally:
         os.close(descriptor)
+
+
+def _read_directory_tree(directory_fd: int, *, prefix: str) -> dict[str, bytes]:
+    result: dict[str, bytes] = {}
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    initial_names = tuple(sorted(os.listdir(directory_fd)))
+    for name in initial_names:
+        _require_child_name(name)
+        relative = f"{prefix}/{name}" if prefix else name
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISREG(info.st_mode):
+            result[relative] = _read_regular_file(directory_fd, name)
+        elif stat.S_ISDIR(info.st_mode):
+            child_fd = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                result.update(_read_directory_tree(child_fd, prefix=relative))
+            finally:
+                os.close(child_fd)
+        else:
+            raise OSError(f"directory tree contains unsafe entry: {relative}")
+    if tuple(sorted(os.listdir(directory_fd))) != initial_names:
+        raise OSError("directory tree namespace changed while reading")
+    return result
+
+
+def _relative_parts(value: str) -> tuple[str, ...]:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise OSError("tree path is unsafe")
+    parts = tuple(value.split("/"))
+    if any(not part or part in {".", ".."} for part in parts):
+        raise OSError("tree path is unsafe")
+    return parts
 
 
 def _open_source_directory(source: Path) -> int:

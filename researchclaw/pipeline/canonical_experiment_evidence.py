@@ -523,6 +523,21 @@ def _decimal_mean(values: object) -> Decimal:
 
 def parse_selected_candidate_manifest(text: str) -> dict[str, Any]:
     payload = _parse_object(text, "selected candidate manifest")
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int:
+        raise CanonicalExperimentEvidenceError(
+            "selected candidate schema_version must be a true integer"
+        )
+    if schema_version == 3:
+        return _parse_domain_evaluator_candidate_manifest(payload)
+    if schema_version != STAGE10_SEAL_SCHEMA_VERSION:
+        raise CanonicalExperimentEvidenceError(
+            "unsupported selected candidate manifest schema"
+        )
+    return _parse_scaffold_candidate_manifest(payload)
+
+
+def _parse_scaffold_candidate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
     _exact_keys(
         payload,
         {
@@ -565,6 +580,41 @@ def parse_selected_candidate_manifest(text: str) -> dict[str, Any]:
     return payload
 
 
+def _parse_domain_evaluator_candidate_manifest(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    _exact_keys(
+        payload,
+        {
+            "schema_version", "seal_policy_version", "candidate_kind",
+            "experiment_contract", "run_config", "config_semantic_policy_version",
+            "config_semantic_sha256", "metric_authority", "package_manifest",
+            "execution_policy", "capture_manifest", "evaluator_schema",
+        },
+        "domain evaluator selected candidate manifest",
+    )
+    _require_equal(payload, "schema_version", 3)
+    _require_equal(payload, "seal_policy_version", 2)
+    _require_equal(payload, "candidate_kind", "domain_evaluator")
+    for field in (
+        "experiment_contract", "run_config", "package_manifest",
+        "execution_policy", "capture_manifest",
+    ):
+        _file_ref_v2(payload[field], field)
+    _require_equal(
+        payload,
+        "config_semantic_policy_version",
+        CONFIG_SEMANTIC_POLICY_VERSION,
+    )
+    _sha256(payload["config_semantic_sha256"], "config_semantic_sha256")
+    if not isinstance(payload["metric_authority"], dict):
+        raise CanonicalExperimentEvidenceError(
+            "domain evaluator metric_authority must be an object"
+        )
+    _required_string(payload["evaluator_schema"], "evaluator_schema")
+    return payload
+
+
 def validate_selected_candidate_manifest(
     run_dir: Path,
     config: RCConfig,
@@ -575,6 +625,17 @@ def validate_selected_candidate_manifest(
     if text is None:
         text = _read_regular_file(manifest_path, "selected candidate manifest")
     payload = parse_selected_candidate_manifest(text)
+    if payload["schema_version"] == 3:
+        from researchclaw.pipeline.stage10_evaluator_capture import (
+            replay_domain_evaluator_candidate,
+        )
+
+        replayed = replay_domain_evaluator_candidate(run_dir, config)
+        if replayed != payload:
+            raise CanonicalExperimentEvidenceError(
+                "domain evaluator selected candidate text differs from disk authority"
+            )
+        return replayed
 
     contract_path = find_stage09_contract(run_dir)
     if contract_path is None:
@@ -2859,6 +2920,17 @@ def _file_ref(value: object, label: str) -> dict[str, Any]:
     _exact_keys(value, {"path", "sha256"}, label)
     _safe_relative_path(value["path"], f"{label}.path")
     _sha256(value["sha256"], f"{label}.sha256")
+    return value
+
+
+def _file_ref_v2(value: object, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CanonicalExperimentEvidenceError(f"{label} must be an object")
+    _exact_keys(value, {"path", "sha256", "size"}, label)
+    _safe_relative_path(value["path"], f"{label}.path")
+    _sha256(value["sha256"], f"{label}.sha256")
+    if type(value["size"]) is not int or value["size"] <= 0:
+        raise CanonicalExperimentEvidenceError(f"{label}.size must be a positive integer")
     return value
 
 
