@@ -391,8 +391,8 @@
       "source_path": "verifier_main.py",
       "capture_path": "verifier/verifier_main.py",
       "role": "verifier",
-      "sha256": "0a645b16ff4f270f1494aa28efb60b1ad0d80fa01230e55b49b377ca9d3bc1fe",
-      "size": 13635
+      "sha256": "8192031d9636009cb785abfafa4c8e42b1564e3b5a08c3730ee8248c710a03a8",
+      "size": 13722
     }
   ]
 }

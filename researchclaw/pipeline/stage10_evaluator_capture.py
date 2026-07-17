@@ -36,7 +36,11 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     parse_selected_candidate_manifest,
     semantic_config_sha256,
 )
-from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
+from researchclaw.pipeline.release_graph_lock import (
+    ReleaseGraphLock,
+    require_active_release_graph_epoch,
+    require_namespace_owned_by_epoch,
+)
 
 
 CAPTURE_DIRECTORY = "evaluator-capture-v1"
@@ -168,17 +172,16 @@ def clear_stage10_candidate_authority(namespace: BoundOutputNamespace) -> None:
 def replay_domain_evaluator_candidate(
     run_dir: Path, config: RCConfig
 ) -> dict[str, Any]:
-    """Replay Stage 10 v3 using only run-local authority and captured bytes."""
+    """Replay pre-activation M1 authority without authorizing Stage 12 use."""
 
     with ReleaseGraphLock.acquire(
         run_dir, "stage10.domain_evaluator_replay", mode="read"
     ) as release_lock:
         with release_lock.open_stage_namespace("stage-10") as namespace:
             first = _capture_candidate_authority(namespace)
-            seal = _replay_candidate_snapshot(
+            seal = _replay_domain_evaluator_candidate_snapshot(
                 first,
-                runtime_config=config,
-                project_root=run_dir,
+                runtime_config=config, project_root=run_dir
             )
             second = _capture_candidate_authority(namespace)
             if second != first:
@@ -187,6 +190,97 @@ def replay_domain_evaluator_candidate(
                 )
             namespace.assert_canonical()
             return seal
+
+
+def _capture_domain_evaluator_candidate_under_lock(
+    namespace: BoundOutputNamespace,
+    *,
+    run_dir: Path,
+    lease: object,
+    expected_stage: str,
+) -> _CandidateAuthoritySnapshot:
+    """Capture Stage 10 authority only under a validated same-run graph epoch."""
+
+    require_active_release_graph_epoch(run_dir, lease)
+    if not isinstance(namespace, BoundOutputNamespace):
+        raise RuntimeError("release_graph_namespace_required")
+    if namespace.run_dir != run_dir:
+        raise RuntimeError("release_graph_namespace_run_mismatch")
+    require_namespace_owned_by_epoch(namespace, lease, expected_stage)
+    seal_bytes = namespace.read_run_file(
+        "stage-10/selected_candidate_manifest.json"
+    )
+    try:
+        seal = parse_selected_candidate_manifest(seal_bytes.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise Stage10EvaluatorCaptureError("Stage 10 seal is not UTF-8") from exc
+    if seal.get("schema_version") != DOMAIN_SEAL_SCHEMA_VERSION:
+        raise Stage10EvaluatorCaptureError(
+            "domain evaluator Stage 10 seal v3 is required"
+        )
+    contract_path = seal["experiment_contract"]["path"]
+    source = _SourceAuthoritySnapshot(
+        contract_path=contract_path,
+        contract_bytes=namespace.read_run_file(contract_path),
+        config_entries=_capture_config_namespace(namespace),
+        package_manifest_bytes=namespace.read_run_file(
+            DOMAIN_EVALUATOR_PACKAGE_MANIFEST_SNAPSHOT_PATH
+        ),
+        execution_policy_bytes=namespace.read_run_file(
+            DOMAIN_EVALUATOR_EXECUTION_POLICY_SNAPSHOT_PATH
+        ),
+    )
+    return _CandidateAuthoritySnapshot(
+        source=source,
+        seal_bytes=seal_bytes,
+        capture_entries=tuple(
+            sorted(
+                _capture_run_tree(
+                    namespace, f"stage-10/{CAPTURE_DIRECTORY}"
+                ).items()
+            )
+        ),
+    )
+
+
+def _replay_domain_evaluator_candidate_snapshot(
+    snapshot: _CandidateAuthoritySnapshot,
+    *,
+    runtime_config: RCConfig,
+    project_root: Path,
+) -> dict[str, Any]:
+    """Semantically replay one immutable Stage 10 authority snapshot."""
+
+    return _replay_candidate_snapshot(
+        snapshot,
+        runtime_config=runtime_config,
+        project_root=project_root,
+    )
+
+
+def _capture_run_tree(
+    namespace: BoundOutputNamespace,
+    root: str,
+) -> dict[str, bytes]:
+    """Capture one regular-file tree through the namespace's held run fd."""
+
+    result: dict[str, bytes] = {}
+
+    def walk(relative_dir: str, output_prefix: str) -> None:
+        entries = namespace.read_run_directory_entries(relative_dir)
+        for name in entries:
+            relative = f"{relative_dir}/{name}"
+            output = f"{output_prefix}/{name}" if output_prefix else name
+            try:
+                children = namespace.read_run_directory_entries(relative)
+            except (NotADirectoryError, OSError):
+                result[output] = namespace.read_run_file(relative)
+            else:
+                del children
+                walk(relative, output)
+
+    walk(root, "")
+    return result
 
 
 def _reset_authority(namespace: BoundOutputNamespace) -> None:

@@ -9,7 +9,7 @@
       "evaluator_id": "trojnet_iscas85_graphsage_localization",
       "package_policy_version": 1,
       "package_manifest_path": "researchclaw/experiment_runtime/domain_evaluators/trojnet_iscas85_v1/package-manifest-v1.json",
-      "package_manifest_sha256": "2bf9c23eac68fab2d02eb65fdc1b36d4b0cefe036fbe07bd8b90621fc0c9d5a0",
+      "package_manifest_sha256": "50d4cd34ea5e10b2c7d0f2b912650f2e713378aa54510b179d7f71621a9b5ffd",
       "metric_registry_path": "researchclaw/experiment_runtime/metric_authority/trojnet_iscas85_graphsage_localization-v2.json",
       "metric_registry_sha256": "d00366c8dfd04c6e3960344c092cf5c65ec0b399a27436f0db4de6724f61cd0b"
     }

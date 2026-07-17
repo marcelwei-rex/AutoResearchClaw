@@ -214,6 +214,44 @@ def _execute_experiment_run(
     )
 
     require_canonical_evidence_capabilities("stage12.execute_experiment_run")
+    from researchclaw.pipeline.stage12_domain_evaluator import (
+        stage12_uses_domain_evaluator,
+    )
+
+    try:
+        uses_domain_evaluator = stage12_uses_domain_evaluator(run_dir)
+    except (CanonicalExperimentEvidenceError, OSError, RuntimeError) as exc:
+        return StageResult(
+            stage=Stage.EXPERIMENT_RUN,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error=f"Sealed Stage 10 candidate is invalid: {exc}",
+        )
+    if uses_domain_evaluator:
+        from researchclaw.pipeline.stage12_domain_evaluator import (
+            execute_domain_evaluator_stage12,
+        )
+
+        try:
+            artifacts = execute_domain_evaluator_stage12(
+                run_dir=run_dir,
+                config=config,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return StageResult(
+                stage=Stage.EXPERIMENT_RUN,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                evidence_refs=(),
+                error=f"Canonical domain evaluator execution failed: {exc}",
+            )
+        return StageResult(
+            stage=Stage.EXPERIMENT_RUN,
+            status=StageStatus.DONE,
+            artifacts=artifacts,
+            evidence_refs=("stage-12/experiment_result_set.json",),
+        )
     from researchclaw.experiment.factory import create_sandbox
 
     controller: CanonicalExecutionController | None = None

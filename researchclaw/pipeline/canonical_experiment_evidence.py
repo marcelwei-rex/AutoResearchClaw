@@ -8,6 +8,7 @@ import math
 import os
 import re
 import shutil
+import tempfile
 import tokenize
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
@@ -69,6 +70,19 @@ _MANDATORY_CANDIDATE_ROLES = {
     "results_table": "results_table.tex",
     "summary": "experiment_summary.json",
 }
+
+
+@dataclass(frozen=True)
+class _LegacyStage12AuthoritySnapshot:
+    entries: tuple[tuple[str, bytes], ...]
+
+    def require(self, path: str) -> bytes:
+        matches = [content for name, content in self.entries if name == path]
+        if len(matches) != 1:
+            raise CanonicalExperimentEvidenceError(
+                f"legacy Stage 12 snapshot path is missing or duplicate: {path}"
+            )
+        return matches[0]
 _FIGURE_AGENT_INTERMEDIATE_NAMES = frozenset(
     {
         "figure_decisions.json",
@@ -762,7 +776,14 @@ def parse_execution_invocation_journal(text: str) -> tuple[dict[str, Any], ...]:
 
 
 def parse_experiment_result_set(text: str) -> dict[str, Any]:
-    payload = _parse_object(text, "Stage 12 result set")
+    discriminator = _parse_object(text, "Stage 12 result set")
+    if discriminator.get("schema_version") == 2:
+        from researchclaw.pipeline.stage12_domain_evaluator import (
+            parse_domain_evaluator_result_set,
+        )
+
+        return parse_domain_evaluator_result_set(text)
+    payload = discriminator
     _exact_keys(
         payload,
         {
@@ -812,10 +833,158 @@ def validate_experiment_result_set(
     text: str | None = None,
 ) -> dict[str, Any]:
     """Replay the complete Stage 12 journal, evidence namespace, and bindings."""
-    manifest_path = run_dir / "stage-12" / "experiment_result_set.json"
-    if text is None:
-        text = _read_regular_file(manifest_path, "Stage 12 result set")
-    payload = parse_experiment_result_set(text)
+    require_canonical_evidence_capabilities("stage12.result_set_replay")
+    with ReleaseGraphLock.acquire(
+        run_dir, "stage12.result_set_replay", mode="read"
+    ) as release_lock:
+        with release_lock.open_stage_namespace("stage-12") as namespace:
+            manifest_override: bytes | None = None
+            try:
+                disk_text = namespace.read_bytes(
+                    "experiment_result_set.json"
+                ).decode("utf-8")
+            except FileNotFoundError:
+                if text is None:
+                    raise
+                disk_text = text
+                manifest_override = text.encode("utf-8")
+            if text is not None and manifest_override is None and text != disk_text:
+                raise CanonicalExperimentEvidenceError(
+                    "Stage 12 manifest text/disk mismatch"
+                )
+            payload = parse_experiment_result_set(disk_text)
+            if payload["schema_version"] == Decimal(2):
+                from researchclaw.pipeline.stage12_domain_evaluator import (
+                    _validate_domain_evaluator_result_set_under_lock,
+                )
+
+                return _validate_domain_evaluator_result_set_under_lock(
+                    run_dir,
+                    config,
+                    namespace=namespace,
+                    lease=release_lock,
+                    manifest_override=manifest_override,
+                    expected_manifest=disk_text.encode("utf-8"),
+                )
+            first = _capture_legacy_stage12_fixpoint(
+                namespace, payload, manifest_override=manifest_override
+            )
+            result = _validate_legacy_experiment_result_set(first, config, payload)
+            second = _capture_legacy_stage12_fixpoint(
+                namespace, payload, manifest_override=manifest_override
+            )
+            if second != first:
+                raise CanonicalExperimentEvidenceError(
+                    "Stage 12 authority changed during replay"
+                )
+            release_lock.assert_canonical()
+            namespace.assert_canonical()
+            return result
+
+
+def _capture_legacy_stage12_fixpoint(
+    namespace: BoundOutputNamespace,
+    payload: dict[str, Any],
+    *,
+    manifest_override: bytes | None = None,
+) -> _LegacyStage12AuthoritySnapshot:
+    paths = {
+        payload["invocation_journal"]["path"],
+        payload["experiment_contract_path"],
+        payload["sealed_candidate_manifest_path"],
+        payload["run_config_path"],
+    }
+    seal_bytes = namespace.read_run_file(payload["sealed_candidate_manifest_path"])
+    try:
+        seal = parse_selected_candidate_manifest(seal_bytes.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise CanonicalExperimentEvidenceError(
+            "selected candidate manifest is not UTF-8"
+        ) from exc
+    if seal["schema_version"] != STAGE10_SEAL_SCHEMA_VERSION:
+        raise CanonicalExperimentEvidenceError(
+            "legacy Stage 12 requires a Stage 10 v2 seal"
+        )
+    paths.update(
+        {
+            "stage-09/domain_selector_policy.json",
+            "stage-09/domain_profile.json",
+            "stage-09/metric_authority_index.json",
+            "stage-09/metric_authority.json",
+        }
+    )
+    paths.update(
+        f"stage-10/selected_candidate/{name}" for name in seal["files"]
+    )
+    for name in namespace.run_entries():
+        if (
+            name == "config.yaml"
+            or _CONFIG_SNAPSHOT_RE.fullmatch(name)
+            or name
+            in {
+                "active_config_snapshot.json",
+                "config_snapshot_history.jsonl",
+                "checkpoint.json",
+            }
+        ):
+            paths.add(name)
+    entries = [(path, namespace.read_run_file(path)) for path in sorted(paths)]
+    entries.append(
+        (
+            "stage-12/experiment_result_set.json",
+            manifest_override
+            if manifest_override is not None
+            else namespace.read_bytes("experiment_result_set.json"),
+        )
+    )
+    entries.extend(
+        (f"stage-12/evidence-v1/{path}", content)
+        for path, content in sorted(
+            namespace.read_directory_tree("evidence-v1").items()
+        )
+    )
+    snapshot = _LegacyStage12AuthoritySnapshot(tuple(entries))
+    if len(dict(snapshot.entries)) != len(snapshot.entries):
+        raise CanonicalExperimentEvidenceError(
+            "legacy Stage 12 snapshot contains duplicate paths"
+        )
+    return snapshot
+
+
+def _validate_legacy_experiment_result_set(
+    snapshot: _LegacyStage12AuthoritySnapshot,
+    config: RCConfig,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Replay v1 only from snapshot A materialized outside the live run."""
+
+    with tempfile.TemporaryDirectory(prefix="researchclaw-stage12-v1-replay-") as root:
+        snapshot_root = Path(root)
+        for relative, content in snapshot.entries:
+            path = Path(relative)
+            if (
+                path.is_absolute()
+                or not path.parts
+                or any(part in {"", ".", ".."} for part in path.parts)
+            ):
+                raise CanonicalExperimentEvidenceError(
+                    f"unsafe legacy Stage 12 snapshot path: {relative}"
+                )
+            destination = snapshot_root / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+        return _validate_legacy_experiment_result_set_from_snapshot_root(
+            snapshot_root, config, payload
+        )
+
+
+def _validate_legacy_experiment_result_set_from_snapshot_root(
+    run_dir: Path,
+    config: RCConfig,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the established v1 semantics to an isolated snapshot view."""
+
     seal, contract = _validate_common_run_bindings(run_dir, config, payload)
 
     journal_path = run_dir / payload["invocation_journal"]["path"]

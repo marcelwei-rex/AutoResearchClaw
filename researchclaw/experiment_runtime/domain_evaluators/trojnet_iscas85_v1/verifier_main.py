@@ -31,7 +31,10 @@ def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _read_text_bytes(path: Path, label: str) -> str:
-    data = path.read_bytes()
+    return _decode_text_bytes(path.read_bytes(), label)
+
+
+def _decode_text_bytes(data: bytes, label: str) -> str:
     if not data.endswith(b"\n") or b"\r" in data or b"\0" in data or data.startswith(b"\xef\xbb\xbf"):
         raise ValueError(f"{label} has noncanonical bytes")
     return data.decode("utf-8")
@@ -268,7 +271,7 @@ def verify(
         for condition in CONDITIONS
     ]
     for ordinal, line in enumerate(
-        _read_text_bytes(scores_path, "score evidence").splitlines()
+        _decode_text_bytes(score_bytes, "score evidence").splitlines()
     ):
         row = json.loads(line, object_pairs_hook=_strict_object)
         if set(row) != {"schema_version", "condition", "seed", "circuit_family", "circuit_variant", "node_ids", "scores"}:

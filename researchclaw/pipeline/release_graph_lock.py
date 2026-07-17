@@ -369,6 +369,52 @@ def require_active_writer_epoch(run_dir: Path, lease: object) -> ReleaseGraphLoc
     return lease
 
 
+def require_active_release_graph_epoch(
+    run_dir: Path, lease: object
+) -> ReleaseGraphLock:
+    """Validate a live trusted reader or writer lease for private replay helpers."""
+
+    if not isinstance(lease, ReleaseGraphLock) or lease._mode not in {"read", "write"}:
+        raise RuntimeError("release_graph_lease_required")
+    owner = lease._require_active()
+    if str(owner.run_dir.absolute()) != str(run_dir.absolute()):
+        raise RuntimeError("release_graph_lease_run_mismatch")
+    lease.assert_canonical()
+    return lease
+
+
+def require_namespace_owned_by_epoch(
+    namespace: "BoundOutputNamespace",
+    lease: object,
+    expected_stage: str,
+) -> ReleaseGraphLock:
+    """Bind one held stage namespace to the same live release-graph epoch."""
+
+    owner = require_active_release_graph_epoch(namespace.run_dir, lease)
+    if namespace.stage_name != expected_stage:
+        raise RuntimeError("release_graph_namespace_stage_mismatch")
+    if namespace.stage_dir != owner.run_dir / expected_stage:
+        raise RuntimeError("release_graph_namespace_path_mismatch")
+    if str(namespace.run_dir.absolute()) != str(owner.run_dir.absolute()):
+        raise RuntimeError("release_graph_namespace_run_mismatch")
+    try:
+        run_info = os.fstat(namespace._run_fd)
+        stage_info = os.fstat(namespace._stage_fd)
+    except OSError as exc:
+        raise RuntimeError("release_graph_namespace_inactive") from exc
+    if (
+        not stat.S_ISDIR(run_info.st_mode)
+        or (run_info.st_dev, run_info.st_ino) != owner._run_identity
+        or (run_info.st_dev, run_info.st_ino) != namespace._run_identity
+        or not stat.S_ISDIR(stage_info.st_mode)
+        or (stage_info.st_dev, stage_info.st_ino) != namespace._stage_identity
+    ):
+        raise RuntimeError("release_graph_namespace_epoch_mismatch")
+    namespace.assert_canonical()
+    owner.assert_canonical()
+    return owner
+
+
 def release_graph_writer(
     function: Callable[_P, _R],
 ) -> Callable[_P, _R]:

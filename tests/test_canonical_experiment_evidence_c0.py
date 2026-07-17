@@ -1484,7 +1484,9 @@ def test_stage12_stage13_candidate_and_root_schemas_round_trip() -> None:
     assert parse_canonical_experiment_manifest(canonical_json_text(root)) == root
 
 
-def test_run_level_replay_closes_stage12_stage13_and_root_bundle(tmp_path: Path) -> None:
+def test_run_level_replay_closes_stage12_stage13_and_root_bundle(
+    tmp_path: Path, canonical_evidence_migration_complete: None
+) -> None:
     run_dir = tmp_path / "run"
     config, root = _write_canonical_bundle(run_dir)
 
@@ -1748,7 +1750,9 @@ def test_stage13_generation_rejects_symlink_without_touching_target(
     assert victim.read_text(encoding="utf-8") == "victim\n"
 
 
-def test_stage13_replay_rejects_forged_direction_and_winner(tmp_path: Path) -> None:
+def test_stage13_replay_rejects_forged_direction_and_winner(
+    tmp_path: Path, canonical_evidence_migration_complete: None
+) -> None:
     run_dir = tmp_path / "run"
     config, _root = _write_canonical_bundle(run_dir)
     _add_refinement_iteration(
@@ -1817,7 +1821,9 @@ def test_stage13_rejects_noncanonical_model_response_grammar(
     assert not (run_dir / "stage-13/evidence-v1").exists()
 
 
-def test_stage13_replay_rejects_tampered_compatibility_copy(tmp_path: Path) -> None:
+def test_stage13_replay_rejects_tampered_compatibility_copy(
+    tmp_path: Path, canonical_evidence_migration_complete: None
+) -> None:
     run_dir = tmp_path / "run"
     config, _root = _write_canonical_bundle(run_dir)
     (run_dir / "stage-13/experiment_final/main.py").write_text(
@@ -2343,7 +2349,9 @@ def test_stage14_symlinked_generation_does_not_touch_external_directory(
     assert marker.read_text(encoding="utf-8") == "external\n"
 
 
-def test_run_level_replay_rejects_stage13_and_root_copy_tampering(tmp_path: Path) -> None:
+def test_run_level_replay_rejects_stage13_and_root_copy_tampering(
+    tmp_path: Path, canonical_evidence_migration_complete: None
+) -> None:
     run_dir = tmp_path / "run"
     config, _root = _write_canonical_bundle(run_dir)
     (run_dir / "stage-13/refinement_log.json").write_text("tampered\n", encoding="utf-8")
@@ -2416,7 +2424,9 @@ def test_stage13_policy_v1_parser_rejects_noncanonical_accepted_state(
         parse_refinement_result_set(canonical_json_text(manifest))
 
 
-def test_stage13_rejects_replacement_of_scaffold_owned_evaluator(tmp_path: Path) -> None:
+def test_stage13_rejects_replacement_of_scaffold_owned_evaluator(
+    tmp_path: Path, canonical_evidence_migration_complete: None
+) -> None:
     run_dir = tmp_path / "run"
     config, _root = _write_canonical_bundle(run_dir)
     _add_refinement_iteration(
@@ -2449,6 +2459,7 @@ def test_stage13_rejects_replacement_of_scaffold_owned_evaluator(tmp_path: Path)
 
 def test_stage12_rejects_normalized_metric_divergent_from_evaluator_result(
     tmp_path: Path,
+    canonical_evidence_migration_complete: None,
 ) -> None:
     run_dir = tmp_path / "run"
     config, _root = _write_canonical_bundle(run_dir)
@@ -2769,6 +2780,7 @@ def test_stage13_policy_v1_parser_rejects_runtime_repair(tmp_path: Path) -> None
 
 def test_root_replay_rejects_stored_candidate_that_is_not_tie_break_winner(
     tmp_path: Path,
+    canonical_evidence_migration_complete: None,
 ) -> None:
     run_dir = tmp_path / "run"
     config, root = _write_canonical_bundle(run_dir)
@@ -2813,6 +2825,7 @@ def test_root_replay_rejects_stored_candidate_that_is_not_tie_break_winner(
 
 def test_root_excludes_well_formed_stale_candidate_but_rejects_malformed_entry(
     tmp_path: Path,
+    canonical_evidence_migration_complete: None,
 ) -> None:
     run_dir = tmp_path / "run"
     config, root = _write_canonical_bundle(run_dir)

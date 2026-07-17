@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 import researchclaw.pipeline.canonical_execution_controller as controller_module
+import researchclaw.pipeline.canonical_experiment_evidence as evidence_module
 import researchclaw.pipeline.release_graph_lock as release_graph_lock_module
 from researchclaw.pipeline.stage_impls import _execution
 from researchclaw.adapters import AdapterBundle
@@ -596,6 +597,96 @@ def test_stage12_full_replay_precedes_manifest_publication(
     assert result.status == StageStatus.FAILED
     assert not (run / "stage-12/experiment_result_set.json").exists()
     assert not (run / "stage-12/evidence-v1").exists()
+
+
+def test_stage12_v1_replay_rejects_late_manifest_mutation(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "run"
+    cfg = _cfg(tmp_path)
+    _write_contract(run, cfg)
+    (run / "stage-09/exp_plan.yaml").write_text(
+        "objectives: []\n", encoding="utf-8"
+    )
+    assert _execute_code_generation(
+        run / "stage-10", run, cfg, AdapterBundle(), llm=None
+    ).status == StageStatus.DONE
+    assert _execute_experiment_run(
+        run / "stage-12", run, cfg, AdapterBundle()
+    ).status == StageStatus.DONE
+    manifest = run / "stage-12/experiment_result_set.json"
+    original = evidence_module._validate_common_run_bindings
+
+    def mutate_after_binding(*args, **kwargs):
+        value = original(*args, **kwargs)
+        manifest.write_text("{}\n", encoding="utf-8")
+        return value
+
+    monkeypatch.setattr(
+        evidence_module, "_validate_common_run_bindings", mutate_after_binding
+    )
+
+    with pytest.raises(
+        evidence_module.CanonicalExperimentEvidenceError,
+        match="authority changed during replay",
+    ):
+        validate_experiment_result_set(run, cfg)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "stage-12/evidence-v1/run-1.json",
+        "stage-12/execution_invocation_journal.jsonl",
+        "stage-09/experiment_contract.yaml",
+        "stage-10/selected_candidate_manifest.json",
+    ],
+)
+def test_stage12_v1_semantics_use_snapshot_a_only(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    run = tmp_path / "run"
+    cfg = _cfg(tmp_path)
+    _write_contract(run, cfg)
+    (run / "stage-09/exp_plan.yaml").write_text(
+        "objectives: []\n", encoding="utf-8"
+    )
+    assert _execute_code_generation(
+        run / "stage-10", run, cfg, AdapterBundle(), llm=None
+    ).status == StageStatus.DONE
+    assert _execute_experiment_run(
+        run / "stage-12", run, cfg, AdapterBundle()
+    ).status == StageStatus.DONE
+
+    target = run / relative
+    valid = target.read_bytes()
+    damaged = b"{}\n"
+    target.write_bytes(damaged)
+    original = evidence_module._validate_legacy_experiment_result_set_from_snapshot_root
+
+    def restore_live_during_semantic_replay(*args, **kwargs):
+        target.write_bytes(valid)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            target.write_bytes(damaged)
+
+    monkeypatch.setattr(
+        evidence_module,
+        "_validate_legacy_experiment_result_set_from_snapshot_root",
+        restore_live_during_semantic_replay,
+    )
+    try:
+        with pytest.raises(evidence_module.CanonicalExperimentEvidenceError):
+            validate_experiment_result_set(run, cfg)
+        assert target.read_bytes() == damaged
+    finally:
+        target.write_bytes(valid)
 
 
 def test_execute_stage_invalidates_old_authority_before_input_preflight(
