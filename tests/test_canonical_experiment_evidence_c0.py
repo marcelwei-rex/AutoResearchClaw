@@ -3122,6 +3122,19 @@ def test_every_partial_capability_map_is_blocked() -> None:
     assert incomplete_canonical_evidence_capabilities(CANONICAL_EVIDENCE_CAPABILITIES) == ()
 
 
+@pytest.mark.parametrize(
+    "value",
+    [True, False, 1.0, Decimal("1"), "1", None],
+)
+def test_capability_versions_require_exact_integers(value: object) -> None:
+    mapping = {name: CAPABILITY_SCHEMA_VERSION for name in REQUIRED_CAPABILITIES}
+    mapping["independent_release_reconstruction"] = value
+
+    assert incomplete_canonical_evidence_capabilities(mapping) == (
+        "independent_release_reconstruction",
+    )
+
+
 @pytest.mark.parametrize("missing_component", REQUIRED_CAPABILITIES)
 def test_every_partial_map_blocks_all_external_and_persistent_entrypoints(
     tmp_path: Path,

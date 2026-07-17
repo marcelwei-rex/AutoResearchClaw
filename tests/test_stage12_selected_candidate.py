@@ -113,16 +113,19 @@ def _write_selected_candidate(run: Path, cfg: RCConfig) -> Path:
     return run / "stage-10" / "selected_candidate"
 
 
-def test_stage12_rejects_when_manifest_missing(
-    tmp_path: Path, canonical_evidence_migration_incomplete: None
+def test_stage12_rejects_missing_selected_candidate_manifest_with_complete_capabilities(
+    tmp_path: Path, canonical_evidence_migration_complete: None
 ) -> None:
     run = tmp_path / "run"
     cfg = _cfg(tmp_path)
     _write_contract(run, cfg)
     (run / "stage-10" / "selected_candidate").mkdir(parents=True)
 
-    with pytest.raises(CanonicalEvidenceMigrationIncomplete):
-        _execute_experiment_run(run / "stage-12", run, cfg, AdapterBundle())
+    result = _execute_experiment_run(run / "stage-12", run, cfg, AdapterBundle())
+
+    assert result.status == StageStatus.FAILED
+    assert "sealed candidate manifest missing" in (result.error or "").lower()
+    assert not (run / "stage-12/experiment_result_set.json").exists()
 
 
 def test_canonical_stage12_contract_has_no_generic_inputs_or_retries() -> None:
@@ -255,7 +258,7 @@ def test_stage12_rejects_invalid_scaffold_owner(tmp_path: Path) -> None:
         _load_sealed_candidate(run, cfg)
 
 
-def test_stage10_scaffold_candidate_runs_in_stage12(
+def test_partial_capability_map_blocks_stage12_before_candidate_execution(
     tmp_path: Path, canonical_evidence_migration_incomplete: None
 ) -> None:
     run = tmp_path / "run"

@@ -73,7 +73,7 @@ def incomplete_canonical_evidence_capabilities(
         incomplete.extend(f"unknown:{name}" for name in sorted(set(values) - set(REQUIRED_CAPABILITIES)))
     for name in REQUIRED_CAPABILITIES:
         value = values.get(name)
-        if isinstance(value, bool) or value != CAPABILITY_SCHEMA_VERSION:
+        if type(value) is not int or value != CAPABILITY_SCHEMA_VERSION:
             incomplete.append(name)
     return tuple(dict.fromkeys(incomplete))
 
