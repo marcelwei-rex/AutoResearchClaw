@@ -24,6 +24,7 @@ from researchclaw.config import PaperRevisionConfig, RCConfig
 from researchclaw.experiment_runtime.contract import (
     derive_contract,
     dump_contract,
+    load_contract,
     sha256_file,
 )
 from researchclaw.pipeline import executor as rc_executor
@@ -1869,6 +1870,46 @@ class TestExperimentDesignGuard:
         assert result.status == StageStatus.FAILED
         assert list(stage_dir.iterdir()) == []
         assert list(detached.iterdir()) == []
+
+    def test_domain_evaluator_stage9_publishes_v3_after_six_snapshot_replay(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+    ) -> None:
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(
+                rc_config.experiment,
+                claim_scope="pipeline_validation",
+                dataset_origin="synthetic",
+                metric_key="auprc",
+                metric_direction="maximize",
+                mode="sandbox",
+            ),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        result = rc_executor._execute_experiment_design(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=FakeLLMClient(json.dumps(_valid_stage9_plan())),
+        )
+
+        assert result.status == StageStatus.DONE
+        contract = load_contract(stage_dir / "experiment_contract.yaml")
+        assert contract.schema_version == 3
+        assert contract.evaluator_authority["kind"] == "domain_evaluator"
+        assert {
+            "domain_evaluator_package_manifest.json",
+            "domain_evaluator_execution_policy.json",
+        }.issubset(result.artifacts)
+        assert (stage_dir / "experiment_contract.sha256").is_file()
 
     def test_diagnostic_collision_cannot_preserve_stale_stage9_authority(
         self,

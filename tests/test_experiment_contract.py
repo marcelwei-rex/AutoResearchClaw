@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -56,10 +57,139 @@ def _valid_contract() -> dict:
     }
 
 
+def _valid_contract_v3() -> dict:
+    topic = "TrojNet hardware Trojan localization on ISCAS-85 circuits"
+    authority = select_metric_authority(topic, "sandbox")
+    return {
+        "schema_version": 3,
+        "topic": topic,
+        "claim_scope": "pipeline_validation",
+        "dataset_origin": "synthetic",
+        "dataset_name": "controlled_synthetic_iscas85_trojan_localization_v1",
+        "primary_metric": {
+            "key": "auprc",
+            "direction": "maximize",
+            "minimum_valid_value": 0.0,
+        },
+        "smoke_budget_sec": 60,
+        "run_budget_sec": 300,
+        "allowed_inputs": [],
+        "allowed_outputs": [{"path": "score_evidence.jsonl", "required": True}],
+        "evaluator": {
+            "command": "python evaluator/evaluator_main.py",
+            "owner": "domain_evaluator",
+            "timeout_sec": 300,
+            "required_result_keys": [],
+        },
+        "safety": {
+            "network": "none",
+            "env_policy": "allowlist",
+            "evidence_policy": "stage12_independent_verifier_only",
+        },
+        "sealing": {
+            "candidate_manifest": "selected_candidate_manifest.json",
+            "content_hash_algorithm": "sha256",
+        },
+        "metric_authority": authority.contract_identity(),
+        "metric_units": authority.metric_units,
+        "metric_display_labels": authority.metric_display_labels,
+        "evaluator_authority": authority.evaluator_authority,
+    }
+
+
 def test_valid_contract_parses() -> None:
     contract = validate_contract_dict(_valid_contract())
     assert contract.claim_scope == "pipeline_validation"
     assert contract.dataset_origin == "synthetic"
+
+
+def test_valid_domain_evaluator_contract_v3_parses() -> None:
+    contract = validate_contract_dict(_valid_contract_v3())
+    assert contract.schema_version == 3
+    assert contract.evaluator_authority["kind"] == "domain_evaluator"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "input_capture_policy_version",
+        "result_set_policy_version",
+        "observation_replay_policy_version",
+    ],
+)
+@pytest.mark.parametrize("value", [True, 1.0, "1", None])
+def test_domain_evaluator_contract_rejects_policy_version_type_confusion(
+    field: str, value: object
+) -> None:
+    data = _valid_contract_v3()
+    data["evaluator_authority"][field] = value
+    with pytest.raises(ContractValidationError, match="true integer"):
+        validate_contract_dict(data)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("claim_scope", "research_release"),
+        ("dataset_origin", "public"),
+        ("dataset_name", "other"),
+    ],
+)
+def test_domain_evaluator_contract_v3_rejects_scope_origin_dataset_mismatch(
+    field: str, value: object
+) -> None:
+    data = _valid_contract_v3()
+    data[field] = value
+    with pytest.raises(ContractValidationError, match="contract v3"):
+        validate_contract_dict(data)
+
+
+def test_contract_rows_cannot_mix_v2_and_v3_authority() -> None:
+    v2 = _valid_contract()
+    v2["schema_version"] = 3
+    v2["evaluator_authority"] = _valid_contract_v3()["evaluator_authority"]
+    with pytest.raises(ContractValidationError):
+        validate_contract_dict(v2)
+
+    v3 = _valid_contract_v3()
+    v3["schema_version"] = 2
+    v3.pop("evaluator_authority")
+    with pytest.raises(ContractValidationError):
+        validate_contract_dict(v3)
+
+
+def test_derive_domain_evaluator_contract_publishes_v3_snapshots(
+    tmp_path: Path,
+) -> None:
+    stage9 = tmp_path / "stage-09"
+    stage9.mkdir()
+    config = SimpleNamespace(
+        research=SimpleNamespace(
+            topic="TrojNet hardware Trojan localization on ISCAS-85 circuits"
+        ),
+        experiment=SimpleNamespace(
+            claim_scope="pipeline_validation",
+            dataset_origin="synthetic",
+            time_budget_sec=300,
+            metric_key="auprc",
+            metric_direction="maximize",
+            mode="sandbox",
+            sandbox=SimpleNamespace(env_policy="allowlist"),
+        ),
+    )
+    contract = derive_contract(config, {}, stage_dir=stage9)
+
+    assert contract.schema_version == 3
+    assert contract.dataset_name == "controlled_synthetic_iscas85_trojan_localization_v1"
+    assert contract.primary_metric["key"] == "auprc"
+    assert {path.name for path in stage9.iterdir()} == {
+        "domain_selector_policy.json",
+        "domain_profile.json",
+        "metric_authority_index.json",
+        "metric_authority.json",
+        "domain_evaluator_package_manifest.json",
+        "domain_evaluator_execution_policy.json",
+    }
 
 
 @pytest.mark.parametrize(

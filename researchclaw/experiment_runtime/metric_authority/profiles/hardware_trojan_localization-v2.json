@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "selector_policy_version": 2,
+  "domain_id": "hardware_trojan_localization",
+  "owner": "domain_evaluator",
+  "supported_experiment_modes": [
+    "sandbox"
+  ]
+}

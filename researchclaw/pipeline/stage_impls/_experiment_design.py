@@ -20,7 +20,10 @@ from researchclaw.experiment_runtime.contract import (
     dump_contract,
     load_contract,
 )
-from researchclaw.experiment_runtime.metric_authority import replay_metric_authority
+from researchclaw.experiment_runtime.metric_authority import (
+    MetricAuthorityError,
+    replay_metric_authority,
+)
 from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._helpers import (
     StageResult,
@@ -45,6 +48,8 @@ _STAGE9_OWNED_OUTPUTS = (
     "benchmark_plan.json",
     "domain_profile.json",
     "domain_selector_policy.json",
+    "domain_evaluator_execution_policy.json",
+    "domain_evaluator_package_manifest.json",
     "exp_plan.yaml",
     "experiment_contract.sha256",
     "experiment_contract.yaml",
@@ -61,6 +66,8 @@ _STAGE9_AUTHORITY_OUTPUTS = (
     "domain_profile.json",
     "metric_authority_index.json",
     "metric_authority.json",
+    "domain_evaluator_package_manifest.json",
+    "domain_evaluator_execution_policy.json",
 )
 
 _STAGE9_DIAGNOSTIC_OUTPUTS = tuple(
@@ -744,16 +751,42 @@ def _execute_experiment_design_bound(
             stage_dir / "experiment_contract.yaml",
             namespace=namespace,
         )
+        replayed_contract = load_contract(
+            stage_dir / "experiment_contract.yaml", namespace=namespace
+        )
+        if replayed_contract != contract:
+            raise ContractValidationError("contract pre-sidecar replay mismatch")
+        replay_metric_authority(
+            run_dir=run_dir,
+            topic=config.research.topic,
+            experiment_mode=config.experiment.mode,
+            stored_identity=contract.metric_authority,
+            metric_units=contract.metric_units,
+            metric_display_labels=contract.metric_display_labels,
+            evaluator_authority=contract.evaluator_authority,
+            namespace=namespace,
+        )
         namespace.write_text_atomic("experiment_contract.sha256", contract_sha + "\n")
-    except ContractValidationError as exc:
+    except (ContractValidationError, MetricAuthorityError) as exc:
         error = f"Experiment contract invalid: {exc}"
         logger.error("Stage 9: %s", error)
         return StageResult(
             stage=Stage.EXPERIMENT_DESIGN,
             status=StageStatus.FAILED,
-            artifacts=("exp_plan.yaml",),
-            evidence_refs=("stage-09/exp_plan.yaml",),
+            artifacts=(),
+            evidence_refs=(),
             error=error,
+        )
+    authority_artifacts = (
+        "domain_selector_policy.json",
+        "domain_profile.json",
+        "metric_authority_index.json",
+        "metric_authority.json",
+    )
+    if contract.schema_version == 3:
+        authority_artifacts += (
+            "domain_evaluator_package_manifest.json",
+            "domain_evaluator_execution_policy.json",
         )
     return StageResult(
         stage=Stage.EXPERIMENT_DESIGN,
@@ -762,10 +795,7 @@ def _execute_experiment_design_bound(
             "exp_plan.yaml",
             "experiment_contract.yaml",
             "experiment_contract.sha256",
-            "domain_selector_policy.json",
-            "domain_profile.json",
-            "metric_authority_index.json",
-            "metric_authority.json",
+            *authority_artifacts,
         ),
         evidence_refs=(
             "stage-09/exp_plan.yaml",
@@ -805,6 +835,7 @@ def _validate_stage9_publication(
         stored_identity=contract.metric_authority,
         metric_units=contract.metric_units,
         metric_display_labels=contract.metric_display_labels,
+        evaluator_authority=contract.evaluator_authority,
         namespace=namespace,
     )
     namespace.assert_canonical()

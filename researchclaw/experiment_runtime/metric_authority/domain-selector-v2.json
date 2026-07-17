@@ -1,0 +1,43 @@
+{
+  "schema_version": 2,
+  "selector_policy_version": 2,
+  "normalization": "nfkc_casefold_space_v1",
+  "no_match": "delegate_v1",
+  "rules": [
+    {
+      "rule_id": "hardware_trojan_trojnet",
+      "pattern_kind": "whole_word",
+      "normalized_pattern": "trojnet",
+      "domain_id": "hardware_trojan_localization",
+      "priority": 1000
+    },
+    {
+      "rule_id": "hardware_trojan_hyphenated",
+      "pattern_kind": "substring",
+      "normalized_pattern": "hardware-trojan",
+      "domain_id": "hardware_trojan_localization",
+      "priority": 990
+    },
+    {
+      "rule_id": "hardware_trojan_phrase",
+      "pattern_kind": "substring",
+      "normalized_pattern": "hardware trojan",
+      "domain_id": "hardware_trojan_localization",
+      "priority": 990
+    },
+    {
+      "rule_id": "hardware_trojan_iscas85",
+      "pattern_kind": "substring",
+      "normalized_pattern": "iscas-85",
+      "domain_id": "hardware_trojan_localization",
+      "priority": 980
+    },
+    {
+      "rule_id": "hardware_trojan_iscas85_compact",
+      "pattern_kind": "whole_word",
+      "normalized_pattern": "iscas85",
+      "domain_id": "hardware_trojan_localization",
+      "priority": 980
+    }
+  ]
+}

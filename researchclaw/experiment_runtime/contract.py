@@ -46,9 +46,10 @@ class ExperimentContract:
     metric_authority: dict[str, Any]
     metric_units: dict[str, str]
     metric_display_labels: dict[str, list[str]]
+    evaluator_authority: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "schema_version": self.schema_version,
             "topic": self.topic,
             "claim_scope": self.claim_scope,
@@ -68,6 +69,44 @@ class ExperimentContract:
                 key: list(value) for key, value in self.metric_display_labels.items()
             },
         }
+        if self.schema_version == 3:
+            value["evaluator_authority"] = dict(self.evaluator_authority or {})
+        return value
+
+
+def _validate_evaluator_authority(
+    value: dict[str, Any], errors: list[str]
+) -> None:
+    expected_fields = {
+        "kind",
+        "domain_id",
+        "evaluator_id",
+        "evaluator_schema",
+        "package_manifest_package_path",
+        "package_manifest_package_sha256",
+        "package_manifest_snapshot_path",
+        "package_manifest_snapshot_sha256",
+        "execution_policy_package_path",
+        "execution_policy_package_sha256",
+        "execution_policy_snapshot_path",
+        "execution_policy_snapshot_sha256",
+        "input_capture_policy_version",
+        "result_set_policy_version",
+        "observation_replay_policy_version",
+    }
+    _require_exact_fields(value, expected_fields, "evaluator_authority", errors)
+    version_fields = {
+        "input_capture_policy_version",
+        "result_set_policy_version",
+        "observation_replay_policy_version",
+    }
+    for field in version_fields:
+        if type(value.get(field)) is not int:
+            errors.append(f"evaluator_authority.{field} must be a true integer")
+    for field in expected_fields - version_fields:
+        field_value = value.get(field)
+        if not isinstance(field_value, str) or not field_value:
+            errors.append(f"evaluator_authority.{field} must be a nonempty string")
 
 
 def sha256_file(path: Path) -> str:
@@ -87,19 +126,20 @@ def contract_sha256(
 def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
     errors: list[str] = []
 
-    expected_fields = {
+    schema_version = data.get("schema_version")
+    base_fields = {
         "schema_version", "topic", "claim_scope", "dataset_origin",
         "dataset_name", "primary_metric", "smoke_budget_sec",
         "run_budget_sec", "allowed_inputs", "allowed_outputs", "evaluator",
         "safety", "sealing", "metric_authority", "metric_units",
         "metric_display_labels",
     }
+    expected_fields = base_fields | ({"evaluator_authority"} if schema_version == 3 else set())
     if set(data) != expected_fields:
-        errors.append("contract fields must match schema v2 exactly")
+        errors.append("contract fields must match the selected schema exactly")
 
-    schema_version = data.get("schema_version")
-    if type(schema_version) is not int or schema_version != 2:
-        errors.append("schema_version must be 2")
+    if type(schema_version) is not int or schema_version not in {2, 3}:
+        errors.append("schema_version must be true integer 2 or 3")
 
     topic_value = data.get("topic")
     topic = topic_value if isinstance(topic_value, str) else ""
@@ -160,10 +200,16 @@ def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
             "evaluator",
             errors,
         )
-        if evaluator.get("command") != "python main.py":
-            errors.append("evaluator.command must be python main.py")
-        if evaluator.get("owner") != "scaffold":
-            errors.append("evaluator.owner must be scaffold")
+        expected_command = (
+            "python evaluator/evaluator_main.py"
+            if schema_version == 3
+            else "python main.py"
+        )
+        expected_owner = "domain_evaluator" if schema_version == 3 else "scaffold"
+        if evaluator.get("command") != expected_command:
+            errors.append("evaluator.command does not match schema policy")
+        if evaluator.get("owner") != expected_owner:
+            errors.append("evaluator.owner does not match schema policy")
         timeout_sec = evaluator.get("timeout_sec")
         if type(timeout_sec) is not int or timeout_sec <= 0:
             errors.append("evaluator.timeout_sec must be a positive integer")
@@ -171,7 +217,8 @@ def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
         if not isinstance(required, list):
             errors.append("evaluator.required_result_keys must be a list")
         else:
-            if required != ["dataset_origin", "metrics"]:
+            expected_required = [] if schema_version == 3 else ["dataset_origin", "metrics"]
+            if required != expected_required:
                 errors.append("evaluator.required_result_keys must match policy exactly")
 
     allowed_inputs = data.get("allowed_inputs")
@@ -189,8 +236,9 @@ def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
     else:
         output = allowed_outputs[0]
         _require_exact_fields(output, {"path", "required"}, "allowed_outputs item", errors)
-        if output.get("path") != "results.json" or output.get("required") is not True:
-            errors.append("allowed_outputs must require results.json")
+        expected_output = "score_evidence.jsonl" if schema_version == 3 else "results.json"
+        if output.get("path") != expected_output or output.get("required") is not True:
+            errors.append("allowed_outputs does not match schema policy")
 
     safety = data.get("safety")
     sealing = data.get("sealing")
@@ -205,7 +253,12 @@ def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
             errors.append("safety.network must be none")
         if safety.get("env_policy") != "allowlist":
             errors.append("safety.env_policy must be allowlist")
-        if safety.get("evidence_policy") != "stage12_recomputed_only":
+        expected_evidence_policy = (
+            "stage12_independent_verifier_only"
+            if schema_version == 3
+            else "stage12_recomputed_only"
+        )
+        if safety.get("evidence_policy") != expected_evidence_policy:
             errors.append("safety.evidence_policy mismatch")
     if not isinstance(sealing, dict):
         errors.append("sealing must be an object")
@@ -225,6 +278,7 @@ def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
     metric_authority = data.get("metric_authority")
     metric_units = data.get("metric_units")
     metric_display_labels = data.get("metric_display_labels")
+    evaluator_authority = data.get("evaluator_authority")
     if not isinstance(metric_authority, dict):
         errors.append("metric_authority must be an object")
         metric_authority = {}
@@ -234,6 +288,13 @@ def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
     if not isinstance(metric_display_labels, dict):
         errors.append("metric_display_labels must be an object")
         metric_display_labels = {}
+    if schema_version == 3 and not isinstance(evaluator_authority, dict):
+        errors.append("evaluator_authority must be an object for schema v3")
+        evaluator_authority = {}
+    elif schema_version != 3 and evaluator_authority is not None:
+        errors.append("evaluator_authority is forbidden for schema v2")
+    if schema_version == 3 and isinstance(evaluator_authority, dict):
+        _validate_evaluator_authority(evaluator_authority, errors)
 
     if not errors:
         try:
@@ -250,8 +311,30 @@ def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
             metric_key = primary_metric.get("key")
             if metric_key not in selected.metric_units:
                 errors.append("primary_metric.key is absent from metric authority")
+            if schema_version != selected.schema_version + 1:
+                errors.append("contract and metric authority schema rows are incompatible")
+            if schema_version == 3 and evaluator_authority != selected.evaluator_authority:
+                errors.append("evaluator_authority does not match trusted selector result")
         except MetricAuthorityError as exc:
             errors.append(f"metric authority is invalid: {exc}")
+
+    if schema_version == 3:
+        if claim_scope != "pipeline_validation":
+            errors.append("contract v3 claim_scope must be pipeline_validation")
+        if dataset_origin != "synthetic":
+            errors.append("contract v3 dataset_origin must be synthetic")
+        if data.get("dataset_name") != "controlled_synthetic_iscas85_trojan_localization_v1":
+            errors.append("contract v3 dataset_name mismatch")
+        if primary_metric != {
+            "key": "auprc",
+            "direction": "maximize",
+            "minimum_valid_value": 0.0,
+        }:
+            errors.append("contract v3 primary metric mismatch")
+        if sorted(metric_units) != [
+            "accuracy", "auprc", "auroc", "f1", "fpr", "precision", "recall", "top_k_precision"
+        ]:
+            errors.append("contract v3 metric key set mismatch")
 
     if errors:
         raise ContractValidationError("; ".join(errors))
@@ -265,7 +348,7 @@ def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
         raise ContractValidationError("dataset_name must be null or a trimmed nonempty string")
     dataset_name = dataset_name_raw
     return ExperimentContract(
-        schema_version=2,
+        schema_version=int(schema_version),
         topic=topic,
         claim_scope=claim_scope,
         dataset_origin=dataset_origin,
@@ -283,6 +366,9 @@ def validate_contract_dict(data: dict[str, Any]) -> ExperimentContract:
         metric_display_labels={
             str(key): list(value) for key, value in metric_display_labels.items()
         },
+        evaluator_authority=(
+            dict(evaluator_authority) if isinstance(evaluator_authority, dict) else None
+        ),
     )
 
 
@@ -354,36 +440,54 @@ def derive_contract(
             )
     except MetricAuthorityError as exc:
         raise ContractValidationError(f"metric authority selection failed: {exc}") from exc
+    is_domain_evaluator = authority.schema_version == 2
     dataset_name = (
-        "synthetic_pipeline_validation_v1"
-        if dataset_origin == "synthetic"
-        else _first_dataset_name(plan)
+        "controlled_synthetic_iscas85_trojan_localization_v1"
+        if is_domain_evaluator
+        else (
+            "synthetic_pipeline_validation_v1"
+            if dataset_origin == "synthetic"
+            else _first_dataset_name(plan)
+        )
     )
     contract = ExperimentContract(
-        schema_version=2,
+        schema_version=3 if is_domain_evaluator else 2,
         topic=topic,
         claim_scope=claim_scope,
         dataset_origin=dataset_origin,
         dataset_name=dataset_name,
         primary_metric={
-            "key": metric_key,
-            "direction": metric_direction,
+            "key": "auprc" if is_domain_evaluator else metric_key,
+            "direction": "maximize" if is_domain_evaluator else metric_direction,
             "minimum_valid_value": 0.0,
         },
         smoke_budget_sec=smoke_budget_sec,
         run_budget_sec=time_budget_sec,
         allowed_inputs=[],
-        allowed_outputs=[{"path": "results.json", "required": True}],
+        allowed_outputs=[{
+            "path": "score_evidence.jsonl" if is_domain_evaluator else "results.json",
+            "required": True,
+        }],
         evaluator={
-            "command": "python main.py",
-            "owner": "scaffold",
+            "command": (
+                "python evaluator/evaluator_main.py"
+                if is_domain_evaluator
+                else "python main.py"
+            ),
+            "owner": "domain_evaluator" if is_domain_evaluator else "scaffold",
             "timeout_sec": time_budget_sec,
-            "required_result_keys": ["dataset_origin", "metrics"],
+            "required_result_keys": (
+                [] if is_domain_evaluator else ["dataset_origin", "metrics"]
+            ),
         },
         safety={
             "network": "none",
             "env_policy": getattr(getattr(experiment, "sandbox", None), "env_policy", "allowlist"),
-            "evidence_policy": "stage12_recomputed_only",
+            "evidence_policy": (
+                "stage12_independent_verifier_only"
+                if is_domain_evaluator
+                else "stage12_recomputed_only"
+            ),
         },
         sealing={
             "candidate_manifest": "selected_candidate_manifest.json",
@@ -392,6 +496,7 @@ def derive_contract(
         metric_authority=authority.contract_identity(),
         metric_units=authority.metric_units,
         metric_display_labels=authority.metric_display_labels,
+        evaluator_authority=authority.evaluator_authority,
     )
     return validate_contract_dict(contract.to_dict())
 

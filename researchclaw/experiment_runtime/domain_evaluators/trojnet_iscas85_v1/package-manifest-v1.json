@@ -1,0 +1,398 @@
+{
+  "schema_version": 1,
+  "package_policy_version": 1,
+  "domain_id": "hardware_trojan_localization",
+  "evaluator_id": "trojnet_iscas85_graphsage_localization",
+  "evaluator_schema": "trojnet_iscas85_graphsage_localization_v1",
+  "execution_policy_path": "execution-policy-v1.json",
+  "execution_policy_sha256": "76b6a383f50505aa68a16643a3a0e29d0625e2f0d2b4f65ba47cbe9d99a6a6f8",
+  "source_roots": [
+    {
+      "root_id": "data",
+      "trusted_path": "researchclaw/experiment_runtime/validation_fixtures/trojnet_iscas85_v1/data/iscas85",
+      "reserved_control_files": []
+    },
+    {
+      "root_id": "package",
+      "trusted_path": "researchclaw/experiment_runtime/domain_evaluators/trojnet_iscas85_v1",
+      "reserved_control_files": [
+        "package-manifest-v1.json"
+      ]
+    },
+    {
+      "root_id": "vendor",
+      "trusted_path": "researchclaw/experiment_runtime/validation_fixtures/trojnet_iscas85_v1/vendor/trojnet",
+      "reserved_control_files": []
+    }
+  ],
+  "files": [
+    {
+      "source_root": "data",
+      "source_path": "c1355/c1355_ht1.bench",
+      "capture_path": "data/c1355/c1355_ht1.bench",
+      "role": "data",
+      "sha256": "1529dd302a738a52896f0ae1360ec45365136808465a0e3da751b830dbc3f60b",
+      "size": 16517
+    },
+    {
+      "source_root": "data",
+      "source_path": "c1355/c1355_ht1_trojan_nodes.txt",
+      "capture_path": "data/c1355/c1355_ht1_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "7b24d581c35eff1680f2081e995755f6e5824724be4694d759fd7b2f6d201cdf",
+      "size": 76
+    },
+    {
+      "source_root": "data",
+      "source_path": "c1355/c1355_ht2.bench",
+      "capture_path": "data/c1355/c1355_ht2.bench",
+      "role": "data",
+      "sha256": "95d05ab4d4cf82bf8f979b1147f5b5635855c9752062beb69d8af37c9b39cd6d",
+      "size": 16515
+    },
+    {
+      "source_root": "data",
+      "source_path": "c1355/c1355_ht2_trojan_nodes.txt",
+      "capture_path": "data/c1355/c1355_ht2_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "7b24d581c35eff1680f2081e995755f6e5824724be4694d759fd7b2f6d201cdf",
+      "size": 76
+    },
+    {
+      "source_root": "data",
+      "source_path": "c1355/c1355_ht3.bench",
+      "capture_path": "data/c1355/c1355_ht3.bench",
+      "role": "data",
+      "sha256": "860cf85ad4088373d6c74262c0ee8b0dd6e68654d8a51b50fcca72a59f741a5b",
+      "size": 16656
+    },
+    {
+      "source_root": "data",
+      "source_path": "c1355/c1355_ht3_trojan_nodes.txt",
+      "capture_path": "data/c1355/c1355_ht3_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "7b24d581c35eff1680f2081e995755f6e5824724be4694d759fd7b2f6d201cdf",
+      "size": 76
+    },
+    {
+      "source_root": "data",
+      "source_path": "c1908/c1908_ht1.bench",
+      "capture_path": "data/c1908/c1908_ht1.bench",
+      "role": "data",
+      "sha256": "cbca2a6d0394bdf983e625a38a547a94c1522c520604d6dfa4c7ee8c4d68e3eb",
+      "size": 25585
+    },
+    {
+      "source_root": "data",
+      "source_path": "c1908/c1908_ht1_trojan_nodes.txt",
+      "capture_path": "data/c1908/c1908_ht1_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "47cf3e3488f6a20eb775249acd40641b283ea9fc86e1c2afef641ca40376d835",
+      "size": 106
+    },
+    {
+      "source_root": "data",
+      "source_path": "c1908/c1908_ht2.bench",
+      "capture_path": "data/c1908/c1908_ht2.bench",
+      "role": "data",
+      "sha256": "c4f40ceda9cec310b8eb6fa352f5356ced1736398db323a1b808cdd0185c701e",
+      "size": 25760
+    },
+    {
+      "source_root": "data",
+      "source_path": "c1908/c1908_ht2_trojan_nodes.txt",
+      "capture_path": "data/c1908/c1908_ht2_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "47cf3e3488f6a20eb775249acd40641b283ea9fc86e1c2afef641ca40376d835",
+      "size": 106
+    },
+    {
+      "source_root": "data",
+      "source_path": "c1908/c1908_ht3.bench",
+      "capture_path": "data/c1908/c1908_ht3.bench",
+      "role": "data",
+      "sha256": "94a8304179a59178133d133a5309d946d81da2cef8294130ba688366cf810b1e",
+      "size": 25920
+    },
+    {
+      "source_root": "data",
+      "source_path": "c1908/c1908_ht3_trojan_nodes.txt",
+      "capture_path": "data/c1908/c1908_ht3_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "47cf3e3488f6a20eb775249acd40641b283ea9fc86e1c2afef641ca40376d835",
+      "size": 106
+    },
+    {
+      "source_root": "data",
+      "source_path": "c3540/c3540_ht1.bench",
+      "capture_path": "data/c3540/c3540_ht1.bench",
+      "role": "data",
+      "sha256": "2444c8e511bf511d3dce14b67fe613333f52ed45830ef8a93936ec1a60b19433",
+      "size": 48129
+    },
+    {
+      "source_root": "data",
+      "source_path": "c3540/c3540_ht1_trojan_nodes.txt",
+      "capture_path": "data/c3540/c3540_ht1_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "4f2387d74f1d812077c522a53f1b21a676526d034ff86314bf2047d389ff86cc",
+      "size": 184
+    },
+    {
+      "source_root": "data",
+      "source_path": "c3540/c3540_ht2.bench",
+      "capture_path": "data/c3540/c3540_ht2.bench",
+      "role": "data",
+      "sha256": "49def3f586684d8dc86e2d41e2d319c0b242869c0b0ab68d3290d4cb57fbdfc1",
+      "size": 48261
+    },
+    {
+      "source_root": "data",
+      "source_path": "c3540/c3540_ht2_trojan_nodes.txt",
+      "capture_path": "data/c3540/c3540_ht2_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "4f2387d74f1d812077c522a53f1b21a676526d034ff86314bf2047d389ff86cc",
+      "size": 184
+    },
+    {
+      "source_root": "data",
+      "source_path": "c3540/c3540_ht3.bench",
+      "capture_path": "data/c3540/c3540_ht3.bench",
+      "role": "data",
+      "sha256": "a0a87ccb71e36e18861efdf12ef8c92d97ca0a2b39435a32e3e507a8028f863f",
+      "size": 48561
+    },
+    {
+      "source_root": "data",
+      "source_path": "c3540/c3540_ht3_trojan_nodes.txt",
+      "capture_path": "data/c3540/c3540_ht3_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "4f2387d74f1d812077c522a53f1b21a676526d034ff86314bf2047d389ff86cc",
+      "size": 184
+    },
+    {
+      "source_root": "data",
+      "source_path": "c432/c432_ht1.bench",
+      "capture_path": "data/c432/c432_ht1.bench",
+      "role": "data",
+      "sha256": "0b9794422f5dfa5a6c257b87ff8e12ceff6643bc58b07c8d412260730c9e659d",
+      "size": 5293
+    },
+    {
+      "source_root": "data",
+      "source_path": "c432/c432_ht1_trojan_nodes.txt",
+      "capture_path": "data/c432/c432_ht1_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "9f99c53df7f1e9e613b287ec15dd6a4f4a487f5d7f3b31f6e9f34b4b12b6359f",
+      "size": 28
+    },
+    {
+      "source_root": "data",
+      "source_path": "c432/c432_ht2.bench",
+      "capture_path": "data/c432/c432_ht2.bench",
+      "role": "data",
+      "sha256": "13f2ba0366f67829a6612f417258f611d4c7b4a5e9a66508945b314dc5ff6d7d",
+      "size": 5256
+    },
+    {
+      "source_root": "data",
+      "source_path": "c432/c432_ht2_trojan_nodes.txt",
+      "capture_path": "data/c432/c432_ht2_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "9f99c53df7f1e9e613b287ec15dd6a4f4a487f5d7f3b31f6e9f34b4b12b6359f",
+      "size": 28
+    },
+    {
+      "source_root": "data",
+      "source_path": "c432/c432_ht3.bench",
+      "capture_path": "data/c432/c432_ht3.bench",
+      "role": "data",
+      "sha256": "51e705701d9139ff8121979bfefb72cf3764f21ba0ab4a1c8b503f4058d734fb",
+      "size": 5341
+    },
+    {
+      "source_root": "data",
+      "source_path": "c432/c432_ht3_trojan_nodes.txt",
+      "capture_path": "data/c432/c432_ht3_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "9f99c53df7f1e9e613b287ec15dd6a4f4a487f5d7f3b31f6e9f34b4b12b6359f",
+      "size": 28
+    },
+    {
+      "source_root": "data",
+      "source_path": "c6288/c6288_ht1.bench",
+      "capture_path": "data/c6288/c6288_ht1.bench",
+      "role": "data",
+      "sha256": "cfffa7beaea216f5b142325a67d98d8e0fa46cd33f3dacba4d46f70e02ce0b30",
+      "size": 70279
+    },
+    {
+      "source_root": "data",
+      "source_path": "c6288/c6288_ht1_trojan_nodes.txt",
+      "capture_path": "data/c6288/c6288_ht1_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "18ac621ed2177f812ba589a848086468544cb756c46d809c54b47c18aaf2441f",
+      "size": 238
+    },
+    {
+      "source_root": "data",
+      "source_path": "c6288/c6288_ht2.bench",
+      "capture_path": "data/c6288/c6288_ht2.bench",
+      "role": "data",
+      "sha256": "181fbc26311a6572f3f83d0b4aa7558522661cea6642d01d879961b81247bd9e",
+      "size": 70543
+    },
+    {
+      "source_root": "data",
+      "source_path": "c6288/c6288_ht2_trojan_nodes.txt",
+      "capture_path": "data/c6288/c6288_ht2_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "18ac621ed2177f812ba589a848086468544cb756c46d809c54b47c18aaf2441f",
+      "size": 238
+    },
+    {
+      "source_root": "data",
+      "source_path": "c6288/c6288_ht3.bench",
+      "capture_path": "data/c6288/c6288_ht3.bench",
+      "role": "data",
+      "sha256": "5f17e821be25ef6e957e5fd1ef2bd7d2e710a08a12a061a047fd3a4fa82a05a9",
+      "size": 70632
+    },
+    {
+      "source_root": "data",
+      "source_path": "c6288/c6288_ht3_trojan_nodes.txt",
+      "capture_path": "data/c6288/c6288_ht3_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "18ac621ed2177f812ba589a848086468544cb756c46d809c54b47c18aaf2441f",
+      "size": 238
+    },
+    {
+      "source_root": "data",
+      "source_path": "c880/c880_ht1.bench",
+      "capture_path": "data/c880/c880_ht1.bench",
+      "role": "data",
+      "sha256": "5e32958c7e6dd69028e67f98af024fef128d1ca44cd6ce80eac17267563f5e48",
+      "size": 12143
+    },
+    {
+      "source_root": "data",
+      "source_path": "c880/c880_ht1_trojan_nodes.txt",
+      "capture_path": "data/c880/c880_ht1_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "b0c256f9ad725975cd4215366f997e9d90be2810b999ebc2722199132ed00c3b",
+      "size": 58
+    },
+    {
+      "source_root": "data",
+      "source_path": "c880/c880_ht2.bench",
+      "capture_path": "data/c880/c880_ht2.bench",
+      "role": "data",
+      "sha256": "66c40a40225426291182436cb8cbece0f48dd5082cc2fe07f0c78d0252655ce0",
+      "size": 12146
+    },
+    {
+      "source_root": "data",
+      "source_path": "c880/c880_ht2_trojan_nodes.txt",
+      "capture_path": "data/c880/c880_ht2_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "b0c256f9ad725975cd4215366f997e9d90be2810b999ebc2722199132ed00c3b",
+      "size": 58
+    },
+    {
+      "source_root": "data",
+      "source_path": "c880/c880_ht3.bench",
+      "capture_path": "data/c880/c880_ht3.bench",
+      "role": "data",
+      "sha256": "dced23253ba92e29700ed1594ad1e3a56c1e6b37d19594a0075c8ebd9e8cf928",
+      "size": 12270
+    },
+    {
+      "source_root": "data",
+      "source_path": "c880/c880_ht3_trojan_nodes.txt",
+      "capture_path": "data/c880/c880_ht3_trojan_nodes.txt",
+      "role": "data",
+      "sha256": "b0c256f9ad725975cd4215366f997e9d90be2810b999ebc2722199132ed00c3b",
+      "size": 58
+    },
+    {
+      "source_root": "package",
+      "source_path": "evaluator_main.py",
+      "capture_path": "evaluator/evaluator_main.py",
+      "role": "evaluator",
+      "sha256": "69d6f07661013615ba9a75eafaad18e0251b1a730b2f9654bfa34e2cf7af9485",
+      "size": 5705
+    },
+    {
+      "source_root": "package",
+      "source_path": "execution-policy-v1.json",
+      "capture_path": "policy/execution-policy-v1.json",
+      "role": "policy",
+      "sha256": "76b6a383f50505aa68a16643a3a0e29d0625e2f0d2b4f65ba47cbe9d99a6a6f8",
+      "size": 1194
+    },
+    {
+      "source_root": "vendor",
+      "source_path": "__init__.py",
+      "capture_path": "vendor/__init__.py",
+      "role": "vendor",
+      "sha256": "57113823f5622576053fd7980d5e7780fd7d0c1278c4a6e87b6a3bbb4902a027",
+      "size": 860
+    },
+    {
+      "source_root": "vendor",
+      "source_path": "anomaly.py",
+      "capture_path": "vendor/anomaly.py",
+      "role": "vendor",
+      "sha256": "7e7f11266a1d69e4d4aa3b2330623c2ecdfe596c2f1c2b86fb2e3d86540d7b8e",
+      "size": 7270
+    },
+    {
+      "source_root": "vendor",
+      "source_path": "data.py",
+      "capture_path": "vendor/data.py",
+      "role": "vendor",
+      "sha256": "b4912d8bb163bc124fc5f26e960213cae0d3c5e38d4e9f09e696fab6af53262d",
+      "size": 19781
+    },
+    {
+      "source_root": "vendor",
+      "source_path": "eval.py",
+      "capture_path": "vendor/eval.py",
+      "role": "vendor",
+      "sha256": "7ce2394a7a69e92395391b2aca252a8d4d6d7489bff09aea5e191e70ee662c57",
+      "size": 17657
+    },
+    {
+      "source_root": "vendor",
+      "source_path": "model.py",
+      "capture_path": "vendor/model.py",
+      "role": "vendor",
+      "sha256": "57dcfe72cc992d40a642d3ee14c81ed8c3a39cec131e0929af9505d1c470e0b1",
+      "size": 8011
+    },
+    {
+      "source_root": "vendor",
+      "source_path": "partition.py",
+      "capture_path": "vendor/partition.py",
+      "role": "vendor",
+      "sha256": "7d5bed05225f9f9266b21532e9035d4514e8873242241162344b547afb2996c3",
+      "size": 11245
+    },
+    {
+      "source_root": "vendor",
+      "source_path": "train.py",
+      "capture_path": "vendor/train.py",
+      "role": "vendor",
+      "sha256": "a590cc1c34bcf9792bff3d2b2c5364aced938c16c6dc7f4755c2fa87074b9822",
+      "size": 11142
+    },
+    {
+      "source_root": "package",
+      "source_path": "verifier_main.py",
+      "capture_path": "verifier/verifier_main.py",
+      "role": "verifier",
+      "sha256": "0a645b16ff4f270f1494aa28efb60b1ad0d80fa01230e55b49b377ca9d3bc1fe",
+      "size": 13635
+    }
+  ]
+}
