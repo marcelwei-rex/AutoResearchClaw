@@ -17,6 +17,14 @@ license = {text = "MIT"}
 anthropic = ["httpx>=0.24"]
 web = ["scholarly>=1.7", "crawl4ai>=0.2", "tavily-python>=0.3"]
 pdf = ["PyMuPDF>=1.23"]
+trojnet-validation = [
+    "networkx==3.6.1",
+    "numpy==2.4.6",
+    "scikit-learn==1.9.0",
+    "scipy==1.17.1",
+    "torch==2.12.1",
+    "torch-geometric==2.8.0",
+]
 all = [
     "httpx>=0.24",
     "scholarly>=1.7",
@@ -37,6 +45,9 @@ packages = ["researchclaw", "sibyl", "arc"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "researchclaw/templates/styles" = "researchclaw/templates/styles"
+"researchclaw/experiment_runtime/validation_fixtures/trojnet_iscas85_v1/data" = "researchclaw/experiment_runtime/validation_fixtures/trojnet_iscas85_v1/data"
+"researchclaw/experiment_runtime/validation_fixtures/trojnet_iscas85_v1/provenance.json" = "researchclaw/experiment_runtime/validation_fixtures/trojnet_iscas85_v1/provenance.json"
+"researchclaw/experiment_runtime/validation_fixtures/trojnet_iscas85_v1/policy.json" = "researchclaw/experiment_runtime/validation_fixtures/trojnet_iscas85_v1/policy.json"
 
 [build-system]
 requires = ["hatchling"]

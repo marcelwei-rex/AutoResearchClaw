@@ -1,0 +1,21 @@
+{
+  "dataset_origin": "synthetic",
+  "fixture_id": "trojnet_iscas85_graphsage_localization_v1",
+  "paper_workspace_source": "1 TrojNet Unsupervised Graph Neural Network Embeddings for Hardware Trojan Detection/02_experiment_workspace/trojnet_experiments",
+  "source_code_sha256": {
+    "trojnet/__init__.py": "57113823f5622576053fd7980d5e7780fd7d0c1278c4a6e87b6a3bbb4902a027",
+    "trojnet/anomaly.py": "7e7f11266a1d69e4d4aa3b2330623c2ecdfe596c2f1c2b86fb2e3d86540d7b8e",
+    "trojnet/data.py": "b4912d8bb163bc124fc5f26e960213cae0d3c5e38d4e9f09e696fab6af53262d",
+    "trojnet/eval.py": "7ce2394a7a69e92395391b2aca252a8d4d6d7489bff09aea5e191e70ee662c57",
+    "trojnet/model.py": "57dcfe72cc992d40a642d3ee14c81ed8c3a39cec131e0929af9505d1c470e0b1",
+    "trojnet/partition.py": "7d5bed05225f9f9266b21532e9035d4514e8873242241162344b547afb2996c3",
+    "trojnet/train.py": "a590cc1c34bcf9792bff3d2b2c5364aced938c16c6dc7f4755c2fa87074b9822"
+  },
+  "source_data_file_count": 36,
+  "source_data_sha256": "c190322c6ecc3f32dd0d8968d4ad12a209198143364b51c09a6e5efb73c669a0",
+  "source_result_paths": [
+    "results/_final_evidence_runs/iscas85_community_graphsage_exp2",
+    "results/_final_evidence_runs/iscas85_graphsage_multiseed3"
+  ],
+  "use_boundary": "pipeline_validation_only"
+}

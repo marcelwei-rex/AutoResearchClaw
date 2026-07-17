@@ -1,0 +1,65 @@
+{
+  "conditions": [
+    "raw_cc1",
+    "scoap_isolation_forest",
+    "trojnet_community_graphsage"
+  ],
+  "fixture_id": "trojnet_iscas85_graphsage_localization_v1",
+  "launcher_sha256": "c43ce9202c24bc4855dafb48fba619f490ca7d659f5be7161e28d3d76ad002f9",
+  "metric_keys": [
+    "auroc",
+    "auprc",
+    "top_k_precision",
+    "accuracy",
+    "precision",
+    "recall",
+    "f1",
+    "fpr"
+  ],
+  "primary_metric": {
+    "direction": "maximize",
+    "key": "auprc"
+  },
+  "profiles": {
+    "smoke": {
+      "circuits": [
+        "c432"
+      ],
+      "epochs": 20,
+      "seeds": [
+        0
+      ]
+    },
+    "validation": {
+      "circuits": [
+        "c432",
+        "c880",
+        "c1355",
+        "c1908",
+        "c3540",
+        "c6288"
+      ],
+      "epochs": 20,
+      "seeds": [
+        0,
+        1,
+        2
+      ]
+    }
+  },
+  "runner_sha256": "8534760a616ff6480fb2a018619729f07aab2f86ef775d1337c5507073716a16",
+  "runtime": {
+    "deterministic_algorithms": true,
+    "packages": {
+      "networkx": "3.6.1",
+      "numpy": "2.4.6",
+      "scikit-learn": "1.9.0",
+      "scipy": "1.17.1",
+      "torch": "2.12.1",
+      "torch-geometric": "2.8.0"
+    },
+    "python_major_minor": "3.11",
+    "torch_num_threads": 1
+  },
+  "schema_version": 1
+}
