@@ -115,6 +115,34 @@ _ROOT_OWNED = (
     "experiment_summary_best.json",
     "analysis_best.md",
 )
+_DOMAIN_CONDITIONS = (
+    "raw_cc1",
+    "scoap_isolation_forest",
+    "trojnet_community_graphsage",
+)
+_DOMAIN_SEEDS = (0, 1, 2)
+_DOMAIN_FAMILIES = ("c1355", "c1908", "c3540", "c432", "c6288", "c880")
+_DOMAIN_VARIANTS = tuple(
+    (family, f"{family}_ht{variant}")
+    for family in _DOMAIN_FAMILIES
+    for variant in (1, 2, 3)
+)
+_DOMAIN_METRIC_KEYS = (
+    "accuracy",
+    "auprc",
+    "auroc",
+    "f1",
+    "fpr",
+    "precision",
+    "recall",
+    "top_k_precision",
+)
+_DOMAIN_OBSERVATION_IDENTITIES = {
+    (family, variant, condition, seed)
+    for condition in _DOMAIN_CONDITIONS
+    for seed in _DOMAIN_SEEDS
+    for family, variant in _DOMAIN_VARIANTS
+}
 
 
 @dataclass(frozen=True)
@@ -1439,11 +1467,9 @@ def _project_metric_observations(
     rows = observations.get("observations")
     if (
         not isinstance(metric_keys, list)
-        or not metric_keys
-        or any(not isinstance(key, str) or not key for key in metric_keys)
-        or len(metric_keys) != len(set(metric_keys))
+        or tuple(metric_keys) != _DOMAIN_METRIC_KEYS
         or not isinstance(rows, list)
-        or len(rows) != 162
+        or len(rows) != len(_DOMAIN_OBSERVATION_IDENTITIES)
     ):
         raise Stage14DomainEvaluatorError(
             "canonical domain metric observation projection is invalid"
@@ -1451,7 +1477,6 @@ def _project_metric_observations(
     projected: dict[str, list[int | Decimal]] = {key: [] for key in metric_keys}
     expected_keys = set(metric_keys)
     identities: set[tuple[str, str, str, int]] = set()
-    group_counts: dict[tuple[str, int], int] = {}
     for row in rows:
         if (
             not isinstance(row, dict)
@@ -1494,8 +1519,6 @@ def _project_metric_observations(
                 "canonical domain observation identity is duplicated"
             )
         identities.add(identity)
-        group = (condition, seed)
-        group_counts[group] = group_counts.get(group, 0) + 1
         metrics = row["metrics"]
         if set(metrics) != expected_keys:
             raise Stage14DomainEvaluatorError(
@@ -1513,7 +1536,7 @@ def _project_metric_observations(
                     "canonical domain metric observation must be finite numeric"
                 )
             projected[key].append(value)
-    if len(group_counts) != 9 or set(group_counts.values()) != {18}:
+    if identities != _DOMAIN_OBSERVATION_IDENTITIES:
         raise Stage14DomainEvaluatorError(
             "canonical domain observation condition/seed closure mismatch"
         )

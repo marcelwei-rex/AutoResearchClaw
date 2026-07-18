@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from decimal import Decimal
+import hashlib
+import json
 from pathlib import Path
 import shutil
 
 import pytest
+import yaml
 
 from researchclaw.adapters import AdapterBundle
 from researchclaw.literature.citation_policy import (
@@ -49,8 +53,8 @@ _DOMAIN_METRICS = (
 def _domain_observation_payload() -> dict[str, object]:
     rows = [
         {
-            "circuit_family": f"c{variant:03d}",
-            "circuit_variant": f"c{variant:03d}_ht1",
+            "circuit_family": family,
+            "circuit_variant": f"{family}_ht{variant}",
             "condition": condition,
             "metrics": {metric: 1 for metric in _DOMAIN_METRICS},
             "n_total": 10,
@@ -63,7 +67,8 @@ def _domain_observation_payload() -> dict[str, object]:
             "trojnet_community_graphsage",
         )
         for seed in (0, 1, 2)
-        for variant in range(1, 19)
+        for family in ("c1355", "c1908", "c3540", "c432", "c6288", "c880")
+        for variant in (1, 2, 3)
     ]
     return {
         "schema_version": 2,
@@ -82,6 +87,209 @@ def _domain_observation_payload() -> dict[str, object]:
             "value": 1,
         },
     }
+
+
+def _ref(path: str, content: bytes) -> dict[str, object]:
+    return {
+        "path": path,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size": len(content),
+    }
+
+
+def _replace_bound_ref(value: object, path: str, content: bytes) -> None:
+    if isinstance(value, dict):
+        if value.get("path") == path and {"sha256", "size"}.issubset(value):
+            value.update(_ref(path, content))
+        for child in value.values():
+            _replace_bound_ref(child, path, content)
+    elif isinstance(value, list):
+        for child in value:
+            _replace_bound_ref(child, path, content)
+
+
+def _rewrite_stage9_domain_snapshots_through_root(run: Path) -> None:
+    def load_json(path: Path) -> dict[str, object]:
+        value = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
+        assert isinstance(value, dict)
+        return value
+
+    stage9 = run / "stage-09"
+    package_path = stage9 / "domain_evaluator_package_manifest.json"
+    policy_path = stage9 / "domain_evaluator_execution_policy.json"
+    package = load_json(package_path)
+    policy = load_json(policy_path)
+    policy["primary_metric_key"] = "f1"
+    policy_bytes = canonical_authority_json_text(policy).encode("utf-8")
+    policy_sha = hashlib.sha256(policy_bytes).hexdigest()
+    package["execution_policy_sha256"] = policy_sha
+    for item in package["files"]:
+        if item["capture_path"] == "policy/execution-policy-v1.json":
+            item["sha256"] = policy_sha
+            item["size"] = len(policy_bytes)
+            break
+    else:
+        raise AssertionError("package policy entry is missing")
+    package_bytes = canonical_authority_json_text(package).encode("utf-8")
+    package_path.write_bytes(package_bytes)
+    policy_path.write_bytes(policy_bytes)
+
+    contract_path = stage9 / "experiment_contract.yaml"
+    contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
+    authority = contract["evaluator_authority"]
+    package_sha = hashlib.sha256(package_bytes).hexdigest()
+    authority["package_manifest_package_sha256"] = package_sha
+    authority["package_manifest_snapshot_sha256"] = package_sha
+    authority["execution_policy_package_sha256"] = policy_sha
+    authority["execution_policy_snapshot_sha256"] = policy_sha
+    contract_bytes = yaml.safe_dump(
+        contract, sort_keys=False, allow_unicode=True
+    ).encode("utf-8")
+    contract_path.write_bytes(contract_bytes)
+    (stage9 / "experiment_contract.sha256").write_text(
+        hashlib.sha256(contract_bytes).hexdigest() + "\n", encoding="ascii"
+    )
+
+    capture_root = run / "stage-10/evaluator-capture-v1"
+    capture_policy = capture_root / "policy/execution-policy-v1.json"
+    capture_policy.write_bytes(policy_bytes)
+    capture_manifest_path = capture_root / "capture-manifest.json"
+    capture_manifest = load_json(capture_manifest_path)
+    _replace_bound_ref(
+        capture_manifest,
+        "stage-09/domain_evaluator_package_manifest.json",
+        package_bytes,
+    )
+    _replace_bound_ref(
+        capture_manifest,
+        "stage-09/domain_evaluator_execution_policy.json",
+        policy_bytes,
+    )
+    source_rows = []
+    for package_item in package["files"]:
+        package_entry = {
+            key: package_item[key]
+            for key in (
+                "source_root",
+                "source_path",
+                "capture_path",
+                "role",
+                "sha256",
+                "size",
+            )
+        }
+        source_rows.append(
+            {
+                key: package_item[key]
+                for key in ("source_root", "source_path", "role", "sha256", "size")
+            }
+        )
+        for captured in capture_manifest["files"]:
+            if captured["path"] == package_item["capture_path"]:
+                captured["sha256"] = package_item["sha256"]
+                captured["size"] = package_item["size"]
+                captured["package_entry_sha256"] = hashlib.sha256(
+                    canonical_authority_json_text(package_entry).encode("utf-8")
+                ).hexdigest()
+                break
+    capture_manifest["source_namespace_sha256"] = hashlib.sha256(
+        canonical_authority_json_text(source_rows).encode("utf-8")
+    ).hexdigest()
+    capture_manifest_bytes = canonical_authority_json_text(capture_manifest).encode(
+        "utf-8"
+    )
+    capture_manifest_path.write_bytes(capture_manifest_bytes)
+
+    seal_path = run / "stage-10/selected_candidate_manifest.json"
+    seal = load_json(seal_path)
+    for path, content in (
+        ("stage-09/experiment_contract.yaml", contract_bytes),
+        ("stage-09/domain_evaluator_package_manifest.json", package_bytes),
+        ("stage-09/domain_evaluator_execution_policy.json", policy_bytes),
+        ("stage-10/evaluator-capture-v1/capture-manifest.json", capture_manifest_bytes),
+    ):
+        _replace_bound_ref(seal, path, content)
+    seal_bytes = canonical_authority_json_text(seal).encode("utf-8")
+    seal_path.write_bytes(seal_bytes)
+
+    baseline_path = run / "stage-12/experiment_result_set.json"
+    baseline = load_json(baseline_path)
+    for path, content in (
+        ("stage-09/experiment_contract.yaml", contract_bytes),
+        ("stage-09/domain_evaluator_package_manifest.json", package_bytes),
+        ("stage-09/domain_evaluator_execution_policy.json", policy_bytes),
+        ("stage-10/evaluator-capture-v1/capture-manifest.json", capture_manifest_bytes),
+        ("stage-10/selected_candidate_manifest.json", seal_bytes),
+    ):
+        _replace_bound_ref(baseline, path, content)
+    baseline_bytes = canonical_authority_json_text(baseline).encode("utf-8")
+    baseline_path.write_bytes(baseline_bytes)
+
+    refinement_path = run / "stage-13/refinement_result_set.json"
+    refinement = load_json(refinement_path)
+    for path, content in (
+        ("stage-09/experiment_contract.yaml", contract_bytes),
+        ("stage-09/domain_evaluator_execution_policy.json", policy_bytes),
+        ("stage-10/evaluator-capture-v1/capture-manifest.json", capture_manifest_bytes),
+        ("stage-10/selected_candidate_manifest.json", seal_bytes),
+        ("stage-12/experiment_result_set.json", baseline_bytes),
+    ):
+        _replace_bound_ref(refinement, path, content)
+    refinement_bytes = canonical_authority_json_text(refinement).encode("utf-8")
+    refinement_path.write_bytes(refinement_bytes)
+
+    candidate_path = next(
+        (run / "stage-14/evidence_candidates").glob(
+            "cand-*/experiment_evidence_candidate.json"
+        )
+    )
+    candidate = load_json(candidate_path)
+    for path, content in (
+        ("stage-09/experiment_contract.yaml", contract_bytes),
+        ("stage-09/domain_evaluator_package_manifest.json", package_bytes),
+        ("stage-09/domain_evaluator_execution_policy.json", policy_bytes),
+        ("stage-10/evaluator-capture-v1/capture-manifest.json", capture_manifest_bytes),
+        ("stage-10/selected_candidate_manifest.json", seal_bytes),
+        ("stage-12/experiment_result_set.json", baseline_bytes),
+        ("stage-13/refinement_result_set.json", refinement_bytes),
+    ):
+        _replace_bound_ref(candidate, path, content)
+    candidate["candidate_id"] = stage14_domain_evaluator._candidate_id_for_payload(
+        candidate
+    )
+    candidate_bytes = canonical_authority_json_text(candidate).encode("utf-8")
+    old_candidate_root = candidate_path.parent
+    new_candidate_root = old_candidate_root.with_name(candidate["candidate_id"])
+    old_candidate_root.rename(new_candidate_root)
+    candidate_path = new_candidate_root / candidate_path.name
+    candidate_path.write_bytes(candidate_bytes)
+
+    root_path = run / "canonical_experiment_evidence.json"
+    root = load_json(root_path)
+    for path, content in (
+        ("stage-09/experiment_contract.yaml", contract_bytes),
+        ("stage-09/domain_evaluator_package_manifest.json", package_bytes),
+        ("stage-09/domain_evaluator_execution_policy.json", policy_bytes),
+        ("stage-10/evaluator-capture-v1/capture-manifest.json", capture_manifest_bytes),
+        ("stage-10/selected_candidate_manifest.json", seal_bytes),
+        ("stage-12/experiment_result_set.json", baseline_bytes),
+        ("stage-13/refinement_result_set.json", refinement_bytes),
+    ):
+        _replace_bound_ref(root, path, content)
+    old_id = old_candidate_root.name
+    new_id = new_candidate_root.name
+    root["selected_candidate"]["candidate_id"] = new_id
+    root["selected_candidate"]["manifest"] = _ref(
+        f"stage-14/evidence_candidates/{new_id}/experiment_evidence_candidate.json",
+        candidate_bytes,
+    )
+    for field, name in (
+        ("selected_summary", "experiment_summary.json"),
+        ("selected_analysis", "analysis.md"),
+    ):
+        source = root[field]["source"]
+        source["path"] = source["path"].replace(old_id, new_id)
+    root_path.write_bytes(canonical_authority_json_text(root).encode("utf-8"))
 
 
 def _prepare_domain_stage14(
@@ -129,7 +337,19 @@ def test_domain_observation_projection_requires_exact_162_row_closure() -> None:
     assert {len(values) for values in projected.values()} == {162}
 
 
-@pytest.mark.parametrize("mutation", ("short", "long", "duplicate", "bool"))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "short",
+        "long",
+        "duplicate",
+        "bool",
+        "condition",
+        "seed",
+        "variant",
+        "metric_keys",
+    ),
+)
 def test_domain_observation_projection_rejects_nonproduction_shape(
     mutation: str,
 ) -> None:
@@ -143,8 +363,26 @@ def test_domain_observation_projection_rejects_nonproduction_shape(
         rows[-1]["circuit_variant"] = "extra_ht1"
     elif mutation == "duplicate":
         rows[-1] = deepcopy(rows[0])
-    else:
+    elif mutation == "bool":
         rows[0]["metrics"]["auprc"] = True
+    elif mutation == "condition":
+        for row in rows:
+            if row["condition"] == "raw_cc1":
+                row["condition"] = "shadow_condition"
+    elif mutation == "seed":
+        for row in rows:
+            if row["seed"] == 0:
+                row["seed"] = 3
+    elif mutation == "variant":
+        rows[0]["circuit_family"] = "shadow"
+        rows[0]["circuit_variant"] = "shadow_ht1"
+    else:
+        metric_keys = payload["metric_keys"]
+        assert isinstance(metric_keys, list)
+        metric_keys[0] = "shadow_metric"
+        for row in rows:
+            metrics = row["metrics"]
+            metrics["shadow_metric"] = metrics.pop("accuracy")
 
     with pytest.raises(
         stage14_domain_evaluator.Stage14DomainEvaluatorError
@@ -396,6 +634,25 @@ def test_stage14_domain_evaluator_publishes_fixed_candidate_and_root(
     )
     assert rerun.status is StageStatus.DONE, rerun.error
     assert len(tuple((stage14 / "evidence_candidates").iterdir())) == 1
+
+    _rewrite_stage9_domain_snapshots_through_root(run)
+    forged_package = (run / "stage-09/domain_evaluator_package_manifest.json").read_bytes()
+    forged_policy = (run / "stage-09/domain_evaluator_execution_policy.json").read_bytes()
+    forged_root = json.loads(
+        (run / "canonical_experiment_evidence.json").read_text(encoding="utf-8"),
+        parse_float=Decimal,
+    )
+    assert forged_root["bindings"]["package_manifest"] == _ref(
+        "stage-09/domain_evaluator_package_manifest.json", forged_package
+    )
+    assert forged_root["bindings"]["execution_policy"] == _ref(
+        "stage-09/domain_evaluator_execution_policy.json", forged_policy
+    )
+    with pytest.raises(
+        CanonicalExperimentEvidenceError,
+        match="expected metric authority reconstruction failed",
+    ):
+        reconstruct_expected_stage9_14_metric_authority(run, config)
 
 
 def test_stage14_domain_publication_clears_root_on_plan_and_replay_failures(

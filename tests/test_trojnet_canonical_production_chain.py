@@ -11,6 +11,8 @@ from researchclaw.literature.verify import parse_bibtex_entries
 from researchclaw.pipeline.canonical_experiment_evidence import (
     validate_canonical_experiment_manifest,
 )
+from researchclaw.pipeline import independent_release_reconstruction as reconstruction_module
+from researchclaw.pipeline import stage12_domain_evaluator
 from researchclaw.pipeline.executor import execute_stage
 from researchclaw.pipeline.independent_release_reconstruction import (
     reconstruct_expected_release_publications,
@@ -72,6 +74,46 @@ def test_stage01_through_stage25_trojnet_pipeline_validation_chain(
         lambda bib, **_kwargs: _verified_report(
             tuple(str(entry["key"]) for entry in parse_bibtex_entries(bib))
         ),
+    )
+
+    call_profile = {
+        "evaluator": 0,
+        "verifier": 0,
+        "stage12_replay": 0,
+        "release_capture": 0,
+    }
+    original_evaluator = stage12_domain_evaluator._run_evaluator
+    original_verifier = stage12_domain_evaluator._run_verifier
+    original_stage12_replay = stage12_domain_evaluator._replay_domain_evaluator_snapshot
+    original_release_capture = reconstruction_module._capture_expected_release_publications
+
+    def counted_evaluator(*args, **kwargs):
+        call_profile["evaluator"] += 1
+        return original_evaluator(*args, **kwargs)
+
+    def counted_verifier(*args, **kwargs):
+        call_profile["verifier"] += 1
+        return original_verifier(*args, **kwargs)
+
+    def counted_stage12_replay(*args, **kwargs):
+        call_profile["stage12_replay"] += 1
+        return original_stage12_replay(*args, **kwargs)
+
+    def counted_release_capture(*args, **kwargs):
+        call_profile["release_capture"] += 1
+        return original_release_capture(*args, **kwargs)
+
+    monkeypatch.setattr(stage12_domain_evaluator, "_run_evaluator", counted_evaluator)
+    monkeypatch.setattr(stage12_domain_evaluator, "_run_verifier", counted_verifier)
+    monkeypatch.setattr(
+        stage12_domain_evaluator,
+        "_replay_domain_evaluator_snapshot",
+        counted_stage12_replay,
+    )
+    monkeypatch.setattr(
+        reconstruction_module,
+        "_capture_expected_release_publications",
+        counted_release_capture,
     )
 
     results = []
@@ -156,3 +198,8 @@ def test_stage01_through_stage25_trojnet_pipeline_validation_chain(
     assert "stage-22/code/verifier_main.py" in authority_roles
     assert "stage-22/code/trojnet/anomaly.py" in authority_roles
     assert "stage-22/code/data/c1355/c1355_ht1.bench" in authority_roles
+    assert call_profile["evaluator"] == 2
+    assert call_profile["stage12_replay"] > 0
+    assert call_profile["stage12_replay"] <= 512
+    assert call_profile["verifier"] == 2 + 2 * call_profile["stage12_replay"]
+    assert 0 < call_profile["release_capture"] <= 4
