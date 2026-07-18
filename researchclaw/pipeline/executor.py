@@ -39,6 +39,39 @@ from researchclaw.experiment.validator import (
 logger = logging.getLogger(__name__)
 
 
+class _DeferredLLMClient:
+    """Construct an LLM client only if a legacy stage actually sends a chat."""
+
+    def __init__(self, factory: Callable[[], LLMClient | None]) -> None:
+        self._factory = factory
+        self._client: LLMClient | None = None
+        self._initialized = False
+
+    def resolve_for_legacy(self) -> LLMClient | None:
+        if not self._initialized:
+            self._client = self._factory()
+            self._initialized = True
+        return self._client
+
+    def chat(self, *args: Any, **kwargs: Any) -> Any:
+        client = self.resolve_for_legacy()
+        if client is None:
+            raise RuntimeError("LLM client is unavailable")
+        return client.chat(*args, **kwargs)
+
+
+def _create_configured_llm(config: RCConfig) -> LLMClient | None:
+    try:
+        if config.llm.provider == "acp":
+            return create_llm_client(config)
+        candidate = LLMClient.from_rc_config(config)
+        if candidate.config.base_url and candidate.config.api_key:
+            return candidate
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("LLM client creation failed: %s", exc)
+    return None
+
+
 @dataclass
 class _MissingAuthorityNamespace:
     """Record that no run namespace existed before an authority HITL wait."""
@@ -934,17 +967,14 @@ def _execute_stage_under_release_scope(
     if bridge.use_memory:
         adapters.memory.append("stages", f"{run_id}:{int(stage)}:running")
 
-    llm = None
-    try:
-        if config.llm.provider == "acp":
-            llm = create_llm_client(config)
-        else:
-            candidate = LLMClient.from_rc_config(config)
-            if candidate.config.base_url and candidate.config.api_key:
-                llm = candidate
-    except Exception as _llm_exc:  # noqa: BLE001
-        logger.warning("LLM client creation failed: %s", _llm_exc)
-        llm = None
+    # Stage 13 chooses its canonical v2 evaluator only after it has invalidated
+    # stale authority under its held writer epoch.  Its fixed evaluator never
+    # needs an LLM; the legacy v1 branch resolves this proxy on its first chat.
+    llm: LLMClient | _DeferredLLMClient | None
+    if stage is Stage.ITERATIVE_REFINE:
+        llm = _DeferredLLMClient(lambda: _create_configured_llm(config))
+    else:
+        llm = _create_configured_llm(config)
 
     try:
         _ = advance(stage, StageStatus.PENDING, TransitionEvent.START)
@@ -976,7 +1006,13 @@ def _execute_stage_under_release_scope(
         )
 
     if result.status == StageStatus.DONE:
-        for output_file in _select_output_files(contract, config):
+        output_files = _select_output_files(contract, config)
+        if (
+            stage is Stage.ITERATIVE_REFINE
+            and result.artifacts == ("refinement_result_set.json",)
+        ):
+            output_files = result.artifacts
+        for output_file in output_files:
             if output_file.endswith("/"):
                 path = stage_dir / output_file.rstrip("/")
                 if not path.is_dir() or not any(path.iterdir()):
@@ -1094,10 +1130,18 @@ def _execute_stage_under_release_scope(
     if bridge.use_memory:
         adapters.memory.append("stages", f"{run_id}:{int(stage)}:{result.status.value}")
 
-    # These stages publish an exact, manifest-bound namespace. Generic
-    # executor diagnostics are not part of that authority and would make the
-    # next stage's strict replay reject an otherwise valid publication.
-    if stage not in _EXACT_AUTHORITY_NAMESPACE_STAGES:
+    # These stages publish an exact, manifest-bound namespace. The v2 Stage 13
+    # fixed evaluator is likewise manifest-only, while the legacy v1 branch
+    # retains its historical diagnostics namespace.
+    exact_authority_namespace = (
+        stage in _EXACT_AUTHORITY_NAMESPACE_STAGES
+        or (
+            stage is Stage.ITERATIVE_REFINE
+            and result.status is StageStatus.DONE
+            and result.artifacts == ("refinement_result_set.json",)
+        )
+    )
+    if not exact_authority_namespace:
         _write_stage_meta(stage_dir, stage, run_id, result)
 
     _t_health_end = _time.monotonic()
@@ -1110,7 +1154,7 @@ def _execute_stage_under_release_scope(
         "error": result.error,
         "timestamp": _utcnow_iso(),
     }
-    if stage not in _EXACT_AUTHORITY_NAMESPACE_STAGES:
+    if not exact_authority_namespace:
         try:
             (stage_dir / "stage_health.json").write_text(
                 json.dumps(stage_health, indent=2), encoding="utf-8"

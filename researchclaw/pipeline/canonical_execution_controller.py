@@ -419,6 +419,12 @@ class CanonicalRefinementController:
         assert self._namespace is not None
         self._namespace.write_text_atomic(name, text)
 
+    def read_run_file(self, relative_path: str) -> bytes:
+        """Read one upstream authority file through the held Stage 13 epoch."""
+        self.assert_canonical()
+        assert self._namespace is not None
+        return self._namespace.read_run_file(relative_path)
+
     def publish_directory_tree(self, name: str, source: Path) -> None:
         self.assert_canonical()
         assert self._namespace is not None

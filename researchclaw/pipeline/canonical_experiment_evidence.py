@@ -1038,6 +1038,12 @@ def _validate_legacy_experiment_result_set_from_snapshot_root(
 
 def parse_refinement_result_set(text: str) -> dict[str, Any]:
     payload = _parse_object(text, "Stage 13 refinement result set")
+    if type(payload.get("schema_version")) is int and payload["schema_version"] == 2:
+        from researchclaw.pipeline.stage13_domain_evaluator import (
+            parse_domain_evaluator_refinement_result_set,
+        )
+
+        return parse_domain_evaluator_refinement_result_set(text)
     _exact_keys(
         payload,
         {
@@ -1111,10 +1117,22 @@ def validate_refinement_result_set(
     text: str | None = None,
 ) -> dict[str, Any]:
     """Replay Stage 13 baseline, ordered iterations, file closure, and selection."""
+    if text is None:
+        from researchclaw.pipeline.stage13_domain_evaluator import (
+            is_domain_evaluator_refinement_on_disk,
+            validate_domain_evaluator_refinement_result_set,
+        )
+
+        if is_domain_evaluator_refinement_on_disk(run_dir):
+            return validate_domain_evaluator_refinement_result_set(run_dir, config)
     manifest_path = run_dir / "stage-13" / "refinement_result_set.json"
     if text is None:
         text = _read_regular_file(manifest_path, "Stage 13 refinement result set")
     payload = parse_refinement_result_set(text)
+    if payload["schema_version"] == 2:
+        raise CanonicalExperimentEvidenceError(
+            "Stage 13 v2 public replay does not accept a manifest override"
+        )
     baseline_text = _read_regular_file(
         run_dir / "stage-12/experiment_result_set.json", "Stage 12 result set"
     )

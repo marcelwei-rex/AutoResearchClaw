@@ -501,9 +501,48 @@ def _execute_iterative_refine(
     )
 
     require_canonical_evidence_capabilities("stage13.execute_iterative_refine")
+    controller: CanonicalRefinementController | None = None
+    try:
+        controller = CanonicalRefinementController.prepare_generation(run_dir, stage_dir)
+    except (CanonicalExperimentEvidenceError, OSError, RuntimeError) as exc:
+        return StageResult(
+            stage=Stage.ITERATIVE_REFINE,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error=f"Canonical Stage 13 generation preparation failed: {exc}",
+        )
+    from researchclaw.pipeline.stage13_domain_evaluator import (
+        _execute_domain_evaluator_stage13_under_controller,
+        _stage13_uses_domain_evaluator_under_controller,
+    )
+    try:
+        uses_domain_evaluator = _stage13_uses_domain_evaluator_under_controller(
+            controller
+        )
+    except (CanonicalExperimentEvidenceError, OSError, RuntimeError) as exc:
+        controller.close()
+        return StageResult(
+            stage=Stage.ITERATIVE_REFINE,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error=f"Stage 13 preflight failed: Stage 12 result-set dispatch failed: {exc}",
+        )
+    if uses_domain_evaluator:
+        try:
+            return _execute_domain_evaluator_stage13_under_controller(
+                controller=controller,
+                run_dir=run_dir,
+                config=config,
+            )
+        finally:
+            controller.close()
+    resolve_for_legacy = getattr(llm, "resolve_for_legacy", None)
+    if callable(resolve_for_legacy):
+        llm = resolve_for_legacy()
     from researchclaw.experiment.factory import create_sandbox
 
-    controller: CanonicalRefinementController | None = None
     publication_workspace: Path | None = None
 
     def finish(result: StageResult) -> StageResult:
@@ -512,17 +551,6 @@ def _execute_iterative_refine(
         if controller is not None:
             controller.close()
         return result
-
-    try:
-        controller = CanonicalRefinementController.prepare_generation(run_dir, stage_dir)
-    except (OSError, RuntimeError) as exc:
-        return finish(StageResult(
-            stage=Stage.ITERATIVE_REFINE,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            evidence_refs=(),
-            error=f"Canonical Stage 13 generation preparation failed: {exc}",
-        ))
 
     publication_workspace = Path(
         tempfile.mkdtemp(prefix="researchclaw-stage13-publish-")
