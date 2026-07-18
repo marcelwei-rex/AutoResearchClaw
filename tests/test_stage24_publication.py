@@ -225,6 +225,85 @@ def _numeric_bundle(
     )
 
 
+def _domain_numeric_bundle(
+    paper_bytes: bytes,
+) -> Stage24InputBundle:
+    bundle = _bundle()
+    paper = _bound("stage-23/paper_final_verified.md", paper_bytes)
+    rows = [
+        {
+            "circuit_family": f"c{variant:03d}",
+            "circuit_variant": f"c{variant:03d}_ht1",
+            "condition": condition,
+            "metrics": {"auprc": 0.5},
+            "n_total": 10,
+            "n_trojan": 1,
+            "seed": seed,
+        }
+        for condition in (
+            "raw_cc1",
+            "scoap_isolation_forest",
+            "trojnet_community_graphsage",
+        )
+        for seed in (0, 1, 2)
+        for variant in range(1, 19)
+    ]
+    rows[0]["metrics"]["auprc"] = 0.75
+    observations_payload = {
+        "schema_version": 2,
+        "observation_policy_version": 1,
+        "dataset_capture_sha256": "a" * 64,
+        "score_evidence_sha256": "b" * 64,
+        "metric_keys": ["auprc"],
+        "observations": rows,
+        "per_seed": [],
+        "aggregate": [],
+        "primary_metric": {
+            "aggregation": "mean_variants_then_mean_seeds_v1",
+            "condition": "trojnet_community_graphsage",
+            "key": "auprc",
+            "observation_set": "exact_18_variants_per_seed",
+            "value": 0.75,
+        },
+    }
+    content = (
+        json.dumps(
+            observations_payload,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+    evidence = SimpleNamespace(
+        manifest=MappingProxyType(
+            {"schema_version": 2, "generation_kind": "domain_evaluator"}
+        ),
+        metric_observations=MappingProxyType(
+            {"auprc": (Decimal("0.75"),) + (Decimal("0.5"),) * 161}
+        ),
+        selected_result_manifest_path="stage-13/refinement_result_set.json",
+        selected_result_manifest_sha256="c" * 64,
+        selected_execution_artifact=_bound(
+            "stage-12/evidence-v2/observations.json", content
+        ),
+    )
+    return replace(
+        bundle,
+        paper=paper,
+        stage23_publication=replace(bundle.stage23_publication, outputs=(paper,)),
+        stage23_inputs=SimpleNamespace(
+            stage22_inputs=SimpleNamespace(
+                evidence=evidence,
+                stage19_inputs=bundle.stage23_inputs.stage22_inputs.stage19_inputs,
+            )
+        ),  # type: ignore[arg-type]
+        citation_plan=MappingProxyType({"claims": ()}),
+        evidence_cards=(),
+        verification=MappingProxyType({"results": ()}),
+        entries=(),
+    )
 class _SchemaLLM:
     calls = 0
 
@@ -655,6 +734,28 @@ def test_stage24_numeric_support_uses_exact_metric_unit_and_label(
         "total": 2,
         "unsupported": 0,
     }
+
+
+def test_stage24_numeric_support_replays_domain_observation_pointer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _domain_numeric_bundle(b"## Results\n\nAUPRC was 0.75.\n")
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage24_publication.validate_contract_dict",
+        lambda *_args: SimpleNamespace(
+            metric_units={"auprc": "ratio"},
+            metric_display_labels={"auprc": ["AUPRC"]},
+        ),
+    )
+
+    support = _numeric_support(
+        bundle, build_claim_obligation_inventory(bundle.paper.content)
+    )
+    supported = next(item for item in support.values() if item["status"] == "supported")
+
+    assert supported["invocation_ordinal"] is None
+    assert supported["authority_path"] == "stage-12/evidence-v2/observations.json"
+    assert supported["semantic_pointer"] == "/observations/0/metrics/auprc"
 
 
 def test_stage24_numeric_label_requires_lexical_boundary(

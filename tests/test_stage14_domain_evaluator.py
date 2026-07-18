@@ -34,6 +34,56 @@ from researchclaw.pipeline.stages import Stage, StageStatus
 from tests.test_stage10_evaluator_capture import _execute_capture, _prepare_run
 
 
+_DOMAIN_METRICS = (
+    "accuracy",
+    "auprc",
+    "auroc",
+    "f1",
+    "fpr",
+    "precision",
+    "recall",
+    "top_k_precision",
+)
+
+
+def _domain_observation_payload() -> dict[str, object]:
+    rows = [
+        {
+            "circuit_family": f"c{variant:03d}",
+            "circuit_variant": f"c{variant:03d}_ht1",
+            "condition": condition,
+            "metrics": {metric: 1 for metric in _DOMAIN_METRICS},
+            "n_total": 10,
+            "n_trojan": 1,
+            "seed": seed,
+        }
+        for condition in (
+            "raw_cc1",
+            "scoap_isolation_forest",
+            "trojnet_community_graphsage",
+        )
+        for seed in (0, 1, 2)
+        for variant in range(1, 19)
+    ]
+    return {
+        "schema_version": 2,
+        "observation_policy_version": 1,
+        "dataset_capture_sha256": "a" * 64,
+        "score_evidence_sha256": "b" * 64,
+        "metric_keys": list(_DOMAIN_METRICS),
+        "observations": rows,
+        "per_seed": [],
+        "aggregate": [],
+        "primary_metric": {
+            "aggregation": "mean_variants_then_mean_seeds_v1",
+            "condition": "trojnet_community_graphsage",
+            "key": "auprc",
+            "observation_set": "exact_18_variants_per_seed",
+            "value": 1,
+        },
+    }
+
+
 def _prepare_domain_stage14(
     tmp_path: Path,
     canonical_evidence_migration_complete: None,
@@ -67,6 +117,41 @@ def test_stage14_domain_results_table_uses_latex_row_breaks() -> None:
 
     assert b"Metric & Value " + b"\\\\" + b"\n\\hline\n" in table
     assert b"\\\\n" not in table
+
+
+def test_domain_observation_projection_requires_exact_162_row_closure() -> None:
+    payload = _domain_observation_payload()
+    projected = stage14_domain_evaluator.project_domain_metric_observations(
+        canonical_authority_json_text(payload).encode("utf-8")
+    )
+
+    assert tuple(projected) == _DOMAIN_METRICS
+    assert {len(values) for values in projected.values()} == {162}
+
+
+@pytest.mark.parametrize("mutation", ("short", "long", "duplicate", "bool"))
+def test_domain_observation_projection_rejects_nonproduction_shape(
+    mutation: str,
+) -> None:
+    payload = _domain_observation_payload()
+    rows = payload["observations"]
+    assert isinstance(rows, list)
+    if mutation == "short":
+        rows.pop()
+    elif mutation == "long":
+        rows.append(deepcopy(rows[-1]))
+        rows[-1]["circuit_variant"] = "extra_ht1"
+    elif mutation == "duplicate":
+        rows[-1] = deepcopy(rows[0])
+    else:
+        rows[0]["metrics"]["auprc"] = True
+
+    with pytest.raises(
+        stage14_domain_evaluator.Stage14DomainEvaluatorError
+    ):
+        stage14_domain_evaluator.project_domain_metric_observations(
+            canonical_authority_json_text(payload).encode("utf-8")
+        )
 
 
 def test_stage14_domain_public_replay_is_capability_first(
@@ -220,6 +305,25 @@ def test_stage14_domain_evaluator_publishes_fixed_candidate_and_root(
     evidence = load_canonical_experiment_evidence(run)
     assert evidence.manifest["schema_version"] == 2
     assert evidence.selected_result["schema_version"] == 2
+    assert tuple(evidence.metric_observations) == (
+        "accuracy",
+        "auprc",
+        "auroc",
+        "f1",
+        "fpr",
+        "precision",
+        "recall",
+        "top_k_precision",
+    )
+    assert {len(values) for values in evidence.metric_observations.values()} == {162}
+    project = {artifact.logical_name: artifact for artifact in evidence.project_artifacts}
+    assert len(project) == 46
+    assert project["main.py"].source_path == (
+        "stage-10/evaluator-capture-v1/evaluator/evaluator_main.py"
+    )
+    assert "verifier_main.py" in project
+    assert "trojnet/anomaly.py" in project
+    assert "data/c1355/c1355_ht1.bench" in project
     assert {artifact.role for artifact in evidence.artifacts} == {
         "analysis",
         "figure_plan",

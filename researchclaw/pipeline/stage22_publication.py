@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping
@@ -45,6 +46,30 @@ class Stage22PublicationSnapshot:
                 f"Stage 22 publication does not contain exactly one {path}"
             )
         return matches[0]
+
+
+def _reset_stage22_publication_namespace(
+    namespace: BoundOutputNamespace,
+) -> None:
+    """Invalidate the manifest first, then quarantine every owned tree entry."""
+
+    manifest = "stage22_export_manifest.json"
+    entries = namespace.direct_entries()
+    ordered = ((manifest,) if manifest in entries else ()) + tuple(
+        name for name in entries if name != manifest
+    )
+    errors: list[str] = []
+    for name in ordered:
+        try:
+            namespace.quarantine_tree_entry(name)
+        except OSError as exc:
+            errors.append(f"{name}: {exc}")
+    try:
+        namespace.assert_canonical()
+    except OSError as exc:
+        errors.append(f"namespace identity: {exc}")
+    if errors:
+        raise OSError("Stage 22 recursive cleanup failed: " + "; ".join(errors))
 
 
 def validate_stage22_export_publication(
@@ -122,18 +147,17 @@ def publish_stage22_outputs(
         raise Stage22PublicationError("export manifest must be published last")
     with BoundOutputNamespace.open(run_dir, stage_dir, "stage-22") as namespace:
         try:
-            namespace.invalidate(("stage22_export_manifest.json",))
+            _reset_stage22_publication_namespace(namespace)
             expected = _build_manifest(
                 bundle=bundle,
                 direct_files=direct_files,
                 code_files=code_files,
                 generated=generated,
             )
-            namespace.reset_flat_namespace()
             for name, content in sorted(direct_files.items()):
                 _require_direct_name(name)
                 namespace.write_bytes_atomic(name, content)
-            namespace.publish_flat_directory("code", code_files)
+            _publish_code_tree(namespace, code_files)
             namespace.assert_canonical()
             _verify_published_files(
                 namespace, expected, bundle=bundle, generated=generated
@@ -171,11 +195,7 @@ def publish_stage22_outputs(
                 )
         except Exception as exc:
             try:
-                namespace.invalidate(("stage22_export_manifest.json",))
-            except Exception as cleanup_exc:  # noqa: BLE001
-                exc.add_note(f"Stage 22 manifest cleanup failed: {cleanup_exc}")
-            try:
-                namespace.reset_flat_namespace()
+                _reset_stage22_publication_namespace(namespace)
             except Exception as cleanup_exc:  # noqa: BLE001
                 exc.add_note(f"Stage 22 namespace cleanup failed: {cleanup_exc}")
             raise
@@ -352,7 +372,7 @@ def _verify_published_files(
     bundle: Stage22InputBundle,
     generated: str,
 ) -> dict[str, bytes]:
-    code_files = namespace.read_flat_directory("code")
+    code_files = namespace.read_directory_tree("code")
     expected_code = {
         entry["path"].removeprefix("code/"): entry["sha256"]
         for entry in manifest["outputs"]  # type: ignore[index]
@@ -430,7 +450,7 @@ def _parse_file_entries(value: object, *, project: bool) -> None:
         _require_relative_path(path, "Stage 22 file path")
         paths.append(path)
         if project:
-            _require_direct_name(entry["logical_name"])
+            _require_relative_path(entry["logical_name"], "project logical name")
             _require_relative_path(entry["source_path"], "project source path")
             _require_sha256(entry["source_sha256"], "project source sha256")
             _require_sha256(entry["export_sha256"], "project export sha256")
@@ -442,6 +462,21 @@ def _parse_file_entries(value: object, *, project: bool) -> None:
             _require_sha256(entry["sha256"], "output sha256")
     if paths != sorted(set(paths)):
         raise Stage22PublicationError("Stage 22 file paths are not unique and sorted")
+
+
+def _publish_code_tree(
+    namespace: BoundOutputNamespace, code_files: Mapping[str, bytes]
+) -> None:
+    if not code_files:
+        raise Stage22PublicationError("Stage 22 code tree is empty")
+    with tempfile.TemporaryDirectory(prefix="researchclaw-stage22-code-") as raw:
+        root = Path(raw)
+        for relative, content in sorted(code_files.items()):
+            safe = _require_relative_path(relative, "Stage 22 code path")
+            destination = root / safe
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+        namespace.publish_directory_tree("code", root)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:

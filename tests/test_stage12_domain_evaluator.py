@@ -33,8 +33,10 @@ from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
 from researchclaw.pipeline.canonical_evidence_capabilities import (
     CanonicalEvidenceMigrationIncomplete,
 )
+from researchclaw.pipeline.executor import execute_stage
+from researchclaw.pipeline._helpers import StageResult
 from researchclaw.pipeline.stage_impls._execution import _execute_experiment_run
-from researchclaw.pipeline.stages import StageStatus
+from researchclaw.pipeline.stages import Stage, StageStatus
 from tests.test_stage10_evaluator_capture import _execute_capture, _prepare_run
 
 
@@ -55,6 +57,36 @@ def _verifier_module():
     finally:
         sys.dont_write_bytecode = previous
     return module
+
+
+def _seed_executor_postcondition_authority(run: Path) -> None:
+    for stage_name in ("stage-10", "stage-12", "stage-13", "stage-14"):
+        (run / stage_name).mkdir(parents=True, exist_ok=True)
+    (run / "stage-10/evaluator-capture-v1").mkdir()
+    (run / "stage-10/evaluator-capture-v1/capture-manifest.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    (run / "stage-10/selected_candidate_manifest.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    (run / "stage-12/evidence-v2").mkdir()
+    (run / "stage-12/evidence-v2/observations.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    for relative in (
+        "stage-12/experiment_result_set.json",
+        "stage-12/execution_invocation_journal.jsonl",
+        "stage-13/refinement_result_set.json",
+        "canonical_experiment_evidence.json",
+        "experiment_summary_best.json",
+        "analysis_best.md",
+    ):
+        (run / relative).write_text("{}\n", encoding="utf-8")
+    candidate = run / "stage-14/evidence_candidates" / ("cand-" + "0" * 64)
+    candidate.mkdir(parents=True)
+    (candidate / "experiment_evidence_candidate.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
 
 
 @pytest.mark.parametrize(
@@ -293,6 +325,493 @@ def test_stage12_domain_evaluator_runs_twice_from_capture_only(
         monkeypatch.setattr(
             stage12_domain_evaluator, "_run_verifier", original_verifier
         )
+
+
+def test_stage12_executor_fixed_path_never_constructs_llm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run, config = _prepare_run(tmp_path)
+    assert _execute_capture(run, config).status == StageStatus.DONE
+    calls = 0
+
+    def unexpected_llm(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("fixed Stage 12 attempted to construct an LLM")
+
+    monkeypatch.setattr(
+        "researchclaw.pipeline.executor._create_configured_llm", unexpected_llm
+    )
+
+    result = execute_stage(
+        Stage.EXPERIMENT_RUN,
+        run_dir=run,
+        run_id="stage12-domain-zero-llm",
+        config=config,
+        adapters=AdapterBundle(),
+        auto_approve_gates=True,
+    )
+
+    assert result.status is StageStatus.DONE, result.error
+    assert calls == 0
+    assert result.artifacts == (
+        "experiment_result_set.json",
+        "execution_invocation_journal.jsonl",
+        "evidence-v2/",
+    )
+
+
+@pytest.mark.parametrize(
+    "reported",
+    (
+        (),
+        ("experiment_result_set.json", "evidence-v2/"),
+        (
+            "evidence-v2/",
+            "execution_invocation_journal.jsonl",
+            "experiment_result_set.json",
+        ),
+    ),
+)
+def test_stage12_executor_never_falls_back_from_domain_artifact_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+    reported: tuple[str, ...],
+) -> None:
+    run, config = _prepare_run(tmp_path)
+    assert _execute_capture(run, config).status == StageStatus.DONE
+    stage12 = run / "stage-12"
+    stage12.mkdir()
+    (stage12 / "experiment_spec.md").write_text("stale\n", encoding="utf-8")
+    (stage12 / "experiment").mkdir()
+    (stage12 / "experiment/main.py").write_text("stale\n", encoding="utf-8")
+    (stage12 / "evidence-v1").mkdir()
+    (stage12 / "evidence-v1/results.json").write_text("{}\n", encoding="utf-8")
+
+    def malformed_producer(*_args, **_kwargs) -> StageResult:
+        return StageResult(
+            stage=Stage.EXPERIMENT_RUN,
+            status=StageStatus.DONE,
+            artifacts=reported,
+        )
+
+    from researchclaw.pipeline import executor as executor_module
+
+    monkeypatch.setitem(
+        executor_module._STAGE_EXECUTORS,
+        Stage.EXPERIMENT_RUN,
+        malformed_producer,
+    )
+
+    result = execute_stage(
+        Stage.EXPERIMENT_RUN,
+        run_dir=run,
+        run_id="stage12-domain-artifact-contract",
+        config=config,
+        adapters=AdapterBundle(),
+        auto_approve_gates=True,
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "artifact contract mismatch" in (result.error or "")
+
+
+def test_stage12_executor_preserves_postcondition_error_when_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run, config = _prepare_run(tmp_path)
+    assert _execute_capture(run, config).status == StageStatus.DONE
+
+    from researchclaw.pipeline import executor as executor_module
+
+    monkeypatch.setitem(
+        executor_module._STAGE_EXECUTORS,
+        Stage.EXPERIMENT_RUN,
+        lambda *_args, **_kwargs: StageResult(
+            stage=Stage.EXPERIMENT_RUN,
+            status=StageStatus.DONE,
+            artifacts=(),
+        ),
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "_invalidate_failed_domain_evaluator_authority",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cleanup collision")),
+    )
+
+    result = execute_stage(
+        Stage.EXPERIMENT_RUN,
+        run_dir=run,
+        run_id="stage12-domain-cleanup-diagnostic",
+        config=config,
+        adapters=AdapterBundle(),
+        auto_approve_gates=True,
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "artifact contract mismatch" in (result.error or "")
+    assert "canonical authority cleanup failed: cleanup collision" in (
+        result.error or ""
+    )
+
+
+@pytest.mark.parametrize(
+    ("failed_stage", "removed", "preserved"),
+    (
+        (
+            Stage.CODE_GENERATION,
+            (
+                "stage-10/selected_candidate_manifest.json",
+                "stage-10/evaluator-capture-v1",
+                "stage-12/experiment_result_set.json",
+                "stage-13/refinement_result_set.json",
+                "canonical_experiment_evidence.json",
+            ),
+            (),
+        ),
+        (
+            Stage.EXPERIMENT_RUN,
+            (
+                "stage-12/experiment_result_set.json",
+                "stage-12/execution_invocation_journal.jsonl",
+                "stage-12/evidence-v2",
+                "stage-13/refinement_result_set.json",
+                "canonical_experiment_evidence.json",
+            ),
+            ("stage-10/selected_candidate_manifest.json",),
+        ),
+        (
+            Stage.ITERATIVE_REFINE,
+            (
+                "stage-13/refinement_result_set.json",
+                "canonical_experiment_evidence.json",
+            ),
+            ("stage-12/experiment_result_set.json",),
+        ),
+        (
+            Stage.RESULT_ANALYSIS,
+            (
+                "stage-14/evidence_candidates",
+                "canonical_experiment_evidence.json",
+            ),
+            (
+                "stage-12/experiment_result_set.json",
+                "stage-13/refinement_result_set.json",
+            ),
+        ),
+    ),
+)
+def test_executor_postcondition_cleanup_is_stage_scoped(
+    tmp_path: Path,
+    failed_stage: Stage,
+    removed: tuple[str, ...],
+    preserved: tuple[str, ...],
+) -> None:
+    run = tmp_path / "run"
+    _seed_executor_postcondition_authority(run)
+
+    from researchclaw.pipeline import executor as executor_module
+
+    with ReleaseGraphLock.acquire(run, "test.postcondition_cleanup") as lease:
+        executor_module._invalidate_failed_domain_evaluator_authority(
+            failed_stage, run, lease
+        )
+
+    for relative in removed:
+        assert not (run / relative).exists()
+    for relative in preserved:
+        assert (run / relative).exists()
+
+
+def test_executor_cleanup_continues_after_root_commit_point_collision(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "run"
+    _seed_executor_postcondition_authority(run)
+    (run / "canonical_experiment_evidence.json").unlink()
+    (run / "canonical_experiment_evidence.json/nested").mkdir(parents=True)
+
+    from researchclaw.pipeline import executor as executor_module
+
+    with ReleaseGraphLock.acquire(run, "test.root_collision") as lease:
+        with pytest.raises(
+            RuntimeError, match="canonical authority invalidation incomplete"
+        ):
+            executor_module._invalidate_failed_domain_evaluator_authority(
+                Stage.CODE_GENERATION, run, lease
+            )
+
+    assert not (run / "stage-10/selected_candidate_manifest.json").exists()
+    assert not (run / "stage-10/evaluator-capture-v1").exists()
+    assert not (run / "stage-12/experiment_result_set.json").exists()
+    assert not (run / "stage-13/refinement_result_set.json").exists()
+    assert (run / "canonical_experiment_evidence.json").is_dir()
+    assert not (run / "experiment_summary_best.json").exists()
+    assert not (run / "analysis_best.md").exists()
+
+
+def test_executor_cleanup_continues_after_current_manifest_collision(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "run"
+    _seed_executor_postcondition_authority(run)
+    (run / "stage-12/experiment_result_set.json").unlink()
+    (run / "stage-12/experiment_result_set.json/nested").mkdir(parents=True)
+
+    from researchclaw.pipeline import executor as executor_module
+
+    with ReleaseGraphLock.acquire(run, "test.current_collision") as lease:
+        with pytest.raises(
+            RuntimeError, match="canonical authority invalidation incomplete"
+        ):
+            executor_module._invalidate_failed_domain_evaluator_authority(
+                Stage.EXPERIMENT_RUN, run, lease
+            )
+
+    assert (run / "stage-12/experiment_result_set.json").is_dir()
+    assert not (run / "stage-12/execution_invocation_journal.jsonl").exists()
+    assert not (run / "stage-12/evidence-v2").exists()
+    assert not (run / "stage-13/refinement_result_set.json").exists()
+    assert not (run / "canonical_experiment_evidence.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("failed_stage", "tree_name", "removed_commit_points"),
+    (
+        (
+            Stage.CODE_GENERATION,
+            "evaluator-capture-v1",
+            (
+                "stage-10/selected_candidate_manifest.json",
+                "stage-12/experiment_result_set.json",
+                "stage-13/refinement_result_set.json",
+                "canonical_experiment_evidence.json",
+            ),
+        ),
+        (
+            Stage.EXPERIMENT_RUN,
+            "evidence-v2",
+            (
+                "stage-12/experiment_result_set.json",
+                "stage-12/execution_invocation_journal.jsonl",
+                "stage-13/refinement_result_set.json",
+                "canonical_experiment_evidence.json",
+            ),
+        ),
+        (
+            Stage.RESULT_ANALYSIS,
+            "evidence_candidates",
+            (
+                "canonical_experiment_evidence.json",
+                "experiment_summary_best.json",
+                "analysis_best.md",
+            ),
+        ),
+    ),
+)
+def test_executor_cleanup_continues_after_recursive_quarantine_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_stage: Stage,
+    tree_name: str,
+    removed_commit_points: tuple[str, ...],
+) -> None:
+    from researchclaw.pipeline import bound_output_namespace as bound_module
+    from researchclaw.pipeline import executor as executor_module
+
+    run = tmp_path / "run"
+    _seed_executor_postcondition_authority(run)
+    original = bound_module._remove_tree_at
+
+    def fail_quarantine_cleanup(parent_fd: int, name: str) -> None:
+        if name.startswith(f".{tree_name}.rejected-"):
+            raise OSError("injected recursive cleanup collision")
+        original(parent_fd, name)
+
+    monkeypatch.setattr(bound_module, "_remove_tree_at", fail_quarantine_cleanup)
+    with ReleaseGraphLock.acquire(run, "test.quarantine_collision") as lease:
+        with pytest.raises(
+            RuntimeError, match="canonical authority invalidation incomplete"
+        ):
+            executor_module._invalidate_failed_domain_evaluator_authority(
+                failed_stage, run, lease
+            )
+
+    stage_name = {
+        Stage.CODE_GENERATION: "stage-10",
+        Stage.EXPERIMENT_RUN: "stage-12",
+        Stage.RESULT_ANALYSIS: "stage-14",
+    }[failed_stage]
+    assert not (run / stage_name / tree_name).exists()
+    for relative in removed_commit_points:
+        assert not (run / relative).exists()
+
+
+def test_executor_postcondition_cleanup_rejects_untrusted_writer_lease(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "run"
+    other = tmp_path / "other"
+    run.mkdir()
+    other.mkdir()
+
+    from researchclaw.pipeline import executor as executor_module
+
+    with pytest.raises(RuntimeError, match="writer_lease_required"):
+        executor_module._invalidate_failed_domain_evaluator_authority(
+            Stage.EXPERIMENT_RUN, run, object()
+        )
+    with ReleaseGraphLock.acquire(run, "test.reader", mode="read") as reader:
+        with pytest.raises(RuntimeError, match="writer_lease_required"):
+            executor_module._invalidate_failed_domain_evaluator_authority(
+                Stage.EXPERIMENT_RUN, run, reader
+            )
+    with ReleaseGraphLock.acquire(run, "test.wrong_run") as writer:
+        with pytest.raises(RuntimeError, match="writer_lease_run_mismatch"):
+            executor_module._invalidate_failed_domain_evaluator_authority(
+                Stage.EXPERIMENT_RUN, other, writer
+            )
+    inactive = ReleaseGraphLock.acquire(run, "test.inactive")
+    inactive.close()
+    with pytest.raises(RuntimeError, match="lease_inactive"):
+        executor_module._invalidate_failed_domain_evaluator_authority(
+            Stage.EXPERIMENT_RUN, run, inactive
+        )
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "error_fragment"),
+    (
+        ("artifact_mismatch", "artifact contract mismatch"),
+        ("missing_output", "Missing or empty output"),
+        ("replay_failure", "Canonical output contract replay failed"),
+    ),
+)
+def test_stage12_executor_withdraws_published_authority_after_contract_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+    failure_mode: str,
+    error_fragment: str,
+) -> None:
+    run, config = _prepare_run(tmp_path)
+    assert _execute_capture(run, config).status == StageStatus.DONE
+    external = tmp_path / "external-authority.txt"
+    external.write_text("EXTERNAL\n", encoding="utf-8")
+
+    from researchclaw.pipeline import executor as executor_module
+
+    real_producer = executor_module._STAGE_EXECUTORS[Stage.EXPERIMENT_RUN]
+
+    def mismatched_wrapper(*args, **kwargs) -> StageResult:
+        produced = real_producer(*args, **kwargs)
+        assert produced.status is StageStatus.DONE, produced.error
+        stage13 = run / "stage-13"
+        stage13.mkdir(exist_ok=True)
+        (stage13 / "refinement_result_set.json").symlink_to(external)
+        for name in (
+            "canonical_experiment_evidence.json",
+            "experiment_summary_best.json",
+            "analysis_best.md",
+        ):
+            (run / name).write_text("STALE\n", encoding="utf-8")
+        if failure_mode == "artifact_mismatch":
+            return replace(produced, artifacts=())
+        if failure_mode == "missing_output":
+            (run / "stage-12/execution_invocation_journal.jsonl").unlink()
+        else:
+            (run / "stage-10/selected_candidate_manifest.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+        return produced
+
+    monkeypatch.setitem(
+        executor_module._STAGE_EXECUTORS,
+        Stage.EXPERIMENT_RUN,
+        mismatched_wrapper,
+    )
+
+    result = execute_stage(
+        Stage.EXPERIMENT_RUN,
+        run_dir=run,
+        run_id="stage12-domain-postcondition-cleanup",
+        config=config,
+        adapters=AdapterBundle(),
+        auto_approve_gates=True,
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert error_fragment in (result.error or "")
+    assert not (run / "stage-12/experiment_result_set.json").exists()
+    assert not (run / "stage-12/execution_invocation_journal.jsonl").exists()
+    assert not (run / "stage-12/evidence-v2").exists()
+    assert not (run / "stage-13/refinement_result_set.json").exists()
+    assert not (run / "canonical_experiment_evidence.json").exists()
+    assert not (run / "experiment_summary_best.json").exists()
+    assert not (run / "analysis_best.md").exists()
+    assert external.read_text(encoding="utf-8") == "EXTERNAL\n"
+    with pytest.raises((CanonicalExperimentEvidenceError, FileNotFoundError, OSError)):
+        validate_experiment_result_set(run, config)
+
+
+def test_stage12_postcondition_cleanup_uses_held_run_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run, config = _prepare_run(tmp_path)
+    assert _execute_capture(run, config).status == StageStatus.DONE
+    detached = tmp_path / "run-detached"
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "sentinel").write_text("EXTERNAL\n", encoding="utf-8")
+
+    from researchclaw.pipeline import executor as executor_module
+
+    real_producer = executor_module._STAGE_EXECUTORS[Stage.EXPERIMENT_RUN]
+
+    def replacing_wrapper(*args, **kwargs) -> StageResult:
+        produced = real_producer(*args, **kwargs)
+        assert produced.status is StageStatus.DONE, produced.error
+        run.rename(detached)
+        run.symlink_to(external, target_is_directory=True)
+        return produced
+
+    monkeypatch.setitem(
+        executor_module._STAGE_EXECUTORS,
+        Stage.EXPERIMENT_RUN,
+        replacing_wrapper,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="release_graph_run_directory_changed"):
+            execute_stage(
+                Stage.EXPERIMENT_RUN,
+                run_dir=run,
+                run_id="stage12-domain-parent-replacement-cleanup",
+                config=config,
+                adapters=AdapterBundle(),
+                auto_approve_gates=True,
+            )
+
+        assert sorted(path.name for path in external.iterdir()) == ["sentinel"]
+        assert not (detached / "stage-12/experiment_result_set.json").exists()
+        assert not (detached / "stage-12/execution_invocation_journal.jsonl").exists()
+        assert not (detached / "stage-12/evidence-v2").exists()
+    finally:
+        if run.is_symlink():
+            run.unlink()
+        if detached.exists():
+            detached.rename(run)
+
+    with pytest.raises((CanonicalExperimentEvidenceError, FileNotFoundError, OSError)):
+        validate_experiment_result_set(run, config)
+    assert (external / "sentinel").read_text(encoding="utf-8") == "EXTERNAL\n"
 
 
 def test_stage12_different_raw_scores_publish_no_authority(

@@ -139,6 +139,25 @@ def _publication_payload(
     return direct, dict(deterministic.code_files)
 
 
+def _nested_code_bundle(config: RCConfig) -> SimpleNamespace:
+    bundle = _bundle(config)
+    files = {
+        "main.py": b"print('canonical')\n",
+        "trojnet/anomaly.py": b"def score():\n    return 1\n",
+        "data/c1355/c1355_ht1.bench": b"INPUT(a)\nOUTPUT(z)\nz = a\n",
+    }
+    bundle.evidence.project_artifacts = tuple(
+        CanonicalProjectArtifact(
+            logical_name=name,
+            source_path=f"stage-10/evaluator-capture-v1/{name}",
+            sha256=hashlib.sha256(content).hexdigest(),
+            content=content,
+        )
+        for name, content in sorted(files.items())
+    )
+    return bundle
+
+
 def test_stage22_publication_writes_manifest_last_and_binds_code(
     tmp_path: Path,
     canonical_config: RCConfig,
@@ -150,7 +169,7 @@ def test_stage22_publication_writes_manifest_last_and_binds_code(
         "stale\n", encoding="utf-8"
     )
     (stage_dir / "paper_final.md").write_text("stale paper\n", encoding="utf-8")
-    bundle = _bundle(canonical_config)
+    bundle = _nested_code_bundle(canonical_config)
     direct_files, code_files = _publication_payload(bundle)
     checks: list[str] = []
 
@@ -182,6 +201,136 @@ def test_stage22_publication_writes_manifest_last_and_binds_code(
         "references.bib"
     ]
     assert snapshot.require_output("paper.tex").content == direct_files["paper.tex"]
+
+
+def test_stage22_nested_code_tree_can_be_republished(
+    tmp_path: Path,
+    canonical_config: RCConfig,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-22"
+    stage_dir.mkdir(parents=True)
+    bundle = _nested_code_bundle(canonical_config)
+    direct_files, code_files = _publication_payload(bundle)
+
+    for _attempt in range(2):
+        publish_stage22_outputs(
+            run_dir,
+            stage_dir,
+            bundle=bundle,
+            direct_files=direct_files,
+            code_files=code_files,
+            generated=_GENERATED,
+            precommit_check=lambda: None,
+        )
+
+    snapshot = load_stage22_export_publication(run_dir, bundle)
+    assert snapshot.require_output("code/trojnet/anomaly.py").content == code_files[
+        "trojnet/anomaly.py"
+    ]
+    assert snapshot.require_output(
+        "code/data/c1355/c1355_ht1.bench"
+    ).content == code_files["data/c1355/c1355_ht1.bench"]
+
+
+def test_stage22_late_failure_removes_nested_success_namespace(
+    tmp_path: Path,
+    canonical_config: RCConfig,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-22"
+    stage_dir.mkdir(parents=True)
+    bundle = _nested_code_bundle(canonical_config)
+    direct_files, code_files = _publication_payload(bundle)
+    checks = 0
+
+    def fail_after_manifest() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise RuntimeError("injected post-manifest source fixpoint failure")
+
+    with pytest.raises(RuntimeError, match="post-manifest"):
+        publish_stage22_outputs(
+            run_dir,
+            stage_dir,
+            bundle=bundle,
+            direct_files=direct_files,
+            code_files=code_files,
+            generated=_GENERATED,
+            precommit_check=fail_after_manifest,
+        )
+
+    assert tuple(stage_dir.iterdir()) == ()
+
+
+@pytest.mark.parametrize("poison", ("symlink", "fifo"))
+def test_stage22_recursive_cleanup_rejects_nested_special_files_without_following(
+    tmp_path: Path,
+    canonical_config: RCConfig,
+    poison: str,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-22"
+    nested = stage_dir / "code/nested"
+    nested.mkdir(parents=True)
+    external = tmp_path / "external.txt"
+    external.write_text("keep\n", encoding="utf-8")
+    if poison == "symlink":
+        (nested / "poison").symlink_to(external)
+    else:
+        os.mkfifo(nested / "poison")
+    (stage_dir / "stage22_export_manifest.json").write_text(
+        "stale\n", encoding="utf-8"
+    )
+    bundle = _bundle(canonical_config)
+    direct_files, code_files = _publication_payload(bundle)
+
+    publish_stage22_outputs(
+        run_dir,
+        stage_dir,
+        bundle=bundle,
+        direct_files=direct_files,
+        code_files=code_files,
+        generated=_GENERATED,
+        precommit_check=lambda: None,
+    )
+
+    assert external.read_text(encoding="utf-8") == "keep\n"
+    assert validate_stage22_export_publication(run_dir, bundle)
+
+
+def test_stage22_recursive_cleanup_collision_invalidates_success_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from researchclaw.pipeline import bound_output_namespace as bound_module
+
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-22"
+    (stage_dir / "code/nested").mkdir(parents=True)
+    (stage_dir / "code/nested/payload.py").write_text(
+        "value = 1\n", encoding="utf-8"
+    )
+    (stage_dir / "stage22_export_manifest.json").write_text(
+        "stale\n", encoding="utf-8"
+    )
+    original = bound_module._remove_tree_at
+
+    def fail_code_cleanup(parent_fd: int, name: str) -> None:
+        if name.startswith(".code.rejected-"):
+            raise OSError("injected recursive cleanup collision")
+        original(parent_fd, name)
+
+    monkeypatch.setattr(bound_module, "_remove_tree_at", fail_code_cleanup)
+    with pytest.raises(OSError, match="recursive cleanup collision"):
+        export_module._reset_stage22_namespace(run_dir, stage_dir)
+
+    assert not (stage_dir / "stage22_export_manifest.json").exists()
+    assert not (stage_dir / "code").exists()
+    monkeypatch.setattr(bound_module, "_remove_tree_at", original)
+    export_module._reset_stage22_namespace(run_dir, stage_dir)
+    assert tuple(stage_dir.iterdir()) == ()
 
 
 def test_stage23_input_loader_captures_only_replayed_stage22_publication(
@@ -240,7 +389,7 @@ def test_stage22_publication_cleans_outputs_when_precommit_fixpoint_fails(
     assert list(stage_dir.iterdir()) == []
 
 
-def test_stage22_invalidates_old_commit_before_rejecting_nested_output_poison(
+def test_stage22_replaces_stale_nested_output_tree_before_publication(
     tmp_path: Path,
     canonical_config: RCConfig,
 ) -> None:
@@ -253,18 +402,21 @@ def test_stage22_invalidates_old_commit_before_rejecting_nested_output_poison(
     bundle = _bundle(canonical_config)
     direct_files, code_files = _publication_payload(bundle)
 
-    with pytest.raises(OSError, match="unsafe entry"):
-        publish_stage22_outputs(
-            run_dir,
-            stage_dir,
-            bundle=bundle,
-            direct_files=direct_files,
-            code_files=code_files,
-            generated=_GENERATED,
-            precommit_check=lambda: None,
-        )
+    publication = publish_stage22_outputs(
+        run_dir,
+        stage_dir,
+        bundle=bundle,
+        direct_files=direct_files,
+        code_files=code_files,
+        generated=_GENERATED,
+        precommit_check=lambda: None,
+    )
 
-    assert not (stage_dir / "stage22_export_manifest.json").exists()
+    assert publication["schema_version"] == 1
+    assert (stage_dir / "stage22_export_manifest.json").read_text(
+        encoding="utf-8"
+    ) != "stale\n"
+    assert not (stage_dir / "code/nested").exists()
 
 
 def test_stage22_postcommit_fixpoint_failure_removes_manifest_and_outputs(
@@ -754,7 +906,7 @@ def test_stage22_parent_replacement_cannot_touch_external_directory(
     outside.mkdir()
     sentinel = outside / "sentinel.txt"
     sentinel.write_text("keep\n", encoding="utf-8")
-    bundle = _bundle(canonical_config)
+    bundle = _nested_code_bundle(canonical_config)
     direct_files, code_files = _publication_payload(bundle)
     moved = run_dir / "stage-22-moved"
 

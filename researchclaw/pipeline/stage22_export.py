@@ -14,7 +14,10 @@ from researchclaw.pipeline.stage22_input_bundle import (
     Stage22InputBundle,
     verify_stage22_input_bundle_unchanged,
 )
-from researchclaw.pipeline.stage22_publication import publish_stage22_outputs
+from researchclaw.pipeline.stage22_publication import (
+    _reset_stage22_publication_namespace,
+    publish_stage22_outputs,
+)
 from researchclaw.pipeline.stage22_semantics import (
     Stage22SemanticError,
     build_stage22_deterministic_outputs,
@@ -107,8 +110,7 @@ def _export_canonical_stage22_after_invalidation(
 
 def _reset_stage22_namespace(run_dir: Path, stage_dir: Path) -> None:
     with BoundOutputNamespace.open(run_dir, stage_dir, "stage-22") as namespace:
-        namespace.invalidate(("stage22_export_manifest.json",))
-        namespace.reset_flat_namespace()
+        _reset_stage22_publication_namespace(namespace)
 
 
 def _compile_export(

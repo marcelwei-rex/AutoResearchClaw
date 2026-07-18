@@ -237,12 +237,22 @@ def _build_code_package(bundle: Stage22InputBundle, paper: str) -> dict[str, byt
         raise Stage22SemanticError("canonical selected project is incomplete")
     packages = _detect_requirements(project)
     project_list = "\n".join(f"- `{name}`" for name in sorted(project))
+    domain_capture = any(
+        artifact.source_path.startswith("stage-10/evaluator-capture-v1/")
+        for artifact in bundle.evidence.project_artifacts
+    )
+    run_command = (
+        "`python main.py --vendor-root trojnet --data-root data "
+        "--policy execution-policy-v1.json --output score_evidence.jsonl`"
+        if domain_capture
+        else "`python main.py`"
+    )
     readme = (
         f"# Code Package for {_extract_title(paper)}\n\n"
         "## Project Files\n"
         f"{project_list}\n\n"
         "## How to Run\n"
-        "`python main.py`\n\n"
+        f"{run_command}\n\n"
         "## Dependencies\n"
         "Install dependencies with `pip install -r requirements.txt`.\n"
     )

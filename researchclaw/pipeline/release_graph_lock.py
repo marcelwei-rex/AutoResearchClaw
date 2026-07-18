@@ -369,6 +369,19 @@ def require_active_writer_epoch(run_dir: Path, lease: object) -> ReleaseGraphLoc
     return lease
 
 
+def require_active_writer_invalidation_epoch(
+    run_dir: Path, lease: object
+) -> ReleaseGraphLock:
+    """Validate a writer lease for fd-bound cleanup of a detached run inode."""
+
+    if not isinstance(lease, ReleaseGraphLock) or lease._mode != "write":
+        raise RuntimeError("release_graph_writer_lease_required")
+    owner = lease._require_active()
+    if str(owner.run_dir.absolute()) != str(run_dir.absolute()):
+        raise RuntimeError("release_graph_writer_lease_run_mismatch")
+    return lease
+
+
 def require_active_release_graph_epoch(
     run_dir: Path, lease: object
 ) -> ReleaseGraphLock:

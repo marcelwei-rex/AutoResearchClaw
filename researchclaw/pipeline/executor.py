@@ -99,6 +99,171 @@ def _select_output_files(contract, config) -> tuple[str, ...]:
         return tuple(alt)
     return tuple(contract.output_files)
 
+
+def _domain_evaluator_output_contract(
+    stage: Stage,
+    run_dir: Path,
+    config: RCConfig,
+) -> tuple[str, ...] | None:
+    """Derive fixed-evaluator outputs from replayed authority, never producer claims."""
+
+    if stage is Stage.CODE_GENERATION:
+        from researchclaw.pipeline.stage10_evaluator_capture import (
+            load_stage10_contract,
+        )
+
+        _path, authority = load_stage10_contract(run_dir)
+        if authority.schema_version != 3:
+            return None
+        return ("evaluator-capture-v1/", "selected_candidate_manifest.json")
+    if stage is Stage.EXPERIMENT_RUN:
+        from researchclaw.pipeline.canonical_experiment_evidence import (
+            validate_selected_candidate_manifest,
+        )
+
+        authority = validate_selected_candidate_manifest(run_dir, config)
+        if authority["schema_version"] != 3:
+            return None
+        return (
+            "experiment_result_set.json",
+            "execution_invocation_journal.jsonl",
+            "evidence-v2/",
+        )
+    if stage is Stage.ITERATIVE_REFINE:
+        from researchclaw.pipeline.canonical_experiment_evidence import (
+            validate_experiment_result_set,
+        )
+
+        authority = validate_experiment_result_set(run_dir, config)
+        if authority["result_set_type"] != "stage12_domain_evaluator":
+            return None
+        return ("refinement_result_set.json",)
+    if stage is Stage.RESULT_ANALYSIS:
+        from researchclaw.pipeline.canonical_experiment_evidence import (
+            validate_canonical_experiment_manifest,
+        )
+
+        authority = validate_canonical_experiment_manifest(run_dir, config)
+        if not (
+            authority.get("schema_version") == 2
+            and authority.get("generation_kind") == "domain_evaluator"
+        ):
+            return None
+        manifest_path = authority["selected_candidate"]["manifest"]["path"]
+        match = re.fullmatch(
+            r"stage-14/(evidence_candidates/cand-[0-9a-f]{64}/"
+            r"experiment_evidence_candidate\.json)",
+            manifest_path,
+        )
+        if match is None:
+            raise ValueError("invalid Stage 14 domain evaluator artifact path")
+        return (match.group(1),)
+    return None
+
+
+def _invalidate_failed_domain_evaluator_authority(
+    stage: Stage,
+    run_dir: Path,
+    lease: object,
+) -> None:
+    """Withdraw a canonical generation whose executor postconditions failed."""
+
+    from researchclaw.pipeline.release_graph_lock import (
+        require_active_writer_invalidation_epoch,
+    )
+
+    release_lock = require_active_writer_invalidation_epoch(run_dir, lease)
+    errors: list[str] = []
+
+    def attempt(label: str, action: Callable[[], None]) -> None:
+        try:
+            action()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{label}: {exc}")
+
+    if stage is Stage.CODE_GENERATION:
+        from researchclaw.pipeline.stage10_evaluator_capture import (
+            clear_stage10_candidate_authority,
+        )
+
+        def clear_stage10() -> None:
+            with release_lock.open_stage_namespace(
+                "stage-10", create_stage=True
+            ) as namespace:
+                clear_stage10_candidate_authority(namespace)
+                namespace.assert_canonical()
+
+        attempt("Stage 10 authority", clear_stage10)
+        attempt(
+            "downstream commit points",
+            release_lock.invalidate_experiment_commit_points,
+        )
+    elif stage is Stage.EXPERIMENT_RUN:
+        from researchclaw.pipeline.stage12_domain_evaluator import _reset_stage12
+
+        def clear_stage12() -> None:
+            with release_lock.open_stage_namespace(
+                "stage-12", create_stage=True
+            ) as namespace:
+                _reset_stage12(namespace)
+                namespace.assert_canonical()
+
+        attempt("Stage 12 authority", clear_stage12)
+        attempt(
+            "downstream commit points",
+            release_lock.invalidate_experiment_commit_points,
+        )
+    elif stage is Stage.ITERATIVE_REFINE:
+        def clear_stage13() -> None:
+            with release_lock.open_stage_namespace(
+                "stage-13", create_stage=True
+            ) as namespace:
+                namespace.quarantine_tree_entry("refinement_result_set.json")
+                namespace.assert_canonical()
+
+        attempt("Stage 13 authority", clear_stage13)
+        attempt(
+            "root commit points",
+            lambda: release_lock.invalidate_experiment_commit_points(
+                include_stage12=False
+            ),
+        )
+    elif stage is Stage.RESULT_ANALYSIS:
+        attempt(
+            "root commit points",
+            lambda: release_lock.invalidate_experiment_commit_points(
+                include_stage12=False, include_stage13=False
+            ),
+        )
+
+        def clear_stage14_candidates() -> None:
+            with release_lock.open_stage_namespace(
+                "stage-14", create_stage=True
+            ) as namespace:
+                namespace.quarantine_tree_entry("evidence_candidates")
+                namespace.assert_canonical()
+
+        attempt("Stage 14 candidates", clear_stage14_candidates)
+    if errors:
+        raise RuntimeError(
+            "canonical authority invalidation incomplete: " + "; ".join(errors)
+        )
+
+
+def _append_authority_cleanup_error(
+    result: StageResult,
+    cleanup_error: Exception,
+) -> StageResult:
+    message = result.error or "Canonical executor postcondition failed"
+    return StageResult(
+        stage=result.stage,
+        status=result.status,
+        artifacts=result.artifacts,
+        error=f"{message}; canonical authority cleanup failed: {cleanup_error}",
+        decision=result.decision,
+        evidence_refs=result.evidence_refs,
+    )
+
 # ---------------------------------------------------------------------------
 # Domain detection (extracted to _domain.py)
 # ---------------------------------------------------------------------------
@@ -869,6 +1034,7 @@ def execute_stage(
             config=config,
             adapters=adapters,
             auto_approve_gates=auto_approve_gates,
+            release_lock=None,
         )
     from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
 
@@ -888,6 +1054,7 @@ def execute_stage(
             config=config,
             adapters=adapters,
             auto_approve_gates=auto_approve_gates,
+            release_lock=release_lock,
         )
         release_lock.assert_canonical()
         return result
@@ -901,6 +1068,7 @@ def _execute_stage_under_release_scope(
     config: RCConfig,
     adapters: AdapterBundle,
     auto_approve_gates: bool = False,
+    release_lock: object | None = None,
 ) -> StageResult:
     """Execute one pipeline stage, validate outputs, and apply gate logic."""
 
@@ -967,11 +1135,16 @@ def _execute_stage_under_release_scope(
     if bridge.use_memory:
         adapters.memory.append("stages", f"{run_id}:{int(stage)}:running")
 
-    # Stages 13-14 choose their canonical v2 evaluator only after invalidating
-    # stale authority under a held writer epoch. Their fixed paths never need an
-    # LLM; the legacy v1 branches resolve this proxy on their first chat.
+    # Stages 10 and 12-14 choose their canonical domain evaluator before any
+    # model call. Fixed paths never need an LLM; legacy branches resolve this
+    # proxy on their first chat.
     llm: LLMClient | _DeferredLLMClient | None
-    if stage in {Stage.ITERATIVE_REFINE, Stage.RESULT_ANALYSIS}:
+    if stage in {
+        Stage.CODE_GENERATION,
+        Stage.EXPERIMENT_RUN,
+        Stage.ITERATIVE_REFINE,
+        Stage.RESULT_ANALYSIS,
+    }:
         llm = _DeferredLLMClient(lambda: _create_configured_llm(config))
     else:
         llm = _create_configured_llm(config)
@@ -1005,23 +1178,47 @@ def _execute_stage_under_release_scope(
             decision="retry",
         )
 
+    invalidate_domain_authority = False
     if result.status == StageStatus.DONE:
         output_files = _select_output_files(contract, config)
-        stage14_domain_result = (
-            stage is Stage.RESULT_ANALYSIS
-            and len(result.artifacts) == 1
-            and result.artifacts[0].startswith(
-                "evidence_candidates/cand-"
+        try:
+            domain_outputs = _domain_evaluator_output_contract(
+                stage, run_dir, config
             )
-            and result.artifacts[0].endswith(
-                "/experiment_evidence_candidate.json"
+        except Exception as exc:  # noqa: BLE001
+            result = StageResult(
+                stage=stage,
+                status=StageStatus.FAILED,
+                artifacts=result.artifacts,
+                error=f"Canonical output contract replay failed: {exc}",
+                decision="retry",
+                evidence_refs=result.evidence_refs,
             )
-        )
-        if (
-            stage is Stage.ITERATIVE_REFINE
-            and result.artifacts == ("refinement_result_set.json",)
-        ) or stage14_domain_result:
-            output_files = result.artifacts
+            domain_outputs = None
+            invalidate_domain_authority = stage in {
+                Stage.CODE_GENERATION,
+                Stage.EXPERIMENT_RUN,
+                Stage.ITERATIVE_REFINE,
+                Stage.RESULT_ANALYSIS,
+            }
+        if result.status == StageStatus.DONE and domain_outputs is not None:
+            if result.artifacts != domain_outputs:
+                result = StageResult(
+                    stage=stage,
+                    status=StageStatus.FAILED,
+                    artifacts=result.artifacts,
+                    error=(
+                        "Canonical domain evaluator artifact contract mismatch: "
+                        f"expected {domain_outputs!r}, got {result.artifacts!r}"
+                    ),
+                    decision="retry",
+                    evidence_refs=result.evidence_refs,
+                )
+                invalidate_domain_authority = True
+            else:
+                output_files = domain_outputs
+        if result.status != StageStatus.DONE:
+            output_files = ()
         for output_file in output_files:
             if output_file.endswith("/"):
                 path = stage_dir / output_file.rstrip("/")
@@ -1034,6 +1231,8 @@ def _execute_stage_under_release_scope(
                         decision="retry",
                         evidence_refs=result.evidence_refs,
                     )
+                    if domain_outputs is not None:
+                        invalidate_domain_authority = True
                     break
             else:
                 path = stage_dir / output_file
@@ -1046,7 +1245,20 @@ def _execute_stage_under_release_scope(
                         decision="retry",
                         evidence_refs=result.evidence_refs,
                     )
+                    if domain_outputs is not None:
+                        invalidate_domain_authority = True
                     break
+        if invalidate_domain_authority:
+            try:
+                if release_lock is None:
+                    raise RuntimeError(
+                        "canonical executor postcondition cleanup requires writer epoch"
+                    )
+                _invalidate_failed_domain_evaluator_authority(
+                    stage, run_dir, release_lock
+                )
+            except Exception as cleanup_exc:  # noqa: BLE001
+                result = _append_authority_cleanup_error(result, cleanup_exc)
 
     # --- MetaClaw PRM quality gate evaluation ---
     try:
@@ -1139,6 +1351,12 @@ def _execute_stage_under_release_scope(
 
     if bridge.use_memory:
         adapters.memory.append("stages", f"{run_id}:{int(stage)}:{result.status.value}")
+
+    # Canonical postcondition failure has already withdrawn its authority under
+    # the held writer epoch. Do not reopen the live stage path for diagnostics
+    # or HITL; the outer epoch performs the final run-directory identity check.
+    if invalidate_domain_authority:
+        return result
 
     # These stages publish an exact, manifest-bound namespace. The v2 Stage 13
     # fixed evaluator is likewise manifest-only, while the legacy v1 branch

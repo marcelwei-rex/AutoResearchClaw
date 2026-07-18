@@ -25,6 +25,7 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalEvidenceArtifact,
     CanonicalExperimentEvidence,
     CanonicalExperimentEvidenceError,
+    CanonicalProjectArtifact,
     _CanonicalPublicationPlan,
     _exact_keys,
     _file_ref_v2,
@@ -127,6 +128,7 @@ class _DomainStage14Snapshot:
     analysis_copy: bytes | None
     stage12_manifest: bytes
     stage13_manifest: bytes
+    stage10_capture_tree: tuple[tuple[str, bytes], ...]
     run_files: tuple[tuple[str, bytes], ...]
     config_entries: tuple[tuple[str, bytes], ...]
 
@@ -833,6 +835,7 @@ def _build_root_plan_from_source(
         analysis_copy=None,
         stage12_manifest=source["baseline_bytes"],
         stage13_manifest=source["refinement_bytes"],
+        stage10_capture_tree=(),
         run_files=tuple(sorted(source["run_files"].items())),
         config_entries=source["config_entries"],
     )
@@ -931,6 +934,15 @@ def _capture_domain_stage14_snapshot(
         analysis_copy = namespace.read_run_file("analysis_best.md")
     stage12_manifest = namespace.read_run_file("stage-12/experiment_result_set.json")
     stage13_manifest = namespace.read_run_file("stage-13/refinement_result_set.json")
+    with lease.open_stage_namespace("stage-10") as stage10_namespace:
+        stage10_capture_tree = tuple(
+            sorted(
+                stage10_namespace.read_directory_tree(
+                    "evaluator-capture-v1"
+                ).items()
+            )
+        )
+        stage10_namespace.assert_canonical()
     try:
         baseline = parse_experiment_result_set(stage12_manifest.decode("utf-8"))
         refinement = parse_domain_evaluator_refinement_result_set(
@@ -953,6 +965,7 @@ def _capture_domain_stage14_snapshot(
         analysis_copy=analysis_copy,
         stage12_manifest=stage12_manifest,
         stage13_manifest=stage13_manifest,
+        stage10_capture_tree=stage10_capture_tree,
         run_files=tuple(sorted(run_files.items())),
         config_entries=config_entries,
     )
@@ -1380,6 +1393,8 @@ def _snapshot_accessor(
     )
     if not isinstance(results, dict) or not isinstance(observations, dict):
         raise Stage14DomainEvaluatorError("canonical domain observation payload is invalid")
+    metric_observations = _project_metric_observations(observations)
+    project_artifacts = _domain_project_artifacts(snapshot, source)
     candidate_manifest = tree["experiment_evidence_candidate.json"]
     contract = _bytes_from_ref(source, source["baseline"]["experiment_contract"])
     return CanonicalExperimentEvidence(
@@ -1408,10 +1423,220 @@ def _snapshot_accessor(
         summary=_freeze_authority_value(summary),
         analysis_bytes=artifact_map["analysis"].content,
         analysis_text=artifact_map["analysis"].content.decode("utf-8"),
-        metric_observations=_freeze_authority_value(observations),
+        metric_observations=_freeze_authority_value(metric_observations),
         structured_results=_freeze_authority_value(results),
         artifacts=artifacts,
-        project_artifacts=(),
+        project_artifacts=project_artifacts,
+    )
+
+
+def _project_metric_observations(
+    observations: Mapping[str, Any],
+) -> dict[str, list[int | Decimal]]:
+    """Project replayed domain rows onto the legacy metric-series interface."""
+
+    metric_keys = observations.get("metric_keys")
+    rows = observations.get("observations")
+    if (
+        not isinstance(metric_keys, list)
+        or not metric_keys
+        or any(not isinstance(key, str) or not key for key in metric_keys)
+        or len(metric_keys) != len(set(metric_keys))
+        or not isinstance(rows, list)
+        or len(rows) != 162
+    ):
+        raise Stage14DomainEvaluatorError(
+            "canonical domain metric observation projection is invalid"
+        )
+    projected: dict[str, list[int | Decimal]] = {key: [] for key in metric_keys}
+    expected_keys = set(metric_keys)
+    identities: set[tuple[str, str, str, int]] = set()
+    group_counts: dict[tuple[str, int], int] = {}
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or set(row)
+            != {
+                "circuit_family",
+                "circuit_variant",
+                "condition",
+                "metrics",
+                "n_total",
+                "n_trojan",
+                "seed",
+            }
+            or not isinstance(row.get("metrics"), dict)
+        ):
+            raise Stage14DomainEvaluatorError(
+                "canonical domain observation row is invalid"
+            )
+        family = row["circuit_family"]
+        variant = row["circuit_variant"]
+        condition = row["condition"]
+        seed = row["seed"]
+        if (
+            not isinstance(family, str)
+            or not family
+            or not isinstance(variant, str)
+            or not variant
+            or not isinstance(condition, str)
+            or not condition
+            or type(seed) is not int
+            or type(row["n_total"]) is not int
+            or type(row["n_trojan"]) is not int
+        ):
+            raise Stage14DomainEvaluatorError(
+                "canonical domain observation identity is invalid"
+            )
+        identity = (family, variant, condition, seed)
+        if identity in identities:
+            raise Stage14DomainEvaluatorError(
+                "canonical domain observation identity is duplicated"
+            )
+        identities.add(identity)
+        group = (condition, seed)
+        group_counts[group] = group_counts.get(group, 0) + 1
+        metrics = row["metrics"]
+        if set(metrics) != expected_keys:
+            raise Stage14DomainEvaluatorError(
+                "canonical domain observation metric layout mismatch"
+            )
+        for key in metric_keys:
+            value = metrics[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, Decimal))
+                or isinstance(value, Decimal)
+                and not value.is_finite()
+            ):
+                raise Stage14DomainEvaluatorError(
+                    "canonical domain metric observation must be finite numeric"
+                )
+            projected[key].append(value)
+    if len(group_counts) != 9 or set(group_counts.values()) != {18}:
+        raise Stage14DomainEvaluatorError(
+            "canonical domain observation condition/seed closure mismatch"
+        )
+    return projected
+
+
+def project_domain_metric_observations(content: bytes) -> dict[str, list[int | Decimal]]:
+    """Strictly replay the v2 observation artifact used by release consumers."""
+
+    try:
+        value = _parse_json_value(content.decode("utf-8"), "domain observations")
+    except UnicodeDecodeError as exc:
+        raise Stage14DomainEvaluatorError(
+            "canonical domain observations are not UTF-8"
+        ) from exc
+    expected = {
+        "schema_version",
+        "observation_policy_version",
+        "dataset_capture_sha256",
+        "score_evidence_sha256",
+        "metric_keys",
+        "observations",
+        "per_seed",
+        "aggregate",
+        "primary_metric",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise Stage14DomainEvaluatorError(
+            "canonical domain observation fields mismatch"
+        )
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 2
+        or type(value["observation_policy_version"]) is not int
+        or value["observation_policy_version"] != 1
+    ):
+        raise Stage14DomainEvaluatorError(
+            "canonical domain observation policy mismatch"
+        )
+    _sha256(value["dataset_capture_sha256"], "dataset_capture_sha256")
+    _sha256(value["score_evidence_sha256"], "score_evidence_sha256")
+    if canonical_authority_json_text(value).encode("utf-8") != content:
+        raise Stage14DomainEvaluatorError(
+            "canonical domain observations are not canonical JSON"
+        )
+    return _project_metric_observations(value)
+
+
+def _domain_project_artifacts(
+    snapshot: _DomainStage14Snapshot,
+    source: Mapping[str, Any],
+) -> tuple[CanonicalProjectArtifact, ...]:
+    """Expose the exact Stage 10 evaluator capture as the release code tree."""
+
+    tree = dict(snapshot.stage10_capture_tree)
+    manifest_path = "capture-manifest.json"
+    expected_manifest = _bytes_from_ref(source, source["baseline"]["capture_manifest"])
+    if tree.get(manifest_path) != expected_manifest:
+        raise Stage14DomainEvaluatorError("Stage 10 capture manifest snapshot mismatch")
+    manifest = _parse_json_value(
+        expected_manifest.decode("utf-8"), "Stage 10 capture manifest"
+    )
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
+        raise Stage14DomainEvaluatorError("Stage 10 capture manifest is invalid")
+    expected_paths = {manifest_path}
+    artifacts: list[CanonicalProjectArtifact] = []
+    for item in manifest["files"]:
+        if not isinstance(item, dict) or set(item) != {
+            "role",
+            "path",
+            "sha256",
+            "size",
+            "package_entry_sha256",
+        }:
+            raise Stage14DomainEvaluatorError("Stage 10 capture file entry is invalid")
+        path = item["path"]
+        if not isinstance(path, str) or path in expected_paths:
+            raise Stage14DomainEvaluatorError("Stage 10 capture file path is invalid")
+        expected_paths.add(path)
+        try:
+            content = tree[path]
+        except KeyError as exc:
+            raise Stage14DomainEvaluatorError(
+                f"Stage 10 capture project file is missing: {path}"
+            ) from exc
+        if (
+            type(item["size"]) is not int
+            or len(content) != item["size"]
+            or hashlib.sha256(content).hexdigest() != item["sha256"]
+        ):
+            raise Stage14DomainEvaluatorError(
+                f"Stage 10 capture project file binding mismatch: {path}"
+            )
+        logical_name = _domain_project_logical_name(path, item["role"])
+        artifacts.append(
+            CanonicalProjectArtifact(
+                logical_name=logical_name,
+                source_path=f"stage-10/evaluator-capture-v1/{path}",
+                sha256=item["sha256"],
+                content=content,
+            )
+        )
+    if set(tree) != expected_paths:
+        raise Stage14DomainEvaluatorError("Stage 10 capture project namespace mismatch")
+    names = [artifact.logical_name for artifact in artifacts]
+    if len(names) != len(set(names)) or "main.py" not in names:
+        raise Stage14DomainEvaluatorError("domain evaluator release project is invalid")
+    return tuple(sorted(artifacts, key=lambda artifact: artifact.logical_name))
+
+
+def _domain_project_logical_name(path: str, role: object) -> str:
+    if role == "evaluator" and path == "evaluator/evaluator_main.py":
+        return "main.py"
+    if role == "verifier" and path == "verifier/verifier_main.py":
+        return "verifier_main.py"
+    if role == "vendor" and path.startswith("vendor/"):
+        return "trojnet/" + path.removeprefix("vendor/")
+    if role == "policy" and path == "policy/execution-policy-v1.json":
+        return "execution-policy-v1.json"
+    if role == "data" and path.startswith("data/"):
+        return path
+    raise Stage14DomainEvaluatorError(
+        f"unsupported domain evaluator release project entry: {path}"
     )
 
 

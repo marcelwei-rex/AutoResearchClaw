@@ -31,7 +31,8 @@ from researchclaw.pipeline.stage10_evaluator_capture import (
 )
 from researchclaw.pipeline.stage_impls._code_generation import _execute_code_generation
 from researchclaw.pipeline.stage_impls import _execution
-from researchclaw.pipeline.stages import StageStatus
+from researchclaw.pipeline.executor import execute_stage
+from researchclaw.pipeline.stages import Stage, StageStatus
 
 
 TOPIC = "TrojNet hardware Trojan localization on ISCAS-85 circuits"
@@ -136,6 +137,38 @@ def test_stage10_domain_evaluator_capture_is_exact_and_replayable(
     }
     assert len(capture_files) == 47
     assert "capture-manifest.json" in capture_files
+
+
+def test_stage10_executor_accepts_exact_domain_capture_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run, config = _prepare_run(tmp_path)
+    (run / "stage-09/exp_plan.yaml").write_text(
+        "mode: fixed_domain_evaluator\n", encoding="utf-8"
+    )
+
+    def unexpected_llm(*_args, **_kwargs):
+        raise AssertionError("fixed Stage 10 attempted to construct an LLM")
+
+    monkeypatch.setattr(
+        "researchclaw.pipeline.executor._create_configured_llm", unexpected_llm
+    )
+    result = execute_stage(
+        Stage.CODE_GENERATION,
+        run_dir=run,
+        run_id="stage10-domain-executor-contract",
+        config=config,
+        adapters=AdapterBundle(),
+        auto_approve_gates=True,
+    )
+
+    assert result.status is StageStatus.DONE, result.error
+    assert result.artifacts == (
+        "evaluator-capture-v1/",
+        "selected_candidate_manifest.json",
+    )
 
 
 def test_captured_authority_rejects_coherent_package_hash_rewrite() -> None:

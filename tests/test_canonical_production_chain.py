@@ -97,7 +97,53 @@ class _ProductionChainLLM:
         user = "\n".join(message.get("content", "") for message in messages)
         system = str(kwargs.get("system", ""))
 
-        if "STAGE 5 BATCH OUTPUT CONTRACT" in user:
+        if "Create a SMART research goal in markdown" in user:
+            response = (
+                "# Research Goal\n\n## Topic\nTrojNet hardware Trojan localization.\n\n"
+                "## Novel Angle\nDeterministic graph-localization evidence is replayed "
+                "under a bounded synthetic validation scope.\n\n## Scope\nISCAS-85 "
+                "circuits and fixed seeds.\n\n## SMART Goal\nRun the complete canonical "
+                "evaluator and preserve exact provenance.\n\n## Constraints\nSynthetic "
+                "pipeline validation only.\n\n## Success Criteria\nAll canonical stages "
+                "replay without unsupported authority.\n"
+            )
+        elif "Decompose this research problem" in user:
+            response = (
+                "# Problem Decomposition\n\n## Source\nCanonical TrojNet validation.\n\n"
+                "## Sub-questions\n1. Are raw scores deterministic?\n2. Are metrics "
+                "independently reconstructed?\n3. Is provenance complete?\n4. Does "
+                "release replay reject mixed generations?\n\n## Priority Ranking\n"
+                "1. Raw authority\n2. Metric reconstruction\n3. Release binding\n\n"
+                "## Risks\nSynthetic evidence does not establish scientific validity.\n"
+            )
+        elif "Evaluate this research topic" in user:
+            response = json.dumps(
+                {
+                    "novelty": 8,
+                    "specificity": 10,
+                    "feasibility": 10,
+                    "overall": 9,
+                    "suggestion": "Keep the pipeline-validation scope explicit.",
+                },
+                sort_keys=True,
+            )
+        elif "Create a merged search strategy package" in user:
+            response = json.dumps(
+                {
+                    "search_plan_yaml": (
+                        "topic: TrojNet hardware Trojan localization on ISCAS-85 circuits\n"
+                        "search_strategies:\n"
+                        "  - name: hardware_trojan_localization\n"
+                        "    queries:\n"
+                        "      - TrojNet hardware Trojan localization ISCAS-85\n"
+                        "      - graph neural network hardware Trojan detection\n"
+                        "filters:\n  min_year: 2020\n"
+                    ),
+                    "sources": [],
+                },
+                sort_keys=True,
+            )
+        elif "STAGE 5 BATCH OUTPUT CONTRACT" in user:
             response = self._screening_response(user)
         elif user.startswith("Extract structured summaries only"):
             response = self._card_response(user)
@@ -310,9 +356,16 @@ class DetectorPlugin:
         )
 
 
-def _config(run_dir: Path, *, claim_scope: str) -> RCConfig:
+def _config(
+    run_dir: Path,
+    *,
+    claim_scope: str,
+    topic: str | None = None,
+) -> RCConfig:
     raw = yaml.safe_load(Path("config.deepseek.sectional-dry-run.yaml").read_text())
     raw["project"]["name"] = "canonical-production-chain"
+    if topic is not None:
+        raw["research"]["topic"] = topic
     raw["research"]["quality_threshold"] = 1.0
     raw["research"]["graceful_degradation"] = True
     raw["llm"]["base_url"] = "test://production-chain"

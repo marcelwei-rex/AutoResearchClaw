@@ -375,7 +375,10 @@ def test_reader_epoch_rejects_stage4_through_stage11_before_outputs(
     assert not (run_dir / f"stage-{int(stage):02d}").exists()
 
 
-def test_reader_epoch_rejects_direct_stage14_publishers(tmp_path: Path) -> None:
+def test_reader_epoch_rejects_direct_stage14_publishers(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
     run_dir = tmp_path / "run"
     stage_dir = run_dir / "stage-14"
     staging = stage_dir / ".candidate-staging-test"

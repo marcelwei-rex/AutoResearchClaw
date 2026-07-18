@@ -25,6 +25,9 @@ from researchclaw.pipeline.stage15_critique import (
     Stage15CritiquePublication,
     _reconstruct_stage15_critique_from_verified_context,
 )
+from researchclaw.pipeline.stage13_domain_evaluator import (
+    parse_domain_evaluator_refinement_result_set,
+)
 from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
 from researchclaw.pipeline.stage19_input_bundle import _read_regular_file
 from researchclaw.pipeline.stage23_verification import Stage23PublicationSnapshot
@@ -215,15 +218,19 @@ def _capture_release_authority_artifacts(
 
     def add_supplemental_disk(role: str, path: str) -> bytes:
         artifact = _read_regular_file(run_dir, validate_release_authority_path(path))
-        primary_content = primary_entries.get(artifact.path)
-        if primary_content is not None:
-            if artifact.content != primary_content:
-                raise IndependentReleaseReconstructionError(
-                    f"release authority bytes diverged for primary path: {artifact.path}"
-                )
-            return artifact.content
-        add(role, artifact.path, artifact.content)
+        add_supplemental(role, artifact.path, artifact.content)
         return artifact.content
+
+    def add_supplemental(role: str, path: str, content: bytes) -> None:
+        path = validate_release_authority_path(path)
+        primary_content = primary_entries.get(path)
+        if primary_content is not None:
+            if content != primary_content:
+                raise IndependentReleaseReconstructionError(
+                    f"release authority bytes diverged for primary path: {path}"
+                )
+            return
+        add(role, path, content)
 
     for entry in stage24_inputs.entries:
         add(entry.role, entry.artifact.path, entry.artifact.content)
@@ -240,7 +247,11 @@ def _capture_release_authority_artifacts(
         ("selected_analysis", evidence.analysis_bytes),
     ):
         ref = evidence.manifest[field]
-        add(field, ref["canonical_path"], content)
+        if _is_domain_evaluator(evidence):
+            path = ref["canonical_copy"]["path"]
+        else:
+            path = ref["canonical_path"]
+        add(field, path, content)
 
     for name in (
         "experiment_contract.sha256",
@@ -253,17 +264,53 @@ def _capture_release_authority_artifacts(
     add_supplemental_disk(
         "stage10_seal", "stage-10/selected_candidate_manifest.json"
     )
-    _capture_flat_directory(
-        run_dir,
-        "stage-10/selected_candidate",
-        role="stage10_project",
-        add_disk=add_supplemental_disk,
-    )
+    if not _is_domain_evaluator(evidence):
+        _capture_flat_directory(
+            run_dir,
+            "stage-10/selected_candidate",
+            role="stage10_project",
+            add_disk=add_supplemental_disk,
+        )
 
     baseline_text = add_supplemental_disk(
         "stage12_manifest", "stage-12/experiment_result_set.json"
     )
     baseline = parse_experiment_result_set(baseline_text.decode("utf-8"))
+    if _is_domain_evaluator(evidence):
+        for field, expected_path in (
+            (
+                "package_manifest",
+                "stage-09/domain_evaluator_package_manifest.json",
+            ),
+            (
+                "execution_policy",
+                "stage-09/domain_evaluator_execution_policy.json",
+            ),
+        ):
+            ref = baseline[field]
+            if ref["path"] != expected_path:
+                raise IndependentReleaseReconstructionError(
+                    f"noncanonical Stage 9 domain authority path: {field}"
+                )
+            content = add_supplemental_disk(
+                "stage09_domain_authority", expected_path
+            )
+            if (
+                hashlib.sha256(content).hexdigest() != ref["sha256"]
+                or len(content) != ref["size"]
+            ):
+                raise IndependentReleaseReconstructionError(
+                    f"Stage 9 domain authority binding mismatch: {field}"
+                )
+        add_supplemental_disk(
+            "stage10_domain_capture", baseline["capture_manifest"]["path"]
+        )
+        for artifact in evidence.project_artifacts:
+            add_supplemental(
+                "stage10_domain_capture",
+                artifact.source_path,
+                artifact.content,
+            )
     add_supplemental_disk(
         "stage12_journal", baseline["invocation_journal"]["path"]
     )
@@ -274,26 +321,38 @@ def _capture_release_authority_artifacts(
         refinement_text = add_supplemental_disk(
             "selected_result_manifest", evidence.selected_result_manifest_path
         )
-        refinement = parse_refinement_result_set(refinement_text.decode("utf-8"))
-        add_supplemental_disk(
-            "stage13_refinement_log", refinement["refinement_log"]["path"]
-        )
-        for iteration in refinement["iterations"]:
-            for ref in (
-                *iteration["project_files"],
-                iteration["validation_report"],
-                iteration["initial_execution"],
-            ):
-                add_supplemental_disk("stage13_evidence", ref["path"])
-        _capture_flat_directory(
-            run_dir,
-            "stage-13/experiment_final",
-            role="stage13_compatibility",
-            add_disk=add_supplemental_disk,
-        )
-        add_supplemental_disk(
-            "stage13_compatibility", "stage-13/experiment_final.py"
-        )
+        if _is_domain_evaluator(evidence):
+            refinement = parse_domain_evaluator_refinement_result_set(
+                refinement_text.decode("utf-8")
+            )
+            if refinement["selected_result"] != {
+                "type": "baseline",
+                "iteration_id": None,
+            } or refinement["iterations"] != []:
+                raise IndependentReleaseReconstructionError(
+                    "domain evaluator refinement selection is invalid"
+                )
+        else:
+            refinement = parse_refinement_result_set(refinement_text.decode("utf-8"))
+            add_supplemental_disk(
+                "stage13_refinement_log", refinement["refinement_log"]["path"]
+            )
+            for iteration in refinement["iterations"]:
+                for ref in (
+                    *iteration["project_files"],
+                    iteration["validation_report"],
+                    iteration["initial_execution"],
+                ):
+                    add_supplemental_disk("stage13_evidence", ref["path"])
+            _capture_flat_directory(
+                run_dir,
+                "stage-13/experiment_final",
+                role="stage13_compatibility",
+                add_disk=add_supplemental_disk,
+            )
+            add_supplemental_disk(
+                "stage13_compatibility", "stage-13/experiment_final.py"
+            )
     elif evidence.selected_result_manifest_path != "stage-12/experiment_result_set.json":
         raise IndependentReleaseReconstructionError(
             "selected result manifest has a noncanonical path"
@@ -302,6 +361,13 @@ def _capture_release_authority_artifacts(
     _capture_stage14_candidates(run_dir, add_disk=add_supplemental_disk)
 
     return _build_exact_release_authority_artifacts(rows)
+
+
+def _is_domain_evaluator(evidence: CanonicalExperimentEvidence) -> bool:
+    return (
+        evidence.manifest.get("schema_version") == 2
+        and evidence.manifest.get("generation_kind") == "domain_evaluator"
+    )
 
 
 def _build_exact_release_authority_artifacts(

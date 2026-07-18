@@ -55,6 +55,10 @@ from researchclaw.pipeline.stage24_obligations import (
     canonical_obligation_inventory_bytes,
     parse_claim_obligation_inventory,
 )
+from researchclaw.pipeline.stage14_domain_evaluator import (
+    Stage14DomainEvaluatorError,
+    project_domain_metric_observations,
+)
 
 
 STAGE24_PUBLICATION_POLICY_VERSION = "stage24_truth_v1"
@@ -798,15 +802,32 @@ def _numeric_support(
         raise Stage24PublicationError("experiment contract is invalid")
     contract = validate_contract_dict(contract_raw)
     execution_artifact = evidence.selected_execution_artifact
-    try:
-        execution_payload = parse_invocation_result(
-            execution_artifact.content.decode("utf-8")
-        )
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise Stage24PublicationError(
-            f"selected execution artifact replay failed: {exc}"
-        ) from exc
-    execution_observations = execution_payload.get("metric_observations")
+    evidence_manifest = getattr(evidence, "manifest", {})
+    domain_evaluator = (
+        evidence_manifest.get("schema_version") == 2
+        and evidence_manifest.get("generation_kind") == "domain_evaluator"
+    )
+    if domain_evaluator:
+        try:
+            execution_observations = project_domain_metric_observations(
+                execution_artifact.content
+            )
+        except (Stage14DomainEvaluatorError, ValueError) as exc:
+            raise Stage24PublicationError(
+                f"selected domain observation replay failed: {exc}"
+            ) from exc
+        execution_ordinal = None
+    else:
+        try:
+            execution_payload = parse_invocation_result(
+                execution_artifact.content.decode("utf-8")
+            )
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise Stage24PublicationError(
+                f"selected execution artifact replay failed: {exc}"
+            ) from exc
+        execution_observations = execution_payload.get("metric_observations")
+        execution_ordinal = execution_payload.get("ordinal")
     if not isinstance(execution_observations, dict):
         raise Stage24PublicationError(
             "selected execution metric observations are missing"
@@ -859,12 +880,16 @@ def _numeric_support(
             "status": "supported",
             "metric": metric,
             "display_label": display_label,
-            "invocation_ordinal": execution_payload.get("ordinal"),
+            "invocation_ordinal": execution_ordinal,
             "observation_ordinal": ordinal,
             "canonical_value": canonical_text,
             "authority_path": execution_artifact.path,
             "authority_sha256": execution_artifact.sha256,
-            "semantic_pointer": f"/metric_observations/{metric}/{ordinal}",
+            "semantic_pointer": (
+                f"/observations/{ordinal}/metrics/{metric}"
+                if domain_evaluator
+                else f"/metric_observations/{metric}/{ordinal}"
+            ),
             "semantic_value_sha256": _sha256(canonical_text.encode("utf-8")),
         }
     return result
