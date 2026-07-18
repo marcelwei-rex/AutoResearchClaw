@@ -20,6 +20,9 @@ from researchclaw.pipeline.canonical_evidence_capabilities import (
 from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
 
 
+_ANALYSIS_CONTROLLER_AUTHORITY = object()
+
+
 @dataclass(frozen=True)
 class InvocationLease:
     """Opaque controller-issued lease required by the C1 sandbox wrapper."""
@@ -440,13 +443,21 @@ class CanonicalAnalysisController:
 
     def __init__(
         self,
+        *,
+        authority: object,
         run_dir: Path,
         stage_dir: Path,
         lock_descriptor: int,
         release_lock: ReleaseGraphLock | None,
+        purpose: str,
     ) -> None:
+        if authority is not _ANALYSIS_CONTROLLER_AUTHORITY:
+            raise RuntimeError("canonical_stage14_controller_untrusted")
+        if purpose not in {"generation", "promotion", "reader"}:
+            raise RuntimeError("canonical_stage14_controller_purpose_invalid")
         self.run_dir = run_dir
         self.stage_dir = stage_dir
+        self._purpose = purpose
         self._lock_descriptor: int | None = lock_descriptor
         self._release_lock: ReleaseGraphLock | None = release_lock
         self._namespace: BoundOutputNamespace | None = None
@@ -463,6 +474,7 @@ class CanonicalAnalysisController:
             "CanonicalAnalysisController.prepare",
             release_mode="write",
             create_stage=True,
+            purpose="generation",
         )
         try:
             if stage_dir != run_dir / "stage-14":
@@ -498,6 +510,7 @@ class CanonicalAnalysisController:
             run_dir / "stage-14",
             "CanonicalAnalysisController.promote",
             release_mode="write",
+            purpose="promotion",
         )
 
     @classmethod
@@ -509,6 +522,7 @@ class CanonicalAnalysisController:
             "load_canonical_experiment_evidence",
             release_mode="read",
             open_namespace=False,
+            purpose="reader",
         )
 
     @classmethod
@@ -521,6 +535,7 @@ class CanonicalAnalysisController:
         release_mode: str,
         create_stage: bool = False,
         open_namespace: bool = True,
+        purpose: str,
     ) -> CanonicalAnalysisController:
         require_canonical_evidence_capabilities(entrypoint)
         release_lock = ReleaseGraphLock.acquire(
@@ -544,9 +559,60 @@ class CanonicalAnalysisController:
             if create_stage:
                 raise RuntimeError("canonical_stage14_directory_unsafe") from exc
             raise
-        controller = cls(run_dir, stage_dir, descriptor, release_lock)
+        controller = cls(
+            authority=_ANALYSIS_CONTROLLER_AUTHORITY,
+            run_dir=run_dir,
+            stage_dir=stage_dir,
+            lock_descriptor=descriptor,
+            release_lock=release_lock,
+            purpose=purpose,
+        )
         controller._namespace = namespace
         return controller
+
+    def require_active_promotion(self, run_dir: Path) -> None:
+        """Prove this is the live Stage 14 writer created for promotion."""
+
+        self._require_active_writer_purpose(run_dir, "promotion")
+
+    def require_active_generation(self, run_dir: Path) -> None:
+        """Prove this is the live Stage 14 writer created for generation."""
+
+        self._require_active_writer_purpose(run_dir, "generation")
+
+    def _require_active_writer_purpose(
+        self, run_dir: Path, expected_purpose: str
+    ) -> None:
+        """Bind a trusted controller purpose to its live writer epoch."""
+
+        if type(self) is not CanonicalAnalysisController:
+            raise RuntimeError("canonical_stage14_promotion_controller_untrusted")
+        if self._purpose != expected_purpose:
+            raise RuntimeError(
+                f"canonical_stage14_{expected_purpose}_controller_required"
+            )
+        if self.run_dir.absolute() != run_dir.absolute():
+            raise RuntimeError(
+                f"canonical_stage14_{expected_purpose}_controller_run_mismatch"
+            )
+        if self.stage_dir != self.run_dir / "stage-14":
+            raise RuntimeError(
+                f"canonical_stage14_{expected_purpose}_controller_stage_mismatch"
+            )
+        if self._release_lock is None or self._namespace is None:
+            raise RuntimeError(
+                f"canonical_stage14_{expected_purpose}_controller_inactive"
+            )
+        from researchclaw.pipeline.release_graph_lock import (
+            require_active_writer_epoch,
+            require_namespace_owned_by_epoch,
+        )
+
+        require_active_writer_epoch(run_dir, self._release_lock)
+        require_namespace_owned_by_epoch(
+            self._namespace, self._release_lock, "stage-14"
+        )
+        self.assert_canonical()
 
     def create_candidate_staging(self) -> Path:
         self.assert_canonical()
@@ -574,6 +640,65 @@ class CanonicalAnalysisController:
     def remove_candidate_tree(self, candidate_id: str) -> None:
         assert self._namespace is not None
         self._namespace.remove_tree_child("evidence_candidates", candidate_id)
+
+    def read_candidate_tree(self) -> dict[str, bytes]:
+        """Capture the complete immutable candidate collection under Stage 14."""
+        self.assert_canonical()
+        assert self._namespace is not None
+        return self._namespace.read_directory_tree("evidence_candidates")
+
+    def run_entries(self) -> tuple[str, ...]:
+        """List direct run entries through the held Stage 14 writer epoch."""
+        self.assert_canonical()
+        if self._namespace is not None:
+            return self._namespace.run_entries()
+        if self._release_lock is None:
+            raise RuntimeError("canonical_stage14_controller_closed")
+        with self._release_lock.open_stage_namespace("stage-14") as namespace:
+            return namespace.run_entries()
+
+    def read_stage_entries(self, stage_name: str) -> tuple[str, ...]:
+        """Read one Stage 14 generation without reopening the live run path."""
+        self.assert_canonical()
+        if stage_name == "stage-14" and self._namespace is not None:
+            return self._namespace.direct_entries()
+        if self._release_lock is None:
+            raise RuntimeError("canonical_stage14_controller_closed")
+        with self._release_lock.open_stage_namespace(stage_name) as namespace:
+            return namespace.direct_entries()
+
+    def read_stage_candidate_tree(self, stage_name: str) -> dict[str, bytes]:
+        """Capture a candidate tree from one held Stage 14 generation."""
+        self.assert_canonical()
+        if stage_name == "stage-14" and self._namespace is not None:
+            return self._namespace.read_directory_tree("evidence_candidates")
+        if self._release_lock is None:
+            raise RuntimeError("canonical_stage14_controller_closed")
+        with self._release_lock.open_stage_namespace(stage_name) as namespace:
+            return namespace.read_directory_tree("evidence_candidates")
+
+    def read_run_file(self, relative_path: str) -> bytes:
+        """Read one upstream authority file through the held Stage 14 epoch."""
+        self.assert_canonical()
+        if self._namespace is not None:
+            return self._namespace.read_run_file(relative_path)
+        if self._release_lock is None:
+            raise RuntimeError("canonical_stage14_controller_closed")
+        with self._release_lock.open_stage_namespace("stage-14") as namespace:
+            return namespace.read_run_file(relative_path)
+
+    def write_run_bytes_atomic(self, name: str, content: bytes) -> None:
+        """Publish one root compatibility file through the held run fd."""
+        self.assert_canonical()
+        if self._release_lock is None:
+            raise RuntimeError("canonical_stage14_controller_closed")
+        self._release_lock.write_run_bytes_atomic(name, content)
+
+    def remove_run_files(self, names: tuple[str, ...]) -> None:
+        """Invalidate root authority without reopening the live run path."""
+        if self._release_lock is None:
+            raise RuntimeError("canonical_stage14_controller_closed")
+        self._release_lock.remove_run_files(names)
 
     def _invalidate_root_authority(self) -> None:
         if self._release_lock is None:

@@ -967,11 +967,11 @@ def _execute_stage_under_release_scope(
     if bridge.use_memory:
         adapters.memory.append("stages", f"{run_id}:{int(stage)}:running")
 
-    # Stage 13 chooses its canonical v2 evaluator only after it has invalidated
-    # stale authority under its held writer epoch.  Its fixed evaluator never
-    # needs an LLM; the legacy v1 branch resolves this proxy on its first chat.
+    # Stages 13-14 choose their canonical v2 evaluator only after invalidating
+    # stale authority under a held writer epoch. Their fixed paths never need an
+    # LLM; the legacy v1 branches resolve this proxy on their first chat.
     llm: LLMClient | _DeferredLLMClient | None
-    if stage is Stage.ITERATIVE_REFINE:
+    if stage in {Stage.ITERATIVE_REFINE, Stage.RESULT_ANALYSIS}:
         llm = _DeferredLLMClient(lambda: _create_configured_llm(config))
     else:
         llm = _create_configured_llm(config)
@@ -1007,10 +1007,20 @@ def _execute_stage_under_release_scope(
 
     if result.status == StageStatus.DONE:
         output_files = _select_output_files(contract, config)
+        stage14_domain_result = (
+            stage is Stage.RESULT_ANALYSIS
+            and len(result.artifacts) == 1
+            and result.artifacts[0].startswith(
+                "evidence_candidates/cand-"
+            )
+            and result.artifacts[0].endswith(
+                "/experiment_evidence_candidate.json"
+            )
+        )
         if (
             stage is Stage.ITERATIVE_REFINE
             and result.artifacts == ("refinement_result_set.json",)
-        ):
+        ) or stage14_domain_result:
             output_files = result.artifacts
         for output_file in output_files:
             if output_file.endswith("/"):
@@ -1139,6 +1149,12 @@ def _execute_stage_under_release_scope(
             stage is Stage.ITERATIVE_REFINE
             and result.status is StageStatus.DONE
             and result.artifacts == ("refinement_result_set.json",)
+        )
+        or (
+            stage is Stage.RESULT_ANALYSIS
+            and len(result.artifacts) == 1
+            and result.artifacts[0].startswith("evidence_candidates/cand-")
+            and result.artifacts[0].endswith("/experiment_evidence_candidate.json")
         )
     )
     if not exact_authority_namespace:

@@ -64,6 +64,21 @@ def _execute_result_analysis(
     staging: Path | None = None
     try:
         controller = CanonicalAnalysisController.prepare_generation(run_dir, stage_dir)
+        from researchclaw.pipeline.stage14_domain_evaluator import (
+            _execute_domain_evaluator_stage14_under_controller,
+            _stage14_uses_domain_evaluator_under_controller,
+        )
+
+        if _stage14_uses_domain_evaluator_under_controller(controller):
+            return _execute_domain_evaluator_stage14_under_controller(
+                controller=controller,
+                run_dir=run_dir,
+                config=config,
+            )
+
+        resolve_for_legacy = getattr(llm, "resolve_for_legacy", None)
+        if callable(resolve_for_legacy):
+            llm = resolve_for_legacy()
         staging = controller.create_candidate_staging()
         rendered = _render_result_analysis_candidate(
             staging,

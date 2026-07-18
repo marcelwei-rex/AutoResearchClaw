@@ -3002,7 +3002,10 @@ def test_integer_schema_fields_reject_bool_float_and_string(bad: object) -> None
         parse_aggregate_results(canonical_json_text(aggregate))
 
 
-def test_candidate_file_closure_and_identity_tokens_are_default_deny(tmp_path: Path) -> None:
+def test_candidate_file_closure_and_identity_tokens_are_default_deny(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
     root = tmp_path / "candidate"
     root.mkdir()
     artifact = root / "experiment_summary.json"

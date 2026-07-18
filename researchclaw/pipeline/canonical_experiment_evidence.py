@@ -672,6 +672,7 @@ def validate_selected_candidate_manifest(
             stored_identity=contract.metric_authority,
             metric_units=contract.metric_units,
             metric_display_labels=contract.metric_display_labels,
+            evaluator_authority=contract.evaluator_authority,
         )
     except MetricAuthorityError as exc:
         raise CanonicalExperimentEvidenceError(
@@ -1276,6 +1277,12 @@ def _validate_refinement_compatibility_copies(
 
 def parse_experiment_evidence_candidate(text: str) -> dict[str, Any]:
     payload = _parse_object(text, "Stage 14 evidence candidate")
+    if type(payload.get("schema_version")) is int and payload["schema_version"] == 2:
+        from researchclaw.pipeline.stage14_domain_evaluator import (
+            parse_domain_evaluator_candidate,
+        )
+
+        return parse_domain_evaluator_candidate(text)
     _exact_keys(
         payload,
         {
@@ -1331,10 +1338,37 @@ def validate_experiment_evidence_candidate(
     text: str | None = None,
 ) -> dict[str, Any]:
     """Replay a Stage 14 candidate's deterministic identity and file closure."""
+    require_canonical_evidence_capabilities(
+        "validate_experiment_evidence_candidate"
+    )
     manifest_path = candidate_root / "experiment_evidence_candidate.json"
+    disk_text: str | None = None
+    if manifest_path.exists() or manifest_path.is_symlink():
+        disk_text = _read_regular_file(manifest_path, "experiment evidence candidate")
+        discriminator = _parse_object(disk_text, "Stage 14 evidence candidate")
+        if type(discriminator.get("schema_version")) is int and discriminator[
+            "schema_version"
+        ] == 2:
+            if text is not None:
+                raise CanonicalExperimentEvidenceError(
+                    "Stage 14 domain candidate does not accept a text override"
+                )
+            from researchclaw.pipeline.stage14_domain_evaluator import (
+                validate_domain_evaluator_candidate,
+            )
+
+            return validate_domain_evaluator_candidate(candidate_root)
     if text is None:
-        text = _read_regular_file(manifest_path, "experiment evidence candidate")
+        if disk_text is None:
+            disk_text = _read_regular_file(
+                manifest_path, "experiment evidence candidate"
+            )
+        text = disk_text
     payload = parse_experiment_evidence_candidate(text)
+    if payload["schema_version"] == 2:
+        raise CanonicalExperimentEvidenceError(
+            "Stage 14 domain candidate does not accept a text override"
+        )
     if candidate_root.parent.name == "evidence_candidates" and candidate_root.name != payload["candidate_id"]:
         raise CanonicalExperimentEvidenceError("candidate directory identity mismatch")
     expected = {"experiment_evidence_candidate.json"}
@@ -1745,6 +1779,12 @@ def _select_canonical_candidate(
 
 def parse_canonical_experiment_manifest(text: str) -> dict[str, Any]:
     payload = _parse_object(text, "canonical experiment evidence manifest")
+    if type(payload.get("schema_version")) is int and payload["schema_version"] == 2:
+        from researchclaw.pipeline.stage14_domain_evaluator import (
+            parse_domain_evaluator_canonical_manifest,
+        )
+
+        return parse_domain_evaluator_canonical_manifest(text)
     _exact_keys(
         payload,
         {
@@ -1798,8 +1838,22 @@ def validate_canonical_experiment_manifest(
 ) -> dict[str, Any]:
     """Replay the selected result, immutable candidate, and root compatibility copies."""
     manifest_path = run_dir / "canonical_experiment_evidence.json"
+    has_manifest_override = text is not None
     if text is None:
         text = _read_regular_file(manifest_path, "canonical experiment evidence manifest")
+    discriminator = _parse_object(text, "canonical experiment evidence manifest")
+    if type(discriminator.get("schema_version")) is int and discriminator[
+        "schema_version"
+    ] == 2:
+        if has_manifest_override:
+            raise CanonicalExperimentEvidenceError(
+                "Stage 14 domain root does not accept a manifest override"
+            )
+        from researchclaw.pipeline.stage14_domain_evaluator import (
+            validate_domain_evaluator_canonical_manifest,
+        )
+
+        return validate_domain_evaluator_canonical_manifest(run_dir, config)
     payload = parse_canonical_experiment_manifest(text)
     selected, upstream, metric_key, direction, metric_value = _derive_selected_result(
         run_dir, config
@@ -1875,6 +1929,7 @@ def reconstruct_expected_stage9_14_metric_authority(
             stored_identity=contract.metric_authority,
             metric_units=contract.metric_units,
             metric_display_labels=contract.metric_display_labels,
+            evaluator_authority=contract.evaluator_authority,
         )
     except (ContractValidationError, MetricAuthorityError) as exc:
         raise CanonicalExperimentEvidenceError(
@@ -1897,7 +1952,12 @@ def reconstruct_expected_stage9_14_metric_authority(
             )
 
     root = validate_canonical_experiment_manifest(run_dir, config)
-    if root["metric_authority"] != selection.contract_identity():
+    root_metric_authority = (
+        root["bindings"]["metric_authority"]
+        if type(root.get("schema_version")) is int and root["schema_version"] == 2
+        else root["metric_authority"]
+    )
+    if root_metric_authority != selection.contract_identity():
         raise CanonicalExperimentEvidenceError(
             "Stage 14 root metric authority replay mismatch"
         )
@@ -1917,6 +1977,23 @@ def load_canonical_experiment_evidence(run_dir: Path) -> CanonicalExperimentEvid
 
     controller = CanonicalAnalysisController.acquire_reader(run_dir)
     try:
+        root = controller.read_run_file("canonical_experiment_evidence.json")
+        try:
+            discriminator = _parse_object(
+                root.decode("utf-8"), "canonical experiment evidence manifest"
+            )
+        except UnicodeDecodeError as exc:
+            raise CanonicalExperimentEvidenceError(
+                "canonical experiment evidence manifest is not UTF-8"
+            ) from exc
+        if type(discriminator.get("schema_version")) is int and discriminator[
+            "schema_version"
+        ] == 2:
+            from researchclaw.pipeline.stage14_domain_evaluator import (
+                load_domain_evaluator_canonical_evidence,
+            )
+
+            return load_domain_evaluator_canonical_evidence(run_dir)
         return _load_canonical_experiment_evidence_under_lock(run_dir)
     finally:
         controller.close()
@@ -1933,6 +2010,17 @@ def _load_canonical_experiment_evidence_under_lock(
             run_dir / manifest_relative,
             "canonical experiment evidence manifest",
         )
+        discriminator = _parse_object(
+            manifest_text, "canonical experiment evidence manifest"
+        )
+        if type(discriminator.get("schema_version")) is int and discriminator[
+            "schema_version"
+        ] == 2:
+            from researchclaw.pipeline.stage14_domain_evaluator import (
+                load_domain_evaluator_canonical_evidence,
+            )
+
+            return load_domain_evaluator_canonical_evidence(run_dir)
         preview = parse_canonical_experiment_manifest(manifest_text)
         config_relative = preview["run_config_path"]
         config_text = _read_regular_file(
@@ -2222,7 +2310,11 @@ def _reconstruct_expected_canonical_evidence_under_lock(
         ("selected_summary", evidence.summary_bytes),
         ("selected_analysis", evidence.analysis_bytes),
     ):
-        relative = expected[field]["canonical_path"]
+        compatibility = expected[field]
+        if "canonical_copy" in compatibility:
+            relative = compatibility["canonical_copy"]["path"]
+        else:
+            relative = compatibility["canonical_path"]
         if _read_regular_bytes(
             run_dir / relative, f"{field} compatibility copy"
         ) != expected_bytes:
@@ -2419,6 +2511,21 @@ def _build_canonical_publication_plan(
 ) -> _CanonicalPublicationPlan:
     """Select and capture one immutable Stage 14 publication plan."""
 
+    refinement_path = run_dir / "stage-13/refinement_result_set.json"
+    if refinement_path.exists() or refinement_path.is_symlink():
+        refinement_text = _read_regular_file(
+            refinement_path, "Stage 13 refinement result set"
+        )
+        discriminator = _parse_object(refinement_text, "Stage 13 refinement result set")
+        if type(discriminator.get("schema_version")) is int and discriminator[
+            "schema_version"
+        ] == 2:
+            from researchclaw.pipeline.stage14_domain_evaluator import (
+                build_domain_evaluator_publication_plan,
+            )
+
+            return build_domain_evaluator_publication_plan(run_dir, config)
+
     selected, upstream, metric_key, direction, metric_value = _derive_selected_result(
         run_dir, config
     )
@@ -2512,6 +2619,54 @@ def publish_canonical_experiment_manifest(
     config: RCConfig,
 ) -> dict[str, Any]:
     """Deterministically select Stage 14 evidence and publish the root pointer last."""
+    require_canonical_evidence_capabilities(
+        "publish_canonical_experiment_manifest"
+    )
+    if _stage13_uses_domain_evaluator_for_promotion(run_dir, controller=None):
+        from researchclaw.pipeline.stage14_domain_evaluator import (
+            publish_domain_evaluator_canonical_manifest,
+        )
+
+        return publish_domain_evaluator_canonical_manifest(run_dir, config)
+    return _publish_legacy_canonical_experiment_manifest(run_dir, config)
+
+
+def _publish_canonical_experiment_manifest_under_controller(
+    controller: object,
+    run_dir: Path,
+    config: RCConfig,
+) -> dict[str, Any]:
+    """Runner-only promotion entry requiring a live trusted Stage 14 writer."""
+
+    require_canonical_evidence_capabilities(
+        "publish_canonical_experiment_manifest_under_controller"
+    )
+    from researchclaw.pipeline.canonical_execution_controller import (
+        CanonicalAnalysisController,
+    )
+
+    if type(controller) is not CanonicalAnalysisController:
+        raise CanonicalExperimentEvidenceError(
+            "untrusted Stage 14 promotion controller"
+        )
+    controller.require_active_promotion(run_dir)
+    if _stage13_uses_domain_evaluator_for_promotion(
+        run_dir, controller=controller
+    ):
+        from researchclaw.pipeline.stage14_domain_evaluator import (
+            _publish_domain_evaluator_canonical_manifest_under_controller,
+        )
+
+        return _publish_domain_evaluator_canonical_manifest_under_controller(
+            controller, run_dir, config
+        )
+    return _publish_legacy_canonical_experiment_manifest(run_dir, config)
+
+
+def _publish_legacy_canonical_experiment_manifest(
+    run_dir: Path,
+    config: RCConfig,
+) -> dict[str, Any]:
     with ReleaseGraphLock.acquire(
         run_dir, "publish_canonical_experiment_manifest", mode="write"
     ) as release_lock:
@@ -2542,6 +2697,44 @@ def publish_canonical_experiment_manifest(
         except Exception:
             release_lock.remove_run_files(owned)
             raise
+
+
+def _stage13_uses_domain_evaluator_for_promotion(
+    run_dir: Path,
+    *,
+    controller: object | None,
+) -> bool:
+    """Read only the Stage 13 grammar discriminator through a held epoch."""
+
+    def parse(content: bytes) -> bool:
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CanonicalExperimentEvidenceError(
+                "Stage 13 refinement result set is not UTF-8"
+            ) from exc
+        payload = _parse_object(text, "Stage 13 refinement result set")
+        return type(payload.get("schema_version")) is int and payload[
+            "schema_version"
+        ] == 2
+
+    if controller is not None:
+        reader = getattr(controller, "read_run_file", None)
+        if not callable(reader):
+            raise CanonicalExperimentEvidenceError("untrusted Stage 14 promotion controller")
+        try:
+            return parse(reader("stage-13/refinement_result_set.json"))
+        except FileNotFoundError:
+            return False
+
+    with ReleaseGraphLock.acquire(
+        run_dir, "publish_canonical_experiment_manifest_discriminator", mode="read"
+    ) as lease:
+        with lease.open_stage_namespace("stage-14") as namespace:
+            try:
+                return parse(namespace.read_run_file("stage-13/refinement_result_set.json"))
+            except FileNotFoundError:
+                return False
 
 
 def _resolve_full_config_identity(run_dir: Path, config: RCConfig) -> tuple[str, str, str]:

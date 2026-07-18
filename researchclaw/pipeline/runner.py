@@ -1377,12 +1377,14 @@ def _promote_best_stage14(run_dir: Path, config: RCConfig) -> None:
         CanonicalAnalysisController,
     )
     from researchclaw.pipeline.canonical_experiment_evidence import (
-        publish_canonical_experiment_manifest,
+        _publish_canonical_experiment_manifest_under_controller,
     )
 
     controller = CanonicalAnalysisController.acquire_promotion(run_dir)
     try:
-        publish_canonical_experiment_manifest(run_dir, config)
+        _publish_canonical_experiment_manifest_under_controller(
+            controller, run_dir, config
+        )
     finally:
         controller.close()
 
