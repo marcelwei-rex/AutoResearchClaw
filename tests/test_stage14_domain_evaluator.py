@@ -396,6 +396,17 @@ def test_stage14_domain_public_replay_is_capability_first(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from researchclaw.pipeline import canonical_evidence_capabilities as capabilities
+
+    # The production capability map is now complete, so explicitly construct
+    # the pre-activation state this ordering guard is meant to exercise.
+    partial = {
+        name: capabilities.CAPABILITY_SCHEMA_VERSION
+        for name in capabilities.REQUIRED_CAPABILITIES
+    }
+    partial["domain_evaluator_authority"] = 0
+    monkeypatch.setattr(capabilities, "CANONICAL_EVIDENCE_CAPABILITIES", partial)
+
     candidate = (
         tmp_path
         / "run/stage-14/evidence_candidates"
@@ -416,7 +427,19 @@ def test_stage14_domain_public_replay_is_capability_first(
 
 def test_stage14_domain_under_controller_entry_is_default_deny(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from researchclaw.pipeline import canonical_evidence_capabilities as capabilities
+
+    # Explicitly construct the pre-activation capability state so the
+    # default-deny path does not depend on the production map being incomplete.
+    partial = {
+        name: capabilities.CAPABILITY_SCHEMA_VERSION
+        for name in capabilities.REQUIRED_CAPABILITIES
+    }
+    partial["domain_evaluator_authority"] = 0
+    monkeypatch.setattr(capabilities, "CANONICAL_EVIDENCE_CAPABILITIES", partial)
+
     calls: list[tuple[str, object]] = []
 
     class FakeController:

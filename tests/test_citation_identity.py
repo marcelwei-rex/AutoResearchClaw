@@ -22,6 +22,7 @@ from researchclaw.literature.citation_identity import (
     validate_registry_artifacts,
 )
 from researchclaw.literature.models import Author, Paper
+from researchclaw.literature.screening import parse_screening_candidates
 from researchclaw.pipeline.stage_impls._literature import _execute_literature_collect
 from researchclaw.pipeline.stages import StageStatus
 
@@ -301,6 +302,110 @@ def test_stage4_writes_registry_candidates_and_bib_from_same_keys(
     assert registry["references_sha256"] == hashlib.sha256(
         (stage_dir / "references.bib").read_bytes()
     ).hexdigest()
+
+
+def test_stage4_seminal_candidates_satisfy_stage5_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-04"
+    (run_dir / "stage-03").mkdir(parents=True)
+    stage_dir.mkdir(parents=True)
+    (run_dir / "stage-03" / "queries.json").write_text(
+        json.dumps({"queries": ["trojnet"], "year_min": 2020}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "researchclaw.literature.search.search_papers_multi_query",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        "researchclaw.data.load_seminal_papers",
+        lambda _topic: [
+            {
+                "title": "In Search of Lost Domain Generalization",
+                "authors": "Gulrajani and Lopez-Paz",
+                "year": 2021,
+                "venue": "ICLR",
+                "cite_key": "gulrajani2021search",
+                "keywords": ["domain generalization", "distribution shift"],
+            }
+        ],
+    )
+    config = SimpleNamespace(
+        research=SimpleNamespace(topic="trojnet", daily_paper_count=20),
+        llm=SimpleNamespace(s2_api_key=""),
+        web_search=SimpleNamespace(enabled=False),
+    )
+
+    result = _execute_literature_collect(
+        stage_dir,
+        run_dir,
+        config,  # type: ignore[arg-type]
+        AdapterBundle(),
+        llm=None,
+    )
+
+    assert result.status is StageStatus.DONE
+    rows = parse_screening_candidates(
+        (stage_dir / "candidates.jsonl").read_text(encoding="utf-8")
+    )
+    assert len(rows) == 1
+    assert rows[0]["paper_id"] == "seminal-gulrajani2021search"
+    assert rows[0]["citation_count"] == 0
+    assert rows[0]["doi"] == ""
+    assert rows[0]["arxiv_id"] == ""
+
+
+def test_stage4_rejects_sealed_candidates_that_stage5_cannot_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-04"
+    (run_dir / "stage-03").mkdir(parents=True)
+    stage_dir.mkdir(parents=True)
+    (run_dir / "stage-03" / "queries.json").write_text(
+        json.dumps({"queries": ["trojnet"], "year_min": 2020}),
+        encoding="utf-8",
+    )
+    malformed = {
+        "paper_id": "provider-missing-count",
+        "title": "TrojNet localization",
+        "authors": [{"name": "Jane Smith"}],
+        "year": 2024,
+        "abstract": "Hardware Trojan localization evidence.",
+        "venue": "Security Conference",
+        "doi": "",
+        "arxiv_id": "",
+        "url": "",
+        "source": "test_provider",
+    }
+    paper = SimpleNamespace(source="test_provider", to_dict=lambda: dict(malformed))
+    monkeypatch.setattr(
+        "researchclaw.literature.search.search_papers_multi_query",
+        lambda *_args, **_kwargs: [paper],
+    )
+    monkeypatch.setattr("researchclaw.data.load_seminal_papers", lambda _topic: [])
+    config = SimpleNamespace(
+        research=SimpleNamespace(topic="trojnet", daily_paper_count=20),
+        llm=SimpleNamespace(s2_api_key=""),
+        web_search=SimpleNamespace(enabled=False),
+    )
+
+    result = _execute_literature_collect(
+        stage_dir,
+        run_dir,
+        config,  # type: ignore[arg-type]
+        AdapterBundle(),
+        llm=None,
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "citation_count must be a nonnegative integer" in (result.error or "")
+    assert not (stage_dir / "cite_key_registry.json").exists()
+    assert not (stage_dir / "references.bib").exists()
 
 
 def test_stage4_placeholder_fallback_fails_before_registry_seal(

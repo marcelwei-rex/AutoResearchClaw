@@ -462,13 +462,16 @@ def _execute_literature_collect(
             for sp in seminal:
                 if sp.get("title", "").lower() not in _existing_titles:
                     candidates.append({
-                        "id": f"seminal-{sp.get('cite_key', '')}",
+                        "paper_id": f"seminal-{sp.get('cite_key', '')}",
                         "title": sp.get("title", ""),
                         "source": "seminal_library",
                         "url": "",
                         "year": sp.get("year", 2020),
                         "abstract": f"Foundational paper on {', '.join(sp.get('keywords', [])[:3])}.",
                         "authors": [{"name": sp.get("authors", "")}],
+                        "citation_count": 0,
+                        "doi": "",
+                        "arxiv_id": "",
                         "cite_key": sp.get("cite_key", ""),
                         "venue": sp.get("venue", ""),
                         "collected_at": _utcnow_iso(),
@@ -598,7 +601,8 @@ def _execute_literature_collect(
     # Candidates and BibTeX are projections of this one registry.
     try:
         sealed = seal_citation_collection(candidates)
-    except CitationIdentityError as exc:
+        parse_screening_candidates(sealed.candidates_jsonl)
+    except (CitationIdentityError, ScreeningContractError) as exc:
         _write_jsonl(stage_dir / "candidates.jsonl", candidates)
         (stage_dir / "search_meta.json").write_text(
             json.dumps(
