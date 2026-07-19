@@ -31,9 +31,9 @@ CANONICAL_EVIDENCE_CAPABILITIES: dict[str, int] = {
     "stage13_refinement_set": CAPABILITY_SCHEMA_VERSION,
     "stage14_candidate_and_promotion": CAPABILITY_SCHEMA_VERSION,
     "metric_contract_authority": CAPABILITY_SCHEMA_VERSION,
-    # TrojNet/domain-evaluator schemas and producers are active following the
-    # separately reviewed activation hardening.
-    "domain_evaluator_authority": CAPABILITY_SCHEMA_VERSION,
+    # TrojNet/domain-evaluator schemas and producers remain blocked until the
+    # separately reviewed migration is complete.
+    "domain_evaluator_authority": 0,
     "shared_accessor": CAPABILITY_SCHEMA_VERSION,
     "stage15_17_consumers": CAPABILITY_SCHEMA_VERSION,
     # This component covers the remaining manuscript path: Stage 18 peer

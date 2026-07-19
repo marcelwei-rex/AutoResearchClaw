@@ -648,11 +648,27 @@ def test_stage14_domain_evaluator_publishes_fixed_candidate_and_root(
     assert forged_root["bindings"]["execution_policy"] == _ref(
         "stage-09/domain_evaluator_execution_policy.json", forged_policy
     )
+    stored_replay_calls = 0
+
+    def unexpected_stored_replay(*_args, **_kwargs):
+        nonlocal stored_replay_calls
+        stored_replay_calls += 1
+        raise AssertionError("trusted oracle allowed Stage 10 stored replay")
+
+    monkeypatch.setattr(
+        canonical_experiment_evidence,
+        "validate_selected_candidate_manifest",
+        unexpected_stored_replay,
+    )
     with pytest.raises(
         CanonicalExperimentEvidenceError,
         match="expected metric authority reconstruction failed",
-    ):
+    ) as exc_info:
         reconstruct_expected_stage9_14_metric_authority(run, config)
+    assert str(exc_info.value.__cause__) == (
+        "evaluator_authority does not match trusted selector result"
+    )
+    assert stored_replay_calls == 0
 
 
 def test_stage14_domain_publication_clears_root_on_plan_and_replay_failures(
