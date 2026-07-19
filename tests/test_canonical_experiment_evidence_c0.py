@@ -3137,7 +3137,7 @@ def test_every_partial_capability_map_is_blocked() -> None:
         assert name in incomplete_canonical_evidence_capabilities(partial)
     assert incomplete_canonical_evidence_capabilities(
         CANONICAL_EVIDENCE_CAPABILITIES
-    ) == ("domain_evaluator_authority",)
+    ) == ()
 
 
 @pytest.mark.parametrize(
