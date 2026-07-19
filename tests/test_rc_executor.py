@@ -27,6 +27,7 @@ from researchclaw.experiment_runtime.contract import (
     load_contract,
     sha256_file,
 )
+from researchclaw.hitl.intervention import HumanAction, HumanInput
 from researchclaw.pipeline import executor as rc_executor
 from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 from researchclaw.pipeline.stage_impls import _release_audit as release_audit
@@ -1678,6 +1679,47 @@ def _valid_stage9_plan() -> dict[str, object]:
     }
 
 
+class _Stage9PostHITLSession:
+    def __init__(
+        self,
+        action: HumanAction,
+        *,
+        edited: bool = False,
+        guidance: str = "",
+        on_wait: object | None = None,
+        pause_before: bool = False,
+        pause_after: bool = True,
+    ) -> None:
+        self.action = action
+        self.edited = edited
+        self.guidance = guidance
+        self.on_wait = on_wait
+        self.pause_before = pause_before
+        self.pause_after = pause_after
+        self.config = SimpleNamespace(cost_budget_usd=0.0)
+
+    def should_pause_before(self, _stage: int) -> bool:
+        return self.pause_before
+
+    def should_pause_after(self, _stage: int) -> bool:
+        return self.pause_after
+
+    def pause(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def wait_for_human(self) -> HumanInput:
+        if callable(self.on_wait):
+            self.on_wait()
+        return HumanInput(
+            action=self.action,
+            guidance=self.guidance,
+            edited_files={"exp_plan.yaml": "changed"} if self.edited else {},
+        )
+
+    def get_policy(self, _stage: int) -> SimpleNamespace:
+        return SimpleNamespace(require_approval=False, min_quality_score=0.0)
+
+
 class TestExperimentDesignGuard:
     # The schema-deficit guard added in _execute_experiment_design uses
     # _normalize_plan_field so that valid non-list field shapes (str, dict,
@@ -1722,7 +1764,11 @@ class TestExperimentDesignGuard:
         )
         fake_llm = FakeLLMClient("{}")
         result = rc_executor._execute_experiment_design(
-            stage_dir, run_dir, rc_config, adapters, llm=fake_llm
+            stage_dir,
+            run_dir,
+            _governed_stage9_config(rc_config),
+            adapters,
+            llm=fake_llm,
         )
         assert result.status == StageStatus.PAUSED
         assert result.decision == "schema_deficient"
@@ -1830,7 +1876,7 @@ class TestExperimentDesignGuard:
         result = rc_executor._execute_experiment_design(
             stage_dir,
             run_dir,
-            rc_config,
+            _governed_stage9_config(rc_config),
             adapters,
             llm=FakeLLMClient(json.dumps(payload)),
         )
@@ -1893,15 +1939,44 @@ class TestExperimentDesignGuard:
             ),
         )
         run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        llm = FakeLLMClient("{}")
         result = rc_executor._execute_experiment_design(
             stage_dir,
             run_dir,
             config,
             adapters,
-            llm=FakeLLMClient(json.dumps(_valid_stage9_plan())),
+            llm=llm,
         )
 
-        assert result.status == StageStatus.DONE
+        assert result.status == StageStatus.DONE, result.error
+        assert llm.calls == []
+        plan = yaml.safe_load((stage_dir / "exp_plan.yaml").read_text())
+        assert plan["mode"] == "fixed_domain_evaluator"
+        assert plan["baselines"] == [
+            "raw_cc1",
+            "scoap_isolation_forest",
+        ]
+        assert plan["proposed_methods"] == ["trojnet_community_graphsage"]
+        assert plan["ablations"] == []
+        assert plan["seeds"] == [0, 1, 2]
+        assert plan["circuit_families"] == [
+            "c1355",
+            "c1908",
+            "c3540",
+            "c432",
+            "c6288",
+            "c880",
+        ]
+        assert plan["metrics"] == [
+            "accuracy",
+            "auprc",
+            "auroc",
+            "f1",
+            "fpr",
+            "precision",
+            "recall",
+            "top_k_precision",
+        ]
         contract = load_contract(stage_dir / "experiment_contract.yaml")
         assert contract.schema_version == 3
         assert contract.evaluator_authority["kind"] == "domain_evaluator"
@@ -1910,6 +1985,854 @@ class TestExperimentDesignGuard:
             "domain_evaluator_execution_policy.json",
         }.issubset(result.artifacts)
         assert (stage_dir / "experiment_contract.sha256").is_file()
+
+    def test_domain_evaluator_stage9_executor_never_constructs_llm(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(
+                rc_config.experiment,
+                claim_scope="pipeline_validation",
+                dataset_origin="synthetic",
+                metric_key="auprc",
+                metric_direction="maximize",
+                mode="sandbox",
+            ),
+        )
+        run_dir, _stage_dir = _prepare_stage9_run(tmp_path)
+
+        def unexpected_llm(_config):
+            raise AssertionError("fixed Stage 9 attempted to construct an LLM")
+
+        monkeypatch.setattr(rc_executor, "_create_configured_llm", unexpected_llm)
+        result = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-fixed-domain-zero-llm",
+            config=config,
+            adapters=adapters,
+            auto_approve_gates=True,
+        )
+
+        assert result.status == StageStatus.DONE, result.error
+        plan = yaml.safe_load(
+            (run_dir / "stage-09/exp_plan.yaml").read_text(encoding="utf-8")
+        )
+        assert plan["mode"] == "fixed_domain_evaluator"
+
+    def test_generic_stage9_executor_resolves_deferred_llm_on_first_chat(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        run_dir, _stage_dir = _prepare_stage9_run(tmp_path)
+        llm = FakeLLMClient(json.dumps(_valid_stage9_plan()))
+        monkeypatch.setattr(
+            rc_executor, "_create_configured_llm", lambda _config: llm
+        )
+
+        result = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-generic-deferred-llm",
+            config=_governed_stage9_config(rc_config),
+            adapters=adapters,
+            auto_approve_gates=True,
+        )
+
+        assert result.status == StageStatus.DONE, result.error
+        assert len(llm.calls) >= 1
+        contract = load_contract(run_dir / "stage-09/experiment_contract.yaml")
+        assert contract.schema_version == 2
+
+    def test_domain_evaluator_stage9_rejects_late_plan_mutation(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(
+                rc_config.experiment,
+                claim_scope="pipeline_validation",
+                dataset_origin="synthetic",
+                metric_key="auprc",
+                metric_direction="maximize",
+                mode="sandbox",
+            ),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        original = module.dump_contract
+
+        def mutate_plan_after_contract(contract, path, *, namespace=None):
+            digest = original(contract, path, namespace=namespace)
+            assert namespace is not None
+            plan = yaml.safe_load(namespace.read_bytes("exp_plan.yaml"))
+            plan["proposed_methods"] = ["shadow_method"]
+            namespace.write_text_atomic(
+                "exp_plan.yaml",
+                yaml.safe_dump(plan, sort_keys=False),
+            )
+            return digest
+
+        monkeypatch.setattr(module, "dump_contract", mutate_plan_after_contract)
+        result = rc_executor._execute_experiment_design(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=FakeLLMClient("{}"),
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert "fixed domain evaluator experiment plan mismatch" in result.error
+        assert list(stage_dir.iterdir()) == []
+
+    def test_domain_evaluator_selector_failure_is_zero_llm_and_fail_closed(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.experiment_runtime.metric_authority import (
+            MetricAuthorityError,
+        )
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(rc_config.experiment, mode="sandbox"),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        llm = FakeLLMClient(json.dumps(_valid_stage9_plan()))
+
+        def reject_selector(*_args, **_kwargs):
+            raise MetricAuthorityError("injected trusted selector failure")
+
+        monkeypatch.setattr(module, "select_metric_authority", reject_selector)
+        result = rc_executor._execute_experiment_design(
+            stage_dir, run_dir, config, adapters, llm=llm
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert "injected trusted selector failure" in result.error
+        assert llm.calls == []
+        assert list(stage_dir.iterdir()) == []
+
+    def test_domain_evaluator_execute_stage_selector_failure_has_zero_side_effects(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.experiment_runtime import metric_authority
+        from researchclaw.experiment_runtime.metric_authority import (
+            MetricAuthorityError,
+        )
+        from researchclaw.agents import benchmark_agent
+
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(rc_config.experiment, mode="sandbox"),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        (stage_dir / "experiment_contract.yaml").write_text(
+            "stale contract\n", encoding="utf-8"
+        )
+
+        def reject_selector(*_args, **_kwargs):
+            raise MetricAuthorityError("injected execute-stage selector failure")
+
+        def unexpected_llm(_config):
+            raise AssertionError("selector failure constructed an LLM")
+
+        class UnexpectedBenchmark:
+            def __init__(self, *_args, **_kwargs):
+                raise AssertionError("selector failure constructed BenchmarkAgent")
+
+        monkeypatch.setattr(metric_authority, "select_metric_authority", reject_selector)
+        monkeypatch.setattr(rc_executor, "_create_configured_llm", unexpected_llm)
+        monkeypatch.setattr(
+            benchmark_agent, "BenchmarkOrchestrator", UnexpectedBenchmark
+        )
+
+        result = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-selector-failure-zero-side-effects",
+            config=config,
+            adapters=adapters,
+            auto_approve_gates=True,
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert "injected execute-stage selector failure" in result.error
+        assert not (stage_dir / "experiment_contract.yaml").exists()
+
+    @pytest.mark.parametrize(
+        ("selector_generations", "expected_llm_calls"),
+        [
+            (("v1", "v2"), 1),
+            (("v2", "v1"), 0),
+            (("v2", "v1", "v2"), 0),
+        ],
+    )
+    def test_domain_evaluator_selector_generation_change_is_fail_closed(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+        selector_generations: tuple[str, ...],
+        expected_llm_calls: int,
+    ) -> None:
+        from researchclaw.experiment_runtime import metric_authority
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        v2_config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(
+                rc_config.experiment,
+                claim_scope="pipeline_validation",
+                dataset_origin="synthetic",
+                metric_key="auprc",
+                metric_direction="maximize",
+                mode="sandbox",
+            ),
+        )
+        v1_config = replace(
+            _governed_stage9_config(rc_config),
+            experiment=replace(
+                _governed_stage9_config(rc_config).experiment,
+                mode="sandbox",
+            ),
+        )
+        config = v1_config if selector_generations[0] == "v1" else v2_config
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        real_selector = metric_authority.select_metric_authority
+        selections = {
+            "v2": real_selector(
+                v2_config.research.topic, v2_config.experiment.mode
+            ),
+            "v1": real_selector(
+                v1_config.research.topic, v1_config.experiment.mode
+            ),
+        }
+        pending = list(selector_generations)
+        calls: list[str] = []
+
+        def changing_selector(*_args, **_kwargs):
+            generation = pending.pop(0)
+            calls.append(generation)
+            return selections[generation]
+
+        llm = FakeLLMClient(json.dumps(_valid_stage9_plan()))
+        factory_calls = 0
+
+        def configured_llm(_config):
+            nonlocal factory_calls
+            factory_calls += 1
+            return llm
+
+        monkeypatch.setattr(
+            metric_authority, "select_metric_authority", changing_selector
+        )
+        monkeypatch.setattr(module, "select_metric_authority", changing_selector)
+        monkeypatch.setattr(rc_executor, "_create_configured_llm", configured_llm)
+
+        result = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-selector-generation-change",
+            config=config,
+            adapters=adapters,
+            auto_approve_gates=True,
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert result.artifacts == ()
+        assert calls == list(selector_generations[:2])
+        assert factory_calls == expected_llm_calls
+        assert not any(
+            (stage_dir / name).exists()
+            for name in module._STAGE9_AUTHORITY_OUTPUTS
+        )
+
+    def test_domain_evaluator_classification_mismatch_always_withdraws_authority(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.experiment_runtime import metric_authority
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(
+                rc_config.experiment,
+                claim_scope="pipeline_validation",
+                dataset_origin="synthetic",
+                metric_key="auprc",
+                metric_direction="maximize",
+                mode="sandbox",
+            ),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        real_selector = metric_authority.select_metric_authority
+        v2_selection = real_selector(config.research.topic, config.experiment.mode)
+        v1_selection = real_selector(
+            "Hardware-performance-counter detection of Spectre attacks",
+            config.experiment.mode,
+        )
+        selections = iter((v1_selection, v2_selection))
+        changing_selector = lambda *_args, **_kwargs: next(selections)
+        monkeypatch.setattr(
+            metric_authority, "select_metric_authority", changing_selector
+        )
+        monkeypatch.setattr(module, "select_metric_authority", changing_selector)
+        original_executor = rc_executor._STAGE_EXECUTORS[Stage.EXPERIMENT_DESIGN]
+
+        def divergent_executor(*args, **kwargs):
+            kwargs["authority_selection"] = v2_selection
+            return original_executor(*args, **kwargs)
+
+        monkeypatch.setitem(
+            rc_executor._STAGE_EXECUTORS,
+            Stage.EXPERIMENT_DESIGN,
+            divergent_executor,
+        )
+
+        result = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-classification-mismatch",
+            config=config,
+            adapters=adapters,
+            auto_approve_gates=True,
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert "Stage 9 authority classification failed" in result.error
+        assert result.artifacts == ()
+        assert not any(
+            (stage_dir / name).exists()
+            for name in module._STAGE9_AUTHORITY_OUTPUTS
+        )
+
+    def test_domain_evaluator_skips_baseline_navigator_symlink(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+    ) -> None:
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(rc_config.experiment, mode="sandbox"),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        external = tmp_path / "external-hitl"
+        external.mkdir()
+        (external / "sentinel").write_text("unchanged", encoding="utf-8")
+        (run_dir / "hitl").symlink_to(external, target_is_directory=True)
+
+        result = rc_executor._execute_experiment_design(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=FakeLLMClient("{}"),
+        )
+
+        assert result.status == StageStatus.DONE, result.error
+        assert sorted(path.name for path in external.iterdir()) == ["sentinel"]
+        assert (external / "sentinel").read_text(encoding="utf-8") == "unchanged"
+
+    @pytest.mark.parametrize("action", [HumanAction.SKIP, HumanAction.ABORT])
+    def test_domain_evaluator_pre_hitl_withdraws_stale_authority_before_return(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        action: HumanAction,
+    ) -> None:
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(rc_config.experiment, mode="sandbox"),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        first = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-fixed-seed-stale-authority",
+            config=config,
+            adapters=adapters,
+            auto_approve_gates=True,
+        )
+        assert first.status == StageStatus.DONE, first.error
+        assert (stage_dir / "experiment_contract.yaml").is_file()
+
+        session = _Stage9PostHITLSession(
+            action,
+            pause_before=True,
+            pause_after=False,
+        )
+        second = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-fixed-pre-hitl-stop",
+            config=config,
+            adapters=replace(adapters, hitl=session),
+            auto_approve_gates=True,
+        )
+
+        assert second.status == StageStatus.FAILED
+        assert second.artifacts == ()
+        assert not any(
+            (stage_dir / name).exists()
+            for name in module._STAGE9_AUTHORITY_OUTPUTS
+        )
+
+    @pytest.mark.parametrize(
+        ("action", "edited", "guidance"),
+        [
+            (HumanAction.EDIT, True, ""),
+            (HumanAction.REJECT, False, ""),
+            (HumanAction.ABORT, False, ""),
+            (HumanAction.APPROVE, False, "change the fixed plan"),
+        ],
+    )
+    def test_domain_evaluator_post_hitl_rejects_mutation_and_withdraws_authority(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        action: HumanAction,
+        edited: bool,
+        guidance: str,
+    ) -> None:
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(rc_config.experiment, mode="sandbox"),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+
+        def mutate_plan() -> None:
+            if edited:
+                (stage_dir / "exp_plan.yaml").write_text(
+                    "mode: shadow\n", encoding="utf-8"
+                )
+
+        session = _Stage9PostHITLSession(
+            action,
+            edited=edited,
+            guidance=guidance,
+            on_wait=mutate_plan,
+        )
+        result = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-fixed-post-hitl-guard",
+            config=config,
+            adapters=replace(adapters, hitl=session),
+            auto_approve_gates=True,
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert result.artifacts == ()
+        assert not any(
+            (stage_dir / name).exists()
+            for name in module._STAGE9_AUTHORITY_OUTPUTS
+        )
+
+    def test_domain_evaluator_post_hitl_approve_fresh_replay_rejects_mutation(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+    ) -> None:
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(rc_config.experiment, mode="sandbox"),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+
+        def mutate_without_declaring_edit() -> None:
+            (stage_dir / "exp_plan.yaml").write_text(
+                "mode: shadow\n", encoding="utf-8"
+            )
+
+        session = _Stage9PostHITLSession(
+            HumanAction.APPROVE,
+            on_wait=mutate_without_declaring_edit,
+        )
+        result = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-fixed-post-hitl-fixpoint",
+            config=config,
+            adapters=replace(adapters, hitl=session),
+            auto_approve_gates=True,
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert "terminal replay failed" in result.error
+        assert not any(
+            (stage_dir / name).exists()
+            for name in module._STAGE9_AUTHORITY_OUTPUTS
+        )
+
+    def test_domain_evaluator_post_hitl_stage_replacement_cleans_detached_authority(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+    ) -> None:
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(rc_config.experiment, mode="sandbox"),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        detached = run_dir / "stage-09-detached"
+        external = tmp_path / "external-stage9"
+        external.mkdir()
+        (external / "sentinel").write_text("unchanged", encoding="utf-8")
+
+        def replace_stage_during_wait() -> None:
+            stage_dir.rename(detached)
+            stage_dir.symlink_to(external, target_is_directory=True)
+
+        session = _Stage9PostHITLSession(
+            HumanAction.EDIT,
+            edited=True,
+            on_wait=replace_stage_during_wait,
+        )
+        result = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-fixed-post-hitl-replacement",
+            config=config,
+            adapters=replace(adapters, hitl=session),
+            auto_approve_gates=True,
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert sorted(path.name for path in external.iterdir()) == ["sentinel"]
+        assert (external / "sentinel").read_text(encoding="utf-8") == "unchanged"
+        assert not any(
+            (detached / name).exists()
+            for name in module._STAGE9_AUTHORITY_OUTPUTS
+        )
+        stage_dir.unlink()
+        detached.rename(stage_dir)
+        assert not (stage_dir / "experiment_contract.yaml").exists()
+
+    def test_domain_evaluator_prm_rejection_withdraws_authority(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+        from researchclaw.metaclaw_bridge.prm_gate import ResearchPRMGate
+
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(rc_config.experiment, mode="sandbox"),
+            metaclaw_bridge=replace(
+                rc_config.metaclaw_bridge,
+                enabled=True,
+                prm=replace(
+                    rc_config.metaclaw_bridge.prm,
+                    enabled=True,
+                    gate_stages=(9,),
+                ),
+            ),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        rejecting_gate = SimpleNamespace(
+            model="rejecting-test-gate",
+            votes=1,
+            evaluate_stage=lambda *_args: -1.0,
+        )
+        monkeypatch.setattr(
+            ResearchPRMGate,
+            "from_bridge_config",
+            lambda *_args, **_kwargs: rejecting_gate,
+        )
+
+        result = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-fixed-prm-reject",
+            config=config,
+            adapters=adapters,
+            auto_approve_gates=True,
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert "PRM quality gate" in result.error
+        assert result.artifacts == ()
+        assert not any(
+            (stage_dir / name).exists()
+            for name in module._STAGE9_AUTHORITY_OUTPUTS
+        )
+
+    def test_domain_evaluator_prm_rejection_survives_report_collision(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.metaclaw_bridge.prm_gate import ResearchPRMGate
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(rc_config.experiment, mode="sandbox"),
+            metaclaw_bridge=replace(
+                rc_config.metaclaw_bridge,
+                enabled=True,
+                prm=replace(
+                    rc_config.metaclaw_bridge.prm,
+                    enabled=True,
+                    gate_stages=(9,),
+                ),
+            ),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        (stage_dir / "prm_score.json").mkdir()
+        monkeypatch.setattr(
+            ResearchPRMGate,
+            "from_bridge_config",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                model="rejecting-collision-gate",
+                votes=1,
+                evaluate_stage=lambda *_args: -1.0,
+            ),
+        )
+
+        result = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-prm-report-collision",
+            config=config,
+            adapters=adapters,
+            auto_approve_gates=True,
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert "PRM quality gate" in result.error
+        assert result.artifacts == ()
+        assert not any(
+            (stage_dir / name).exists()
+            for name in module._STAGE9_AUTHORITY_OUTPUTS
+        )
+
+    def test_domain_evaluator_prm_rejection_cleans_before_post_hitl_wait(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.metaclaw_bridge.prm_gate import ResearchPRMGate
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(rc_config.experiment, mode="sandbox"),
+            metaclaw_bridge=replace(
+                rc_config.metaclaw_bridge,
+                enabled=True,
+                prm=replace(
+                    rc_config.metaclaw_bridge.prm,
+                    enabled=True,
+                    gate_stages=(9,),
+                ),
+            ),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        monkeypatch.setattr(
+            ResearchPRMGate,
+            "from_bridge_config",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                model="reject-before-wait",
+                votes=1,
+                evaluate_stage=lambda *_args: -1.0,
+            ),
+        )
+
+        def assert_clean_during_wait() -> None:
+            assert not any(
+                (stage_dir / name).exists()
+                for name in module._STAGE9_AUTHORITY_OUTPUTS
+            )
+
+        session = _Stage9PostHITLSession(
+            HumanAction.APPROVE,
+            on_wait=assert_clean_during_wait,
+        )
+        result = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-prm-clean-before-hitl",
+            config=config,
+            adapters=replace(adapters, hitl=session),
+            auto_approve_gates=True,
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert result.artifacts == ()
+
+    def test_domain_evaluator_prm_replacement_uses_held_namespace(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.metaclaw_bridge.prm_gate import ResearchPRMGate
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        config = replace(
+            rc_config,
+            research=replace(
+                rc_config.research,
+                topic="TrojNet hardware Trojan localization on ISCAS-85 circuits",
+            ),
+            experiment=replace(rc_config.experiment, mode="sandbox"),
+            metaclaw_bridge=replace(
+                rc_config.metaclaw_bridge,
+                enabled=True,
+                prm=replace(
+                    rc_config.metaclaw_bridge.prm,
+                    enabled=True,
+                    gate_stages=(9,),
+                ),
+            ),
+        )
+        run_dir, stage_dir = _prepare_stage9_run(tmp_path)
+        detached = run_dir / "stage-09-detached"
+        external = tmp_path / "external-prm"
+        external.mkdir()
+        (external / "sentinel").write_text("unchanged", encoding="utf-8")
+
+        def reject_after_replacement(*_args) -> float:
+            stage_dir.rename(detached)
+            stage_dir.symlink_to(external, target_is_directory=True)
+            return -1.0
+
+        rejecting_gate = SimpleNamespace(
+            model="replacement-test-gate",
+            votes=1,
+            evaluate_stage=reject_after_replacement,
+        )
+        monkeypatch.setattr(
+            ResearchPRMGate,
+            "from_bridge_config",
+            lambda *_args, **_kwargs: rejecting_gate,
+        )
+
+        result = rc_executor.execute_stage(
+            Stage.EXPERIMENT_DESIGN,
+            run_dir=run_dir,
+            run_id="stage9-fixed-prm-replacement",
+            config=config,
+            adapters=adapters,
+            auto_approve_gates=True,
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert sorted(path.name for path in external.iterdir()) == ["sentinel"]
+        assert (external / "sentinel").read_text(encoding="utf-8") == "unchanged"
+        assert not any(
+            (detached / name).exists()
+            for name in module._STAGE9_AUTHORITY_OUTPUTS
+        )
+        stage_dir.unlink()
+        detached.rename(stage_dir)
+        assert not (stage_dir / "experiment_contract.yaml").exists()
 
     def test_diagnostic_collision_cannot_preserve_stale_stage9_authority(
         self,
@@ -2031,7 +2954,9 @@ class TestExperimentDesignGuard:
         def reject_replay(**_kwargs):
             raise MetricAuthorityError("injected final replay failure")
 
-        monkeypatch.setattr(module, "replay_metric_authority", reject_replay)
+        monkeypatch.setattr(
+            module, "_replay_metric_authority_selection", reject_replay
+        )
         result = rc_executor._execute_experiment_design(
             stage_dir,
             run_dir,

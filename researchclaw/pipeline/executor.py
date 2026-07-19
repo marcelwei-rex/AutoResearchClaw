@@ -8,7 +8,7 @@ import time as _time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import yaml
 
@@ -37,6 +37,11 @@ from researchclaw.experiment.validator import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from researchclaw.experiment_runtime.metric_authority import (
+        MetricAuthoritySelection,
+    )
 
 
 class _DeferredLLMClient:
@@ -264,6 +269,67 @@ def _append_authority_cleanup_error(
         evidence_refs=result.evidence_refs,
     )
 
+
+def _finalize_fixed_stage9_authority(
+    result: StageResult,
+    run_dir: Path,
+    config: RCConfig,
+    lease: object,
+    namespace: BoundOutputNamespace,
+) -> StageResult:
+    """Replay approved Stage 9 authority or withdraw every failed terminal state."""
+
+    from researchclaw.pipeline.release_graph_lock import (
+        require_active_writer_invalidation_epoch,
+    )
+    from researchclaw.pipeline.stage_impls._experiment_design import (
+        _cleanup_stage9_outputs,
+        _validate_stage9_publication,
+    )
+
+    _ = require_active_writer_invalidation_epoch(run_dir, lease)
+    if namespace.run_dir != run_dir or namespace.stage_name != "stage-09":
+        raise RuntimeError("fixed Stage 9 finalizer namespace mismatch")
+    terminal = result
+    if terminal.status is StageStatus.DONE:
+        try:
+            _validate_stage9_publication(namespace, run_dir, config)
+            namespace.assert_canonical()
+            return terminal
+        except Exception as exc:  # noqa: BLE001
+            terminal = StageResult(
+                stage=result.stage,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"Fixed Stage 9 terminal replay failed: {exc}",
+                decision="abort",
+                evidence_refs=(),
+            )
+
+    if terminal.artifacts or terminal.evidence_refs:
+        terminal = StageResult(
+            stage=terminal.stage,
+            status=terminal.status,
+            artifacts=(),
+            error=terminal.error,
+            decision=terminal.decision,
+            evidence_refs=(),
+        )
+
+    try:
+        _cleanup_stage9_outputs(namespace)
+        namespace.assert_canonical()
+    except Exception as cleanup_exc:  # noqa: BLE001
+        return _append_authority_cleanup_error(terminal, cleanup_exc)
+    return StageResult(
+        stage=terminal.stage,
+        status=terminal.status,
+        artifacts=(),
+        error=terminal.error,
+        decision=terminal.decision,
+        evidence_refs=(),
+    )
+
 # ---------------------------------------------------------------------------
 # Domain detection (extracted to _domain.py)
 # ---------------------------------------------------------------------------
@@ -421,9 +487,21 @@ def _get_hitl_session(adapters: AdapterBundle) -> Any:
 
 
 def _capture_hitl_authority_namespace(
-    stage: Stage, run_dir: Path
+    stage: Stage,
+    run_dir: Path,
+    *,
+    fixed_stage9_authority: bool = False,
+    release_lock: object | None = None,
 ) -> BoundOutputNamespace | _MissingAuthorityNamespace | None:
-    """Hold Stage 25 identity across one HITL wait without following parents."""
+    """Hold deterministic authority identity across one HITL wait."""
+
+    if fixed_stage9_authority:
+        from researchclaw.pipeline.release_graph_lock import (
+            require_active_writer_invalidation_epoch,
+        )
+
+        writer = require_active_writer_invalidation_epoch(run_dir, release_lock)
+        return writer.open_stage_namespace("stage-09")
 
     if stage is not Stage.DEAI_AUDIT:
         return None
@@ -449,6 +527,15 @@ def _invalidate_hitl_authority_stage(
     if stage is Stage.DEAI_AUDIT and authority_namespace is None:
         raise OSError("Stage 25 HITL invalidation requires a held namespace")
     if isinstance(authority_namespace, _MissingAuthorityNamespace):
+        authority_namespace.assert_canonical()
+        return
+
+    if authority_namespace is not None and stage is Stage.EXPERIMENT_DESIGN:
+        from researchclaw.pipeline.stage_impls._experiment_design import (
+            _cleanup_stage9_outputs,
+        )
+
+        _cleanup_stage9_outputs(authority_namespace)
         authority_namespace.assert_canonical()
         return
 
@@ -512,6 +599,8 @@ def _guard_authority_human_input(
     run_dir: Path,
     human_input: Any,
     authority_namespace: BoundOutputNamespace | _MissingAuthorityNamespace | None = None,
+    *,
+    fixed_stage9_authority: bool = False,
 ) -> StageResult | None:
     from researchclaw.hitl.intervention import HumanAction
 
@@ -524,9 +613,15 @@ def _guard_authority_human_input(
         )
     mutation_requested = bool(
         human_input.edited_files
-        or (stage is Stage.DEAI_AUDIT and human_input.guidance)
+        or (
+            (stage is Stage.DEAI_AUDIT or fixed_stage9_authority)
+            and human_input.guidance
+        )
     )
-    if stage in SKIP_FORBIDDEN_STAGES and (
+    authority_hitl_forbidden = stage in SKIP_FORBIDDEN_STAGES or (
+        stage is Stage.EXPERIMENT_DESIGN and fixed_stage9_authority
+    )
+    if authority_hitl_forbidden and (
         human_input.action != HumanAction.APPROVE or mutation_requested
     ):
         return _forbidden_hitl_result(
@@ -535,7 +630,10 @@ def _guard_authority_human_input(
             action=f"post-stage {human_input.action.value.upper()}",
             authority_namespace=authority_namespace,
         )
-    if stage is Stage.DEAI_AUDIT and authority_namespace is not None:
+    if (
+        (stage is Stage.DEAI_AUDIT or fixed_stage9_authority)
+        and authority_namespace is not None
+    ):
         try:
             authority_namespace.assert_canonical()
         except OSError:
@@ -551,6 +649,9 @@ def _guard_authority_human_input(
 def _run_hitl_pre_stage(
     stage: Stage, run_dir: Path, adapters: AdapterBundle,
     config: RCConfig | None = None,
+    *,
+    fixed_stage9_authority: bool = False,
+    authority_namespace: BoundOutputNamespace | _MissingAuthorityNamespace | None = None,
 ) -> StageResult | None:
     """HITL pre-stage hook: pause before execution if policy requires.
 
@@ -570,16 +671,18 @@ def _run_hitl_pre_stage(
     contract = CONTRACTS.get(stage)
     output_files = _select_output_files(contract, config)
 
-    try:
-        authority_namespace = _capture_hitl_authority_namespace(stage, run_dir)
-    except OSError as exc:
-        return StageResult(
-            stage=stage,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            error=f"Cannot capture authority namespace before HITL wait: {exc}",
-            decision="abort",
-        )
+    owns_authority_namespace = authority_namespace is None
+    if owns_authority_namespace:
+        try:
+            authority_namespace = _capture_hitl_authority_namespace(stage, run_dir)
+        except OSError as exc:
+            return StageResult(
+                stage=stage,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"Cannot capture authority namespace before HITL wait: {exc}",
+                decision="abort",
+            )
     try:
         session.pause(
             stage_num,
@@ -591,7 +694,11 @@ def _run_hitl_pre_stage(
         human_input = session.wait_for_human()
 
         authority_guard = _guard_authority_human_input(
-            stage, run_dir, human_input, authority_namespace
+            stage,
+            run_dir,
+            human_input,
+            authority_namespace,
+            fixed_stage9_authority=fixed_stage9_authority,
         )
         if authority_guard is not None:
             return authority_guard
@@ -615,20 +722,29 @@ def _run_hitl_pre_stage(
         # Inject guidance if provided. Stage 25 rejects guidance above because
         # its deterministic audit has no mutable prompt input.
         if human_input.guidance:
-            stage_dir = run_dir / f"stage-{stage_num:02d}"
-            stage_dir.mkdir(parents=True, exist_ok=True)
-            guidance_file = stage_dir / "hitl_guidance.md"
-            guidance_file.write_text(human_input.guidance, encoding="utf-8")
+            if isinstance(authority_namespace, BoundOutputNamespace):
+                authority_namespace.write_text_atomic(
+                    "hitl_guidance.md", human_input.guidance
+                )
+            else:
+                stage_dir = run_dir / f"stage-{stage_num:02d}"
+                stage_dir.mkdir(parents=True, exist_ok=True)
+                guidance_file = stage_dir / "hitl_guidance.md"
+                guidance_file.write_text(human_input.guidance, encoding="utf-8")
 
         return None  # Proceed with execution
     finally:
-        if authority_namespace is not None:
+        if owns_authority_namespace and authority_namespace is not None:
             authority_namespace.close()
 
 
 def _run_hitl_post_stage(
     stage: Stage, result: StageResult, run_dir: Path, adapters: AdapterBundle,
     config: RCConfig | None = None,
+    *,
+    fixed_stage9_authority: bool = False,
+    release_lock: object | None = None,
+    stage9_namespace: BoundOutputNamespace | None = None,
 ) -> StageResult:
     """HITL post-stage hook: pause after execution for review.
 
@@ -650,16 +766,27 @@ def _run_hitl_post_stage(
         if budget > 0 and guard.should_pause(run_dir):
             from researchclaw.hitl.intervention import HumanAction, PauseReason
 
-            try:
-                authority_namespace = _capture_hitl_authority_namespace(stage, run_dir)
-            except OSError as exc:
-                return StageResult(
-                    stage=stage,
-                    status=StageStatus.FAILED,
-                    artifacts=(),
-                    error=f"Cannot capture authority namespace before cost HITL: {exc}",
-                    decision="abort",
-                )
+            owns_authority_namespace = not (
+                fixed_stage9_authority and stage9_namespace is not None
+            )
+            if owns_authority_namespace:
+                try:
+                    authority_namespace = _capture_hitl_authority_namespace(
+                        stage,
+                        run_dir,
+                        fixed_stage9_authority=fixed_stage9_authority,
+                        release_lock=release_lock,
+                    )
+                except OSError as exc:
+                    return StageResult(
+                        stage=stage,
+                        status=StageStatus.FAILED,
+                        artifacts=(),
+                        error=f"Cannot capture authority namespace before cost HITL: {exc}",
+                        decision="abort",
+                    )
+            else:
+                authority_namespace = stage9_namespace
             try:
                 session.pause(
                     stage_num,
@@ -669,7 +796,11 @@ def _run_hitl_post_stage(
                 )
                 human_input = session.wait_for_human()
                 authority_result = _guard_authority_human_input(
-                    stage, run_dir, human_input, authority_namespace
+                    stage,
+                    run_dir,
+                    human_input,
+                    authority_namespace,
+                    fixed_stage9_authority=fixed_stage9_authority,
                 )
                 if authority_result is not None:
                     return authority_result
@@ -682,7 +813,7 @@ def _run_hitl_post_stage(
                         decision="abort",
                     )
             finally:
-                if authority_namespace is not None:
+                if owns_authority_namespace and authority_namespace is not None:
                     authority_namespace.close()
     except Exception as _cg_exc:
         logger.debug("CostGuard check skipped: %s", _cg_exc)
@@ -696,11 +827,20 @@ def _run_hitl_post_stage(
             sp = SmartPause(threshold=0.7, run_dir=run_dir)
             q_score = None
             stage_dir = run_dir / f"stage-{stage_num:02d}"
-            prm_file = stage_dir / "prm_score.json"
-            if prm_file.exists():
+            prm_bytes = None
+            if fixed_stage9_authority and stage9_namespace is not None:
+                try:
+                    prm_bytes = stage9_namespace.read_bytes("prm_score.json")
+                except FileNotFoundError:
+                    pass
+            else:
+                prm_file = stage_dir / "prm_score.json"
+                if prm_file.exists():
+                    prm_bytes = prm_file.read_bytes()
+            if prm_bytes is not None:
                 import json as _sp_json
 
-                prm_data = _sp_json.loads(prm_file.read_text(encoding="utf-8"))
+                prm_data = _sp_json.loads(prm_bytes.decode("utf-8"))
                 q_score = prm_data.get("prm_score")
             should_smart_pause, _signal = sp.should_pause(
                 stage_num, stage.name, quality_score=q_score
@@ -731,9 +871,18 @@ def _run_hitl_post_stage(
             health_file = stage_dir / "stage_health.json"
             if health_file.exists():
                 health = _json_mod.loads(health_file.read_text(encoding="utf-8"))
-                prm_file = stage_dir / "prm_score.json"
-                if prm_file.exists():
-                    prm = _json_mod.loads(prm_file.read_text(encoding="utf-8"))
+                prm_bytes = None
+                if fixed_stage9_authority and stage9_namespace is not None:
+                    try:
+                        prm_bytes = stage9_namespace.read_bytes("prm_score.json")
+                    except FileNotFoundError:
+                        pass
+                else:
+                    prm_file = stage_dir / "prm_score.json"
+                    if prm_file.exists():
+                        prm_bytes = prm_file.read_bytes()
+                if prm_bytes is not None:
+                    prm = _json_mod.loads(prm_bytes.decode("utf-8"))
                     score = prm.get("prm_score", 1.0)
                     if score < policy.min_quality_score:
                         reason = PauseReason.QUALITY_BELOW_THRESHOLD
@@ -754,24 +903,42 @@ def _run_hitl_post_stage(
     # Read first 500 chars of key output files for summary
     stage_dir = run_dir / f"stage-{stage_num:02d}"
     for fname in output_files[:3]:
-        fpath = stage_dir / fname
-        if fpath.is_file():
+        if fixed_stage9_authority and stage9_namespace is not None:
             try:
-                text = fpath.read_text(encoding="utf-8")[:500]
+                text = stage9_namespace.read_bytes(fname).decode("utf-8")[:500]
                 context_lines.append(f"\n--- {fname} ---\n{text}")
-            except (OSError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError, FileNotFoundError):
                 pass
+        else:
+            fpath = stage_dir / fname
+            if fpath.is_file():
+                try:
+                    text = fpath.read_text(encoding="utf-8")[:500]
+                    context_lines.append(f"\n--- {fname} ---\n{text}")
+                except (OSError, UnicodeDecodeError):
+                    pass
 
-    try:
-        authority_namespace = _capture_hitl_authority_namespace(stage, run_dir)
-    except OSError as exc:
-        return StageResult(
-            stage=stage,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            error=f"Cannot capture authority namespace before post-stage HITL: {exc}",
-            decision="abort",
-        )
+    owns_authority_namespace = not (
+        fixed_stage9_authority and stage9_namespace is not None
+    )
+    if owns_authority_namespace:
+        try:
+            authority_namespace = _capture_hitl_authority_namespace(
+                stage,
+                run_dir,
+                fixed_stage9_authority=fixed_stage9_authority,
+                release_lock=release_lock,
+            )
+        except OSError as exc:
+            return StageResult(
+                stage=stage,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"Cannot capture authority namespace before post-stage HITL: {exc}",
+                decision="abort",
+            )
+    else:
+        authority_namespace = stage9_namespace
     try:
         session.pause(
             stage_num,
@@ -783,7 +950,11 @@ def _run_hitl_post_stage(
         human_input = session.wait_for_human()
 
         authority_result = _guard_authority_human_input(
-            stage, run_dir, human_input, authority_namespace
+            stage,
+            run_dir,
+            human_input,
+            authority_namespace,
+            fixed_stage9_authority=fixed_stage9_authority,
         )
         if authority_result is not None:
             return authority_result
@@ -844,7 +1015,7 @@ def _run_hitl_post_stage(
 
         return result
     finally:
-        if authority_namespace is not None:
+        if owns_authority_namespace and authority_namespace is not None:
             authority_namespace.close()
 
 
@@ -1070,6 +1241,81 @@ def _execute_stage_under_release_scope(
     auto_approve_gates: bool = False,
     release_lock: object | None = None,
 ) -> StageResult:
+    """Bind fixed Stage 9 to one directory fd for its complete attempt."""
+
+    if stage is not Stage.EXPERIMENT_DESIGN:
+        return _execute_stage_under_release_scope_impl(
+            stage,
+            run_dir=run_dir,
+            run_id=run_id,
+            config=config,
+            adapters=adapters,
+            auto_approve_gates=auto_approve_gates,
+            release_lock=release_lock,
+        )
+
+    from researchclaw.experiment_runtime.metric_authority import (
+        select_metric_authority,
+    )
+    from researchclaw.pipeline.release_graph_lock import (
+        require_active_writer_invalidation_epoch,
+    )
+    from researchclaw.pipeline.stage_impls._experiment_design import (
+        _cleanup_stage9_outputs,
+    )
+
+    try:
+        writer = require_active_writer_invalidation_epoch(run_dir, release_lock)
+        stage9_namespace = writer.open_stage_namespace(
+            "stage-09", create_stage=True
+        )
+        try:
+            _cleanup_stage9_outputs(stage9_namespace)
+            stage9_namespace.assert_canonical()
+            selection = select_metric_authority(
+                config.research.topic, config.experiment.mode
+            )
+        except Exception:
+            stage9_namespace.close()
+            raise
+    except Exception as exc:  # noqa: BLE001
+        return StageResult(
+            stage=stage,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Stage 9 attempt initialization failed: {exc}",
+            decision="abort",
+        )
+    try:
+        return _execute_stage_under_release_scope_impl(
+            stage,
+            run_dir=run_dir,
+            run_id=run_id,
+            config=config,
+            adapters=adapters,
+            auto_approve_gates=auto_approve_gates,
+            release_lock=writer,
+            fixed_stage9_authority=selection.schema_version == 2,
+            stage9_namespace=stage9_namespace,
+            stage9_authority_selection=selection,
+        )
+    finally:
+        stage9_namespace.close()
+
+
+def _execute_stage_under_release_scope_impl(
+    stage: Stage,
+    *,
+    run_dir: Path,
+    run_id: str,
+    config: RCConfig,
+    adapters: AdapterBundle,
+    auto_approve_gates: bool = False,
+    release_lock: object | None = None,
+    fixed_stage9_authority: bool = False,
+    stage9_namespace: BoundOutputNamespace | None = None,
+    stage9_authority_selection: MetricAuthoritySelection | None = None,
+) -> StageResult:
     """Execute one pipeline stage, validate outputs, and apply gate logic."""
 
     if int(stage) >= int(Stage.EXPERIMENT_RUN):
@@ -1079,35 +1325,56 @@ def _execute_stage_under_release_scope(
 
         require_canonical_evidence_capabilities(f"execute_stage.{stage.name}")
 
+    if stage9_namespace is not None and stage9_authority_selection is None:
+        return StageResult(
+            stage=stage,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error="Stage 9 held namespace requires its captured authority selection",
+            decision="abort",
+        )
+
     # --- HITL pre-stage hook ---
-    hitl_result = _run_hitl_pre_stage(stage, run_dir, adapters, config=config)
+    hitl_result = _run_hitl_pre_stage(
+        stage,
+        run_dir,
+        adapters,
+        config=config,
+        fixed_stage9_authority=fixed_stage9_authority,
+        authority_namespace=stage9_namespace,
+    )
     if hitl_result is not None:
         return hitl_result
 
-    stage_dir = run_dir / f"stage-{int(stage):02d}"
-    if stage_dir.is_symlink():
-        return StageResult(
-            stage=stage,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            error=f"Stage output directory is a symlink: {stage_dir.name}",
-        )
-    try:
-        stage_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return StageResult(
-            stage=stage,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            error=f"Cannot create stage output directory: {exc}",
-        )
-    if stage_dir.is_symlink() or not stage_dir.is_dir():
-        return StageResult(
-            stage=stage,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            error=f"Stage output directory is unsafe: {stage_dir.name}",
-        )
+    stage_dir = (
+        stage9_namespace.stage_dir
+        if stage9_namespace is not None
+        else run_dir / f"stage-{int(stage):02d}"
+    )
+    if stage9_namespace is None:
+        if stage_dir.is_symlink():
+            return StageResult(
+                stage=stage,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"Stage output directory is a symlink: {stage_dir.name}",
+            )
+        try:
+            stage_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return StageResult(
+                stage=stage,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"Cannot create stage output directory: {exc}",
+            )
+        if stage_dir.is_symlink() or not stage_dir.is_dir():
+            return StageResult(
+                stage=stage,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"Stage output directory is unsafe: {stage_dir.name}",
+            )
     _t_health_start = _time.monotonic()
     contract: StageContract = CONTRACTS[stage]
 
@@ -1135,11 +1402,12 @@ def _execute_stage_under_release_scope(
     if bridge.use_memory:
         adapters.memory.append("stages", f"{run_id}:{int(stage)}:running")
 
-    # Stages 10 and 12-14 choose their canonical domain evaluator before any
+    # Stages 9-10 and 12-14 choose their canonical domain evaluator before any
     # model call. Fixed paths never need an LLM; legacy branches resolve this
     # proxy on their first chat.
     llm: LLMClient | _DeferredLLMClient | None
     if stage in {
+        Stage.EXPERIMENT_DESIGN,
         Stage.CODE_GENERATION,
         Stage.EXPERIMENT_RUN,
         Stage.ITERATIVE_REFINE,
@@ -1161,9 +1429,21 @@ def _execute_stage_under_release_scope(
             } or None,
         )
         try:
-            result = executor(
-                stage_dir, run_dir, config, adapters, llm=llm, prompts=prompts
-            )
+            if stage9_namespace is not None:
+                result = executor(
+                    stage_dir,
+                    run_dir,
+                    config,
+                    adapters,
+                    llm=llm,
+                    prompts=prompts,
+                    namespace=stage9_namespace,
+                    authority_selection=stage9_authority_selection,
+                )
+            else:
+                result = executor(
+                    stage_dir, run_dir, config, adapters, llm=llm, prompts=prompts
+                )
         except TypeError as exc:
             if "unexpected keyword argument 'prompts'" not in str(exc):
                 raise
@@ -1220,6 +1500,25 @@ def _execute_stage_under_release_scope(
         if result.status != StageStatus.DONE:
             output_files = ()
         for output_file in output_files:
+            if fixed_stage9_authority and stage9_namespace is not None:
+                try:
+                    if output_file.endswith("/"):
+                        raise OSError(
+                            "fixed Stage 9 output contract cannot contain directories"
+                        )
+                    if not stage9_namespace.read_bytes(output_file):
+                        raise OSError("output is empty")
+                except OSError:
+                    result = StageResult(
+                        stage=stage,
+                        status=StageStatus.FAILED,
+                        artifacts=result.artifacts,
+                        error=f"Missing or empty output: {output_file}",
+                        decision="retry",
+                        evidence_refs=result.evidence_refs,
+                    )
+                    break
+                continue
             if output_file.endswith("/"):
                 path = stage_dir / output_file.rstrip("/")
                 if not path.is_dir() or not any(path.iterdir()):
@@ -1260,6 +1559,37 @@ def _execute_stage_under_release_scope(
             except Exception as cleanup_exc:  # noqa: BLE001
                 result = _append_authority_cleanup_error(result, cleanup_exc)
 
+    stage9_classification_failed = False
+    if stage is Stage.EXPERIMENT_DESIGN and result.status is StageStatus.DONE:
+        try:
+            from researchclaw.experiment_runtime.contract import load_contract_bytes
+
+            if stage9_namespace is None:
+                raise RuntimeError("Stage 9 authority requires a held namespace")
+            if stage9_authority_selection is None:
+                raise RuntimeError("Stage 9 authority selection was not captured")
+            published_contract = load_contract_bytes(
+                stage9_namespace.read_bytes("experiment_contract.yaml"),
+                authority_selection=stage9_authority_selection,
+            )
+            if (published_contract.schema_version == 3) != fixed_stage9_authority:
+                raise RuntimeError("Stage 9 selector/contract schema mismatch")
+            stage9_namespace.assert_canonical()
+        except Exception as exc:  # noqa: BLE001
+            stage9_classification_failed = True
+            result = StageResult(
+                stage=stage,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"Stage 9 authority classification failed: {exc}",
+                decision="abort",
+                evidence_refs=(),
+            )
+    if stage9_classification_failed and stage9_namespace is not None:
+        result = _finalize_fixed_stage9_authority(
+            result, run_dir, config, release_lock, stage9_namespace
+        )
+
     # --- MetaClaw PRM quality gate evaluation ---
     try:
         mc_bridge = getattr(config, "metaclaw_bridge", None)
@@ -1279,12 +1609,22 @@ def _execute_stage_under_release_scope(
                         # Read stage output for PRM evaluation
                         output_text = ""
                         for art in result.artifacts:
-                            art_path = stage_dir / art
-                            if art_path.exists() and art_path.is_file():
+                            if fixed_stage9_authority and stage9_namespace is not None:
                                 try:
-                                    output_text += art_path.read_text(encoding="utf-8")[:4000]
+                                    output_text += stage9_namespace.read_bytes(
+                                        art
+                                    ).decode("utf-8")[:4000]
                                 except (UnicodeDecodeError, OSError):
                                     pass
+                            else:
+                                art_path = stage_dir / art
+                                if art_path.exists() and art_path.is_file():
+                                    try:
+                                        output_text += art_path.read_text(
+                                            encoding="utf-8"
+                                        )[:4000]
+                                    except (UnicodeDecodeError, OSError):
+                                        pass
                         if output_text:
                             prm_score = prm_gate.evaluate_stage(int(stage), output_text)
                             logger.info(
@@ -1292,20 +1632,9 @@ def _execute_stage_under_release_scope(
                                 int(stage),
                                 prm_score,
                             )
-                            # Write PRM score to stage health
-                            import json as _prm_json
-
-                            prm_report = {
-                                "stage": int(stage),
-                                "prm_score": prm_score,
-                                "model": prm_gate.model,
-                                "votes": prm_gate.votes,
-                            }
-                            (stage_dir / "prm_score.json").write_text(
-                                _prm_json.dumps(prm_report, indent=2),
-                                encoding="utf-8",
-                            )
-                            # If PRM score is -1 (fail), mark stage as failed
+                            # A completed PRM rejection is terminal evidence.
+                            # Diagnostic publication below is best-effort and
+                            # must never turn the rejected stage back to DONE.
                             if prm_score == -1.0:
                                 logger.warning(
                                     "MetaClaw PRM rejected stage %d output",
@@ -1318,6 +1647,25 @@ def _execute_stage_under_release_scope(
                                     error="PRM quality gate: output below quality threshold",
                                     decision="retry",
                                     evidence_refs=result.evidence_refs,
+                                )
+                            # Write PRM score to stage health
+                            import json as _prm_json
+
+                            prm_report = {
+                                "stage": int(stage),
+                                "prm_score": prm_score,
+                                "model": prm_gate.model,
+                                "votes": prm_gate.votes,
+                            }
+                            prm_text = _prm_json.dumps(prm_report, indent=2)
+                            if fixed_stage9_authority and stage9_namespace is not None:
+                                stage9_namespace.write_text_atomic(
+                                    "prm_score.json", prm_text
+                                )
+                            else:
+                                (stage_dir / "prm_score.json").write_text(
+                                    prm_text,
+                                    encoding="utf-8",
                                 )
     except Exception:  # noqa: BLE001
         logger.warning("MetaClaw PRM evaluation failed (non-blocking)")
@@ -1349,6 +1697,18 @@ def _execute_stage_under_release_scope(
                     f"Approval required for {stage.name}",
                 )
 
+    # A rejected fixed Stage 9 generation must not remain authoritative while
+    # a later diagnostic/HITL path is waiting. The terminal guard repeats this
+    # invalidation after HITL to reject any non-cooperative reintroduction.
+    if (
+        fixed_stage9_authority
+        and result.status is not StageStatus.DONE
+        and stage9_namespace is not None
+    ):
+        result = _finalize_fixed_stage9_authority(
+            result, run_dir, config, release_lock, stage9_namespace
+        )
+
     if bridge.use_memory:
         adapters.memory.append("stages", f"{run_id}:{int(stage)}:{result.status.value}")
 
@@ -1363,6 +1723,10 @@ def _execute_stage_under_release_scope(
     # retains its historical diagnostics namespace.
     exact_authority_namespace = (
         stage in _EXACT_AUTHORITY_NAMESPACE_STAGES
+        or (
+            stage is Stage.EXPERIMENT_DESIGN
+            and fixed_stage9_authority
+        )
         or (
             stage is Stage.ITERATIVE_REFINE
             and result.status is StageStatus.DONE
@@ -1397,6 +1761,28 @@ def _execute_stage_under_release_scope(
             pass
 
     # --- HITL post-stage hook ---
-    result = _run_hitl_post_stage(stage, result, run_dir, adapters, config=config)
+    result = _run_hitl_post_stage(
+        stage,
+        result,
+        run_dir,
+        adapters,
+        config=config,
+        fixed_stage9_authority=fixed_stage9_authority,
+        release_lock=release_lock,
+        stage9_namespace=stage9_namespace,
+    )
+
+    if fixed_stage9_authority:
+        if stage9_namespace is None:
+            return StageResult(
+                stage=stage,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error="Fixed Stage 9 terminal guard lost its held namespace",
+                decision="abort",
+            )
+        result = _finalize_fixed_stage9_authority(
+            result, run_dir, config, release_lock, stage9_namespace
+        )
 
     return result

@@ -18,11 +18,15 @@ from researchclaw.experiment_runtime.contract import (
     contract_sha256,
     derive_contract,
     dump_contract,
-    load_contract,
+    load_contract_bytes,
 )
 from researchclaw.experiment_runtime.metric_authority import (
+    _replay_metric_authority_selection,
     MetricAuthorityError,
-    replay_metric_authority,
+    MetricAuthoritySelection,
+    build_domain_evaluator_capture_plan,
+    derive_domain_evaluator_experiment_plan,
+    select_metric_authority,
 )
 from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._helpers import (
@@ -151,54 +155,103 @@ def _execute_experiment_design(
     *,
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
+    namespace: BoundOutputNamespace | None = None,
+    authority_selection: MetricAuthoritySelection | None = None,
 ) -> StageResult:
+    if namespace is not None:
+        if namespace.run_dir != run_dir or namespace.stage_dir != stage_dir:
+            return StageResult(
+                stage=Stage.EXPERIMENT_DESIGN,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error="Stage 9 held namespace does not match producer paths",
+                decision="retry",
+            )
+        return _execute_experiment_design_in_namespace(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            namespace=namespace,
+            authority_selection=authority_selection,
+            llm=llm,
+            prompts=prompts,
+        )
     try:
         with BoundOutputNamespace.open(
             run_dir, stage_dir, "stage-09"
         ) as namespace:
-            _cleanup_stage9_outputs(namespace)
-            namespace.assert_canonical()
-            try:
-                result = _execute_experiment_design_bound(
-                    stage_dir,
-                    run_dir,
-                    config,
-                    adapters,
-                    namespace=namespace,
-                    llm=llm,
-                    prompts=prompts,
-                )
-                if result.status == StageStatus.DONE:
-                    _validate_stage9_publication(namespace, run_dir, config)
-                else:
-                    preserved = tuple(
-                        name
-                        for name in result.artifacts
-                        if name in _STAGE9_DIAGNOSTIC_OUTPUTS
-                    )
-                    _cleanup_stage9_outputs(
-                        namespace, preserve_diagnostics=preserved
-                    )
-                namespace.assert_canonical()
-                return result
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    _cleanup_stage9_outputs(namespace)
-                except OSError as cleanup_exc:
-                    exc.add_note(f"Stage 9 fd-bound cleanup also failed: {cleanup_exc}")
-                return StageResult(
-                    stage=Stage.EXPERIMENT_DESIGN,
-                    status=StageStatus.FAILED,
-                    artifacts=(),
-                    error=f"Stage 9 publication failed: {exc}",
-                    decision="retry",
-                )
+            return _execute_experiment_design_in_namespace(
+                stage_dir,
+                run_dir,
+                config,
+                adapters,
+                namespace=namespace,
+                authority_selection=authority_selection,
+                llm=llm,
+                prompts=prompts,
+            )
     except OSError as exc:
         return StageResult(
             stage=Stage.EXPERIMENT_DESIGN,
             status=StageStatus.FAILED,
             artifacts=(),
             error=f"Stage 9 output namespace is unsafe: {exc}",
+            decision="retry",
+        )
+
+
+def _execute_experiment_design_in_namespace(
+    stage_dir: Path,
+    run_dir: Path,
+    config: RCConfig,
+    adapters: AdapterBundle,
+    *,
+    namespace: BoundOutputNamespace,
+    authority_selection: MetricAuthoritySelection | None,
+    llm: LLMClient | None,
+    prompts: PromptManager | None,
+) -> StageResult:
+    try:
+        _cleanup_stage9_outputs(namespace)
+        namespace.assert_canonical()
+        if authority_selection is None:
+            authority_selection = select_metric_authority(
+                config.research.topic, config.experiment.mode
+            )
+        result = _execute_experiment_design_bound(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            namespace=namespace,
+            authority_selection=authority_selection,
+            llm=llm,
+            prompts=prompts,
+        )
+        if result.status == StageStatus.DONE:
+            _validate_stage9_publication(namespace, run_dir, config)
+        else:
+            preserved = tuple(
+                name
+                for name in result.artifacts
+                if name in _STAGE9_DIAGNOSTIC_OUTPUTS
+            )
+            _cleanup_stage9_outputs(
+                namespace, preserve_diagnostics=preserved
+            )
+        namespace.assert_canonical()
+        return result
+    except Exception as exc:  # noqa: BLE001
+        try:
+            _cleanup_stage9_outputs(namespace)
+        except OSError as cleanup_exc:
+            exc.add_note(f"Stage 9 fd-bound cleanup also failed: {cleanup_exc}")
+        return StageResult(
+            stage=Stage.EXPERIMENT_DESIGN,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Stage 9 publication failed: {exc}",
             decision="retry",
         )
 
@@ -210,6 +263,7 @@ def _execute_experiment_design_bound(
     adapters: AdapterBundle,
     *,
     namespace: BoundOutputNamespace,
+    authority_selection: MetricAuthoritySelection,
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
@@ -221,6 +275,13 @@ def _execute_experiment_design_bound(
         config, run_dir, include_goal=True, include_hypotheses=True
     )
     plan: dict[str, Any] | None = None
+    domain_capture_plan = None
+    selected_authority = authority_selection
+    if selected_authority.schema_version == 2:
+        domain_capture_plan = build_domain_evaluator_capture_plan(
+            selected_authority
+        )
+        plan = derive_domain_evaluator_experiment_plan(domain_capture_plan)
 
     # ── Domain detection ──────────────────────────────────────────────────
     # Detect the research domain early so we can adapt experiment design
@@ -282,7 +343,7 @@ def _execute_experiment_design_bound(
         except Exception:  # noqa: BLE001
             logger.debug("Domain experiment design context unavailable", exc_info=True)
 
-    if llm is not None:
+    if llm is not None and domain_capture_plan is None:
         _pm = prompts or PromptManager()
         # Pass dataset_guidance block for experiment design
         try:
@@ -543,7 +604,9 @@ def _execute_experiment_design_bound(
         if _ba_domain_profile is not None
         else "generic"
     )
-    _ba_domain_ok = _ba_domain_id.startswith("ml_")
+    _ba_domain_ok = (
+        domain_capture_plan is None and _ba_domain_id.startswith("ml_")
+    )
     if not _ba_domain_ok:
         logger.info(
             "BenchmarkAgent skipped: domain profile '%s' is not an ML profile (topic: %s)",
@@ -634,7 +697,8 @@ def _execute_experiment_design_bound(
         except Exception:  # noqa: BLE001
             pass
 
-    plan.setdefault("topic", config.research.topic)
+    if domain_capture_plan is None:
+        plan.setdefault("topic", config.research.topic)
 
     # BUG-R41-09: Enforce condition count limit based on time budget.
     # Too many conditions (30+) guarantee timeouts and wasted compute.
@@ -692,7 +756,12 @@ def _execute_experiment_design_bound(
         raise ContractValidationError(f"HITL guidance is unsafe: {exc}") from exc
     if guidance:
         try:
-            if guidance and llm is not None and isinstance(plan, dict):
+            if (
+                guidance
+                and domain_capture_plan is None
+                and llm is not None
+                and isinstance(plan, dict)
+            ):
                 logger.info("Applying HITL guidance to experiment design")
                 resp = llm.chat(
                     [{"role": "user", "content": (
@@ -716,27 +785,31 @@ def _execute_experiment_design_bound(
             logger.debug("HITL guidance application failed (non-blocking)")
 
     # --- HITL: Baseline Navigator data persistence ---
-    try:
-        from researchclaw.hitl.workshops.baseline import BaselineNavigator, BaselineCandidate
+    if domain_capture_plan is None:
+        try:
+            from researchclaw.hitl.workshops.baseline import (
+                BaselineCandidate,
+                BaselineNavigator,
+            )
 
-        nav = BaselineNavigator(run_dir, llm_client=llm)
-        if isinstance(plan, dict):
-            baselines = plan.get("baselines", [])
-            if isinstance(baselines, list):
-                for b in baselines:
-                    if isinstance(b, dict):
-                        nav.baselines.append(BaselineCandidate(
-                            name=b.get("name", str(b)),
-                            description=b.get("description", ""),
-                        ))
-                    elif isinstance(b, str):
-                        nav.baselines.append(BaselineCandidate(name=b))
-            metrics = plan.get("metrics", [])
-            if isinstance(metrics, list):
-                nav.metrics = [str(m) for m in metrics]
-        nav.save()
-    except Exception:
-        pass
+            nav = BaselineNavigator(run_dir, llm_client=llm)
+            if isinstance(plan, dict):
+                baselines = plan.get("baselines", [])
+                if isinstance(baselines, list):
+                    for b in baselines:
+                        if isinstance(b, dict):
+                            nav.baselines.append(BaselineCandidate(
+                                name=b.get("name", str(b)),
+                                description=b.get("description", ""),
+                            ))
+                        elif isinstance(b, str):
+                            nav.baselines.append(BaselineCandidate(name=b))
+                metrics = plan.get("metrics", [])
+                if isinstance(metrics, list):
+                    nav.metrics = [str(m) for m in metrics]
+            nav.save()
+        except Exception:
+            pass
 
     namespace.write_text_atomic(
         "exp_plan.yaml",
@@ -744,22 +817,30 @@ def _execute_experiment_design_bound(
     )
     try:
         contract = derive_contract(
-            config, plan, stage_dir=stage_dir, namespace=namespace
+            config,
+            plan,
+            stage_dir=stage_dir,
+            namespace=namespace,
+            authority_selection=(
+                domain_capture_plan.selection
+                if domain_capture_plan is not None
+                else selected_authority
+            ),
         )
         contract_sha = dump_contract(
             contract,
             stage_dir / "experiment_contract.yaml",
             namespace=namespace,
         )
-        replayed_contract = load_contract(
-            stage_dir / "experiment_contract.yaml", namespace=namespace
+        replayed_contract = load_contract_bytes(
+            namespace.read_bytes("experiment_contract.yaml"),
+            authority_selection=selected_authority,
         )
         if replayed_contract != contract:
             raise ContractValidationError("contract pre-sidecar replay mismatch")
-        replay_metric_authority(
+        _replay_metric_authority_selection(
+            selection=selected_authority,
             run_dir=run_dir,
-            topic=config.research.topic,
-            experiment_mode=config.experiment.mode,
             stored_identity=contract.metric_authority,
             metric_units=contract.metric_units,
             metric_display_labels=contract.metric_display_labels,
@@ -819,7 +900,13 @@ def _validate_stage9_publication(
         raise ContractValidationError("experiment plan replay root must be an object")
 
     contract_path = namespace.stage_dir / "experiment_contract.yaml"
-    contract = load_contract(contract_path, namespace=namespace)
+    replayed_selection = select_metric_authority(
+        config.research.topic, config.experiment.mode
+    )
+    contract = load_contract_bytes(
+        namespace.read_bytes("experiment_contract.yaml"),
+        authority_selection=replayed_selection,
+    )
     digest = contract_sha256(contract_path, namespace=namespace)
     try:
         sidecar = namespace.read_bytes("experiment_contract.sha256").decode("ascii")
@@ -828,14 +915,21 @@ def _validate_stage9_publication(
     if sidecar != digest + "\n":
         raise ContractValidationError("contract sidecar does not bind contract bytes")
 
-    replay_metric_authority(
+    _replay_metric_authority_selection(
+        selection=replayed_selection,
         run_dir=run_dir,
-        topic=config.research.topic,
-        experiment_mode=config.experiment.mode,
         stored_identity=contract.metric_authority,
         metric_units=contract.metric_units,
         metric_display_labels=contract.metric_display_labels,
         evaluator_authority=contract.evaluator_authority,
         namespace=namespace,
     )
+    if contract.schema_version == 3:
+        expected_plan = derive_domain_evaluator_experiment_plan(
+            build_domain_evaluator_capture_plan(replayed_selection)
+        )
+        if plan != expected_plan:
+            raise ContractValidationError(
+                "fixed domain evaluator experiment plan mismatch"
+            )
     namespace.assert_canonical()

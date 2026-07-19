@@ -172,7 +172,9 @@ def test_stage10_executor_accepts_exact_domain_capture_contract(
 
 
 def test_captured_authority_rejects_coherent_package_hash_rewrite() -> None:
-    plan = metric_authority.build_domain_evaluator_capture_plan(TOPIC, "sandbox")
+    plan = metric_authority.build_domain_evaluator_capture_plan(
+        metric_authority.select_metric_authority(TOPIC, "sandbox")
+    )
     forged_manifest = plan.package_manifest_bytes + b" "
     forged_authority = dict(plan.selection.evaluator_authority or {})
     forged_sha = hashlib.sha256(forged_manifest).hexdigest()

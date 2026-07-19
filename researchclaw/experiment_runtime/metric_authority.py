@@ -127,11 +127,10 @@ class DomainEvaluatorCapturePlan:
 
 
 def build_domain_evaluator_capture_plan(
-    topic: str, experiment_mode: str
+    selection: MetricAuthoritySelection,
 ) -> DomainEvaluatorCapturePlan:
     """Capture one exact trusted package plan without authorizing live paths."""
 
-    selection = select_metric_authority(topic, experiment_mode)
     if selection.schema_version != 2 or selection.evaluator_authority is None:
         raise MetricAuthorityError("selected authority is not a domain evaluator")
     manifest_path = TRUSTED_SOURCE_BASE / TROJNET_PACKAGE_MANIFEST_PATH
@@ -197,6 +196,42 @@ def build_domain_evaluator_capture_plan(
         files=tuple(ordered_entries),
         contents=deepcopy(contents),
     )
+
+
+def derive_domain_evaluator_experiment_plan(
+    capture: DomainEvaluatorCapturePlan,
+) -> dict[str, Any]:
+    """Derive the fixed Stage 9 plan from the trusted execution policy."""
+
+    policy = _load_execution_policy_bytes(capture.execution_policy_bytes)
+    primary_condition = policy["primary_condition"]
+    return {
+        "plan_schema_version": 1,
+        "mode": "fixed_domain_evaluator",
+        "evaluator_id": capture.selection.evaluator_id,
+        "objectives": [
+            "Evaluate the fixed TrojNet localization conditions under the trusted execution policy"
+        ],
+        "datasets": ["controlled_synthetic_iscas85_trojan_localization_v1"],
+        "baselines": [
+            condition
+            for condition in policy["conditions"]
+            if condition != primary_condition
+        ],
+        "proposed_methods": [primary_condition],
+        "ablations": [],
+        "metrics": list(policy["metric_keys"]),
+        "seeds": list(policy["seeds"]),
+        "circuit_families": list(policy["circuit_families"]),
+        "variants_per_family": policy["variants_per_family"],
+        "primary_metric": policy["primary_metric_key"],
+        "primary_aggregation": policy["primary_aggregation"],
+        "execution_policy_version": policy["execution_policy_version"],
+        "invocation_count": policy["invocation_count"],
+        "risks": [
+            "pipeline-validation results are limited to the controlled synthetic fixture"
+        ],
+    }
 
 
 def replay_captured_domain_evaluator_authority(
@@ -716,19 +751,17 @@ def publish_metric_authority_snapshots(
         ) from exc
 
 
-def replay_metric_authority(
+def _replay_metric_authority_selection(
     *,
+    selection: MetricAuthoritySelection,
     run_dir: Path,
-    topic: str,
-    experiment_mode: str,
     stored_identity: Mapping[str, Any],
     metric_units: Mapping[str, Any],
     metric_display_labels: Mapping[str, Any],
     evaluator_authority: Mapping[str, Any] | None = None,
     namespace: BoundOutputNamespace | None = None,
 ) -> MetricAuthoritySelection:
-    """Rerun both trusted selectors, then compare all run-local snapshots."""
-    selection = select_metric_authority(topic, experiment_mode)
+    """Replay snapshots against one caller-captured trusted selection."""
     expected_identity = selection.contract_identity()
     if dict(stored_identity) != expected_identity:
         raise MetricAuthorityError("stored metric authority identity mismatch")
@@ -773,6 +806,30 @@ def replay_metric_authority(
             f"run-local metric snapshot namespace is unsafe: {exc}"
         ) from exc
     return selection
+
+
+def replay_metric_authority(
+    *,
+    run_dir: Path,
+    topic: str,
+    experiment_mode: str,
+    stored_identity: Mapping[str, Any],
+    metric_units: Mapping[str, Any],
+    metric_display_labels: Mapping[str, Any],
+    evaluator_authority: Mapping[str, Any] | None = None,
+    namespace: BoundOutputNamespace | None = None,
+) -> MetricAuthoritySelection:
+    """Rerun the trusted selector, then compare all run-local snapshots."""
+
+    return _replay_metric_authority_selection(
+        selection=select_metric_authority(topic, experiment_mode),
+        run_dir=run_dir,
+        stored_identity=stored_identity,
+        metric_units=metric_units,
+        metric_display_labels=metric_display_labels,
+        evaluator_authority=evaluator_authority,
+        namespace=namespace,
+    )
 
 
 def _select_domain_id(normalized_topic: str, policy: Mapping[str, Any]) -> str:

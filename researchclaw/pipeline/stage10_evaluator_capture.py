@@ -25,6 +25,7 @@ from researchclaw.experiment_runtime.metric_authority import (
     MetricAuthorityError,
     build_domain_evaluator_capture_plan,
     replay_captured_domain_evaluator_authority,
+    select_metric_authority,
 )
 from researchclaw.literature.citation_policy import (
     ConfigSnapshotNamespaceInputs,
@@ -108,8 +109,10 @@ def publish_domain_evaluator_candidate(
                     )
                 )
                 plan = build_domain_evaluator_capture_plan(
-                    captured_config.research.topic,
-                    captured_config.experiment.mode,
+                    select_metric_authority(
+                        captured_config.research.topic,
+                        captured_config.experiment.mode,
+                    )
                 )
                 manifest_bytes = _capture_manifest_bytes(contract, plan)
                 _publish_capture_tree(namespace, plan, manifest_bytes)
