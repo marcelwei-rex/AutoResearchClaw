@@ -21,6 +21,9 @@ from researchclaw.pipeline.stage_impls._paper_writing import (
     _validate_stage17_manuscript_structure,
     _write_paper_sections,
 )
+from researchclaw.literature.citation_plan import (
+    build_heading_citation_writer_instructions_from_authority,
+)
 from researchclaw.pipeline.stage_impls._review_publish import (
     _citation_count_policy_violations,
     _execute_peer_review,
@@ -281,6 +284,93 @@ def test_stage17_writer_prompts_use_only_section_scoped_citation_authority() -> 
             "GENERAL CITATION MANDATE"
         )
         assert "override every earlier general citation requirement" in system
+
+
+def test_heading_authority_is_exact_for_related_work_only() -> None:
+    plan = {
+        "claims": [
+            {
+                "claim_id": f"planned-claim-{index:03d}",
+                "claim_text": f"Bounded claim {index}.",
+                "section_path": ["Related Work"],
+                "planned_citations": [
+                    {
+                        "cite_key": f"author{index}2024work",
+                        "evidence_excerpt_ids": [f"ev-{index}"],
+                    }
+                ],
+            }
+            for index in range(1, 20)
+        ]
+    }
+    cards = [
+        {
+            "cite_key": f"author{index}2024work",
+            "extraction_status": "success",
+            "evidence_excerpts": [
+                {
+                    "excerpt_id": f"ev-{index}",
+                    "excerpt_text": f"Evidence {index}.",
+                }
+            ],
+        }
+        for index in range(1, 20)
+    ]
+
+    authority = build_heading_citation_writer_instructions_from_authority(
+        plan,
+        cards,
+        heading_names=("Introduction", "Related Work", "Method"),
+    )
+
+    assert all(f"author{index}2024work" not in authority["Introduction"] for index in range(1, 20))
+    assert all(f"author{index}2024work" in authority["Related Work"] for index in range(1, 20))
+    assert all(f"author{index}2024work" not in authority["Method"] for index in range(1, 20))
+    assert "Cite every required key above" not in authority["Introduction"]
+    assert "Cite every required key above" not in authority["Method"]
+
+
+def test_stage17_heading_writer_isolates_related_work_authority() -> None:
+    llm = _SequentialLLM(
+        [
+            "## Title\n\nPaper.\n\n## Abstract\n\nA.\n\n## Introduction\n\nI.",
+            "## Related Work\n\nPrior work [smith2024deep].",
+            "## Method\n\nM.\n\n## Experiments\n\nE.",
+            "## Results\n\nR.\n\n## Discussion\n\nD.\n\n"
+            "## Limitations\n\nL.\n\n## Conclusion\n\nC.",
+        ]
+    )
+    authority = {
+        heading: "No citation authority is assigned to this writing part."
+        for heading in (
+            "Abstract", "Introduction", "Method", "Experiments", "Results",
+            "Discussion", "Limitations", "Conclusion",
+        )
+    }
+    authority["Related Work"] = (
+        "FINAL CITATION PLAN (THE ONLY CITATION AUTHORITY):\n"
+        "Required citation key: [smith2024deep]\n"
+        "Retained abstract evidence: Evidence.\n"
+        "CITATION RULES:\n- Cite every required key above at least once."
+    )
+
+    _write_paper_sections(
+        llm=cast(Any, llm), pm=cast(Any, _PromptManagerStub()),
+        preamble="", topic_constraint="", exp_metrics_instruction="",
+        citation_instruction="", outline="Poison [foreign2024paper].",
+        citation_repair_claims=(
+            {"section": "Related Work", "claim_text": "Bounded claim.", "cite_key": "smith2024deep"},
+        ),
+        heading_citation_instructions=authority,
+    )
+
+    prompts = ["\n".join(message["content"] for message in call) for call in llm.calls]
+    assert len(prompts) == 4
+    assert "smith2024deep" not in prompts[0]
+    assert "smith2024deep" in prompts[1]
+    assert "smith2024deep" not in prompts[2]
+    assert "smith2024deep" not in prompts[3]
+    assert all("foreign2024paper" not in prompt for prompt in prompts)
 
 
 def test_stage17_repair_removes_foreign_citations_before_regeneration() -> None:

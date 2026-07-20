@@ -1456,16 +1456,17 @@ def test_stage17_uses_final_plan_only_and_writes_replayable_closure(
     key = shortlist[0]["cite_key"]
     llm = _SequenceLLM(
         [
-            (
-                "## Title\n\nBounded Study\n\n## Abstract\n\nAbstract.\n\n"
-                "## Introduction\n\nIntroduction.\n\n"
-                f"## Related Work\n\n### Theme\n\nEvidence-backed context [{key}]."
-            ),
-            "## Method\n\nMethod.\n\n## Experiments\n\nExperiment setup.",
-            "## Results\n\nDetection F1 was 95%.\n\n"
-            "## Discussion\n\nDiscussion.\n\n"
-            "## Limitations\n\nLimitations.\n\n"
-            "## Conclusion\n\nConclusion.",
+                (
+                    "## Title\n\nBounded Study\n\n## Abstract\n\nAbstract.\n\n"
+                    "## Introduction\n\nIntroduction."
+                ),
+                "## Related Work\n\n### Theme\n\nEvidence-backed context.",
+                "## Method\n\nMethod.\n\n## Experiments\n\nExperiment setup.",
+                "## Results\n\nDetection F1 was 95%.\n\n"
+                "## Discussion\n\nDiscussion.\n\n"
+                "## Limitations\n\nLimitations.\n\n"
+                "## Conclusion\n\nConclusion.",
+                f"## Related Work\n\n### Theme\n\nEvidence-backed context [{key}].",
         ]
     )
     stage17 = run_dir / "stage-17"
@@ -1478,6 +1479,7 @@ def test_stage17_uses_final_plan_only_and_writes_replayable_closure(
         llm=llm,  # type: ignore[arg-type]
     )
     assert result.status is StageStatus.DONE, result.error
+    assert (stage17 / "citation_heading_repair_log.json").is_file()
     prompts = "\n".join(llm.calls)
     assert "FINAL CITATION PLAN" in prompts
     assert "AVAILABLE REFERENCES" not in prompts

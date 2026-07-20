@@ -435,6 +435,49 @@ def build_citation_writer_instruction_from_authority(
     )
 
 
+def build_heading_citation_writer_instructions_from_authority(
+    plan: Mapping[str, Any],
+    cards: list[Mapping[str, Any]],
+    *,
+    heading_names: tuple[str, ...],
+) -> dict[str, str]:
+    """Render exact final-plan authority separately for each top-level heading."""
+
+    if len(heading_names) != len(set(heading_names)) or any(
+        not isinstance(name, str) or not name for name in heading_names
+    ):
+        raise CitationPlanContractError("heading authority names must be unique strings")
+    return {
+        heading: build_citation_writer_instruction_from_authority(
+            plan,
+            cards,
+            section_names=(heading,),
+        )
+        for heading in heading_names
+    }
+
+
+def attribute_citation_keys_to_top_level_headings(
+    paper_text: str,
+) -> dict[str, frozenset[str]]:
+    """Strictly attribute Markdown citation markers to their top-level heading."""
+
+    try:
+        document = parse_manuscript(paper_text, strict=True)
+    except ManuscriptStructureError as exc:
+        raise CitationPlanContractError(
+            f"cannot attribute citations from an ambiguous manuscript: {exc}"
+        ) from exc
+    attributed: dict[str, set[str]] = {}
+    for section in document.sections:
+        top_level = section.path[0]
+        attributed.setdefault(top_level, set()).update(extract_citation_keys(section.body))
+    return {
+        heading: frozenset(keys)
+        for heading, keys in attributed.items()
+    }
+
+
 def load_canonical_bibliography(run_dir: Path) -> str:
     """Load and replay the immutable registry-bound Stage 4 bibliography."""
 
@@ -648,12 +691,12 @@ def build_citation_closure_from_texts(
             and structure.get("issues") == []
         )
         if structure_valid:
-            section_keys: dict[str, set[str]] = {}
-            for section in document.sections:
-                top_level = section.path[0].casefold()
-                section_keys.setdefault(top_level, set()).update(
-                    extract_citation_keys(section.body)
-                )
+            section_keys = {
+                heading.casefold(): keys
+                for heading, keys in attribute_citation_keys_to_top_level_headings(
+                    paper_text
+                ).items()
+            }
             for claim in plan["claims"]:
                 assigned = claim["section_path"][-1].casefold()
                 for citation in claim["planned_citations"]:

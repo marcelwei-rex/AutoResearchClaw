@@ -24,10 +24,12 @@ from researchclaw.literature.citation_policy import (
 )
 from researchclaw.literature.citation_plan import (
     CitationPlanContractError,
+    attribute_citation_keys_to_top_level_headings,
+    build_heading_citation_writer_instructions_from_authority,
     build_citation_closure_report,
     build_citation_plan,
+    # Stable monkeypatch seam for legacy executor fixtures.
     build_citation_writer_instruction,
-    build_citation_writer_instruction_from_authority,
     load_final_citation_plan,
     validate_citation_closure_report,
     validate_citation_plan,
@@ -40,7 +42,11 @@ from researchclaw.literature.experiment_fact_closure import (
     remove_unsupported_experiment_fact_blocks,
     validate_experiment_fact_closure_report,
 )
-from researchclaw.pipeline._domain import _detect_domain, _is_ml_domain
+from researchclaw.pipeline._domain import (
+    _detect_domain,
+    _is_ml_domain,
+    _prompt_bank_domain_from_config,
+)
 from researchclaw.pipeline._helpers import (
     StageResult,
     _build_context_preamble,
@@ -55,8 +61,10 @@ from researchclaw.pipeline._helpers import (
 )
 from researchclaw.pipeline.manuscript_sections import (
     ManuscriptStructureError,
+    merge_manuscript,
     parse_manuscript,
 )
+from researchclaw.pipeline.sectional_validation import extract_citation_keys
 from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidence,
     CanonicalExperimentEvidenceError,
@@ -993,6 +1001,7 @@ def _write_paper_sections(
     stage_dir: Path | None = None,
     citation_repair_claims: tuple[dict[str, str], ...] = (),
     part_citation_instructions: Mapping[str, str] | None = None,
+    heading_citation_instructions: Mapping[str, str] | None = None,
 ) -> str:
     """Write a conference-grade paper in 3 sequential LLM calls.
 
@@ -1006,6 +1015,15 @@ def _write_paper_sections(
       Call 2: Model / Theoretical framework + Phenomenology / Computational setup
       Call 3: Results + Discussion + Conclusions (no Broader Impact, no Related Work block)
     """
+    if heading_citation_instructions is not None:
+        return _write_heading_scoped_paper_sections(
+            llm=llm, pm=pm, preamble=preamble, topic_constraint=topic_constraint,
+            exp_metrics_instruction=exp_metrics_instruction, outline=outline,
+            model_name=model_name, is_hep=is_hep, stage_dir=stage_dir,
+            citation_repair_claims=citation_repair_claims,
+            heading_citation_instructions=heading_citation_instructions,
+        )
+
     # Render writing_structure block for injection
     try:
         _writing_structure = pm.block("writing_structure")
@@ -1420,6 +1438,237 @@ def _write_paper_sections(
     logger.info("Stage 17: Full draft — %d chars, ~%d words", len(draft), total_words)
 
     return draft
+
+
+def _citation_safe_system(system: str, authority: str) -> str:
+    """Remove inherited citation mandates before adding one heading authority."""
+
+    retained = [
+        line for line in system.splitlines()
+        if "cite" not in line.casefold() and "citation" not in line.casefold()
+    ]
+    return _section_scoped_writer_system("\n".join(retained), authority)
+
+
+def _heading_writer_groups(
+    base_groups: tuple[tuple[str, ...], ...],
+    claims: tuple[dict[str, str], ...],
+) -> tuple[tuple[str, ...], ...]:
+    """Keep zero-authority headings together; isolate every authority heading."""
+
+    authority_headings = {claim["section"] for claim in claims}
+    result: list[tuple[str, ...]] = []
+    for base_group in base_groups:
+        pending: list[str] = []
+        for heading in base_group:
+            if heading in authority_headings:
+                if pending:
+                    result.append(tuple(pending))
+                    pending = []
+                result.append((heading,))
+            else:
+                pending.append(heading)
+        if pending:
+            result.append(tuple(pending))
+    return tuple(result)
+
+
+def _write_heading_scoped_paper_sections(
+    *,
+    llm: LLMClient,
+    pm: PromptManager,
+    preamble: str,
+    topic_constraint: str,
+    exp_metrics_instruction: str,
+    outline: str,
+    model_name: str,
+    is_hep: bool,
+    stage_dir: Path | None,
+    citation_repair_claims: tuple[dict[str, str], ...],
+    heading_citation_instructions: Mapping[str, str],
+) -> str:
+    """Write only contiguous zero-authority or single authority-heading groups."""
+
+    base_groups = (
+        (("Abstract", "Introduction"),
+         ("Model / Theoretical Framework", "Phenomenology / Computational Setup"),
+         ("Results", "Discussion", "Conclusions"))
+        if is_hep else
+        (("Abstract", "Introduction", "Related Work"),
+         ("Method", "Experiments"),
+         ("Results", "Discussion", "Limitations", "Conclusion"))
+    )
+    headings = tuple(heading for group in base_groups for heading in group)
+    if set(heading_citation_instructions) != set(headings):
+        raise ValueError("heading citation authority must cover the active template")
+    groups = _heading_writer_groups(base_groups, citation_repair_claims)
+    system = pm.for_stage(
+        "paper_draft", evolution_overlay="", preamble="", topic_constraint="",
+        exp_metrics_instruction="", citation_instruction="", writing_structure="",
+        outline="", venue_guidance="",
+    ).system
+    report_entries: list[dict[str, Any]] = []
+    generated: list[str] = []
+    for index, group in enumerate(groups):
+        allowed = frozenset(
+            claim["cite_key"] for claim in citation_repair_claims
+            if claim["section"] in group
+        )
+        authority = "\n\n".join(heading_citation_instructions[heading] for heading in group)
+        safe_outline = _filter_citation_markers(outline, allowed)
+        safe_prior = _citation_free_prior_context("\n\n".join(generated))
+        title_slot = index == 0
+        requested = (("Title",) if title_slot else ()) + group
+        heading_lines = "\n".join(f"- ## {heading}" for heading in requested)
+        user = (
+            f"{_filter_citation_markers(preamble, allowed)}\n"
+            f"{_filter_citation_markers(topic_constraint, allowed)}\n"
+            f"{_filter_citation_markers(exp_metrics_instruction, allowed)}\n\n"
+            f"Write exactly these manuscript headings:\n{heading_lines}\n\n"
+            f"{authority}\n\n"
+            "Prior context is citation-free and may not be repeated:\n"
+            f"---\n{safe_prior}\n---\n\n"
+            f"Outline:\n{safe_outline}\n"
+            "Do not output a References section."
+            + _SECTION_OUTPUT_CONTRACT
+        )
+        response = _chat_with_prompt(
+            llm, _citation_safe_system(system, authority), user,
+            max_tokens=24000 if model_name.startswith(("gpt-5", "o3", "o4")) else 12000,
+            retries=1,
+        ).content.strip()
+        part = _validate_or_regenerate_paper_part(
+            llm=llm, initial_text=response, part_name=f"heading-group-{index + 1}",
+            expected_major_sections=group, title_slot=title_slot,
+            citation_repair_context=_compact_part_citation_context(citation_repair_claims, group),
+            allowed_citation_keys=allowed, max_tokens=12000,
+            report_entries=report_entries, stage_dir=stage_dir,
+        )
+        generated.append(part)
+    return "\n\n".join(generated)
+
+
+def _heading_citation_state(
+    paper_text: str, claims: tuple[dict[str, str], ...]
+) -> dict[str, set[str]]:
+    """Return the exact heading-local citation closure state for a draft."""
+
+    assigned: dict[str, set[str]] = {}
+    for claim in claims:
+        assigned.setdefault(claim["section"], set()).add(claim["cite_key"])
+    attributed = attribute_citation_keys_to_top_level_headings(paper_text)
+    actual = {heading: set(keys) for heading, keys in attributed.items()}
+    all_expected = set().union(*assigned.values()) if assigned else set()
+    all_actual = set(extract_citation_keys(paper_text))
+    missing = {
+        heading: keys - actual.get(heading, set())
+        for heading, keys in assigned.items()
+        if keys - actual.get(heading, set())
+    }
+    misplaced = {
+        heading: actual.get(heading, set()) - assigned.get(heading, set())
+        for heading in actual
+        if actual.get(heading, set()) - assigned.get(heading, set())
+    }
+    return {
+        "missing": set().union(*missing.values()) if missing else set(),
+        "misplaced": set().union(*misplaced.values()) if misplaced else set(),
+        "unknown_or_unplanned": all_actual - all_expected,
+        "missing_by_heading": missing,
+        "actual": all_actual,
+    }
+
+
+def _top_level_heading_blocks(paper_text: str) -> dict[str, str]:
+    document = parse_manuscript(paper_text, strict=True)
+    lines = paper_text.splitlines(keepends=True)
+    top_sections = [section for section in document.sections if len(section.path) == 1]
+    blocks: dict[str, str] = {}
+    for index, section in enumerate(top_sections):
+        end = top_sections[index + 1].start_line if index + 1 < len(top_sections) else len(lines)
+        blocks[section.title] = "".join(lines[section.start_line:end])
+    return blocks
+
+
+def _repair_heading_citation_closure(
+    *,
+    llm: LLMClient,
+    run_dir: Path,
+    stage_dir: Path,
+    paper_text: str,
+    evidence: CanonicalExperimentEvidence,
+    claims: tuple[dict[str, str], ...],
+    heading_citation_instructions: Mapping[str, str],
+    system: str,
+) -> str:
+    """Apply one bounded repair per missing heading before fact repair freezes bytes."""
+
+    document = parse_manuscript(paper_text, strict=True)
+    allowed_by_heading: dict[str, frozenset[str]] = {}
+    for heading in heading_citation_instructions:
+        allowed_by_heading[heading] = frozenset(
+            claim["cite_key"] for claim in claims if claim["section"] == heading
+        )
+    replacements = {
+        section.section_id: _filter_citation_markers(
+            section.body, allowed_by_heading.get(section.path[0], frozenset())
+        )
+        for section in document.sections
+    }
+    cleaned = merge_manuscript(document, replacements)
+    baseline = build_experiment_fact_closure_report(
+        run_dir, paper_text=cleaned, evidence=evidence
+    )["manuscript_numeric_values"]
+    operations: list[dict[str, Any]] = [{
+        "kind": "unauthorized_marker_removal",
+        "source_sha256": hashlib.sha256(paper_text.encode("utf-8")).hexdigest(),
+        "cleaned_sha256": hashlib.sha256(cleaned.encode("utf-8")).hexdigest(),
+    }]
+    current = cleaned
+    state = _heading_citation_state(current, claims)
+    for heading, missing_keys in state["missing_by_heading"].items():
+        block = _top_level_heading_blocks(current).get(heading)
+        if block is None:
+            raise CitationPlanContractError(f"required citation heading is missing: {heading}")
+        authority = heading_citation_instructions[heading]
+        prompt = (
+            f"Repair only this exact top-level heading block: {heading}.\n"
+            f"It must contain each missing authorized key exactly as needed: "
+            f"{', '.join(f'[{key}]' for key in sorted(missing_keys))}.\n"
+            "Do not add any other citation key. Preserve every numeric literal exactly. "
+            "Return only the replacement heading block.\n\n"
+            f"{authority}\n\n<heading_block>\n{block}</heading_block>"
+        )
+        repaired = _chat_with_prompt(
+            llm, _citation_safe_system(system, authority), prompt,
+            max_tokens=12000, retries=1,
+        ).content.strip()
+        if not repaired.startswith(f"## {heading}"):
+            raise CitationPlanContractError("heading-local citation repair returned wrong heading")
+        repaired_headings = _top_level_heading_blocks(repaired)
+        if set(repaired_headings) != {heading}:
+            raise CitationPlanContractError(
+                "heading-local citation repair returned extra top-level headings"
+            )
+        current = current.replace(block, repaired + "\n", 1)
+        operations.append({
+            "kind": "bounded_heading_repair",
+            "heading": heading,
+            "missing_keys": sorted(missing_keys),
+        })
+    after = build_experiment_fact_closure_report(
+        run_dir, paper_text=current, evidence=evidence
+    )["manuscript_numeric_values"]
+    state = _heading_citation_state(current, claims)
+    if baseline != after:
+        raise CitationPlanContractError("heading-local citation repair changed numeric tokens")
+    if state["unknown_or_unplanned"] or state["misplaced"] or state["missing"]:
+        raise CitationPlanContractError("heading-local citation repair did not close citations")
+    (stage_dir / "citation_heading_repair_log.json").write_text(
+        canonical_json_text({"schema_version": 1, "_diagnostic": True, "operations": operations}),
+        encoding="utf-8",
+    )
+    return current
 
 
 # ---------------------------------------------------------------------------
@@ -2148,6 +2397,7 @@ def _execute_paper_draft(
         "experiment_fact_closure_initial.json",
         "experiment_fact_closure_after.json",
         "experiment_fact_repair_log.json",
+        "citation_heading_repair_log.json",
         "draft_quality.json",
         "paper_meta.json",
         "quality_warnings.json",
@@ -2519,7 +2769,13 @@ def _execute_paper_draft(
 
     try:
         final_citation_plan = load_final_citation_plan(run_dir, config)
-        citation_cards = load_validated_cards(run_dir, config)
+        # An empty final plan grants no citation authority, so no card bytes are
+        # needed to render the corresponding no-citation heading instructions.
+        citation_cards = (
+            load_validated_cards(run_dir, config)
+            if final_citation_plan["claims"]
+            else {}
+        )
     except CitationPlanContractError as exc:
         return StageResult(
             stage=Stage.PAPER_DRAFT,
@@ -2536,23 +2792,18 @@ def _execute_paper_draft(
         }
         for claim in final_citation_plan["claims"]
     )
-    part_citation_instructions = {
-        "part-1": build_citation_writer_instruction_from_authority(
-            final_citation_plan,
-            citation_cards,
-            section_names=("Abstract", "Introduction", "Related Work"),
-        ),
-        "part-2": build_citation_writer_instruction_from_authority(
-            final_citation_plan,
-            citation_cards,
-            section_names=("Method", "Experiments"),
-        ),
-        "part-3": build_citation_writer_instruction_from_authority(
-            final_citation_plan,
-            citation_cards,
-            section_names=("Results", "Discussion", "Limitations", "Conclusion"),
-        ),
-    }
+    heading_names = (
+        ("Abstract", "Introduction", "Model / Theoretical Framework",
+         "Phenomenology / Computational Setup", "Results", "Discussion", "Conclusions")
+        if _prompt_bank_domain_from_config(config) == "hep_ph" else
+        ("Abstract", "Introduction", "Related Work", "Method", "Experiments",
+         "Results", "Discussion", "Limitations", "Conclusion")
+    )
+    heading_citation_instructions = (
+        build_heading_citation_writer_instructions_from_authority(
+            final_citation_plan, citation_cards, heading_names=heading_names
+        )
+    )
 
     # R11-5: Experiment quality minimum threshold before paper writing
     # Parse analysis.md for quality rating and condition completeness
@@ -2736,7 +2987,7 @@ def _execute_paper_draft(
                 is_hep=_paper_is_hep,
                 stage_dir=stage_dir,
                 citation_repair_claims=citation_repair_claims,
-                part_citation_instructions=part_citation_instructions,
+                heading_citation_instructions=heading_citation_instructions,
             )
         except PaperSectionContractError as exc:
             (stage_dir / "paper_draft_invalid.md").write_text(
@@ -2881,6 +3132,40 @@ Generated: {_utcnow_iso()}
             ),
         )
 
+    if llm is not None and citation_repair_claims:
+        repair_system = _pm.for_stage(
+            "paper_draft", evolution_overlay="", preamble="", topic_constraint="",
+            exp_metrics_instruction="", citation_instruction="", writing_structure="",
+            outline="", venue_guidance="",
+        ).system
+        try:
+            final_draft = _repair_heading_citation_closure(
+                llm=llm,
+                run_dir=run_dir,
+                stage_dir=stage_dir,
+                paper_text=final_draft,
+                evidence=evidence,
+                claims=citation_repair_claims,
+                heading_citation_instructions=heading_citation_instructions,
+                system=repair_system,
+            )
+            structure_report = _validate_stage17_manuscript_structure(
+                final_draft, stage_dir=stage_dir
+            )
+            if not structure_report["valid"]:
+                raise CitationPlanContractError(
+                    "heading-local citation repair broke manuscript structure"
+                )
+        except (CitationPlanContractError, ManuscriptStructureError, OSError) as exc:
+            (stage_dir / "paper_draft_invalid.md").write_text(final_draft, encoding="utf-8")
+            return StageResult(
+                stage=Stage.PAPER_DRAFT,
+                status=StageStatus.FAILED,
+                artifacts=("paper_draft_invalid.md", "paper_structure_report.json", "section_generation_report.json"),
+                error=f"Paper draft heading citation closure failed: {exc}",
+                decision="retry",
+            )
+
     try:
         experiment_report = build_experiment_fact_closure_report(
             run_dir, paper_text=final_draft, evidence=evidence
@@ -2987,6 +3272,7 @@ Generated: {_utcnow_iso()}
             failure_artifacts.append("experiment_fact_closure_invalid.json")
             failure_refs.append("stage-17/experiment_fact_closure_invalid.json")
         for diagnostic_name in (
+            "citation_heading_repair_log.json",
             "experiment_fact_closure_initial.json",
             "experiment_fact_closure_after.json",
             "experiment_fact_repair_log.json",
@@ -3033,6 +3319,7 @@ Generated: {_utcnow_iso()}
     ]
     success_refs = [f"stage-17/{name}" for name in success_artifacts]
     for diagnostic_name in (
+        "citation_heading_repair_log.json",
         "experiment_fact_closure_initial.json",
         "experiment_fact_closure_after.json",
         "experiment_fact_repair_log.json",
