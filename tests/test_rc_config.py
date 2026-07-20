@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 from typing import cast
 
@@ -188,7 +189,12 @@ def test_paper_revision_config_rejects_unsafe_or_unknown_values(
 def test_only_dedicated_dry_run_config_enables_sectional_revision() -> None:
     root = Path(__file__).resolve().parents[1]
     enabled: list[str] = []
-    for path in root.glob("config*.yaml"):
+    tracked_configs = subprocess.check_output(
+        ["git", "-C", str(root), "ls-files", "--", "config*.yaml"],
+        text=True,
+    ).splitlines()
+    for relative_path in tracked_configs:
+        path = root / relative_path
         payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         revision = payload.get("paper_revision") or {}
         if revision.get("sectional_enabled", False) is True:

@@ -228,25 +228,28 @@ def _numeric_bundle(
 def _domain_numeric_bundle(
     paper_bytes: bytes,
 ) -> Stage24InputBundle:
+    from researchclaw.pipeline.stage14_domain_evaluator import (
+        _DOMAIN_CONDITIONS,
+        _DOMAIN_METRIC_KEYS,
+        _DOMAIN_SEEDS,
+        _DOMAIN_VARIANTS,
+    )
+
     bundle = _bundle()
     paper = _bound("stage-23/paper_final_verified.md", paper_bytes)
     rows = [
         {
-            "circuit_family": f"c{variant:03d}",
-            "circuit_variant": f"c{variant:03d}_ht1",
+            "circuit_family": family,
+            "circuit_variant": variant,
             "condition": condition,
-            "metrics": {"auprc": 0.5},
+            "metrics": {metric_key: 0.5 for metric_key in _DOMAIN_METRIC_KEYS},
             "n_total": 10,
             "n_trojan": 1,
             "seed": seed,
         }
-        for condition in (
-            "raw_cc1",
-            "scoap_isolation_forest",
-            "trojnet_community_graphsage",
-        )
-        for seed in (0, 1, 2)
-        for variant in range(1, 19)
+        for condition in _DOMAIN_CONDITIONS
+        for seed in _DOMAIN_SEEDS
+        for family, variant in _DOMAIN_VARIANTS
     ]
     rows[0]["metrics"]["auprc"] = 0.75
     observations_payload = {
@@ -254,7 +257,7 @@ def _domain_numeric_bundle(
         "observation_policy_version": 1,
         "dataset_capture_sha256": "a" * 64,
         "score_evidence_sha256": "b" * 64,
-        "metric_keys": ["auprc"],
+        "metric_keys": list(_DOMAIN_METRIC_KEYS),
         "observations": rows,
         "per_seed": [],
         "aggregate": [],
@@ -281,7 +284,14 @@ def _domain_numeric_bundle(
             {"schema_version": 2, "generation_kind": "domain_evaluator"}
         ),
         metric_observations=MappingProxyType(
-            {"auprc": (Decimal("0.75"),) + (Decimal("0.5"),) * 161}
+            {
+                metric_key: (
+                    (Decimal("0.75"),) + (Decimal("0.5"),) * 161
+                    if metric_key == "auprc"
+                    else (Decimal("0.5"),) * 162
+                )
+                for metric_key in _DOMAIN_METRIC_KEYS
+            }
         ),
         selected_result_manifest_path="stage-13/refinement_result_set.json",
         selected_result_manifest_sha256="c" * 64,
