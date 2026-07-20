@@ -1518,6 +1518,71 @@ def test_stage17_uses_final_plan_only_and_writes_replayable_closure(
     assert "closure" in (review.error or "").lower()
 
 
+def test_stage17_rejects_foreign_key_from_heading_repair(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    config = _real_config_snapshot(run_dir)
+    shortlist = _prepare_stage5(run_dir, [_candidate(1)], config)
+    stage6 = run_dir / "stage-06"
+    stage6.mkdir()
+    assert _execute_knowledge_extract(
+        stage6,
+        run_dir,
+        config,
+        AdapterBundle(),
+        llm=_SequenceLLM([_card_response(shortlist)]),  # type: ignore[arg-type]
+    ).status is StageStatus.DONE
+    stage9 = run_dir / "stage-09"
+    stage9.mkdir()
+    dump_contract(derive_contract(config, None), stage9 / "experiment_contract.yaml")
+    run_path = run_dir / "stage-12" / "runs" / "results.json"
+    run_path.parent.mkdir(parents=True)
+    run_path.write_text(
+        json.dumps(
+            {
+                "claim_scope": "pipeline_validation",
+                "dataset_origin": "synthetic",
+                "evaluator_owner": "scaffold",
+                "metrics": {"detection_f1": 0.95},
+            }
+        ),
+        encoding="utf-8",
+    )
+    stage16 = run_dir / "stage-16"
+    stage16.mkdir()
+    assert _execute_paper_outline(
+        stage16, run_dir, config, AdapterBundle(), llm=None
+    ).status is StageStatus.DONE
+    llm = _SequenceLLM(
+        [
+            "## Title\n\nBounded Study\n\n## Abstract\n\nAbstract.\n\n"
+            "## Introduction\n\nIntroduction.",
+            "## Related Work\n\nEvidence-backed context.",
+            "## Method\n\nMethod.\n\n## Experiments\n\nExperiment setup.",
+            "## Results\n\nDetection F1 was 95%.\n\n"
+            "## Discussion\n\nDiscussion.\n\n"
+            "## Limitations\n\nLimitations.\n\n"
+            "## Conclusion\n\nConclusion.",
+            "## Related Work\n\nForeign repair [foreign2024].",
+        ]
+    )
+    stage17 = run_dir / "stage-17"
+    stage17.mkdir()
+    result = _execute_paper_draft(
+        stage17,
+        run_dir,
+        config,
+        AdapterBundle(),
+        llm=llm,  # type: ignore[arg-type]
+    )
+    assert result.status is StageStatus.FAILED
+    assert "heading citation closure failed" in (result.error or "").lower()
+    assert (stage17 / "paper_draft_invalid.md").is_file()
+    assert not (stage17 / "paper_draft.md").exists()
+    assert not (stage17 / "citation_closure_report.json").exists()
+
+
 def test_citation_plan_v2_assigns_hep_background_to_introduction(
     tmp_path: Path,
 ) -> None:

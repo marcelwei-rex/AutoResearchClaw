@@ -137,8 +137,10 @@ def load_stage22_input_bundle(
         )
     except Stage22InputBundleError:
         raise
-    except (UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
-        raise Stage22InputBundleError(f"Stage 22 input replay failed: {exc}") from exc
+    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
+        raise Stage22InputBundleError(
+            f"canonical experiment evidence input replay failed: {exc}"
+        ) from exc
     return Stage22InputBundle(
         evidence=evidence,
         canonical_config=canonical_config,
