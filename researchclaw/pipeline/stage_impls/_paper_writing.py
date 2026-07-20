@@ -27,11 +27,12 @@ from researchclaw.literature.citation_plan import (
     build_citation_closure_report,
     build_citation_plan,
     build_citation_writer_instruction,
+    build_citation_writer_instruction_from_authority,
     load_final_citation_plan,
     validate_citation_closure_report,
     validate_citation_plan,
 )
-from researchclaw.literature.evidence_cards import canonical_json_text
+from researchclaw.literature.evidence_cards import canonical_json_text, load_validated_cards
 from researchclaw.literature.experiment_fact_closure import (
     ExperimentFactClosureError,
     build_experiment_fact_closure_report,
@@ -73,6 +74,12 @@ from researchclaw.pipeline.stage15_decision_projection import (
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
+
+_WRITER_CITE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*\d{4}[A-Za-z0-9_-]*$")
+_WRITER_MARKDOWN_CITATION_RE = re.compile(r"\[([^\[\]]{4,300})\]")
+_WRITER_LATEX_CITATION_RE = re.compile(
+    r"(\\cite[a-zA-Z*]*(?:\[[^\]]*\])*)\{([^}]+)\}"
+)
 
 
 _SECTION_OUTPUT_CONTRACT = """
@@ -436,6 +443,7 @@ def _validate_or_regenerate_paper_part(
     expected_major_sections: tuple[str, ...],
     title_slot: bool,
     citation_repair_context: str,
+    allowed_citation_keys: frozenset[str],
     max_tokens: int,
     report_entries: list[dict[str, Any]],
     stage_dir: Path | None,
@@ -490,6 +498,7 @@ def _validate_or_regenerate_paper_part(
             f"{ordinal}. ## {heading}"
             for ordinal, heading in enumerate(expected_major_sections, start=start)
         )
+        safe_previous_text = _filter_citation_markers(text, allowed_citation_keys)
         repair_prompt = f"""Repair one bounded manuscript part.
 
 Part name: {part_name}
@@ -502,8 +511,8 @@ Previous deterministic violations:
 Rules:
 - Output only the h2 sequence above, in exactly that order.
 - Do not output any other h2 section or a complete paper.
-- Preserve the owned sections' factual content and exact [cite_key] markers.
-- Do not invent, replace, or remove citations except when removing a non-owned section.
+- Preserve only citation markers authorized for this part.
+- Remove every unauthorized citation marker. Do not invent or replace citations.
 - Optional h3 subsections may remain under their existing owned h2 parent.
 - Do not add a preamble, explanation, code fence, or References section.
 
@@ -511,7 +520,7 @@ Validated citation claims assigned to this part:
 {citation_repair_context}
 
 <previous_invalid_response>
-{text}
+{safe_previous_text}
 </previous_invalid_response>
 """
         try:
@@ -910,6 +919,63 @@ def _compact_part_citation_context(
     return "\n".join(lines) if lines else "None. Do not add citation markers."
 
 
+def _part_citation_instruction(
+    claims: tuple[dict[str, str], ...],
+    expected_major_sections: tuple[str, ...],
+) -> str:
+    """Render the exact citation authority available to one writer call."""
+
+    context = _compact_part_citation_context(claims, expected_major_sections)
+    return (
+        "SECTION-SCOPED CITATION AUTHORITY:\n"
+        f"{context}\n"
+        "- Use only the exact required keys listed above for this part.\n"
+        "- If the authority is None, do not add any citation marker in this part.\n"
+        "- Do not invent a citation for a named method, foundation, dataset, or prior work.\n"
+    )
+
+
+def _citation_free_prior_context(text: str) -> str:
+    """Remove citation markers before passing an earlier part to another writer call."""
+
+    return _filter_citation_markers(text, frozenset())
+
+
+def _filter_citation_markers(text: str, allowed_keys: frozenset[str]) -> str:
+    """Keep only authorized citation keys while preserving non-citation brackets."""
+
+    def _strip_markdown(match: re.Match[str]) -> str:
+        keys = [item.strip() for item in re.split(r"[,;]", match.group(1))]
+        if keys and all(_WRITER_CITE_KEY_RE.fullmatch(key) for key in keys):
+            retained = [key for key in keys if key in allowed_keys]
+            return f"[{', '.join(retained)}]" if retained else ""
+        return match.group(0)
+
+    def _strip_latex(match: re.Match[str]) -> str:
+        keys = [item.strip() for item in match.group(2).split(",")]
+        if not keys or not all(_WRITER_CITE_KEY_RE.fullmatch(key) for key in keys):
+            return match.group(0)
+        retained = [key for key in keys if key in allowed_keys]
+        return f"{match.group(1)}{{{','.join(retained)}}}" if retained else ""
+
+    text = _WRITER_MARKDOWN_CITATION_RE.sub(_strip_markdown, text)
+    return _WRITER_LATEX_CITATION_RE.sub(_strip_latex, text)
+
+
+def _section_scoped_writer_system(system: str, citation_instruction: str) -> str:
+    """Append a same-layer citation override to a prompt-bank system instruction."""
+
+    return (
+        system.rstrip()
+        + "\n\nSECTION-SCOPED CITATION OVERRIDE:\n"
+        + citation_instruction.strip()
+        + "\nThese section-scoped citation rules override every earlier general citation "
+        "requirement in this system prompt. Do not emit a citation marker not authorized "
+        "by this section-scoped authority.\n"
+        + _SECTION_OUTPUT_CONTRACT.strip()
+    )
+
+
 def _write_paper_sections(
     *,
     llm: LLMClient,
@@ -926,6 +992,7 @@ def _write_paper_sections(
     is_hep: bool = False,
     stage_dir: Path | None = None,
     citation_repair_claims: tuple[dict[str, str], ...] = (),
+    part_citation_instructions: Mapping[str, str] | None = None,
 ) -> str:
     """Write a conference-grade paper in 3 sequential LLM calls.
 
@@ -953,13 +1020,69 @@ def _write_paper_sections(
         exp_metrics_instruction=exp_metrics_instruction,
         citation_instruction=citation_instruction,
         writing_structure=_writing_structure,
-        outline=outline,
+        outline="",
         venue_guidance=venue_guidance,
     ).system
 
     bounded_system = system.rstrip() + "\n\n" + _SECTION_OUTPUT_CONTRACT.strip()
     sections: list[str] = []
     section_generation_entries: list[dict[str, Any]] = []
+    part1_sections = (
+        ("Abstract", "Introduction")
+        if is_hep
+        else ("Abstract", "Introduction", "Related Work")
+    )
+    part2_sections = (
+        ("Model / Theoretical Framework", "Phenomenology / Computational Setup")
+        if is_hep
+        else ("Method", "Experiments")
+    )
+    part3_sections = (
+        ("Results", "Discussion", "Conclusions")
+        if is_hep
+        else ("Results", "Discussion", "Limitations", "Conclusion")
+    )
+    if part_citation_instructions is None:
+        if citation_instruction:
+            raise ValueError(
+                "writer calls with citation authority require section-scoped instructions"
+            )
+        part_citation_instructions = {
+            "part-1": _part_citation_instruction(citation_repair_claims, part1_sections),
+            "part-2": _part_citation_instruction(citation_repair_claims, part2_sections),
+            "part-3": _part_citation_instruction(citation_repair_claims, part3_sections),
+        }
+    if set(part_citation_instructions) != {"part-1", "part-2", "part-3"} or any(
+        not isinstance(value, str) or not value.strip()
+        for value in part_citation_instructions.values()
+    ):
+        raise ValueError("writer citation instructions must cover exactly three parts")
+    part1_citation_instruction = part_citation_instructions["part-1"]
+    part2_citation_instruction = part_citation_instructions["part-2"]
+    part3_citation_instruction = part_citation_instructions["part-3"]
+    part_allowed_citation_keys = {
+        "part-1": frozenset(
+            claim["cite_key"]
+            for claim in citation_repair_claims
+            if claim["section"] in part1_sections
+        ),
+        "part-2": frozenset(
+            claim["cite_key"]
+            for claim in citation_repair_claims
+            if claim["section"] in part2_sections
+        ),
+        "part-3": frozenset(
+            claim["cite_key"]
+            for claim in citation_repair_claims
+            if claim["section"] in part3_sections
+        ),
+    }
+    part1_outline = _filter_citation_markers(outline, part_allowed_citation_keys["part-1"])
+    part2_outline = _filter_citation_markers(outline, part_allowed_citation_keys["part-2"])
+    part3_outline = _filter_citation_markers(outline, part_allowed_citation_keys["part-3"])
+    part1_system = _section_scoped_writer_system(bounded_system, part1_citation_instruction)
+    part2_system = _section_scoped_writer_system(bounded_system, part2_citation_instruction)
+    part3_system = _section_scoped_writer_system(bounded_system, part3_citation_instruction)
 
     # --- R4-3: Title guidelines and abstract structure ---
     try:
@@ -995,7 +1118,7 @@ def _write_paper_sections(
             f"{preamble}\n\n"
             f"{topic_constraint}"
             f"{exp_metrics_instruction}\n\n"
-            f"{citation_instruction}\n\n"
+            f"{part1_citation_instruction}\n"
             f"{academic_style_guide}\n"
             f"{narrative_writing_rules}\n"
             f"{anti_hedging_rules}\n"
@@ -1012,7 +1135,7 @@ def _write_paper_sections(
             "eligible literature under the effective citation policy (ATLAS/CMS/LZ/XENONnT/Fermi-LAT "
             "and recent JHEP/PRD theory work), statement of what the paper contributes. "
             "The review of prior work goes HERE; do NOT open a 'Related Work' section.\n\n"
-            f"Outline:\n{outline}\n\n"
+            f"Outline:\n{part1_outline}\n\n"
             "Output markdown with ## headers. Do NOT include a References section.\n"
             "Start DIRECTLY with '## Title'. All equations must be LaTeX; all numerical "
             "quantities in natural units (GeV, pb, cm^2). Do NOT include 'Broader Impact' "
@@ -1023,7 +1146,7 @@ def _write_paper_sections(
             f"{preamble}\n\n"
             f"{topic_constraint}"
             f"{exp_metrics_instruction}\n\n"
-            f"{citation_instruction}\n\n"
+            f"{part1_citation_instruction}\n"
             f"{title_guidelines}\n\n"
             f"{academic_style_guide}\n"
             f"{narrative_writing_rules}\n"
@@ -1041,7 +1164,7 @@ def _write_paper_sections(
             "paper organization paragraph. Follow the effective citation policy.\n"
             "4. **Related Work** (600-800 words): organized into 3-4 thematic subsections, each discussing "
             "eligible prior work with proper citations. Compare approaches, identify limitations, position this work.\n\n"
-            f"Outline:\n{outline}\n\n"
+            f"Outline:\n{part1_outline}\n\n"
             "Output markdown with ## headers. Do NOT include a References section.\n"
             "IMPORTANT: Start DIRECTLY with '## Title'. Do NOT include any preamble, "
             "data verification, condition listing, or metric enumeration before the title. "
@@ -1055,7 +1178,7 @@ def _write_paper_sections(
 
     # T3.5: Retry once on failure, use placeholder if still fails
     try:
-        resp1 = _chat_with_prompt(llm, bounded_system, call1_user, max_tokens=_paper_max_tokens, retries=1)
+        resp1 = _chat_with_prompt(llm, part1_system, call1_user, max_tokens=_paper_max_tokens, retries=1)
         part1 = resp1.content.strip()
     except Exception as exc:  # noqa: BLE001
         logger.error("Stage 17: Part 1 LLM call failed after transport retry")
@@ -1073,22 +1196,20 @@ def _write_paper_sections(
         llm=llm,
         initial_text=part1,
         part_name="part-1",
-        expected_major_sections=("Abstract", "Introduction")
-        if is_hep
-        else ("Abstract", "Introduction", "Related Work"),
+        expected_major_sections=part1_sections,
         title_slot=True,
         citation_repair_context=_compact_part_citation_context(
             citation_repair_claims,
-            ("Abstract", "Introduction")
-            if is_hep
-            else ("Abstract", "Introduction", "Related Work"),
+            part1_sections,
         ),
+        allowed_citation_keys=part_allowed_citation_keys["part-1"],
         max_tokens=_paper_max_tokens,
         report_entries=section_generation_entries,
         stage_dir=stage_dir,
     )
     sections.append(part1)
     logger.info("Stage 17: Part 1 (Title+Abstract+Intro+Related Work) — %d chars", len(part1))
+    part1_prior_context = _citation_free_prior_context(part1)
 
     # --- Call 2: Method + Experiments (ML)  OR  Model + Phenomenology (HEP) ---
     if is_hep:
@@ -1098,13 +1219,9 @@ def _write_paper_sections(
             f"{exp_metrics_instruction}\n\n"
             f"{narrative_writing_rules}\n"
             f"{anti_hedging_rules}\n\n"
-            "CITATION REQUIREMENT: The Model section MUST cite the original paper(s) "
-            "defining the Lagrangian / EFT operators being studied. The Phenomenology "
-            "section MUST cite each experimental bound invoked (ATLAS/CMS/LZ/XENONnT/"
-            "Fermi-LAT original papers, not reviews). Use [cite_key] syntax.\n"
-            f"{citation_instruction}\n\n"
+            f"{part2_citation_instruction}\n"
             "You are continuing an HEP phenomenology paper. The sections written so far are:\n\n"
-            f"---\n{part1}\n---\n\n"
+            f"---\n{part1_prior_context}\n---\n\n"
             "Now write the next sections:\n\n"
             "4. **Model / Theoretical framework** (1200-1800 words): the Lagrangian density "
             "(LaTeX, numbered equations), particle content, gauge structure, free parameters "
@@ -1114,9 +1231,9 @@ def _write_paper_sections(
             "5. **Phenomenology / Computational setup** (800-1200 words): the observables "
             "(cross sections, decay widths, relic density, direct-detection rates) and the "
             "formulas or tool-chain used to compute them. List every experimental constraint "
-            "imposed with explicit CL level and reference. Units MUST be natural (GeV, pb, "
+            "imposed with its explicit CL level and only an authorized reference. Units MUST be natural (GeV, pb, "
             "cm^2, Omega_h^2).\n\n"
-            f"Outline:\n{outline}\n\n"
+            f"Outline:\n{part2_outline}\n\n"
             "Output markdown with ## headers. Continue from where Part 1 ended."
         )
     else:
@@ -1126,13 +1243,9 @@ def _write_paper_sections(
             f"{exp_metrics_instruction}\n\n"
             f"{narrative_writing_rules}\n"
             f"{anti_hedging_rules}\n\n"
-            # IMP-21: Citation instruction for Method + Experiments
-            "CITATION REQUIREMENT: The Method section MUST cite at least 3-5 related "
-            "technical papers (foundations your method builds on). The Experiments section "
-            "MUST cite baseline method papers. Use [cite_key] syntax.\n"
-            f"{citation_instruction}\n\n"
+            f"{part2_citation_instruction}\n"
             "You are continuing a paper. The sections written so far are:\n\n"
-            f"---\n{part1}\n---\n\n"
+            f"---\n{part1_prior_context}\n---\n\n"
             "Now write the next sections, maintaining consistency with the above:\n\n"
             "5. **Method** (1000-1500 words): formal problem definition with mathematical notation "
             "($x$, $\\theta$, etc.), detailed algorithm description with equations, step-by-step procedure, "
@@ -1144,22 +1257,18 @@ def _write_paper_sections(
             "METHOD NAMES IN TABLES: Use SHORT abbreviations (4-8 chars) for method names "
             "in tables. Define abbreviation mappings in a footnote. "
             "NEVER put method names longer than 20 characters in table cells.\n\n"
-            f"Outline:\n{outline}\n\n"
+            f"Outline:\n{part2_outline}\n\n"
             "Output markdown with ## headers. Continue from where Part 1 ended."
         )
     call2_user += _SECTION_OUTPUT_CONTRACT
     try:
-        resp2 = _chat_with_prompt(llm, bounded_system, call2_user, max_tokens=_paper_max_tokens, retries=1)
+        resp2 = _chat_with_prompt(llm, part2_system, call2_user, max_tokens=_paper_max_tokens, retries=1)
         part2 = resp2.content.strip()
     except Exception as exc:  # noqa: BLE001
         logger.error("Stage 17: Part 2 LLM call failed after transport retry")
         _raise_initial_part_transport_failure(
             part_name="part-2",
-            expected_major_sections=(
-                ("Model / Theoretical Framework", "Phenomenology / Computational Setup")
-                if is_hep
-                else ("Method", "Experiments")
-            ),
+            expected_major_sections=part2_sections,
             title_slot=False,
             exc=exc,
             report_entries=section_generation_entries,
@@ -1169,24 +1278,20 @@ def _write_paper_sections(
         llm=llm,
         initial_text=part2,
         part_name="part-2",
-        expected_major_sections=(
-            ("Model / Theoretical Framework", "Phenomenology / Computational Setup")
-            if is_hep
-            else ("Method", "Experiments")
-        ),
+        expected_major_sections=part2_sections,
         title_slot=False,
         citation_repair_context=_compact_part_citation_context(
             citation_repair_claims,
-            ("Model / Theoretical Framework", "Phenomenology / Computational Setup")
-            if is_hep
-            else ("Method", "Experiments"),
+            part2_sections,
         ),
+        allowed_citation_keys=part_allowed_citation_keys["part-2"],
         max_tokens=_paper_max_tokens,
         report_entries=section_generation_entries,
         stage_dir=stage_dir,
     )
     sections.append(part2)
     logger.info("Stage 17: Part 2 (Method+Experiments) — %d chars", len(part2))
+    part2_prior_context = _citation_free_prior_context(part2)
 
     # --- Call 3: Results + Discussion + (Limitations) + Conclusion ---
     if is_hep:
@@ -1197,12 +1302,9 @@ def _write_paper_sections(
             f"{narrative_writing_rules}\n"
             f"{anti_hedging_rules}\n"
             f"{anti_repetition_rules}\n\n"
-            "CITATION REQUIREMENT: Discussion must cite eligible prior JHEP/PRD phenomenology "
-            "analyses that studied the same or neighbouring parameter space. Cite each "
-            "experimental bound plotted on the exclusion figures.\n"
-            f"{citation_instruction}\n\n"
+            f"{part3_citation_instruction}\n"
             "You are completing an HEP phenomenology paper. Sections so far:\n\n"
-            f"---\n{part1}\n\n{part2}\n---\n\n"
+            f"---\n{part1_prior_context}\n\n{part2_prior_context}\n---\n\n"
             "Now write the final sections:\n\n"
             "6. **Results** (800-1200 words): report parameter-space scans and 95% CL "
             "exclusion contours. Include tabulated predictions and a headline log-log "
@@ -1233,13 +1335,9 @@ def _write_paper_sections(
             f"{narrative_writing_rules}\n"
             f"{anti_hedging_rules}\n"
             f"{anti_repetition_rules}\n\n"
-            # IMP-21: Citation instruction for Results + Discussion + Conclusion
-            "CITATION REQUIREMENT: The Discussion section MUST cite at least 3-5 papers "
-            "when comparing findings with prior work. The Conclusion may cite eligible "
-            "foundational references.\n"
-            f"{citation_instruction}\n\n"
+            f"{part3_citation_instruction}\n"
             "You are completing a paper. The sections written so far are:\n\n"
-            f"---\n{part1}\n\n{part2}\n---\n\n"
+            f"---\n{part1_prior_context}\n\n{part2_prior_context}\n---\n\n"
             "Now write the final sections, maintaining consistency:\n\n"
             "7. **Results** (600-800 words):\n"
             "   - START with an AGGREGATED results table (Table 1): rows = methods, columns = metrics.\n"
@@ -1253,7 +1351,8 @@ def _write_paper_sections(
             "     One figure MUST be a performance comparison chart. Figures MUST be referenced "
             "     in text: 'As shown in Figure 1, ...'\n"
             "8. **Discussion** (400-600 words): interpretation of key findings, unexpected results, "
-            "comparison with prior work (CITE 3-5 papers here!), practical implications.\n"
+            "comparison with prior work only when authorized by this section's citation authority, "
+            "practical implications.\n"
             "9. **Limitations** (200-300 words): honest assessment of scope, dataset, methodology. "
             "ALL caveats consolidated HERE — nowhere else in the paper.\n"
             "10. **Conclusion** (100-200 words MAXIMUM — this is a HARD LIMIT): "
@@ -1271,15 +1370,13 @@ def _write_paper_sections(
         )
     call3_user += _SECTION_OUTPUT_CONTRACT
     try:
-        resp3 = _chat_with_prompt(llm, bounded_system, call3_user, max_tokens=_paper_max_tokens, retries=1)
+        resp3 = _chat_with_prompt(llm, part3_system, call3_user, max_tokens=_paper_max_tokens, retries=1)
         part3 = resp3.content.strip()
     except Exception as exc:  # noqa: BLE001
         logger.error("Stage 17: Part 3 LLM call failed after transport retry")
         _raise_initial_part_transport_failure(
             part_name="part-3",
-            expected_major_sections=("Results", "Discussion", "Conclusions")
-            if is_hep
-            else ("Results", "Discussion", "Limitations", "Conclusion"),
+            expected_major_sections=part3_sections,
             title_slot=False,
             exc=exc,
             report_entries=section_generation_entries,
@@ -1289,16 +1386,13 @@ def _write_paper_sections(
         llm=llm,
         initial_text=part3,
         part_name="part-3",
-        expected_major_sections=("Results", "Discussion", "Conclusions")
-        if is_hep
-        else ("Results", "Discussion", "Limitations", "Conclusion"),
+        expected_major_sections=part3_sections,
         title_slot=False,
         citation_repair_context=_compact_part_citation_context(
             citation_repair_claims,
-            ("Results", "Discussion", "Conclusions")
-            if is_hep
-            else ("Results", "Discussion", "Limitations", "Conclusion"),
+            part3_sections,
         ),
+        allowed_citation_keys=part_allowed_citation_keys["part-3"],
         max_tokens=_paper_max_tokens,
         report_entries=section_generation_entries,
         stage_dir=stage_dir,
@@ -2425,7 +2519,7 @@ def _execute_paper_draft(
 
     try:
         final_citation_plan = load_final_citation_plan(run_dir, config)
-        citation_instruction = build_citation_writer_instruction(run_dir, config)
+        citation_cards = load_validated_cards(run_dir, config)
     except CitationPlanContractError as exc:
         return StageResult(
             stage=Stage.PAPER_DRAFT,
@@ -2442,6 +2536,23 @@ def _execute_paper_draft(
         }
         for claim in final_citation_plan["claims"]
     )
+    part_citation_instructions = {
+        "part-1": build_citation_writer_instruction_from_authority(
+            final_citation_plan,
+            citation_cards,
+            section_names=("Abstract", "Introduction", "Related Work"),
+        ),
+        "part-2": build_citation_writer_instruction_from_authority(
+            final_citation_plan,
+            citation_cards,
+            section_names=("Method", "Experiments"),
+        ),
+        "part-3": build_citation_writer_instruction_from_authority(
+            final_citation_plan,
+            citation_cards,
+            section_names=("Results", "Discussion", "Limitations", "Conclusion"),
+        ),
+    }
 
     # R11-5: Experiment quality minimum threshold before paper writing
     # Parse analysis.md for quality rating and condition completeness
@@ -2617,7 +2728,7 @@ def _execute_paper_draft(
                 preamble=preamble,
                 topic_constraint=topic_constraint,
                 exp_metrics_instruction=exp_metrics_instruction,
-                citation_instruction=citation_instruction,
+                citation_instruction="",
                 outline=outline,
                 model_name=config.llm.primary_model,
                 venue_label=_paper_venue_label,
@@ -2625,6 +2736,7 @@ def _execute_paper_draft(
                 is_hep=_paper_is_hep,
                 stage_dir=stage_dir,
                 citation_repair_claims=citation_repair_claims,
+                part_citation_instructions=part_citation_instructions,
             )
         except PaperSectionContractError as exc:
             (stage_dir / "paper_draft_invalid.md").write_text(

@@ -360,9 +360,26 @@ def build_citation_writer_instruction(run_dir: Path, config: RCConfig) -> str:
 
     plan = load_final_citation_plan(run_dir, config)
     cards = load_validated_cards(run_dir, config)
+    return build_citation_writer_instruction_from_authority(plan, cards)
+
+
+def build_citation_writer_instruction_from_authority(
+    plan: Mapping[str, Any],
+    cards: list[Mapping[str, Any]],
+    *,
+    section_names: tuple[str, ...] | None = None,
+) -> str:
+    """Render exact citation authority for the requested manuscript sections."""
+
+    allowed_sections = None if section_names is None else set(section_names)
     cards_by_key = {str(card["cite_key"]): card for card in cards}
     blocks: list[str] = []
     for claim in plan["claims"]:
+        if (
+            allowed_sections is not None
+            and str(claim["section_path"][0]) not in allowed_sections
+        ):
+            continue
         citation = claim["planned_citations"][0]
         cite_key = citation["cite_key"]
         card = cards_by_key.get(cite_key)
@@ -397,7 +414,15 @@ def build_citation_writer_instruction(run_dir: Path, config: RCConfig) -> str:
             )
         )
     if not blocks:
-        raise CitationPlanContractError("final citation plan has no writable claims")
+        if allowed_sections is None:
+            raise CitationPlanContractError("final citation plan has no writable claims")
+        return (
+            "\n\nFINAL CITATION PLAN (THE ONLY CITATION AUTHORITY):\n"
+            "No citation authority is assigned to this writing part.\n"
+            "\nCITATION RULES:\n"
+            "- Do not use any citation marker in this part.\n"
+            "- Do not write a References section; it is generated from the canonical bibliography.\n"
+        )
     return (
         "\n\nFINAL CITATION PLAN (THE ONLY CITATION AUTHORITY):\n"
         + "\n\n".join(blocks)

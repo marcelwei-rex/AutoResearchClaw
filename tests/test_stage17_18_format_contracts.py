@@ -25,6 +25,7 @@ from researchclaw.pipeline.stage_impls._review_publish import (
     _citation_count_policy_violations,
     _execute_peer_review,
 )
+from researchclaw.prompts import PromptManager
 from researchclaw.pipeline.stages import StageStatus
 
 
@@ -196,6 +197,165 @@ def test_all_three_stage17_calls_receive_the_section_output_contract() -> None:
         assert system.rstrip().endswith(
             "Do not emit a title/preamble outside the requested `##` sections."
         )
+
+
+def test_stage17_writer_prompts_use_only_section_scoped_citation_authority() -> None:
+    class _CitationMandatePromptManager(_PromptManagerStub):
+        def for_stage(self, *_args: object, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                system=(
+                    "GENERAL CITATION MANDATE: CITE ORIGINAL PAPERS and "
+                    "MUST cite baseline methods. "
+                    f"SYSTEM_OUTLINE={kwargs['outline']}"
+                ),
+                user="review the paper",
+                json_mode=False,
+                max_tokens=8192,
+            )
+
+    llm = _SequentialLLM(
+        [
+            "## Title\n\nExample\n\n## Abstract\n\nAbstract.\n\n"
+            "## Introduction\n\nIntroduction.\n\n"
+            "## Related Work\n\nPrior work [smith2024deep].",
+            "## Method\n\nMethod.\n\n## Experiments\n\nExperiments.",
+            "## Results\n\nResults.\n\n## Discussion\n\nDiscussion.\n\n"
+            "## Limitations\n\nLimitations.\n\n## Conclusion\n\nConclusion.",
+        ]
+    )
+
+    _write_paper_sections(
+        llm=cast(Any, llm),
+        pm=cast(Any, _CitationMandatePromptManager()),
+        preamble="",
+        topic_constraint="",
+        exp_metrics_instruction="",
+        citation_instruction="",
+        outline="Outline poison [foreign2024paper] and \\cite{foreign2024paper}.",
+        citation_repair_claims=(
+            {
+                "section": "Related Work",
+                "claim_text": "Bounded evidence claim.",
+                "cite_key": "smith2024deep",
+            },
+        ),
+        part_citation_instructions={
+            "part-1": (
+                "FINAL CITATION PLAN (THE ONLY CITATION AUTHORITY):\n"
+                "- CLAIM planned-claim-001 (section: Related Work)\n"
+                "  Required citation key: [smith2024deep]\n"
+                "  Retained abstract evidence:\n"
+                "  - ev-1: \"Bounded evidence.\"\n"
+                "CITATION RULES:\n"
+                "- Cite every required key above at least once using exact [cite_key] syntax."
+            ),
+            "part-2": (
+                "FINAL CITATION PLAN (THE ONLY CITATION AUTHORITY):\n"
+                "No citation authority is assigned to this writing part.\n"
+                "CITATION RULES:\n- Do not use any citation marker in this part."
+            ),
+            "part-3": (
+                "FINAL CITATION PLAN (THE ONLY CITATION AUTHORITY):\n"
+                "No citation authority is assigned to this writing part.\n"
+                "CITATION RULES:\n- Do not use any citation marker in this part."
+            ),
+        },
+    )
+
+    prompts = ["\n".join(message["content"] for message in call) for call in llm.calls]
+    assert "Required citation key: [smith2024deep]" in prompts[0]
+    assert "foreign2024paper" not in prompts[0]
+    for prompt in prompts[1:]:
+        assert "smith2024deep" not in prompt
+        assert "foreign2024paper" not in prompt
+        assert "Cite every required key above" not in prompt
+        assert "No citation authority is assigned to this writing part." in prompt
+        assert "Do not use any citation marker in this part." in prompt
+        assert "MUST cite at least 3-5" not in prompt
+        assert "CITE 3-5 papers here!" not in prompt
+    for system in llm.systems:
+        assert "GENERAL CITATION MANDATE" in system
+        assert "foreign2024paper" not in system
+        assert "SECTION-SCOPED CITATION OVERRIDE" in system
+        assert system.index("SECTION-SCOPED CITATION OVERRIDE") > system.index(
+            "GENERAL CITATION MANDATE"
+        )
+        assert "override every earlier general citation requirement" in system
+
+
+def test_stage17_repair_removes_foreign_citations_before_regeneration() -> None:
+    llm = _SequentialLLM(
+        [
+            "## Title\n\nPaper.\n\n## Abstract\n\nA.\n\n"
+            "## Introduction\n\nI.\n\n## Related Work\n\nR. [smith2024deep]",
+            "## Method\n\nM. [foreign2024paper] and \\cite{foreign2024paper}.\n\n"
+            "## Results\n\nWrong section.",
+            "## Method\n\nM.\n\n## Experiments\n\nE.",
+            "## Results\n\nR.\n\n## Discussion\n\nD.\n\n"
+            "## Limitations\n\nL.\n\n## Conclusion\n\nC.",
+        ]
+    )
+
+    _write_paper_sections(
+        llm=cast(Any, llm),
+        pm=cast(Any, _PromptManagerStub()),
+        preamble="",
+        topic_constraint="",
+        exp_metrics_instruction="",
+        citation_instruction="",
+        outline="",
+        citation_repair_claims=(
+            {
+                "section": "Related Work",
+                "claim_text": "Bounded evidence claim.",
+                "cite_key": "smith2024deep",
+            },
+        ),
+        part_citation_instructions={
+            "part-1": "Related Work authority [smith2024deep].",
+            "part-2": "No citation authority is assigned to this writing part.",
+            "part-3": "No citation authority is assigned to this writing part.",
+        },
+    )
+
+    repair_prompt = "\n".join(message["content"] for message in llm.calls[2])
+    assert "foreign2024paper" not in repair_prompt
+    assert "Remove every unauthorized citation marker." in repair_prompt
+    assert "None. Do not add citation markers." in repair_prompt
+
+
+def test_stage17_section_authority_overrides_real_ml_system_citation_mandates() -> None:
+    llm = _SequentialLLM(
+        [
+            "## Title\n\nPaper.\n\n## Abstract\n\nA.\n\n"
+            "## Introduction\n\nI.\n\n## Related Work\n\nR.",
+            "## Method\n\nM.\n\n## Experiments\n\nE.",
+            "## Results\n\nR.\n\n## Discussion\n\nD.\n\n"
+            "## Limitations\n\nL.\n\n## Conclusion\n\nC.",
+        ]
+    )
+
+    _write_paper_sections(
+        llm=cast(Any, llm),
+        pm=PromptManager(domain="ml"),
+        preamble="",
+        topic_constraint="",
+        exp_metrics_instruction="",
+        citation_instruction="",
+        outline="Outline [foreign2024paper].",
+        part_citation_instructions={
+            part: "No citation authority is assigned to this writing part."
+            for part in ("part-1", "part-2", "part-3")
+        },
+    )
+
+    assert "CITE ORIGINAL PAPERS" in llm.systems[1]
+    for system in llm.systems:
+        assert "foreign2024paper" not in system
+        assert system.index("SECTION-SCOPED CITATION OVERRIDE") > system.index(
+            "CITE ORIGINAL PAPERS"
+        )
+        assert "No citation authority is assigned to this writing part." in system
 
 
 def test_stage17_part_contract_rejects_extra_major_section() -> None:

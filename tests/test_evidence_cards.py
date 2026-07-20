@@ -36,6 +36,7 @@ from researchclaw.literature.citation_plan import (
     CitationPlanContractError,
     build_citation_closure_report,
     build_citation_writer_instruction,
+    build_citation_writer_instruction_from_authority,
     load_final_citation_plan,
     parse_citation_plan,
     validate_paper_citation_minimum,
@@ -50,6 +51,7 @@ from researchclaw.literature.evidence_cards import (
     build_cards_manifest,
     build_evidence_card,
     canonical_json_text,
+    load_validated_cards,
     parse_card_batch_response,
     parse_evidence_card,
     render_evidence_card_markdown,
@@ -976,6 +978,24 @@ def test_stage16_effective_policy_binds_run_local_config(tmp_path: Path) -> None
     assert shortlist[0]["cite_key"] in instruction
     assert shortlist[0]["abstract"] in instruction
     assert "AVAILABLE REFERENCES" not in instruction
+
+    cards = load_validated_cards(run_dir, config)
+    related_work_instruction = build_citation_writer_instruction_from_authority(
+        final_plan,
+        cards,
+        section_names=("Related Work",),
+    )
+    method_instruction = build_citation_writer_instruction_from_authority(
+        final_plan,
+        cards,
+        section_names=("Method", "Experiments"),
+    )
+    assert shortlist[0]["cite_key"] in related_work_instruction
+    assert shortlist[0]["abstract"] in related_work_instruction
+    assert "Cite every required key above" in related_work_instruction
+    assert shortlist[0]["cite_key"] not in method_instruction
+    assert "Cite every required key above" not in method_instruction
+    assert "Do not use any citation marker in this part." in method_instruction
 
     history_path = run_dir / "config_snapshot_history.jsonl"
     history_text = history_path.read_text(encoding="utf-8")
