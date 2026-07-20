@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,6 +15,7 @@ from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
 from researchclaw.pipeline import runner as rc_runner
 from researchclaw.pipeline.executor import StageResult
+from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
 from researchclaw.pipeline.stages import STAGE_SEQUENCE, Stage, StageStatus
 
 
@@ -840,6 +842,7 @@ def test_max_pivot_count_prevents_infinite_loop(
     adapters: AdapterBundle,
 ) -> None:
     seen: list[Stage] = []
+    promotion_calls = 0
 
     def mock_execute_stage(stage: Stage, **kwargs) -> StageResult:
         _ = kwargs
@@ -850,6 +853,12 @@ def test_max_pivot_count_prevents_infinite_loop(
         return _done(stage)
 
     monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+
+    def _promotion_spy(*_args: object, **_kwargs: object) -> None:
+        nonlocal promotion_calls
+        promotion_calls += 1
+
+    monkeypatch.setattr(rc_runner, "_promote_best_stage14", _promotion_spy)
     results = rc_runner.execute_pipeline(
         run_dir=run_dir,
         run_id="run-max-pivot",
@@ -860,6 +869,679 @@ def test_max_pivot_count_prevents_infinite_loop(
     from researchclaw.pipeline.stages import MAX_DECISION_PIVOTS
     decision_count = sum(1 for s in seen if s == Stage.RESEARCH_DECISION)
     assert decision_count <= MAX_DECISION_PIVOTS + 1
+    assert Stage.PAPER_OUTLINE not in seen
+    assert results[-1].stage is Stage.RESEARCH_DECISION
+    assert results[-1].status is StageStatus.FAILED
+    assert results[-1].decision == "refinement_exhausted"
+    assert "max_refinement_attempts" in (results[-1].error or "")
+    assert promotion_calls == 0
+    summary = json.loads((run_dir / "pipeline_summary.json").read_text())
+    assert summary["final_stage"] == int(Stage.RESEARCH_DECISION)
+    assert summary["final_status"] == "failed"
+    assert summary["final_decision"] == "refinement_exhausted"
+    assert "max_refinement_attempts" in summary["final_error"]
+    assert rc_runner.read_checkpoint(run_dir) is None
+    assert not (run_dir / "heartbeat.json").exists()
+
+
+def test_refinement_exhaustion_invalidates_downstream_commit_points(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    external = tmp_path / "external-manifest"
+    external.write_text("EXTERNAL", encoding="utf-8")
+    for stage_name, names in rc_runner._REFINEMENT_EXHAUSTION_COMMIT_POINTS.items():
+        stage_dir = run_dir / stage_name
+        stage_dir.mkdir()
+        (stage_dir / "diagnostic.txt").write_text("keep", encoding="utf-8")
+        for name in names:
+            (stage_dir / name).write_text("authority", encoding="utf-8")
+    stage24_manifest = run_dir / "stage-24" / "stage24_truth_manifest.json"
+    stage24_manifest.unlink()
+    stage24_manifest.symlink_to(external)
+
+    with ReleaseGraphLock.acquire(run_dir, "test-exhaustion-cleanup") as release_lock:
+        with ExitStack() as stack:
+            namespaces = rc_runner._capture_refinement_exhaustion_namespaces(
+                run_dir, release_lock, stack
+            )
+            rc_runner._invalidate_refinement_exhaustion_authority(
+                run_dir, release_lock, namespaces
+            )
+
+    for stage_name, names in rc_runner._REFINEMENT_EXHAUSTION_COMMIT_POINTS.items():
+        stage_dir = run_dir / stage_name
+        assert (stage_dir / "diagnostic.txt").read_text(encoding="utf-8") == "keep"
+        assert all(not (stage_dir / name).exists() for name in names)
+    assert external.read_text(encoding="utf-8") == "EXTERNAL"
+
+
+def test_consecutive_empty_metrics_fail_before_stage16(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    seen: list[Stage] = []
+
+    def mock_execute_stage(stage: Stage, **kwargs: object) -> StageResult:
+        del kwargs
+        seen.append(stage)
+        if stage is Stage.RESEARCH_DECISION:
+            return _refine_result(stage)
+        return _done(stage)
+
+    monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+    monkeypatch.setattr(
+        rc_runner,
+        "_read_pivot_count_bound",
+        lambda _run_dir, _release_lock: 1,
+    )
+    monkeypatch.setattr(
+        rc_runner,
+        "_consecutive_empty_metrics_bound",
+        lambda _run_dir, _count, _release_lock: True,
+    )
+    results = rc_runner.execute_pipeline(
+        run_dir=run_dir,
+        run_id="run-empty-refine",
+        config=rc_config,
+        adapters=adapters,
+    )
+
+    assert Stage.PAPER_OUTLINE not in seen
+    assert results[-1].status is StageStatus.FAILED
+    assert results[-1].decision == "refinement_exhausted"
+    assert "consecutive_empty_metrics" in (results[-1].error or "")
+    assert rc_runner.read_checkpoint(run_dir) is None
+    assert not (run_dir / "heartbeat.json").exists()
+
+
+def test_refinement_exhaustion_cleanup_continues_after_collision(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    for stage_name, names in rc_runner._REFINEMENT_EXHAUSTION_COMMIT_POINTS.items():
+        stage_dir = run_dir / stage_name
+        stage_dir.mkdir()
+        for name in names:
+            (stage_dir / name).write_text("authority", encoding="utf-8")
+    collision = run_dir / "stage-16" / "outline_binding.json"
+    collision.unlink()
+    collision.mkdir()
+    (collision / "nested").mkdir()
+
+    with ReleaseGraphLock.acquire(run_dir, "test-exhaustion-collision") as release_lock:
+        with ExitStack() as stack:
+            namespaces = rc_runner._capture_refinement_exhaustion_namespaces(
+                run_dir, release_lock, stack
+            )
+            with pytest.raises(OSError, match="cleanup was incomplete"):
+                rc_runner._invalidate_refinement_exhaustion_authority(
+                    run_dir, release_lock, namespaces
+                )
+
+    assert collision.is_dir()
+    assert not (run_dir / "stage-16" / "outline.md").exists()
+    for stage_name in tuple(rc_runner._REFINEMENT_EXHAUSTION_COMMIT_POINTS)[1:]:
+        names = rc_runner._REFINEMENT_EXHAUSTION_COMMIT_POINTS[stage_name]
+        assert all(not (run_dir / stage_name / name).exists() for name in names)
+
+
+def _write_refinement_exhaustion_authority(run_dir: Path) -> None:
+    for stage_name, names in rc_runner._REFINEMENT_EXHAUSTION_COMMIT_POINTS.items():
+        stage_dir = run_dir / stage_name
+        stage_dir.mkdir(exist_ok=True)
+        (stage_dir / "diagnostic.txt").write_text("keep", encoding="utf-8")
+        for name in names:
+            (stage_dir / name).write_text("authority", encoding="utf-8")
+
+
+def test_refinement_exhaustion_run_parent_replacement_cleans_detached_only(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    _write_refinement_exhaustion_authority(run_dir)
+    moved = run_dir.with_name("run-moved")
+    replacement_files: dict[Path, bytes] = {}
+
+    def mock_execute_stage(stage: Stage, **kwargs: object) -> StageResult:
+        del kwargs
+        if stage is Stage.RESEARCH_DECISION:
+            return _refine_result(stage)
+        return _done(stage)
+
+    def replace_run(_run_dir: Path, _release_lock: object) -> int:
+        run_dir.rename(moved)
+        run_dir.mkdir()
+        for stage_name, names in rc_runner._REFINEMENT_EXHAUSTION_COMMIT_POINTS.items():
+            stage_dir = run_dir / stage_name
+            stage_dir.mkdir()
+            sentinel = stage_dir / "sentinel.txt"
+            authority = stage_dir / names[0]
+            sentinel.write_text("EXTERNAL", encoding="utf-8")
+            authority.write_text("EXTERNAL-AUTHORITY", encoding="utf-8")
+            replacement_files[sentinel] = sentinel.read_bytes()
+            replacement_files[authority] = authority.read_bytes()
+        return rc_runner.MAX_DECISION_PIVOTS
+
+    monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+    monkeypatch.setattr(rc_runner, "_read_pivot_count_bound", replace_run)
+
+    with pytest.raises(RuntimeError, match="release_graph_run_directory_changed"):
+        rc_runner.execute_pipeline(
+            run_dir=run_dir,
+            run_id="run-parent-replaced",
+            config=rc_config,
+            adapters=adapters,
+        )
+
+    assert all(path.read_bytes() == content for path, content in replacement_files.items())
+    for stage_name, names in rc_runner._REFINEMENT_EXHAUSTION_COMMIT_POINTS.items():
+        detached_stage = moved / stage_name
+        assert all(not (detached_stage / name).exists() for name in names)
+        assert (detached_stage / "diagnostic.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_refinement_exhaustion_stage_parent_replacement_cleans_detached_only(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    _write_refinement_exhaustion_authority(run_dir)
+    stage16 = run_dir / "stage-16"
+    detached = run_dir / "stage-16-moved"
+
+    def mock_execute_stage(stage: Stage, **kwargs: object) -> StageResult:
+        del kwargs
+        if stage is Stage.RESEARCH_DECISION:
+            return _refine_result(stage)
+        return _done(stage)
+
+    def replace_stage(_run_dir: Path, _release_lock: object) -> int:
+        stage16.rename(detached)
+        stage16.mkdir()
+        (stage16 / "sentinel.txt").write_text("EXTERNAL", encoding="utf-8")
+        (stage16 / "outline_binding.json").write_text(
+            "EXTERNAL-AUTHORITY", encoding="utf-8"
+        )
+        return rc_runner.MAX_DECISION_PIVOTS
+
+    monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+    monkeypatch.setattr(rc_runner, "_read_pivot_count_bound", replace_stage)
+    results = rc_runner.execute_pipeline(
+        run_dir=run_dir,
+        run_id="stage-parent-replaced",
+        config=rc_config,
+        adapters=adapters,
+    )
+
+    assert results[-1].status is StageStatus.FAILED
+    assert results[-1].decision == "refinement_exhausted"
+    assert "cleanup failed" in (results[-1].error or "")
+    assert (stage16 / "sentinel.txt").read_text(encoding="utf-8") == "EXTERNAL"
+    assert (stage16 / "outline_binding.json").read_text(encoding="utf-8") == (
+        "EXTERNAL-AUTHORITY"
+    )
+    assert not (detached / "outline_binding.json").exists()
+    assert (detached / "diagnostic.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_nonexhausted_refine_parent_replacement_rejects_before_live_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    moved = run_dir.with_name("run-moved")
+    replacement = run_dir
+    real_record = rc_runner._record_decision_history_bound
+
+    def mock_execute_stage(stage: Stage, **kwargs: object) -> StageResult:
+        del kwargs
+        if stage is Stage.RESEARCH_DECISION:
+            return _refine_result(stage)
+        return _done(stage)
+
+    def replace_before_history(*args: object, **kwargs: object) -> None:
+        run_dir.rename(moved)
+        replacement.mkdir()
+        (replacement / "sentinel.txt").write_text("EXTERNAL", encoding="utf-8")
+        (replacement / "decision_history.json").write_text(
+            "EXTERNAL-HISTORY", encoding="utf-8"
+        )
+        real_record(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+    monkeypatch.setattr(
+        rc_runner, "_record_decision_history_bound", replace_before_history
+    )
+
+    with pytest.raises(RuntimeError, match="release_graph_run_directory_changed"):
+        rc_runner.execute_pipeline(
+            run_dir=run_dir,
+            run_id="nonexhausted-parent-replaced",
+            config=rc_config,
+            adapters=adapters,
+        )
+
+    assert (replacement / "sentinel.txt").read_text(encoding="utf-8") == "EXTERNAL"
+    assert (replacement / "decision_history.json").read_text(encoding="utf-8") == (
+        "EXTERNAL-HISTORY"
+    )
+
+
+def test_internal_rollback_suppresses_runner_path_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    from researchclaw.pipeline import release_artifacts
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("internal rollback reopened a runner-level path")
+
+    monkeypatch.setattr(rc_runner, "execute_stage", lambda stage, **_kwargs: _done(stage))
+    monkeypatch.setattr(rc_runner, "_apply_injected_artifacts", forbidden)
+    monkeypatch.setattr(rc_runner, "_write_checkpoint", forbidden)
+    monkeypatch.setattr(rc_runner, "_write_heartbeat", forbidden)
+    monkeypatch.setattr(rc_runner, "_build_pipeline_summary", forbidden)
+    monkeypatch.setattr(rc_runner, "_write_pipeline_summary", forbidden)
+    monkeypatch.setattr(release_artifacts, "append_attempt", forbidden)
+    monkeypatch.setattr(release_artifacts, "append_cost_entry", forbidden)
+
+    with ReleaseGraphLock.acquire(run_dir, "internal-rollback") as release_lock:
+        results = rc_runner.execute_pipeline(
+            run_dir=run_dir,
+            run_id="internal-rollback",
+            config=rc_config,
+            adapters=adapters,
+            from_stage=Stage.RESEARCH_DECISION,
+            to_stage=Stage.RESEARCH_DECISION,
+            _release_lock=release_lock,
+            _internal_rollback=True,
+        )
+
+    assert [result.stage for result in results] == [Stage.RESEARCH_DECISION]
+    assert not (run_dir / "injected_artifacts.json").exists()
+    assert not (run_dir / "checkpoint.json").exists()
+    assert not (run_dir / "heartbeat.json").exists()
+    assert not (run_dir / "pipeline_summary.json").exists()
+
+
+def test_generic_pivot_internal_rollback_publishes_allowed_skip_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    cfg = dataclasses.replace(
+        rc_config,
+        runtime=dataclasses.replace(rc_config.runtime, skip_stages=(10,)),
+    )
+    decision_count = 0
+
+    def mock_execute_stage(stage: Stage, **kwargs: object) -> StageResult:
+        nonlocal decision_count
+        del kwargs
+        if stage is Stage.RESEARCH_DECISION:
+            decision_count += 1
+            if decision_count == 1:
+                return _pivot_result(stage)
+        return _done(stage)
+
+    monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+    results = rc_runner.execute_pipeline(
+        run_dir=run_dir,
+        run_id="pivot-skip-contract",
+        config=cfg,
+        adapters=adapters,
+        from_stage=Stage.RESEARCH_DECISION,
+    )
+
+    skipped_marker = run_dir / "stage-10" / "experiment" / "SKIPPED.md"
+    assert "was skipped by runtime.skip_stages" in skipped_marker.read_text(
+        encoding="utf-8"
+    )
+    assert (run_dir / "stage-10" / "experiment_spec.md").is_file()
+    skipped = [
+        result
+        for result in results
+        if result.stage is Stage.CODE_GENERATION and result.decision == "skipped"
+    ]
+    assert len(skipped) == 1
+    assert skipped[0].artifacts == ("experiment/", "experiment_spec.md")
+
+
+def test_internal_skip_publisher_uses_held_inode_after_parent_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    cfg = dataclasses.replace(
+        rc_config,
+        runtime=dataclasses.replace(rc_config.runtime, skip_stages=(10,)),
+    )
+    moved = run_dir.with_name("run-moved")
+    decision_count = 0
+    real_publish = rc_runner._write_skipped_stage_outputs_bound
+
+    def mock_execute_stage(stage: Stage, **kwargs: object) -> StageResult:
+        nonlocal decision_count
+        del kwargs
+        if stage is Stage.RESEARCH_DECISION:
+            decision_count += 1
+            if decision_count == 1:
+                return _pivot_result(stage)
+        return _done(stage)
+
+    def replace_before_skip(*args: object, **kwargs: object) -> tuple[str, ...]:
+        run_dir.rename(moved)
+        run_dir.mkdir()
+        (run_dir / "sentinel.txt").write_text("EXTERNAL", encoding="utf-8")
+        return real_publish(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+    monkeypatch.setattr(
+        rc_runner, "_write_skipped_stage_outputs_bound", replace_before_skip
+    )
+
+    with pytest.raises(RuntimeError, match="release_graph_run_directory_changed"):
+        rc_runner.execute_pipeline(
+            run_dir=run_dir,
+            run_id="pivot-skip-replaced",
+            config=cfg,
+            adapters=adapters,
+            from_stage=Stage.RESEARCH_DECISION,
+        )
+
+    assert {path.name for path in run_dir.iterdir()} == {"sentinel.txt"}
+    assert (run_dir / "sentinel.txt").read_text(encoding="utf-8") == "EXTERNAL"
+    assert not (moved / "stage-10" / "experiment" / "SKIPPED.md").exists()
+
+
+def test_recursive_rollback_parent_replacement_has_zero_replacement_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    moved = run_dir.with_name("run-moved")
+    decision_count = 0
+
+    def mock_execute_stage(stage: Stage, **kwargs: object) -> StageResult:
+        nonlocal decision_count
+        del kwargs
+        if stage is Stage.RESEARCH_DECISION:
+            decision_count += 1
+            if decision_count == 1:
+                return _refine_result(stage)
+        if stage is Stage.DEAI_AUDIT:
+            run_dir.rename(moved)
+            run_dir.mkdir()
+            (run_dir / "sentinel.txt").write_text("EXTERNAL", encoding="utf-8")
+        return _done(stage)
+
+    monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+
+    with pytest.raises(RuntimeError, match="release_graph_run_directory_changed"):
+        rc_runner.execute_pipeline(
+            run_dir=run_dir,
+            run_id="recursive-parent-replaced",
+            config=rc_config,
+            adapters=adapters,
+            from_stage=Stage.RESEARCH_DECISION,
+        )
+
+    assert {path.name for path in run_dir.iterdir()} == {"sentinel.txt"}
+    assert (run_dir / "sentinel.txt").read_text(encoding="utf-8") == "EXTERNAL"
+
+
+def test_pivot_count_uses_held_inode_during_a_b_a_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    moved = run_dir.with_name("run-moved")
+    replacement = run_dir.with_name("replacement-moved")
+    real_read = rc_runner._read_run_regular_file_bound
+    switched = False
+
+    def mock_execute_stage(stage: Stage, **kwargs: object) -> StageResult:
+        del kwargs
+        if stage is Stage.RESEARCH_DECISION:
+            return _pivot_result(stage)
+        return _done(stage)
+
+    def switch_around_read(
+        current_run: Path, release_lock: object, relative_path: str
+    ) -> bytes | None:
+        nonlocal switched
+        if relative_path == "decision_history.json" and not switched:
+            switched = True
+            run_dir.rename(moved)
+            run_dir.mkdir()
+            (run_dir / "decision_history.json").write_text(
+                json.dumps([{}, {}]), encoding="utf-8"
+            )
+            run_dir.rename(replacement)
+            moved.rename(run_dir)
+        return real_read(current_run, release_lock, relative_path)
+
+    monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+    monkeypatch.setattr(
+        rc_runner, "_read_run_regular_file_bound", switch_around_read
+    )
+    results = rc_runner.execute_pipeline(
+        run_dir=run_dir,
+        run_id="a-b-a-pivot",
+        config=rc_config,
+        adapters=adapters,
+        to_stage=Stage.RESEARCH_DECISION,
+    )
+
+    assert results[-1].status is StageStatus.DONE
+    assert results[-1].decision == "pivot"
+    assert rc_runner.read_checkpoint(run_dir) is None
+    assert json.loads((replacement / "decision_history.json").read_text()) == [{}, {}]
+
+
+@pytest.mark.parametrize("decision", ("refine", "pivot"))
+def test_stage15_rollback_invalidates_stale_stage16_resume_pointers(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+    decision: str,
+) -> None:
+    rc_runner._write_checkpoint(run_dir, Stage.RESEARCH_DECISION, "stale")
+    rc_runner._write_heartbeat(run_dir, Stage.RESEARCH_DECISION, "stale")
+
+    def mock_execute_stage(stage: Stage, **kwargs: object) -> StageResult:
+        del kwargs
+        if stage is Stage.RESEARCH_DECISION:
+            return _refine_result(stage) if decision == "refine" else _pivot_result(stage)
+        return _done(stage)
+
+    monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+    results = rc_runner.execute_pipeline(
+        run_dir=run_dir,
+        run_id=f"stale-{decision}",
+        config=rc_config,
+        adapters=adapters,
+        from_stage=Stage.RESEARCH_DECISION,
+        to_stage=Stage.RESEARCH_DECISION,
+    )
+
+    assert results[-1].decision == decision
+    assert rc_runner.read_checkpoint(run_dir) is None
+    assert not (run_dir / "checkpoint.json").exists()
+    assert not (run_dir / "heartbeat.json").exists()
+
+
+def test_exhaustion_invalidator_rejects_foreign_namespace(
+    tmp_path: Path,
+) -> None:
+    run_a = tmp_path / "run-a"
+    run_b = tmp_path / "run-b"
+    run_a.mkdir()
+    run_b.mkdir()
+    stage_b = run_b / "stage-16"
+    stage_b.mkdir()
+    authority = stage_b / "outline_binding.json"
+    authority.write_text("B", encoding="utf-8")
+
+    with ReleaseGraphLock.acquire(run_b, "capture-foreign") as lock_b:
+        namespace_b = lock_b.open_stage_namespace("stage-16")
+    namespaces: dict[str, object | None] = {
+        name: None for name in rc_runner._REFINEMENT_EXHAUSTION_COMMIT_POINTS
+    }
+    namespaces["stage-16"] = namespace_b
+    try:
+        with ReleaseGraphLock.acquire(run_a, "reject-foreign") as lock_a:
+            with pytest.raises(RuntimeError, match="namespace binding mismatch"):
+                rc_runner._invalidate_refinement_exhaustion_authority(
+                    run_a, lock_a, namespaces  # type: ignore[arg-type]
+                )
+    finally:
+        namespace_b.close()
+
+    assert authority.read_text(encoding="utf-8") == "B"
+
+
+@pytest.mark.parametrize("foreign_stage", ("stage-17", "stage-25"))
+def test_exhaustion_invalidator_validates_all_before_deleting_foreign_namespace(
+    tmp_path: Path,
+    foreign_stage: str,
+) -> None:
+    run_a = tmp_path / "run-a"
+    run_b = tmp_path / "run-b"
+    run_a.mkdir()
+    run_b.mkdir()
+    stage16_a = run_a / "stage-16"
+    stage16_a.mkdir()
+    authority_a = stage16_a / "outline_binding.json"
+    authority_a.write_text("A", encoding="utf-8")
+    (run_b / foreign_stage).mkdir()
+
+    with ReleaseGraphLock.acquire(run_a, "validate-first-a") as lock_a:
+        with ReleaseGraphLock.acquire(run_b, "validate-first-b") as lock_b:
+            with ExitStack() as stack:
+                namespaces: dict[str, object | None] = {
+                    name: None
+                    for name in rc_runner._REFINEMENT_EXHAUSTION_COMMIT_POINTS
+                }
+                namespaces["stage-16"] = stack.enter_context(
+                    lock_a.open_stage_namespace("stage-16")
+                )
+                namespaces[foreign_stage] = stack.enter_context(
+                    lock_b.open_stage_namespace(foreign_stage)
+                )
+                with pytest.raises(RuntimeError, match="namespace binding mismatch"):
+                    rc_runner._invalidate_refinement_exhaustion_authority(
+                        run_a, lock_a, namespaces  # type: ignore[arg-type]
+                    )
+
+    assert authority_a.read_text(encoding="utf-8") == "A"
+
+
+def test_exhaustion_invalidator_validates_all_before_deleting_wrong_stage(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    for stage_name in ("stage-16", "stage-18"):
+        (run_dir / stage_name).mkdir()
+    authority = run_dir / "stage-16" / "outline_binding.json"
+    authority.write_text("A", encoding="utf-8")
+
+    with ReleaseGraphLock.acquire(run_dir, "validate-wrong-stage") as release_lock:
+        with ExitStack() as stack:
+            namespaces: dict[str, object | None] = {
+                name: None
+                for name in rc_runner._REFINEMENT_EXHAUSTION_COMMIT_POINTS
+            }
+            namespaces["stage-16"] = stack.enter_context(
+                release_lock.open_stage_namespace("stage-16")
+            )
+            namespaces["stage-17"] = stack.enter_context(
+                release_lock.open_stage_namespace("stage-18")
+            )
+            with pytest.raises(RuntimeError, match="namespace binding mismatch"):
+                rc_runner._invalidate_refinement_exhaustion_authority(
+                    run_dir, release_lock, namespaces  # type: ignore[arg-type]
+                )
+
+    assert authority.read_text(encoding="utf-8") == "A"
+
+
+@pytest.mark.parametrize("incremental", (False, True))
+def test_bound_rollback_versioning_uses_held_run_inode(
+    tmp_path: Path, incremental: bool
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    for stage_num in range(int(Stage.ITERATIVE_REFINE), int(Stage.RESEARCH_DECISION) + 1):
+        stage_dir = run_dir / f"stage-{stage_num:02d}"
+        stage_dir.mkdir()
+        (stage_dir / "payload.txt").write_text(
+            f"stage-{stage_num}", encoding="utf-8"
+        )
+
+    with ReleaseGraphLock.acquire(run_dir, "bound-versioning") as release_lock:
+        rc_runner._version_rollback_stages_bound(
+            run_dir,
+            Stage.ITERATIVE_REFINE,
+            1,
+            release_lock,
+            incremental=incremental,
+        )
+
+    for stage_num in range(int(Stage.ITERATIVE_REFINE), int(Stage.RESEARCH_DECISION) + 1):
+        stage_name = f"stage-{stage_num:02d}"
+        archived = run_dir / f"{stage_name}_v1" / "payload.txt"
+        assert archived.read_text(encoding="utf-8") == f"stage-{stage_num}"
+        live = run_dir / stage_name / "payload.txt"
+        if incremental:
+            assert live.read_text(encoding="utf-8") == f"stage-{stage_num}"
+        else:
+            assert not live.exists()
+
+
+@pytest.mark.parametrize("lease_kind", ("fake", "reader", "inactive"))
+def test_exhaustion_invalidator_rejects_untrusted_writer_lease(
+    tmp_path: Path, lease_kind: str
+) -> None:
+    run_dir = tmp_path / lease_kind
+    run_dir.mkdir()
+    namespaces = {
+        name: None for name in rc_runner._REFINEMENT_EXHAUSTION_COMMIT_POINTS
+    }
+    if lease_kind == "fake":
+        lease: object = object()
+    else:
+        acquired = ReleaseGraphLock.acquire(
+            run_dir, lease_kind, mode="read" if lease_kind == "reader" else "write"
+        )
+        lease = acquired
+        if lease_kind == "inactive":
+            acquired.close()
+    try:
+        with pytest.raises(RuntimeError, match="writer_lease_required|lease_inactive"):
+            rc_runner._invalidate_refinement_exhaustion_authority(
+                run_dir, lease, namespaces
+            )
+    finally:
+        if lease_kind == "reader":
+            acquired.close()
 
 
 def test_proceed_decision_does_not_trigger_rollback(

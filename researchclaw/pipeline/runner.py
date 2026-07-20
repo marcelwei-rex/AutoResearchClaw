@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 import importlib
 import logging
-import math
 import os
 import shutil
+import stat
 import tempfile
 import threading
 import time as _time
+import uuid
+from contextlib import ExitStack
 from pathlib import Path
+from typing import Any
 
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
@@ -148,6 +151,70 @@ def _write_skipped_stage_outputs(
     return tuple(artifacts)
 
 
+def _write_skipped_stage_outputs_bound(
+    run_dir: Path,
+    stage: Stage,
+    run_id: str,
+    release_lock: object,
+) -> tuple[str, ...]:
+    """Publish generic skip contracts through the active writer's held run fd."""
+
+    if stage in SKIP_FORBIDDEN_STAGES:
+        raise ValueError(
+            f"cannot create skipped outputs for evidence-authority stage: {int(stage)}"
+        )
+    from researchclaw.pipeline.release_graph_lock import require_active_writer_epoch
+
+    writer = require_active_writer_epoch(run_dir, release_lock)
+    artifacts: list[str] = []
+    with writer.open_stage_namespace(
+        f"stage-{int(stage):02d}", create_stage=True
+    ) as namespace:
+        for output in CONTRACTS[stage].output_files:
+            if output.endswith("/"):
+                namespace.publish_flat_directory(
+                    output[:-1],
+                    {
+                        "SKIPPED.md": (
+                            f"# Skipped Stage\n\nStage {int(stage)} {stage.name} "
+                            "was skipped by runtime.skip_stages.\n"
+                        ).encode("utf-8")
+                    },
+                )
+            elif output.endswith(".json"):
+                namespace.write_text_atomic(
+                    output,
+                    json.dumps(
+                        {
+                            "skipped": True,
+                            "stage": int(stage),
+                            "stage_name": stage.name,
+                            "run_id": run_id,
+                            "generated": _utcnow_iso(),
+                        },
+                        indent=2,
+                    ),
+                )
+            elif output.endswith((".yaml", ".yml")):
+                namespace.write_text_atomic(
+                    output,
+                    "skipped: true\n"
+                    f"stage: {int(stage)}\n"
+                    f"stage_name: {stage.name}\n"
+                    f"run_id: {run_id}\n",
+                )
+            else:
+                namespace.write_text_atomic(
+                    output,
+                    f"# Skipped Stage\n\nStage {int(stage)} {stage.name} "
+                    "was skipped by runtime.skip_stages.\n",
+                )
+            artifacts.append(output)
+        namespace.assert_canonical()
+    writer.assert_canonical()
+    return tuple(artifacts)
+
+
 def _build_pipeline_summary(
     *,
     run_id: str,
@@ -175,6 +242,11 @@ def _build_pipeline_summary(
         "generated": _utcnow_iso(),
         "content_metrics": _collect_content_metrics(run_dir),
     }
+    if results:
+        if results[-1].error:
+            summary["final_error"] = results[-1].error
+        if results[-1].decision:
+            summary["final_decision"] = results[-1].decision
     return summary
 
 
@@ -346,6 +418,8 @@ def execute_pipeline(
     skip_noncritical: bool = False,
     kb_root: Path | None = None,
     cancel_event: "threading.Event | None" = None,
+    _release_lock: object | None = None,
+    _internal_rollback: bool = False,
 ) -> list[StageResult]:
     """Execute pipeline stages sequentially from *from_stage* to *to_stage* (inclusive)."""
 
@@ -356,6 +430,14 @@ def execute_pipeline(
 
     if requested_range_requires_canonical_evidence(from_stage, to_stage):
         require_canonical_evidence_capabilities("execute_pipeline")
+    if _internal_rollback and _release_lock is None:
+        raise RuntimeError("internal rollback requires an active writer epoch")
+    if _release_lock is not None:
+        from researchclaw.pipeline.release_graph_lock import (
+            require_active_writer_epoch,
+        )
+
+        require_active_writer_epoch(run_dir, _release_lock)
 
     results: list[StageResult] = []
     started = False
@@ -370,7 +452,7 @@ def execute_pipeline(
             + ", ".join(str(stage) for stage in forbidden_skips)
         )
 
-    if not (run_dir / "injected_artifacts.json").exists():
+    if not _internal_rollback and not (run_dir / "injected_artifacts.json").exists():
         injected = _apply_injected_artifacts(run_dir, config)
         if injected:
             print(f"[{run_id}] Injected artifacts: {', '.join(injected)}")
@@ -386,15 +468,16 @@ def execute_pipeline(
 
     # ── Integration hooks: EventLog, CostTracker ──
     event_log = None
-    try:
-        from researchclaw.pipeline.event_log import EventLog, EventType, create_event
-        event_log = EventLog(log_dir=run_dir)
-        event_log.append(create_event(
-            EventType.PIPELINE_START, run_id=run_id,
-            stages=total_stages, from_stage=int(from_stage),
-        ))
-    except Exception:
-        logger.debug("Event log initialisation skipped")
+    if not _internal_rollback:
+        try:
+            from researchclaw.pipeline.event_log import EventLog, EventType, create_event
+            event_log = EventLog(log_dir=run_dir)
+            event_log.append(create_event(
+                EventType.PIPELINE_START, run_id=run_id,
+                stages=total_stages, from_stage=int(from_stage),
+            ))
+        except Exception:
+            logger.debug("Event log initialisation skipped")
 
     cost_budget = getattr(config.experiment.cli_agent, "max_budget_usd", 0.0) or 0.0
 
@@ -425,7 +508,12 @@ def execute_pipeline(
                     )
                 except Exception:
                     pass
-            artifacts = _write_skipped_stage_outputs(run_dir, stage, run_id)
+            if _internal_rollback:
+                artifacts = _write_skipped_stage_outputs_bound(
+                    run_dir, stage, run_id, _release_lock
+                )
+            else:
+                artifacts = _write_skipped_stage_outputs(run_dir, stage, run_id)
             result = StageResult(
                 stage=stage,
                 status=StageStatus.DONE,
@@ -451,8 +539,9 @@ def execute_pipeline(
                     pass
             arts = ", ".join(artifacts) if artifacts else "none"
             print(f"{prefix} {stage.name} — skipped by config → {arts}")
-            _write_checkpoint(run_dir, stage, run_id, adapters=adapters)
-            _write_heartbeat(run_dir, stage, run_id)
+            if not _internal_rollback:
+                _write_checkpoint(run_dir, stage, run_id, adapters=adapters)
+                _write_heartbeat(run_dir, stage, run_id)
             if to_stage is not None and stage == to_stage:
                 logger.info("[%s] Reached --to-stage %s, stopping.", run_id, stage.name)
                 print(f"[{run_id}] Reached --to-stage {stage.name}, stopping pipeline.")
@@ -492,59 +581,203 @@ def execute_pipeline(
 
         t0 = _time.monotonic()
 
-        result = execute_stage(
-            stage,
-            run_dir=run_dir,
-            run_id=run_id,
-            config=config,
-            adapters=adapters,
-            auto_approve_gates=auto_approve_gates,
-        )
+        stage15_pivot_count: int | None = None
+        stage15_pivot_results: list[StageResult] | None = None
+        if stage is Stage.RESEARCH_DECISION:
+            from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
+
+            with ReleaseGraphLock.acquire(
+                run_dir, "runner.research_decision_terminalization", mode="write"
+            ) as decision_epoch:
+                with ExitStack() as namespace_stack:
+                    exhaustion_namespaces = (
+                        _capture_refinement_exhaustion_namespaces(
+                            run_dir, decision_epoch, namespace_stack
+                        )
+                    )
+                    result = execute_stage(
+                        stage,
+                        run_dir=run_dir,
+                        run_id=run_id,
+                        config=config,
+                        adapters=adapters,
+                        auto_approve_gates=auto_approve_gates,
+                    )
+                    if (
+                        result.status is StageStatus.DONE
+                        and result.decision in DECISION_ROLLBACK
+                    ):
+                        _invalidate_decision_resume_pointers(
+                            run_dir, decision_epoch
+                        )
+                        stage15_pivot_count = _read_pivot_count_bound(
+                            run_dir, decision_epoch
+                        )
+                        exhaustion_reason: str | None = None
+                        if stage15_pivot_count > 0 and _consecutive_empty_metrics_bound(
+                            run_dir, stage15_pivot_count, decision_epoch
+                        ):
+                            exhaustion_reason = "consecutive_empty_metrics"
+                            logger.warning(
+                                "Consecutive REFINE cycles produced empty metrics — "
+                                "failing closed"
+                            )
+                            print(
+                                f"[{run_id}] Consecutive empty metrics across REFINE "
+                                "cycles — refinement exhausted"
+                            )
+                        elif stage15_pivot_count >= MAX_DECISION_PIVOTS:
+                            exhaustion_reason = "max_refinement_attempts"
+                            logger.warning(
+                                "Max pivot attempts (%d) reached — refinement exhausted",
+                                MAX_DECISION_PIVOTS,
+                            )
+                            print(
+                                f"[{run_id}] Max pivot attempts reached — "
+                                "refinement exhausted"
+                            )
+                        if exhaustion_reason is not None:
+                            result = _finalize_refinement_exhausted(
+                                run_dir,
+                                result,
+                                reason=exhaustion_reason,
+                                release_lock=decision_epoch,
+                                namespaces=exhaustion_namespaces,
+                            )
+                        elif to_stage is not Stage.RESEARCH_DECISION:
+                            rollback_target = DECISION_ROLLBACK[result.decision]
+                            if (
+                                config.experiment.mode
+                                in ("collider_agent", "biology_agent", "stat_agent")
+                                and result.decision == "refine"
+                            ):
+                                rollback_target = Stage.EXPERIMENT_RUN
+                            _record_decision_history_bound(
+                                run_dir,
+                                result.decision,
+                                rollback_target,
+                                stage15_pivot_count + 1,
+                                decision_epoch,
+                            )
+                            decision_epoch.assert_canonical()
+                            _append_rollback_attempt_bound(
+                                run_dir,
+                                run_id,
+                                rollback_target,
+                                result.decision,
+                                decision_epoch,
+                            )
+                            decision_epoch.assert_canonical()
+                            logger.info(
+                                "Decision %s: rolling back to %s (attempt %d/%d)",
+                                result.decision.upper(),
+                                rollback_target.name,
+                                stage15_pivot_count + 1,
+                                MAX_DECISION_PIVOTS,
+                            )
+                            print(
+                                f"[{run_id}] Decision: {result.decision.upper()} → "
+                                f"rollback to {rollback_target.name} "
+                                f"(attempt {stage15_pivot_count + 1}/"
+                                f"{MAX_DECISION_PIVOTS})"
+                            )
+                            agent_refine = (
+                                config.experiment.mode
+                                in ("collider_agent", "biology_agent", "stat_agent")
+                                and result.decision == "refine"
+                            )
+                            _version_rollback_stages_bound(
+                                run_dir,
+                                rollback_target,
+                                stage15_pivot_count + 1,
+                                decision_epoch,
+                                incremental=agent_refine,
+                            )
+                            decision_epoch.assert_canonical()
+                            stage15_pivot_results = execute_pipeline(
+                                run_dir=run_dir,
+                                run_id=run_id,
+                                config=config,
+                                adapters=adapters,
+                                from_stage=rollback_target,
+                                auto_approve_gates=auto_approve_gates,
+                                stop_on_gate=stop_on_gate,
+                                skip_noncritical=skip_noncritical,
+                                kb_root=kb_root,
+                                cancel_event=cancel_event,
+                                _release_lock=decision_epoch,
+                                _internal_rollback=True,
+                            )
+                            decision_epoch.assert_canonical()
+                            refinement_exhausted = bool(
+                                stage15_pivot_results
+                                and stage15_pivot_results[-1].stage
+                                is Stage.RESEARCH_DECISION
+                                and stage15_pivot_results[-1].status
+                                is StageStatus.FAILED
+                                and stage15_pivot_results[-1].decision
+                                == "refinement_exhausted"
+                            )
+                            if not refinement_exhausted:
+                                _promote_best_stage14(run_dir, config)
+                            decision_epoch.assert_canonical()
+                    # No path-based diagnostics may run after a parent replacement.
+                    decision_epoch.assert_canonical()
+        else:
+            result = execute_stage(
+                stage,
+                run_dir=run_dir,
+                run_id=run_id,
+                config=config,
+                adapters=adapters,
+                auto_approve_gates=auto_approve_gates,
+            )
         elapsed = _time.monotonic() - t0
 
         # ── v2: append-only attempt log + per-stage cost entry ──
         # Failed/degraded attempts are first-class records; never deleted.
-        try:
-            from researchclaw.pipeline import release_artifacts as _ra
-
-            _attempt = _ra.append_attempt(
-                run_dir,
-                run_id=run_id,
-                stage=stage_num,
-                stage_name=stage.name,
-                status=result.status.value,
-                decision=result.decision or "",
-                error=result.error,
-                elapsed_sec=elapsed,
-                artifacts=result.artifacts,
-            )
-            # get_global_tracker().total_cost_usd is CUMULATIVE. Writing that
-            # as each row's cost_usd and later summing rows double-counts.
-            # Write the per-stage DELTA as cost_usd, and record the running
-            # total separately as cumulative_usd.
-            _cumulative = None
+        if not _internal_rollback:
             try:
-                from researchclaw.cost_tracker import get_global_tracker
+                from researchclaw.pipeline import release_artifacts as _ra
 
-                _cumulative = float(get_global_tracker().total_cost_usd)
+                _attempt = _ra.append_attempt(
+                    run_dir,
+                    run_id=run_id,
+                    stage=stage_num,
+                    stage_name=stage.name,
+                    status=result.status.value,
+                    decision=result.decision or "",
+                    error=result.error,
+                    elapsed_sec=elapsed,
+                    artifacts=result.artifacts,
+                )
+                # get_global_tracker().total_cost_usd is CUMULATIVE. Writing that
+                # as each row's cost_usd and later summing rows double-counts.
+                # Write the per-stage DELTA as cost_usd, and record the running
+                # total separately as cumulative_usd.
+                _cumulative = None
+                try:
+                    from researchclaw.cost_tracker import get_global_tracker
+
+                    _cumulative = float(get_global_tracker().total_cost_usd)
+                except Exception:  # noqa: BLE001
+                    pass
+                _delta = None
+                if _cumulative is not None:
+                    _prev = _ra.last_cumulative_cost(run_dir)
+                    _delta = max(0.0, round(_cumulative - _prev, 6))
+                _ra.append_cost_entry(
+                    run_dir,
+                    stage=stage_num,
+                    stage_name=stage.name,
+                    model=config.llm.primary_model or "",
+                    attempt_id=_attempt["attempt_id"],
+                    cost_usd=_delta,
+                    cumulative_usd=_cumulative,
+                    elapsed_sec=elapsed,
+                )
             except Exception:  # noqa: BLE001
-                pass
-            _delta = None
-            if _cumulative is not None:
-                _prev = _ra.last_cumulative_cost(run_dir)
-                _delta = max(0.0, round(_cumulative - _prev, 6))
-            _ra.append_cost_entry(
-                run_dir,
-                stage=stage_num,
-                stage_name=stage.name,
-                model=config.llm.primary_model or "",
-                attempt_id=_attempt["attempt_id"],
-                cost_usd=_delta,
-                cumulative_usd=_cumulative,
-                elapsed_sec=elapsed,
-            )
-        except Exception:  # noqa: BLE001
-            logger.warning("Attempt/cost log append failed", exc_info=True)
+                logger.warning("Attempt/cost log append failed", exc_info=True)
 
         # ── Event log: stage end ──
         if event_log:
@@ -559,7 +792,11 @@ def execute_pipeline(
                 pass
 
         # ── ExperimentSpec: generate after design, validate after analysis ──
-        if stage == Stage.EXPERIMENT_DESIGN and result.status == StageStatus.DONE:
+        if (
+            not _internal_rollback
+            and stage == Stage.EXPERIMENT_DESIGN
+            and result.status == StageStatus.DONE
+        ):
             try:
                 from researchclaw.pipeline.experiment_spec import ExperimentSpec, MetricDef, generate_spec
                 spec_text = generate_spec(config.research.topic, "")
@@ -570,7 +807,11 @@ def execute_pipeline(
                 logger.debug("Experiment spec generation skipped")
 
         # ── Pitfall detection after code generation / experiment run ──
-        if stage in (Stage.CODE_GENERATION, Stage.EXPERIMENT_RUN) and result.status == StageStatus.DONE:
+        if (
+            not _internal_rollback
+            and stage in (Stage.CODE_GENERATION, Stage.EXPERIMENT_RUN)
+            and result.status == StageStatus.DONE
+        ):
             try:
                 from researchclaw.pipeline.pitfall_detector import PitfallDetector
                 detector = PitfallDetector()
@@ -608,7 +849,11 @@ def execute_pipeline(
             print(f"{prefix} {stage.name} -- PAUSED ({elapsed:.1f}s) -- {err}")
         results.append(result)
 
-        if kb_root is not None and result.status == StageStatus.DONE:
+        if (
+            not _internal_rollback
+            and kb_root is not None
+            and result.status == StageStatus.DONE
+        ):
             try:
                 stage_dir = run_dir / f"stage-{int(stage):02d}"
                 write_stage_to_kb(
@@ -624,7 +869,16 @@ def execute_pipeline(
             except Exception:  # noqa: BLE001
                 pass
 
-        if result.status == StageStatus.DONE:
+        decision_rolls_back = (
+            stage is Stage.RESEARCH_DECISION
+            and result.status is StageStatus.DONE
+            and result.decision in DECISION_ROLLBACK
+        )
+        if (
+            not _internal_rollback
+            and result.status == StageStatus.DONE
+            and not decision_rolls_back
+        ):
             _write_checkpoint(run_dir, stage, run_id, adapters=adapters)
 
         # ── Stop after to_stage if specified ──
@@ -634,7 +888,11 @@ def execute_pipeline(
             break
 
         # --- Heartbeat for sentinel watchdog ---
-        if result.status == StageStatus.DONE:
+        if (
+            not _internal_rollback
+            and result.status == StageStatus.DONE
+            and not decision_rolls_back
+        ):
             _write_heartbeat(run_dir, stage, run_id)
 
         # --- PIVOT/REFINE decision handling ---
@@ -643,131 +901,16 @@ def execute_pipeline(
             and result.status == StageStatus.DONE
             and result.decision in DECISION_ROLLBACK
         ):
-            pivot_count = _read_pivot_count(run_dir)
-            # R6-4: Skip REFINE if experiment metrics are empty for consecutive cycles
-            if pivot_count > 0 and _consecutive_empty_metrics(run_dir, pivot_count):
-                logger.warning(
-                    "Consecutive REFINE cycles produced empty metrics — forcing PROCEED"
-                )
-                print(
-                    f"[{run_id}] Consecutive empty metrics across REFINE cycles — forcing PROCEED"
-                )
-                # BUG-211: Promote best stage-14 before proceeding with
-                # empty data — an earlier iteration may have real metrics.
-                _promote_best_stage14(run_dir, config)
-            elif pivot_count < MAX_DECISION_PIVOTS:
-                rollback_target = DECISION_ROLLBACK[result.decision]
-                # Agent-based modes: REFINE means re-run the agent atomically.
-                # Stage 13 ITERATIVE_REFINE is a no-op for these modes (it
-                # would refine python files the agent never executed), so
-                # routing REFINE there wastes a pipeline cycle.  Send REFINE
-                # straight back to EXPERIMENT_RUN so the sandbox re-spawns
-                # claude with the REPAIR_PROMPT.md the requirements gate
-                # just wrote.
-                if (
-                    config.experiment.mode in ("collider_agent", "biology_agent", "stat_agent")
-                    and result.decision == "refine"
-                ):
-                    rollback_target = Stage.EXPERIMENT_RUN
-                _record_decision_history(
-                    run_dir, result.decision, rollback_target, pivot_count + 1
-                )
-                # v2: rollbacks are recorded in the attempt log too, so the
-                # full retry topology is auditable from one artifact.
-                try:
-                    from researchclaw.pipeline import release_artifacts as _ra
-
-                    _ra.append_attempt(
-                        run_dir,
-                        run_id=run_id,
-                        stage=int(rollback_target),
-                        stage_name=rollback_target.name,
-                        status="rolled_back_to",
-                        decision=result.decision,
-                        kind="decision_rollback",
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.debug("Rollback attempt-log append skipped")
-                logger.info(
-                    "Decision %s: rolling back to %s (attempt %d/%d)",
-                    result.decision.upper(),
-                    rollback_target.name,
-                    pivot_count + 1,
-                    MAX_DECISION_PIVOTS,
-                )
-                print(
-                    f"[{run_id}] Decision: {result.decision.upper()} → "
-                    f"rollback to {rollback_target.name} "
-                    f"(attempt {pivot_count + 1}/{MAX_DECISION_PIVOTS})"
-                )
-                # Version existing stage directories before overwriting.
-                # Agent-mode REFINE preserves the stage-12 workspace via
-                # incremental snapshot (copytree, not rename) so the
-                # rerunning sandbox can read prior model files / CSVs / KO
-                # tables instead of starting from a blank workspace.  This
-                # is what makes the requirements-gate retry usefully
-                # incremental rather than just a stochastic resample.
-                _agent_refine = (
-                    config.experiment.mode in ("collider_agent", "biology_agent", "stat_agent")
-                    and result.decision == "refine"
-                )
-                _version_rollback_stages(
-                    run_dir, rollback_target, pivot_count + 1,
-                    incremental=_agent_refine,
-                )
-                # Recurse from rollback target
-                pivot_results = execute_pipeline(
-                    run_dir=run_dir,
-                    run_id=run_id,
-                    config=config,
-                    adapters=adapters,
-                    from_stage=rollback_target,
-                    auto_approve_gates=auto_approve_gates,
-                    stop_on_gate=stop_on_gate,
-                    skip_noncritical=skip_noncritical,
-                    kb_root=kb_root,
-                    cancel_event=cancel_event,
-                )
-                results.extend(pivot_results)
-                # BUG-211: Promote best stage-14 after REFINE completes so
-                # downstream stages use the best data, not just the latest.
-                _promote_best_stage14(run_dir, config)
+            if stage15_pivot_count is None:
+                raise RuntimeError("Stage 15 decision classification was not captured")
+            if stage15_pivot_count < MAX_DECISION_PIVOTS:
+                if to_stage is not Stage.RESEARCH_DECISION:
+                    if stage15_pivot_results is None:
+                        raise RuntimeError("Stage 15 rollback was not terminalized")
+                    results.extend(stage15_pivot_results)
                 break  # Exit current loop; recursive call handles the rest
-            else:
-                # Quality gate: check if experiment results are actually usable
-                _quality_ok, _quality_msg = _check_experiment_quality(
-                    run_dir, pivot_count
-                )
-                if not _quality_ok:
-                    logger.warning(
-                        "Max pivot attempts (%d) reached — forcing PROCEED "
-                        "with quality warning: %s",
-                        MAX_DECISION_PIVOTS,
-                        _quality_msg,
-                    )
-                    print(
-                        f"[{run_id}] QUALITY WARNING: {_quality_msg}"
-                    )
-                    # Write quality warning to run directory
-                    _qw_path = run_dir / "quality_warning.txt"
-                    _qw_path.write_text(
-                        f"Max pivots ({MAX_DECISION_PIVOTS}) reached.\n"
-                        f"Quality gate failed: {_quality_msg}\n"
-                        f"Paper will be written but may have significant issues.\n",
-                        encoding="utf-8",
-                    )
-                else:
-                    logger.warning(
-                        "Max pivot attempts (%d) reached — forcing PROCEED",
-                        MAX_DECISION_PIVOTS,
-                    )
-                print(
-                    f"[{run_id}] Max pivot attempts reached — forcing PROCEED"
-                )
-
-                # BUG-205: After forced PROCEED, promote the BEST stage-14
-                # experiment summary across all REFINE iterations.
-                _promote_best_stage14(run_dir, config)
+            else:  # pragma: no cover - terminalized under the held writer epoch
+                raise RuntimeError("Stage 15 exhaustion escaped terminalization")
 
         # --- HITL: Handle abort decision ---
         if result.decision == "abort":
@@ -801,6 +944,12 @@ def execute_pipeline(
 
         if result.status == StageStatus.BLOCKED_APPROVAL and stop_on_gate:
             break
+
+    if _internal_rollback:
+        from researchclaw.pipeline.release_graph_lock import require_active_writer_epoch
+
+        require_active_writer_epoch(run_dir, _release_lock).assert_canonical()
+        return results
 
     summary = _build_pipeline_summary(
         run_id=run_id,
@@ -1292,6 +1441,524 @@ def _package_deliverables(
     return dest
 
 
+_REFINEMENT_EXHAUSTION_COMMIT_POINTS: dict[str, tuple[str, ...]] = {
+    "stage-16": (
+        "outline_binding.json",
+        "outline.md",
+        "citation_plan.json",
+        "citation_plan.preliminary.json",
+        "citation_policy_effective.json",
+    ),
+    "stage-17": (
+        "paper_meta.json",
+        "paper_draft.md",
+        "paper_structure_report.json",
+        "experiment_fact_closure_report.json",
+        "citation_closure_report.json",
+        "references_preverified.bib",
+    ),
+    "stage-18": ("review_structure_report.json", "reviews.md"),
+    "stage-19": (
+        "section_revision_manifest.json",
+        "revision_evidence_binding.json",
+        "paper_revised.md",
+    ),
+    "stage-20": (
+        "quality_gate_manifest.json",
+        "quality_report.json",
+        "fabrication_flags.json",
+    ),
+    "stage-21": ("bundle_index.json", "archive.md"),
+    "stage-22": ("stage22_export_manifest.json",),
+    "stage-23": ("stage23_verification_manifest.json",),
+    "stage-24": ("stage24_truth_manifest.json",),
+    "stage-25": ("stage25_deai_manifest.json",),
+}
+
+
+def _read_run_regular_file_bound(
+    run_dir: Path, release_lock: object, relative_path: str
+) -> bytes | None:
+    """Read one run-relative regular file through the held writer inode."""
+
+    from researchclaw.pipeline.release_graph_lock import (
+        require_active_writer_invalidation_epoch,
+    )
+
+    writer = require_active_writer_invalidation_epoch(run_dir, release_lock)
+    parts = tuple(relative_path.split("/"))
+    if not parts or any(
+        not part or part in {".", ".."} or "\\" in part for part in parts
+    ):
+        raise OSError(f"invalid run-relative path: {relative_path}")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = writer.duplicate_run_fd()
+    opened = [descriptor]
+    try:
+        for part in parts[:-1]:
+            try:
+                descriptor = os.open(part, directory_flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                return None
+            opened.append(descriptor)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        try:
+            file_fd = os.open(parts[-1], flags, dir_fd=descriptor)
+        except FileNotFoundError:
+            return None
+        try:
+            before = os.fstat(file_fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise OSError(f"run input is not a regular file: {relative_path}")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(file_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            after = os.fstat(file_fd)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ):
+                raise OSError(f"run input changed while reading: {relative_path}")
+            return b"".join(chunks)
+        finally:
+            os.close(file_fd)
+    finally:
+        for opened_fd in reversed(opened):
+            os.close(opened_fd)
+
+
+def _read_pivot_count_bound(run_dir: Path, release_lock: object) -> int:
+    raw = _read_run_regular_file_bound(
+        run_dir, release_lock, "decision_history.json"
+    )
+    if raw is None:
+        return 0
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return 0
+    return len(data) if isinstance(data, list) else 0
+
+
+def _record_decision_history_bound(
+    run_dir: Path,
+    decision: str,
+    rollback_target: Stage,
+    attempt: int,
+    release_lock: object,
+) -> None:
+    from researchclaw.pipeline.release_graph_lock import (
+        require_active_writer_invalidation_epoch,
+    )
+
+    writer = require_active_writer_invalidation_epoch(run_dir, release_lock)
+    raw = _read_run_regular_file_bound(
+        run_dir, release_lock, "decision_history.json"
+    )
+    history: list[dict[str, object]] = []
+    if raw is not None:
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            data = None
+        if isinstance(data, list):
+            history = data
+    history.append(
+        {
+            "decision": decision,
+            "rollback_target": rollback_target.name,
+            "rollback_stage_num": int(rollback_target),
+            "attempt": attempt,
+            "timestamp": _utcnow_iso(),
+        }
+    )
+    writer.write_run_bytes_atomic(
+        "decision_history.json", json.dumps(history, indent=2).encode("utf-8")
+    )
+
+
+def _consecutive_empty_metrics_bound(
+    run_dir: Path, pivot_count: int, release_lock: object
+) -> bool:
+    current_relative = "stage-14/experiment_summary.json"
+    if _read_run_regular_file_bound(run_dir, release_lock, current_relative) is None:
+        for version in range(pivot_count + 1, 0, -1):
+            candidate = f"stage-14_v{version}/experiment_summary.json"
+            if _read_run_regular_file_bound(run_dir, release_lock, candidate) is not None:
+                current_relative = candidate
+                break
+    previous_relative = f"stage-14_v{pivot_count}/experiment_summary.json"
+    for relative in (current_relative, previous_relative):
+        raw = _read_run_regular_file_bound(run_dir, release_lock, relative)
+        if raw is None:
+            return False
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        metrics_summary = data.get("metrics_summary", {})
+        best_run = data.get("best_run", {})
+        if (isinstance(metrics_summary, dict) and metrics_summary) or (
+            isinstance(best_run, dict) and best_run.get("metrics")
+        ):
+            return False
+    return True
+
+
+def _invalidate_decision_resume_pointers(
+    run_dir: Path, release_lock: object
+) -> None:
+    from researchclaw.pipeline.release_graph_lock import require_active_writer_epoch
+
+    writer = require_active_writer_epoch(run_dir, release_lock)
+    errors: list[str] = []
+    for name in ("checkpoint.json", "heartbeat.json"):
+        try:
+            writer.remove_run_files((name,))
+        except OSError as exc:
+            errors.append(f"{name}: {exc}")
+    if errors:
+        raise OSError("decision resume pointer invalidation failed: " + "; ".join(errors))
+
+
+def _append_rollback_attempt_bound(
+    run_dir: Path,
+    run_id: str,
+    rollback_target: Stage,
+    decision: str,
+    release_lock: object,
+) -> None:
+    from researchclaw.pipeline import release_artifacts
+    from researchclaw.pipeline.release_graph_lock import (
+        require_active_writer_invalidation_epoch,
+    )
+
+    writer = require_active_writer_invalidation_epoch(run_dir, release_lock)
+    run_fd = writer.duplicate_run_fd()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        try:
+            attempts_info = os.stat(
+                "attempts", dir_fd=run_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            os.mkdir("attempts", 0o700, dir_fd=run_fd)
+        else:
+            if not stat.S_ISDIR(attempts_info.st_mode):
+                raise OSError("attempt log namespace is unsafe")
+        attempts_fd = os.open("attempts", directory_flags, dir_fd=run_fd)
+        try:
+            try:
+                flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                log_fd = os.open("attempt_log.jsonl", flags, dir_fd=attempts_fd)
+            except FileNotFoundError:
+                existing = b""
+            else:
+                try:
+                    log_info = os.fstat(log_fd)
+                    if not stat.S_ISREG(log_info.st_mode):
+                        raise OSError("attempt log is not a regular file")
+                    chunks: list[bytes] = []
+                    while True:
+                        chunk = os.read(log_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    existing = b"".join(chunks)
+                finally:
+                    os.close(log_fd)
+            prior = 0
+            try:
+                lines = existing.decode("utf-8").splitlines()
+            except UnicodeDecodeError as exc:
+                raise OSError("attempt log is not UTF-8") from exc
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(item, dict)
+                    and item.get("stage") == int(rollback_target)
+                    and item.get("kind") == "decision_rollback"
+                ):
+                    prior += 1
+            entry = {
+                "schema_version": release_artifacts.SCHEMA_VERSION,
+                "kind": "decision_rollback",
+                "run_id": run_id,
+                "stage": int(rollback_target),
+                "stage_name": rollback_target.name,
+                "attempt": prior + 1,
+                "attempt_id": f"stage{int(rollback_target):02d}-a{prior + 1}",
+                "status": "rolled_back_to",
+                "decision": decision,
+                "error": None,
+                "elapsed_sec": None,
+                "artifacts": [],
+                "timestamp": release_artifacts.utcnow_iso(),
+            }
+            prefix = existing
+            if prefix and not prefix.endswith(b"\n"):
+                prefix += b"\n"
+            content = prefix + json.dumps(
+                entry, ensure_ascii=False, default=str
+            ).encode("utf-8") + b"\n"
+            temporary = f".attempt_log.jsonl.tmp-{uuid.uuid4().hex}"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            temporary_fd = os.open(temporary, flags, 0o600, dir_fd=attempts_fd)
+            try:
+                offset = 0
+                while offset < len(content):
+                    written = os.write(temporary_fd, content[offset:])
+                    if written <= 0:
+                        raise OSError("attempt log write made no progress")
+                    offset += written
+                os.fsync(temporary_fd)
+            except Exception:
+                try:
+                    os.unlink(temporary, dir_fd=attempts_fd)
+                except FileNotFoundError:
+                    pass
+                raise
+            finally:
+                os.close(temporary_fd)
+            os.replace(
+                temporary,
+                "attempt_log.jsonl",
+                src_dir_fd=attempts_fd,
+                dst_dir_fd=attempts_fd,
+            )
+            os.fsync(attempts_fd)
+        finally:
+            os.close(attempts_fd)
+    finally:
+        os.close(run_fd)
+
+
+def _version_rollback_stages_bound(
+    run_dir: Path,
+    rollback_target: Stage,
+    attempt: int,
+    release_lock: object,
+    *,
+    incremental: bool = False,
+) -> None:
+    from researchclaw.pipeline.bound_output_namespace import (
+        _copy_tree_fd_to_fd,
+        _remove_tree_at,
+    )
+    from researchclaw.pipeline.release_graph_lock import require_active_writer_epoch
+
+    writer = require_active_writer_epoch(run_dir, release_lock)
+    run_fd = writer.duplicate_run_fd()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        for stage_num in range(int(rollback_target), int(Stage.RESEARCH_DECISION) + 1):
+            stage_name = f"stage-{stage_num:02d}"
+            archive_name = f"{stage_name}_v{attempt}"
+            try:
+                source_info = os.stat(
+                    stage_name, dir_fd=run_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(source_info.st_mode):
+                raise OSError(f"rollback stage is unsafe: {stage_name}")
+            _remove_tree_at(run_fd, archive_name)
+            if incremental and stage_num >= int(Stage.EXPERIMENT_RUN):
+                os.mkdir(archive_name, 0o700, dir_fd=run_fd)
+                source_fd = os.open(stage_name, directory_flags, dir_fd=run_fd)
+                try:
+                    destination_fd = os.open(
+                        archive_name, directory_flags, dir_fd=run_fd
+                    )
+                    try:
+                        _copy_tree_fd_to_fd(source_fd, destination_fd)
+                        source_after = os.fstat(source_fd)
+                        source_entry = os.stat(
+                            stage_name, dir_fd=run_fd, follow_symlinks=False
+                        )
+                        if (source_after.st_dev, source_after.st_ino) != (
+                            source_entry.st_dev,
+                            source_entry.st_ino,
+                        ):
+                            raise OSError(
+                                f"rollback stage changed while copying: {stage_name}"
+                            )
+                    finally:
+                        os.close(destination_fd)
+                except Exception:
+                    _remove_tree_at(run_fd, archive_name)
+                    raise
+                finally:
+                    os.close(source_fd)
+            else:
+                os.rename(
+                    stage_name,
+                    archive_name,
+                    src_dir_fd=run_fd,
+                    dst_dir_fd=run_fd,
+                )
+    finally:
+        os.close(run_fd)
+    writer.assert_canonical()
+
+
+def _capture_refinement_exhaustion_namespaces(
+    run_dir: Path,
+    release_lock: object,
+    stack: ExitStack,
+) -> dict[str, Any | None]:
+    """Capture existing downstream stage inodes before Stage 15 executes."""
+
+    from researchclaw.pipeline.release_graph_lock import require_active_writer_epoch
+
+    writer = require_active_writer_epoch(run_dir, release_lock)
+    namespaces: dict[str, Any | None] = {}
+    for stage_name in _REFINEMENT_EXHAUSTION_COMMIT_POINTS:
+        try:
+            namespace = writer.open_stage_namespace(stage_name)
+        except FileNotFoundError:
+            namespaces[stage_name] = None
+            continue
+        namespaces[stage_name] = stack.enter_context(namespace)
+    return namespaces
+
+
+def _invalidate_refinement_exhaustion_authority(
+    run_dir: Path,
+    release_lock: object,
+    namespaces: dict[str, Any | None],
+) -> None:
+    """Withdraw every downstream commit point without following live symlinks."""
+
+    from researchclaw.pipeline.release_graph_lock import (
+        require_active_writer_invalidation_epoch,
+    )
+
+    require_active_writer_invalidation_epoch(run_dir, release_lock)
+    if set(namespaces) != set(_REFINEMENT_EXHAUSTION_COMMIT_POINTS):
+        raise RuntimeError("refinement exhaustion namespace set mismatch")
+    # Validate the complete namespace set before withdrawing any authority.
+    # A foreign or wrong-stage entry must not cause partial deletion.
+    for stage_name, names in _REFINEMENT_EXHAUSTION_COMMIT_POINTS.items():
+        namespace = namespaces[stage_name]
+        if namespace is None:
+            continue
+        _require_detached_namespace_owned_by_writer(
+            run_dir, release_lock, namespace, stage_name
+        )
+    errors: list[str] = []
+    for stage_name, names in _REFINEMENT_EXHAUSTION_COMMIT_POINTS.items():
+        namespace = namespaces[stage_name]
+        if namespace is None:
+            continue
+        for name in names:
+            try:
+                namespace.remove_flat_entries((name,))
+            except OSError as exc:
+                errors.append(f"{stage_name}/{name}: {exc}")
+        try:
+            namespace.assert_canonical()
+        except OSError as exc:
+            errors.append(f"{stage_name} identity: {exc}")
+    if errors:
+        raise OSError(
+            "refinement exhaustion authority cleanup was incomplete: "
+            + "; ".join(errors)
+        )
+
+
+def _require_detached_namespace_owned_by_writer(
+    run_dir: Path,
+    release_lock: object,
+    namespace: Any,
+    expected_stage: str,
+) -> None:
+    """Bind a captured stage fd to a writer without resolving the live path."""
+
+    from researchclaw.pipeline.release_graph_lock import (
+        require_active_writer_invalidation_epoch,
+    )
+
+    writer = require_active_writer_invalidation_epoch(run_dir, release_lock)
+    if (
+        getattr(namespace, "stage_name", None) != expected_stage
+        or str(getattr(namespace, "run_dir", Path()).absolute())
+        != str(run_dir.absolute())
+        or getattr(namespace, "stage_dir", None) != run_dir / expected_stage
+    ):
+        raise RuntimeError("refinement exhaustion namespace binding mismatch")
+    writer_fd = writer.duplicate_run_fd()
+    try:
+        writer_info = os.fstat(writer_fd)
+        namespace_run_info = os.fstat(namespace._run_fd)
+        namespace_stage_info = os.fstat(namespace._stage_fd)
+    except (AttributeError, OSError) as exc:
+        raise RuntimeError("refinement exhaustion namespace is inactive") from exc
+    finally:
+        os.close(writer_fd)
+    if (
+        not stat.S_ISDIR(namespace_run_info.st_mode)
+        or not stat.S_ISDIR(namespace_stage_info.st_mode)
+        or (writer_info.st_dev, writer_info.st_ino)
+        != (namespace_run_info.st_dev, namespace_run_info.st_ino)
+        or getattr(namespace, "_run_identity", None)
+        != (namespace_run_info.st_dev, namespace_run_info.st_ino)
+        or getattr(namespace, "_stage_identity", None)
+        != (namespace_stage_info.st_dev, namespace_stage_info.st_ino)
+    ):
+        raise RuntimeError("refinement exhaustion namespace epoch mismatch")
+
+
+def _finalize_refinement_exhausted(
+    run_dir: Path,
+    decision_result: StageResult,
+    *,
+    reason: str,
+    release_lock: object,
+    namespaces: dict[str, Any | None],
+) -> StageResult:
+    error = f"refinement_exhausted: {reason}"
+    try:
+        _invalidate_refinement_exhaustion_authority(
+            run_dir, release_lock, namespaces
+        )
+    except Exception as exc:  # noqa: BLE001
+        error += f"; downstream authority cleanup failed: {exc}"
+    return StageResult(
+        stage=Stage.RESEARCH_DECISION,
+        status=StageStatus.FAILED,
+        artifacts=decision_result.artifacts,
+        evidence_refs=decision_result.evidence_refs,
+        error=error,
+        decision="refinement_exhausted",
+    )
+
+
 def _version_rollback_stages(
     run_dir: Path,
     rollback_target: Stage,
@@ -1387,88 +2054,6 @@ def _promote_best_stage14(run_dir: Path, config: RCConfig) -> None:
         )
     finally:
         controller.close()
-
-
-def _check_experiment_quality(
-    run_dir: Path, pivot_count: int
-) -> tuple[bool, str]:
-    """Quality gate before forced PROCEED.
-
-    Returns (ok, message). ok=False means experiment results have critical
-    quality issues and the forced-PROCEED paper will likely be poor.
-    """
-    # BUG-DA8-18: Check experiment_summary_best.json first (repair-promoted)
-    summary_path = run_dir / "experiment_summary_best.json"
-    if not summary_path.exists():
-        summary_path = run_dir / "stage-14" / "experiment_summary.json"
-    if not summary_path.exists():
-        for v in range(pivot_count, 0, -1):
-            alt = run_dir / f"stage-14_v{v}" / "experiment_summary.json"
-            if alt.exists():
-                summary_path = alt
-                break
-
-    if not summary_path.exists():
-        return False, "No experiment_summary.json found — no metrics produced"
-
-    try:
-        data = json.loads(summary_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return False, "experiment_summary.json is malformed"
-
-    # Check 1: Are all metrics zero?
-    ms = data.get("metrics_summary", {})
-    if isinstance(ms, dict):
-        values: list[float] = []
-        for k, v in ms.items():
-            if isinstance(v, (int, float)):
-                values.append(float(v))
-            # BUG-212: metrics_summary values are often dicts {min,max,mean,count}
-            elif isinstance(v, dict) and "mean" in v:
-                _mv = v["mean"]
-                if isinstance(_mv, (int, float)):
-                    values.append(float(_mv))
-        if values and all(v == 0.0 for v in values):
-            return False, "All experiment metrics are zero — experiments likely failed"
-
-    # Check 2: Zero variance across conditions (R13-1)
-    # Look for ablation_warnings or condition comparison data
-    ablation_warnings = data.get("ablation_warnings", [])
-    # BUG-212: Key is "condition_summaries", not "conditions"
-    conditions = data.get(
-        "condition_summaries", data.get("condition_metrics", {})
-    )
-    if isinstance(conditions, dict) and len(conditions) >= 2:
-        primary_values: list[float] = []
-        for cond_name, cond_data in conditions.items():
-            if isinstance(cond_data, dict):
-                # BUG-212: Primary metric lives inside cond_data["metrics"]
-                _metrics = cond_data.get("metrics", cond_data)
-                pm = _metrics.get(
-                    "primary_metric",
-                    _metrics.get("primary_metric_mean"),
-                )
-                if isinstance(pm, (int, float)):
-                    primary_values.append(float(pm))
-        if len(primary_values) >= 2 and len(set(primary_values)) == 1:
-            return False, (
-                f"All {len(primary_values)} conditions have identical primary_metric "
-                f"({primary_values[0]}) — condition implementations are likely broken"
-            )
-
-    # Check 3: Too many ablation warnings
-    if isinstance(ablation_warnings, list) and len(ablation_warnings) >= 3:
-        return False, (
-            f"{len(ablation_warnings)} ablation warnings — most conditions "
-            f"produce identical results"
-        )
-
-    # Check 4: Analysis quality score (if available)
-    quality = data.get("analysis_quality", data.get("quality_score"))
-    if isinstance(quality, (int, float)) and quality < 3.0:
-        return False, f"Analysis quality score {quality}/10 — below minimum threshold"
-
-    return True, "Quality checks passed"
 
 
 def _read_pivot_count(run_dir: Path) -> int:

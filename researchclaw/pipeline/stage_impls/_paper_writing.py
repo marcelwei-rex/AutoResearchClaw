@@ -63,6 +63,13 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     load_canonical_experiment_evidence,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
+from researchclaw.pipeline.stage15_decision_projection import (
+    DECISION_POLICY_VERSION,
+    DECISION_PROJECTION_SCHEMA_VERSION,
+    Stage15DecisionProjectionError,
+    build_stage15_decision_projection,
+    uses_fixed_domain_decision_policy,
+)
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
@@ -97,6 +104,13 @@ _STAGE15_STANDARD_DECISION_FIELDS = frozenset(
         "canonical_experiment_evidence_sha256",
         "decision_path",
         "decision_sha256",
+    }
+)
+_STAGE15_DOMAIN_DECISION_FIELDS = _STAGE15_STANDARD_DECISION_FIELDS | frozenset(
+    {
+        "decision_policy_version",
+        "decision_projection_schema_version",
+        "decision_projection_sha256",
     }
 )
 _STAGE15_AGENT_DECISION_FIELDS = frozenset(
@@ -175,7 +189,13 @@ def _load_bound_stage15_decision(
         "Stage 15 decision binding",
     )
     binding_fields = frozenset(binding)
-    if binding_fields == _STAGE15_STANDARD_DECISION_FIELDS:
+    fixed_domain_policy = uses_fixed_domain_decision_policy(evidence)
+    expected_standard_fields = (
+        _STAGE15_DOMAIN_DECISION_FIELDS
+        if fixed_domain_policy
+        else _STAGE15_STANDARD_DECISION_FIELDS
+    )
+    if binding_fields == expected_standard_fields:
         if (
             not isinstance(binding["raw_text_excerpt"], str)
             or binding["raw_text_excerpt"] != decision_text[:500]
@@ -185,6 +205,25 @@ def _load_bound_stage15_decision(
             or not binding["generated"].strip()
         ):
             raise ValueError("Stage 15 standard decision binding is invalid")
+        if fixed_domain_policy:
+            try:
+                projection = build_stage15_decision_projection(evidence)
+            except Stage15DecisionProjectionError as exc:
+                raise ValueError(f"Stage 15 decision projection is invalid: {exc}") from exc
+            expected_projection = {
+                "decision_policy_version": DECISION_POLICY_VERSION,
+                "decision_projection_schema_version": DECISION_PROJECTION_SCHEMA_VERSION,
+                "decision_projection_sha256": projection.sha256,
+            }
+            if type(binding["decision_projection_schema_version"]) is not int:
+                raise ValueError(
+                    "Stage 15 decision projection schema version must be an integer"
+                )
+            for field, value in expected_projection.items():
+                if binding.get(field) != value:
+                    raise ValueError(
+                        f"Stage 15 decision projection binding mismatch: {field}"
+                    )
     elif binding_fields == _STAGE15_AGENT_DECISION_FIELDS:
         raise ValueError(
             "Stage 15 agent requirements decisions are not authorized for "

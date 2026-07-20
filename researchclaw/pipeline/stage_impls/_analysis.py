@@ -46,6 +46,12 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     publish_experiment_evidence_candidate,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
+from researchclaw.pipeline.stage15_decision_projection import (
+    Stage15DecisionProjectionError,
+    build_stage15_decision_projection,
+    fixed_domain_decision_prompt,
+    uses_fixed_domain_decision_policy,
+)
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
@@ -1184,7 +1190,27 @@ def _execute_research_decision_bound(
             error=f"Canonical experiment evidence is invalid: {exc}",
             decision="retry",
         )
+    if llm is None:
+        return StageResult(
+            stage=Stage.RESEARCH_DECISION,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error="decision_model_unavailable",
+            decision="retry",
+        )
     analysis = evidence.analysis_text
+    projection = None
+    if uses_fixed_domain_decision_policy(evidence):
+        try:
+            projection = build_stage15_decision_projection(evidence)
+        except Stage15DecisionProjectionError as exc:
+            return StageResult(
+                stage=Stage.RESEARCH_DECISION,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"Canonical decision projection is invalid: {exc}",
+                decision="retry",
+            )
 
     # P6: Detect degenerate REFINE cycles — inject warning if metrics stagnate
     _degenerate_hint = ""
@@ -1229,27 +1255,18 @@ def _execute_research_decision_bound(
     except Exception:  # noqa: BLE001
         pass
 
-    if llm is not None:
+    if projection is not None:
+        system_prompt, user_prompt = fixed_domain_decision_prompt(projection)
+        resp = _chat_with_prompt(llm, system_prompt, user_prompt)
+        decision_md = resp.content
+        critique_source = projection.prompt_text
+    else:
         _pm = prompts or PromptManager()
         sp = _pm.for_stage("research_decision", evolution_overlay="", analysis=analysis)
         _user = sp.user + _degenerate_hint + _diagnosis_hint + _ablation_refine_hint
         resp = _chat_with_prompt(llm, sp.system, _user)
         decision_md = resp.content
-    else:
-        decision_md = f"""# Research Decision
-
-## Decision
-PROCEED
-
-## Justification
-Current evidence suggests measurable progress with actionable limitations.
-
-## Next Actions
-- Build detailed paper outline
-- Expand ablation and uncertainty analysis in writing
-
-Generated: {_utcnow_iso()}
-"""
+        critique_source = analysis
     namespace.write_text_atomic("decision.md", decision_md)
 
     # --- Extract structured decision ---
@@ -1316,6 +1333,14 @@ Generated: {_utcnow_iso()}
         "decision_path": "stage-15/decision.md",
         "decision_sha256": hashlib.sha256(decision_md.encode("utf-8")).hexdigest(),
     }
+    if projection is not None:
+        decision_payload.update(
+            {
+                "decision_policy_version": projection.policy_version,
+                "decision_projection_schema_version": projection.schema_version,
+                "decision_projection_sha256": projection.sha256,
+            }
+        )
     namespace.write_text_atomic(
         "decision_structured.json", json.dumps(decision_payload, indent=2)
     )
@@ -1331,7 +1356,7 @@ Generated: {_utcnow_iso()}
         run_dir,
         config,
         llm,
-        analysis,
+        critique_source,
         evidence=evidence,
         namespace=namespace,
     )

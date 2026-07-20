@@ -1559,6 +1559,133 @@ class TestParseDecision:
 
 
 class TestResearchDecisionStructured:
+    def test_execute_stage_fails_when_decision_model_is_unavailable(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        monkeypatch.setattr(rc_executor, "_create_configured_llm", lambda _config: None)
+        monkeypatch.setattr(
+            "researchclaw.pipeline.stage_impls._analysis.load_canonical_experiment_evidence",
+            lambda _run_dir: SimpleNamespace(),
+        )
+
+        result = rc_executor.execute_stage(
+            Stage.RESEARCH_DECISION,
+            run_dir=run_dir,
+            run_id="no-decision-model",
+            config=rc_config,
+            adapters=adapters,
+        )
+
+        assert result.status is StageStatus.FAILED
+        assert result.error == "decision_model_unavailable"
+        stage15 = run_dir / "stage-15"
+        assert not (stage15 / "decision.md").exists()
+        assert not (stage15 / "decision_structured.json").exists()
+        assert not (stage15 / "critique.json").exists()
+
+    def test_execute_stage_fails_when_decision_model_construction_raises(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        def _raise(_cls: type[object], _config: RCConfig) -> None:
+            raise RuntimeError("provider unavailable")
+
+        monkeypatch.setattr(rc_executor.LLMClient, "from_rc_config", _raise)
+        monkeypatch.setattr(
+            "researchclaw.pipeline.stage_impls._analysis.load_canonical_experiment_evidence",
+            lambda _run_dir: SimpleNamespace(),
+        )
+        result = rc_executor.execute_stage(
+            Stage.RESEARCH_DECISION,
+            run_dir=run_dir,
+            run_id="decision-model-error",
+            config=rc_config,
+            adapters=adapters,
+        )
+
+        assert result.status is StageStatus.FAILED
+        assert result.error == "decision_model_unavailable"
+        stage15 = run_dir / "stage-15"
+        assert not (stage15 / "decision.md").exists()
+        assert not (stage15 / "decision_structured.json").exists()
+
+    def test_fixed_domain_decision_uses_projection_prompt_and_binding(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        run_dir = tmp_path / "run"
+        stage15 = run_dir / "stage-15"
+        stage15.mkdir(parents=True)
+        evidence = SimpleNamespace(
+            manifest={"schema_version": 2, "generation_kind": "domain_evaluator"},
+            manifest_path="canonical_experiment_evidence.json",
+            manifest_sha256="a" * 64,
+            analysis_text="narrow analysis",
+            metric_observations={"auprc": (Decimal("0.1"), Decimal("0.2"))},
+        )
+        projection = SimpleNamespace(
+            schema_version=1,
+            policy_version="domain_evaluator_decision_v1",
+            sha256="b" * 64,
+            prompt_text='{"deterministic_gates":{"evidence_completeness":true}}\n',
+        )
+        captured: dict[str, str] = {}
+        monkeypatch.setattr(
+            "researchclaw.pipeline.stage_impls._analysis.load_canonical_experiment_evidence",
+            lambda _run_dir: evidence,
+        )
+        monkeypatch.setattr(
+            "researchclaw.pipeline.stage15_critique.load_canonical_experiment_evidence",
+            lambda _run_dir: evidence,
+        )
+        monkeypatch.setattr(
+            "researchclaw.pipeline.stage_impls._analysis.build_stage15_decision_projection",
+            lambda _evidence: projection,
+        )
+
+        def _chat(_llm: object, system: str, user: str, **_kwargs: object) -> SimpleNamespace:
+            captured["system"] = system
+            captured["user"] = user
+            return SimpleNamespace(
+                content=(
+                    "## Decision\nPROCEED\n## Justification\nComplete.\n"
+                    "## Evidence\nBound.\n## Next Actions\nDraft.\n"
+                )
+            )
+
+        monkeypatch.setattr(
+            "researchclaw.pipeline.stage_impls._analysis._chat_with_prompt", _chat
+        )
+        result = rc_executor._execute_research_decision(
+            stage15,
+            run_dir,
+            rc_config,
+            adapters,
+            llm=SimpleNamespace(),
+        )
+
+        assert result.status is StageStatus.DONE
+        assert projection.prompt_text in captured["user"]
+        assert "subjective analysis-quality score" in captured["user"]
+        payload = json.loads((stage15 / "decision_structured.json").read_text())
+        assert payload["decision_projection_sha256"] == projection.sha256
+        assert payload["decision_policy_version"] == projection.policy_version
+
     def test_decision_produces_structured_json(
         self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
     ) -> None:
@@ -1591,17 +1718,30 @@ class TestResearchDecisionStructured:
         )
         assert result.decision == "pivot"
 
-    def test_no_llm_defaults_to_proceed(
-        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
+    def test_no_llm_fails_without_publishing_decision(
+        self,
+        tmp_path: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         run_dir = tmp_path / "run"
         run_dir.mkdir()
         stage_dir = run_dir / "stage-15"
         stage_dir.mkdir(parents=True)
+        monkeypatch.setattr(
+            "researchclaw.pipeline.stage_impls._analysis.load_canonical_experiment_evidence",
+            lambda _run_dir: SimpleNamespace(),
+        )
         result = rc_executor._execute_research_decision(
             stage_dir, run_dir, rc_config, adapters, llm=None
         )
-        assert result.decision == "proceed"
+        assert result.status is StageStatus.FAILED
+        assert result.decision == "retry"
+        assert result.error == "decision_model_unavailable"
+        assert result.artifacts == ()
+        assert not (stage_dir / "decision.md").exists()
+        assert not (stage_dir / "decision_structured.json").exists()
 
     def test_ambiguous_llm_response_pauses(
         self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle

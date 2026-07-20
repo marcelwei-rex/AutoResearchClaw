@@ -3496,6 +3496,44 @@ def test_stage15_rejects_source_change_during_critic_call(
     assert not (stage15 / "decision_structured.json").exists()
 
 
+def test_stage15_rejects_generation_change_during_decision_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _root = _write_canonical_bundle(run_dir)
+    stage15 = run_dir / "stage-15"
+    stage15.mkdir()
+
+    def _mutating_decision(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        (run_dir / "canonical_experiment_evidence.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
+        return SimpleNamespace(
+            content="PROCEED: baseline, seed, and metric evidence are bounded."
+        )
+
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._analysis._chat_with_prompt",
+        _mutating_decision,
+    )
+    result = _execute_research_decision(
+        stage15,
+        run_dir,
+        config,
+        AdapterBundle(),
+        llm=SimpleNamespace(),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert not (stage15 / "decision.md").exists()
+    assert not (stage15 / "decision_structured.json").exists()
+    assert not (stage15 / "critique.json").exists()
+    assert not (stage15 / "stage15_critique_manifest.json").exists()
+
+
 def test_stage15_agent_mode_fails_before_llm_or_decision_write(
     tmp_path: Path,
     canonical_evidence_migration_complete: None,
