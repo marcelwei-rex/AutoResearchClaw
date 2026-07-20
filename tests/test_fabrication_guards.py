@@ -92,94 +92,61 @@ class TestNoncriticalStages:
 class TestStage12HardGuards:
     """Test the _execute_experiment_run hard guards in isolation."""
 
-    def _call_experiment_run(self, stage_dir: Path, run_dir: Path,
-                            config: MagicMock, result_mock: MagicMock) -> object:
-        """Invoke _execute_experiment_run with mocked sandbox."""
+    def _call_experiment_run(
+        self, stage_dir: Path, run_dir: Path, config: MagicMock
+    ) -> tuple[object, MagicMock]:
+        """Invoke Stage 12 with an unavailable Stage 10 seal and sandbox spy."""
         from researchclaw.pipeline.stage_impls._execution import _execute_experiment_run
 
-        # Phase 2: _load_sealed_candidate requires a real manifest. We mock it
-        # to return a temp dir with main.py so the Stage 12 hard-guard logic
-        # (zero-metrics / suspiciously-fast / crash-signal) is exercised.
-        _fake_candidate = stage_dir / "_fake_selected"
-        _fake_candidate.mkdir(parents=True, exist_ok=True)
-        (_fake_candidate / "main.py").write_text("print('test')\n", encoding="utf-8")
-
-        # Mock the sandbox creation and run
         mock_sandbox = MagicMock()
-        mock_sandbox.run.return_value = result_mock
-        mock_sandbox.run_project.return_value = result_mock
-
-        with patch("researchclaw.experiment.factory.create_sandbox", return_value=mock_sandbox), \
-             patch("researchclaw.pipeline.stage_impls._execution._load_sealed_candidate", return_value=_fake_candidate), \
-             patch("researchclaw.pipeline.stage_impls._execution._read_prior_artifact", return_value=""), \
-             patch("researchclaw.pipeline.stage_impls._execution._utcnow_iso", return_value="2026-01-01T00:00:00Z"):
-            return _execute_experiment_run(
+        with patch(
+            "researchclaw.experiment.factory.create_sandbox",
+            return_value=mock_sandbox,
+        ):
+            result = _execute_experiment_run(
                 stage_dir, run_dir, config, MagicMock(),
                 llm=None, prompts=None,
             )
+        return result, mock_sandbox
 
-    def test_failed_no_metrics_returns_failed(self, stage_dir: Path, run_dir: Path) -> None:
-        """Experiment failed with zero metrics must return FAILED."""
+    def test_unsealed_candidate_blocks_failed_sandbox_before_execution(
+        self, stage_dir: Path, run_dir: Path
+    ) -> None:
+        """A failed sandbox result cannot run before Stage 10 sealing succeeds."""
         cfg = _make_config()
-        result = MagicMock()
-        result.returncode = 1
-        result.timed_out = False
-        result.metrics = {}
-        result.stdout = "Traceback (most recent call last): ModuleNotFoundError"
-        result.stderr = "Error"
-        result.elapsed_sec = 3.46
 
-        sr = self._call_experiment_run(stage_dir, run_dir, cfg, result)
+        sr, sandbox = self._call_experiment_run(stage_dir, run_dir, cfg)
         assert sr.status == StageStatus.FAILED
-        assert "zero real metrics" in (sr.error or "").lower() or "failed" in (sr.error or "").lower()
+        assert "sealed stage 10 candidate is invalid" in (sr.error or "").lower()
+        sandbox.run_project.assert_not_called()
 
     def test_unsealed_fast_result_cannot_bypass_canonical_preflight(
         self, stage_dir: Path, run_dir: Path
     ) -> None:
         """A sandbox result cannot substitute for sealed canonical inputs."""
         cfg = _make_config(time_budget_sec=7200)
-        result = MagicMock()
-        result.returncode = 0
-        result.timed_out = False
-        result.metrics = {}
-        result.stdout = "done"
-        result.stderr = ""
-        result.elapsed_sec = 7.1
-
-        sr = self._call_experiment_run(stage_dir, run_dir, cfg, result)
+        sr, sandbox = self._call_experiment_run(stage_dir, run_dir, cfg)
         assert sr.status == StageStatus.FAILED
-        assert "canonical stage 12 preflight failed" in (sr.error or "").lower()
+        assert "sealed stage 10 candidate is invalid" in (sr.error or "").lower()
+        sandbox.run_project.assert_not_called()
 
     def test_sandbox_metrics_are_not_canonical_authority(
         self, stage_dir: Path, run_dir: Path
     ) -> None:
         """A metrics dict returned by the sandbox is not result-set authority."""
         cfg = _make_config()
-        result = MagicMock()
-        result.returncode = 0
-        result.timed_out = False
-        result.metrics = {"accuracy": 0.85, "loss": 0.32}
-        result.stdout = "Training complete"
-        result.stderr = ""
-        result.elapsed_sec = 120.0
-
-        sr = self._call_experiment_run(stage_dir, run_dir, cfg, result)
+        sr, sandbox = self._call_experiment_run(stage_dir, run_dir, cfg)
         assert sr.status == StageStatus.FAILED
-        assert "canonical stage 12 preflight failed" in (sr.error or "").lower()
+        assert "sealed stage 10 candidate is invalid" in (sr.error or "").lower()
+        sandbox.run_project.assert_not_called()
 
     def test_stdout_failure_no_metrics_returns_failed(self, stage_dir: Path, run_dir: Path) -> None:
         """Experiment with failure signals in stdout and no metrics returns FAILED."""
         cfg = _make_config()
-        result = MagicMock()
-        result.returncode = 0
-        result.timed_out = False
-        result.metrics = {}
-        result.stdout = "FAIL: training diverged NaN/divergence at step 10"
-        result.stderr = ""
-        result.elapsed_sec = 15.0
-
-        sr = self._call_experiment_run(stage_dir, run_dir, cfg, result)
+        sr, sandbox = self._call_experiment_run(stage_dir, run_dir, cfg)
         assert sr.status == StageStatus.FAILED
+        assert "sealed stage 10 candidate is invalid" in (sr.error or "").lower()
+        sandbox.run_project.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

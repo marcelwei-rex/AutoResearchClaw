@@ -207,10 +207,10 @@ def test_executor_treats_code_generation_as_gate_for_hep_ph(tmp_path, monkeypatc
 # ---------------------------------------------------------------------------
 
 
-def test_canonical_stage12_rejects_legacy_collider_incremental_mode(
+def test_canonical_stage12_rejects_legacy_collider_inputs_before_execution(
     tmp_path, monkeypatch, caplog
 ):
-    """C1-A supports only sandbox/docker and never enters legacy snapshot code."""
+    """Legacy collider inputs cannot bypass the Stage 10 seal preflight."""
     import logging
     from dataclasses import replace
 
@@ -262,7 +262,7 @@ def test_canonical_stage12_rejects_legacy_collider_incremental_mode(
         )
 
     assert result.status.value == "failed"
-    assert "does not support experiment mode" in (result.error or "")
+    assert "sealed stage 10 candidate is invalid" in (result.error or "").lower()
     assert not any("incremental footprint" in r.message.lower() for r in caplog.records)
 
 
@@ -287,8 +287,8 @@ def test_estimate_stage12_footprint_bytes_sums_all_versions(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_stage13_collider_mode_cannot_publish_canonical_refinement(tmp_path):
-    """An unsupported agent mode cannot create compatibility evidence."""
+def test_stage13_legacy_results_cannot_publish_canonical_refinement(tmp_path):
+    """Stage 13 cannot continue from an unsealed legacy Stage 12 result tree."""
     from researchclaw.adapters import AdapterBundle
     from researchclaw.pipeline.stage_impls._execution import _execute_iterative_refine
 
@@ -318,7 +318,7 @@ def test_stage13_collider_mode_cannot_publish_canonical_refinement(tmp_path):
     )
 
     assert result.status.value == "failed"
-    assert "does not support experiment mode" in (result.error or "")
+    assert "stage 12 result-set dispatch failed" in (result.error or "").lower()
     assert not (s13 / "experiment_final").exists()
     assert not (s13 / "refinement_result_set.json").exists()
 
@@ -490,10 +490,10 @@ def test_prepare_workspace_incremental_skipped_when_no_artifacts(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_canonical_stage12_archives_old_workspace_before_rejecting_collider_mode(
+def test_canonical_stage12_preserves_legacy_workspace_on_seal_preflight_failure(
     tmp_path, monkeypatch
 ):
-    """Rerun invalidation precedes unsupported-mode preflight failure."""
+    """Invalid legacy input fails before canonical generation rollover."""
     from researchclaw.adapters import AdapterBundle
     from researchclaw.experiment import collider_agent_sandbox as ca_mod
     from researchclaw.experiment.sandbox import SandboxResult
@@ -547,15 +547,15 @@ def test_canonical_stage12_archives_old_workspace_before_rejecting_collider_mode
     )
 
     assert result.status.value == "failed"
-    assert "does not support experiment mode" in (result.error or "")
-    assert (run_dir / "stage-12_v1/runs/results.json").is_file()
-    assert not (run_dir / "stage-12/runs/results.json").exists()
+    assert "sealed stage 10 candidate is invalid" in (result.error or "").lower()
+    assert (run_dir / "stage-12/runs/results.json").is_file()
+    assert not (run_dir / "stage-12_v1").exists()
 
 
-def test_canonical_stage12_archives_any_nonempty_unsupported_generation(
+def test_canonical_stage12_does_not_rollover_unsealed_legacy_generation(
     tmp_path, monkeypatch
 ):
-    """Generation rollover is directory-based, not legacy workspace-content based."""
+    """An unsealed Stage 10 generation is rejected without touching legacy output."""
     from dataclasses import replace
     from researchclaw.adapters import AdapterBundle
     from researchclaw.experiment import collider_agent_sandbox as ca_mod
@@ -586,10 +586,12 @@ def test_canonical_stage12_archives_any_nonempty_unsupported_generation(
         collider_agent=replace(cfg.experiment.collider_agent, incremental=True),
     ))
 
-    _ = _execute_experiment_run(s12, run_dir, cfg, AdapterBundle())
+    result = _execute_experiment_run(s12, run_dir, cfg, AdapterBundle())
 
-    assert (run_dir / "stage-12_v1/runs").is_dir()
-    assert not (run_dir / "stage-12/runs").exists()
+    assert result.status.value == "failed"
+    assert "sealed stage 10 candidate is invalid" in (result.error or "").lower()
+    assert (run_dir / "stage-12/runs").is_dir()
+    assert not (run_dir / "stage-12_v1").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -648,7 +650,10 @@ def test_executor_does_not_gate_code_generation_for_non_hep_ph(tmp_path, monkeyp
     s09.mkdir()
     (s09 / "exp_plan.yaml").write_text("x: 1", encoding="utf-8")
 
+    calls = []
+
     def _stub_codegen(stage_dir, run_dir, config, adapters, *args, **kwargs):
+        calls.append(stage_dir)
         # Default-mode contract requires experiment/ + experiment_spec.md
         (stage_dir / "experiment").mkdir(parents=True, exist_ok=True)
         (stage_dir / "experiment" / "main.py").write_text("# stub\n", encoding="utf-8")
@@ -670,4 +675,6 @@ def test_executor_does_not_gate_code_generation_for_non_hep_ph(tmp_path, monkeyp
         adapters=adapters,
         auto_approve_gates=False,
     )
-    assert result.status == StageStatus.DONE
+    assert calls
+    assert result.status == StageStatus.FAILED
+    assert "canonical stage 9 contract is missing" in (result.error or "").lower()
