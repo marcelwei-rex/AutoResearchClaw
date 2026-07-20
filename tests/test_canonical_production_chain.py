@@ -147,6 +147,25 @@ class _ProductionChainLLM:
             response = self._screening_response(user)
         elif user.startswith("Extract structured summaries only"):
             response = self._card_response(user)
+        elif "Required keys: objectives,datasets,baselines,proposed_methods," in user:
+            response = (
+                "objectives:\n"
+                "  - Detect bounded hardware-counter anomalies.\n"
+                "datasets:\n"
+                "  - synthetic_counter_traces\n"
+                "baselines:\n"
+                "  - threshold_counter_detector\n"
+                "proposed_methods:\n"
+                "  - bounded_counterguard\n"
+                "ablations:\n"
+                "  - no_temporal_context\n"
+                "metrics:\n"
+                "  - detection_f1\n"
+                "risks:\n"
+                "  - synthetic_scope_only\n"
+                "compute_budget:\n"
+                "  - bounded_cpu_validation\n"
+            )
         elif user.startswith("Generate exactly one Python file named detector_plugin.py"):
             response = self._research_release_experiment()
         elif "You improve only the model-owned files" in system:
@@ -158,6 +177,13 @@ class _ProductionChainLLM:
                 "# Research Decision\n\n## Decision\nPROCEED\n\n"
                 "## Justification\nThe canonical baseline run produced the configured "
                 "metric and preserves the evidence boundary.\n"
+            )
+        elif "fixed, independently replayed domain-evaluator evidence projection" in system:
+            response = (
+                "## Decision\nPROCEED\n\n"
+                "## Justification\nAll fixed projection gates are satisfied.\n\n"
+                "## Evidence\nThe immutable evaluator projection is complete.\n\n"
+                "## Next Actions\nProceed with the canonical release path.\n"
             )
         elif "SECTION OUTPUT CONTRACT" in user:
             response = self._paper_part(user)
@@ -249,6 +275,23 @@ class _ProductionChainLLM:
 
     @classmethod
     def _paper_part(cls, user: str) -> str:
+        requested_headings = re.findall(r"^- ## (.+)$", user, flags=re.MULTILINE)
+        if requested_headings:
+            allowed_keys = re.findall(r"Required citation key: \[([^]]+)]", user)
+            parts: list[str] = []
+            for heading in requested_headings:
+                if heading == "Title":
+                    parts.append("## Title\nCounterGuard: Runtime Detection from Hardware Events")
+                    continue
+                prose = ""
+                if heading == "Related Work" and allowed_keys:
+                    prose = " ".join(
+                        f"Bounded related-work evidence [{key}]."
+                        for key in allowed_keys
+                    )
+                parts.append(f"## {heading}\n{prose}")
+            return "\n\n".join(parts)
+
         claims = re.findall(
             r"- CLAIM [^\n]+ \(section: ([^)]+)\)\n"
             r"  Allowed wording ceiling: ([^\n]+)\n"
@@ -299,7 +342,8 @@ class _ProductionChainLLM:
             f"The {label} narrative describes the bounded workflow with careful "
             "scope, deterministic evidence ownership, and explicit limitations"
         )
-        return " ".join(phrase for _ in range(count)) + f" [{cite_key}]."
+        suffix = f" [{cite_key}]." if cite_key else "."
+        return " ".join(phrase for _ in range(count)) + suffix
 
     @staticmethod
     def _non_improving_plugin() -> str:
@@ -545,9 +589,10 @@ def test_stage04_through_stage25_uses_real_canonical_production_chain(
 
     current_stage: list[Stage] = [Stage.LITERATURE_COLLECT]
     llm = _ProductionChainLLM(run_dir)
+    generic_llm_stages = _LLM_STAGES | {Stage.EXPERIMENT_DESIGN}
 
     def llm_factory(_config: RCConfig) -> object:
-        return llm if current_stage[0] in _LLM_STAGES else _NoLLM()
+        return llm if current_stage[0] in generic_llm_stages else _NoLLM()
 
     monkeypatch.setattr(LLMClient, "from_rc_config", staticmethod(llm_factory))
     monkeypatch.setattr(
