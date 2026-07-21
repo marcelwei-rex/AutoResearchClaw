@@ -420,6 +420,7 @@ def test_clean_sectional_outputs_removes_every_success_named_artifact(
         "section_revision_manifest.json",
         "unresolved_comments.json",
         "validation_context.json",
+        "sectional_llm_diagnostics.json",
     ):
         (stage_dir / name).write_text("owned", encoding="utf-8")
     for name in ("sections", "section_validation"):
@@ -430,6 +431,87 @@ def test_clean_sectional_outputs_removes_every_success_named_artifact(
     clean_sectional_outputs(stage_dir)
 
     assert not any(stage_dir.iterdir())
+
+
+def test_planner_failure_persists_diagnostics_without_success_authority(
+    tmp_path: Path,
+) -> None:
+    run_dir, stage_dir = _prepare_run(tmp_path)
+
+    class FailingPlanner(_FakeProvider):
+        diagnostic_records = (
+            {
+                "role": "planner",
+                "model": "writer-model",
+                "call_index": 1,
+                "max_tokens": 8192,
+                "finish_reason": "length",
+                "truncated": False,
+                "prompt_tokens": 10,
+                "completion_tokens": 8192,
+                "total_tokens": 8202,
+                "content_length": 0,
+                "error_category": "empty_response",
+            },
+        )
+
+        def build_plan(self, *, ledger, document):
+            _ = ledger, document
+            raise RuntimeError("sectional planner empty_response after 2 calls")
+
+    with pytest.raises(RuntimeError, match="planner empty_response"):
+        _execute_sectional_revision(
+            stage_dir=stage_dir,
+            run_dir=run_dir,
+            config=_config(),
+            claim_scope="pipeline_validation",
+            provider=FailingPlanner(),
+            evidence=_evidence(),
+        )
+
+    diagnostic_path = stage_dir / "sectional_llm_diagnostics.json"
+    diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    assert diagnostic["llm_call_count"] == 1
+    assert diagnostic["llm_call_limit"] > 1
+    assert diagnostic["calls"][0]["role"] == "planner"
+    assert all("content" not in row and "raw" not in row for row in diagnostic["calls"])
+    assert not (stage_dir / "paper_revised.md").exists()
+    assert not (stage_dir / "revision_plan.json").exists()
+
+
+def test_sectional_llm_global_call_limit_fails_closed(tmp_path: Path) -> None:
+    run_dir, stage_dir = _prepare_run(tmp_path)
+
+    class ExcessiveCallsProvider(_FakeProvider):
+        @property
+        def diagnostic_records(self):
+            row = {
+                "role": "planner",
+                "model": "writer-model",
+                "call_index": 1,
+                "max_tokens": 8192,
+                "finish_reason": "stop",
+                "truncated": False,
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+                "content_length": 2,
+                "error_category": "success",
+            }
+            return tuple(dict(row) for _ in range(10_000))
+
+    with pytest.raises(RuntimeError, match="call limit exceeded"):
+        _execute_sectional_revision(
+            stage_dir=stage_dir,
+            run_dir=run_dir,
+            config=_config(),
+            claim_scope="pipeline_validation",
+            provider=ExcessiveCallsProvider(),
+            evidence=_evidence(),
+        )
+
+    assert not (stage_dir / "paper_revised.md").exists()
+    assert not (stage_dir / "revision_plan.json").exists()
 
 
 def test_context_builder_fails_when_canonical_bib_omits_draft_key(

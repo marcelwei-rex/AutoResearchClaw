@@ -113,8 +113,10 @@ def test_planner_rejects_unknown_top_level_fields() -> None:
             "unexpected": True,
         }
     )
-    with pytest.raises(RuntimeError, match="fields mismatch"):
-        _provider(fake).build_plan(ledger=ledger, document=document)
+    provider = _provider(fake)
+    with pytest.raises(RuntimeError, match="planner schema_error after 2 calls"):
+        provider.build_plan(ledger=ledger, document=document)
+    assert len(fake.calls) == 2
 
 
 @pytest.mark.parametrize(
@@ -156,6 +158,125 @@ def test_provider_rejects_truncated_but_valid_json_response() -> None:
     )
     with pytest.raises(RuntimeError, match="truncated"):
         _provider(fake).build_plan(ledger=ledger, document=document)
+
+
+def test_empty_planner_response_gets_one_bounded_repair() -> None:
+    document, ledger, method, comment, _ = _inputs()
+    responses: list[object] = [
+        LLMResponse(content="", model="writer-model", finish_reason="length"),
+        {
+            "schema_version": 1,
+            "planner_version": 1,
+            "source_paper_sha256": document.source_sha256,
+            "source_reviews_sha256": ledger.source_reviews_sha256,
+            "section_model_version": 1,
+            "assignments": [
+                {
+                    "comment_id": comment.comment_id,
+                    "target_section_ids": [method.section_id],
+                    "disposition": "assigned",
+                    "reason": None,
+                }
+            ],
+        },
+    ]
+    fake = _FakeLLM(lambda payload, kwargs: responses.pop(0))
+    provider = _provider(fake)
+
+    plan = provider.build_plan(ledger=ledger, document=document)
+
+    assert plan["assignments"][0]["comment_id"] == comment.comment_id
+    assert len(fake.calls) == 2
+    assert [row["error_category"] for row in provider.diagnostic_records] == [
+        "empty_response",
+        "success",
+    ]
+    assert all(row["role"] == "planner" for row in provider.diagnostic_records)
+
+
+def test_second_empty_planner_response_fails_without_third_call() -> None:
+    document, ledger, _, _, _ = _inputs()
+    fake = _FakeLLM(
+        lambda payload, kwargs: LLMResponse(
+            content="",
+            model="writer-model",
+            finish_reason="length",
+        )
+    )
+    provider = _provider(fake)
+
+    with pytest.raises(RuntimeError, match="planner.*empty_response"):
+        provider.build_plan(ledger=ledger, document=document)
+
+    assert len(fake.calls) == 2
+    assert len(provider.diagnostic_records) == 2
+
+
+def test_truncated_planner_response_gets_one_bounded_repair() -> None:
+    document, ledger, _, _, _ = _inputs()
+    responses: list[object] = [
+        LLMResponse(
+            content='{"schema_version": 1',
+            model="writer-model",
+            finish_reason="length",
+            truncated=True,
+        ),
+        {
+            "schema_version": 1,
+            "planner_version": 1,
+            "source_paper_sha256": document.source_sha256,
+            "source_reviews_sha256": ledger.source_reviews_sha256,
+            "section_model_version": 1,
+            "assignments": [],
+        },
+    ]
+    fake = _FakeLLM(lambda payload, kwargs: responses.pop(0))
+    provider = _provider(fake)
+
+    provider.build_plan(ledger=ledger, document=document)
+
+    assert len(fake.calls) == 2
+    assert [row["error_category"] for row in provider.diagnostic_records] == [
+        "truncated_response",
+        "success",
+    ]
+
+
+def test_second_malformed_planner_response_fails_without_third_call() -> None:
+    document, ledger, _, _, _ = _inputs()
+    fake = _FakeLLM(lambda payload, kwargs: "not json")
+    provider = _provider(fake)
+
+    with pytest.raises(RuntimeError, match="planner malformed_response"):
+        provider.build_plan(ledger=ledger, document=document)
+
+    assert len(fake.calls) == 2
+    assert len(provider.diagnostic_records) == 2
+
+
+def test_planner_root_schema_error_gets_one_bounded_repair() -> None:
+    document, ledger, _, _, _ = _inputs()
+    responses: list[object] = [
+        {"schema_version": 1, "unexpected": True},
+        {
+            "schema_version": 1,
+            "planner_version": 1,
+            "source_paper_sha256": document.source_sha256,
+            "source_reviews_sha256": ledger.source_reviews_sha256,
+            "section_model_version": 1,
+            "assignments": [],
+        },
+    ]
+    fake = _FakeLLM(lambda payload, kwargs: responses.pop(0))
+    provider = _provider(fake)
+
+    provider.build_plan(ledger=ledger, document=document)
+
+    assert len(fake.calls) == 2
+    assert [row["error_category"] for row in provider.diagnostic_records] == [
+        "schema_error",
+        "success",
+    ]
 
 
 def test_writer_receives_only_one_section_and_accounts_for_every_comment() -> None:
@@ -209,6 +330,72 @@ def test_writer_rejects_missing_comment_resolution() -> None:
         )
 
 
+def test_empty_writer_response_gets_one_bounded_repair() -> None:
+    _, _, method, comment, context = _inputs()
+    responses: list[object] = [
+        "",
+        {
+            "schema_version": 1,
+            "section_id": method.section_id,
+            "revised_body": method.body + "\nClarified.\n",
+            "resolutions": [
+                {
+                    "comment_id": comment.comment_id,
+                    "writer_status": "addressed",
+                    "reason": "Clarified.",
+                }
+            ],
+        },
+    ]
+    fake = _FakeLLM(lambda payload, kwargs: responses.pop(0))
+    provider = _provider(fake)
+
+    provider.propose(
+        section=method,
+        comments=(comment,),
+        attempt=1,
+        context=context,
+    )
+
+    assert len(fake.calls) == 2
+    records = provider.diagnostic_records
+    assert [row["error_category"] for row in records] == [
+        "empty_response",
+        "success",
+    ]
+    assert all(row["role"] == "writer" for row in records)
+    assert all(row["section_id"] == method.section_id for row in records)
+
+
+def test_writer_repair_with_foreign_identity_is_rejected() -> None:
+    _, _, method, comment, context = _inputs()
+    responses: list[object] = [
+        "",
+        {
+            "schema_version": 1,
+            "section_id": "foreign-section",
+            "revised_body": method.body,
+            "resolutions": [
+                {
+                    "comment_id": comment.comment_id,
+                    "writer_status": "addressed",
+                    "reason": "Wrong section identity.",
+                }
+            ],
+        },
+    ]
+    fake = _FakeLLM(lambda payload, kwargs: responses.pop(0))
+
+    with pytest.raises(RuntimeError, match="section_id mismatches"):
+        _provider(fake).propose(
+            section=method,
+            comments=(comment,),
+            attempt=1,
+            context=context,
+        )
+    assert len(fake.calls) == 2
+
+
 def test_critic_uses_isolated_model_and_exact_identity() -> None:
     _, _, method, comment, _ = _inputs()
 
@@ -259,6 +446,41 @@ def test_critic_rejects_identity_claim_from_another_attempt() -> None:
             attempt_id="attempt-1",
             validator_codes=(),
         )
+
+
+def test_empty_critic_response_gets_one_bounded_repair() -> None:
+    _, _, method, comment, _ = _inputs()
+    responses: list[object] = [
+        "",
+        {
+            "schema_version": 1,
+            "comment_id": comment.comment_id,
+            "section_id": method.section_id,
+            "attempt_id": "attempt-1",
+            "verdict": "resolved",
+            "reason": "Resolved.",
+        },
+    ]
+    fake = _FakeLLM(lambda payload, kwargs: responses.pop(0))
+    provider = _provider(fake)
+
+    provider.assess(
+        comment=comment,
+        section=method,
+        original_body=method.body,
+        revised_body=method.body + "\nClarified.\n",
+        attempt_id="attempt-1",
+        validator_codes=(),
+    )
+
+    assert len(fake.calls) == 2
+    records = provider.diagnostic_records
+    assert [row["error_category"] for row in records] == [
+        "empty_response",
+        "success",
+    ]
+    assert all(row["role"] == "critic" for row in records)
+    assert all(row["comment_id"] == comment.comment_id for row in records)
 
 
 def test_provider_rejects_same_writer_and_critic_model() -> None:

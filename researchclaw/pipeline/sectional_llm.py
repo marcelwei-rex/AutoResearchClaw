@@ -32,6 +32,11 @@ Assess one review comment against one original/revised section pair and the
 deterministic validator result. Do not rewrite text. Return only the requested
 JSON object."""
 
+_FORMAT_REPAIR_SUFFIX = """
+Your previous response was empty, truncated, malformed, or had the wrong root
+fields. Return one complete JSON object matching response_schema exactly. Do
+not include prose or Markdown fences."""
+
 
 @dataclass(frozen=True)
 class _WriterResolution:
@@ -57,6 +62,11 @@ class LLMSectionalRevisionProvider:
             raise ValueError("writer_model and critic_model are required")
         if self.writer_model == self.critic_model:
             raise ValueError("writer_model and critic_model must differ")
+        self._diagnostic_records: list[dict[str, Any]] = []
+
+    @property
+    def diagnostic_records(self) -> tuple[dict[str, Any], ...]:
+        return tuple(dict(record) for record in self._diagnostic_records)
 
     def build_plan(
         self,
@@ -102,10 +112,19 @@ class LLMSectionalRevisionProvider:
             },
         }
         response = self._chat_json(
+            role="planner",
             model=self.writer_model,
             system=_PLANNER_SYSTEM,
             payload=payload,
             max_tokens=8192,
+            expected_keys={
+                "schema_version",
+                "planner_version",
+                "source_paper_sha256",
+                "source_reviews_sha256",
+                "section_model_version",
+                "assignments",
+            },
         )
         _expect_keys(
             response,
@@ -173,10 +192,19 @@ class LLMSectionalRevisionProvider:
             },
         }
         response = self._chat_json(
+            role="writer",
             model=self.writer_model,
             system=_WRITER_SYSTEM,
             payload=payload,
             max_tokens=16384,
+            expected_keys={
+                "schema_version",
+                "section_id",
+                "revised_body",
+                "resolutions",
+            },
+            section_id=section.section_id,
+            attempt_id=f"{section.section_id}-attempt-{attempt}",
         )
         _expect_keys(
             response,
@@ -262,10 +290,22 @@ class LLMSectionalRevisionProvider:
             },
         }
         response = self._chat_json(
+            role="critic",
             model=self.critic_model,
             system=_CRITIC_SYSTEM,
             payload=payload,
             max_tokens=2048,
+            expected_keys={
+                "schema_version",
+                "comment_id",
+                "section_id",
+                "attempt_id",
+                "verdict",
+                "reason",
+            },
+            section_id=section.section_id,
+            attempt_id=attempt_id,
+            comment_id=comment.comment_id,
         )
         _expect_keys(
             response,
@@ -303,23 +343,123 @@ class LLMSectionalRevisionProvider:
     def _chat_json(
         self,
         *,
+        role: str,
         model: str,
         system: str,
         payload: Mapping[str, Any],
         max_tokens: int,
+        expected_keys: set[str],
+        section_id: str | None = None,
+        attempt_id: str | None = None,
+        comment_id: str | None = None,
     ) -> dict[str, Any]:
-        response = self._llm.chat(
-            [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            system=system,
-            model=model,
-            max_tokens=max_tokens,
-            temperature=0,
-            json_mode=True,
-            strip_thinking=True,
+        error_category = "malformed_response"
+        for call_index in (1, 2):
+            call_system = system if call_index == 1 else system + _FORMAT_REPAIR_SUFFIX
+            try:
+                response = self._llm.chat(
+                    [
+                        {
+                            "role": "user",
+                            "content": json.dumps(payload, ensure_ascii=False),
+                        }
+                    ],
+                    system=call_system,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=0,
+                    json_mode=True,
+                    strip_thinking=True,
+                )
+            except RuntimeError:
+                self._record_diagnostic(
+                    role=role,
+                    model=model,
+                    call_index=call_index,
+                    max_tokens=max_tokens,
+                    error_category="transport_error",
+                    section_id=section_id,
+                    attempt_id=attempt_id,
+                    comment_id=comment_id,
+                )
+                raise
+
+            parsed: dict[str, Any] | None = None
+            content = response.content if isinstance(response.content, str) else ""
+            if not content.strip():
+                error_category = "empty_response"
+            elif response.truncated:
+                error_category = "truncated_response"
+            else:
+                try:
+                    parsed = _parse_json_object(content)
+                except RuntimeError:
+                    error_category = "malformed_response"
+                else:
+                    if set(parsed) != expected_keys:
+                        error_category = "schema_error"
+                        parsed = None
+                    else:
+                        error_category = "success"
+
+            self._record_diagnostic(
+                role=role,
+                model=model,
+                call_index=call_index,
+                max_tokens=max_tokens,
+                error_category=error_category,
+                response=response,
+                section_id=section_id,
+                attempt_id=attempt_id,
+                comment_id=comment_id,
+            )
+            if parsed is not None:
+                return parsed
+
+        raise RuntimeError(
+            f"sectional {role} {error_category} after 2 calls"
         )
-        if response.truncated:
-            raise RuntimeError("LLM response was truncated")
-        return _parse_json_object(response.content)
+
+    def _record_diagnostic(
+        self,
+        *,
+        role: str,
+        model: str,
+        call_index: int,
+        max_tokens: int,
+        error_category: str,
+        response: object | None = None,
+        section_id: str | None = None,
+        attempt_id: str | None = None,
+        comment_id: str | None = None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "role": role,
+            "model": model,
+            "call_index": call_index,
+            "max_tokens": max_tokens,
+            "finish_reason": str(getattr(response, "finish_reason", "") or ""),
+            "truncated": getattr(response, "truncated", False) is True,
+            "prompt_tokens": _true_nonnegative_int(
+                getattr(response, "prompt_tokens", 0)
+            ),
+            "completion_tokens": _true_nonnegative_int(
+                getattr(response, "completion_tokens", 0)
+            ),
+            "total_tokens": _true_nonnegative_int(
+                getattr(response, "total_tokens", 0)
+            ),
+            "content_length": len(str(getattr(response, "content", "") or "")),
+            "error_category": error_category,
+        }
+        for key, value in (
+            ("section_id", section_id),
+            ("attempt_id", attempt_id),
+            ("comment_id", comment_id),
+        ):
+            if value is not None:
+                record[key] = value
+        self._diagnostic_records.append(record)
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
@@ -359,3 +499,7 @@ def _nonempty_string(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError(f"{field} must be a nonempty string")
     return value
+
+
+def _true_nonnegative_int(value: object) -> int:
+    return value if type(value) is int and value >= 0 else 0

@@ -41,6 +41,15 @@ llm:
     )
 
 
+def _append_sectional_revision_config(path: Path) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "paper_revision:\n"
+            "  sectional_enabled: true\n"
+            "  critic_model: critic-model\n"
+        )
+
+
 def test_main_with_no_args_returns_zero_and_prints_help(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -151,6 +160,82 @@ def test_cmd_run_reports_paused_pipeline(
     assert code == 0
     assert "Pipeline paused:" in captured.out
     assert "1 paused" in captured.out
+
+
+def test_cmd_run_preflights_sectional_critic_before_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_valid_config(config_path)
+    _append_sectional_revision_config(config_path)
+    output_dir = tmp_path / "new-run"
+    calls: list[str | None] = []
+
+    class FakeClient:
+        def preflight(self, model: str | None = None) -> tuple[bool, str]:
+            calls.append(model)
+            return True, "OK"
+
+    import researchclaw.llm as llm_mod
+    from researchclaw.pipeline import runner as rc_runner
+
+    monkeypatch.setattr(llm_mod, "create_llm_client", lambda config: FakeClient())
+    monkeypatch.setattr(rc_runner, "execute_pipeline", lambda **kwargs: [])
+
+    args = argparse.Namespace(
+        config=str(config_path),
+        topic=None,
+        output=str(output_dir),
+        from_stage=None,
+        auto_approve=False,
+        skip_preflight=False,
+        resume=False,
+        skip_noncritical_stage=False,
+        no_graceful_degradation=False,
+    )
+    assert rc_cli.cmd_run(args) == 0
+    assert calls == [None, "critic-model"]
+
+
+def test_cmd_run_stops_before_creating_run_when_critic_preflight_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_valid_config(config_path)
+    _append_sectional_revision_config(config_path)
+    output_dir = tmp_path / "must-not-exist"
+
+    class FakeClient:
+        def preflight(self, model: str | None = None) -> tuple[bool, str]:
+            if model == "critic-model":
+                return False, "critic unavailable"
+            return True, "OK"
+
+    import researchclaw.llm as llm_mod
+    from researchclaw.pipeline import runner as rc_runner
+
+    monkeypatch.setattr(llm_mod, "create_llm_client", lambda config: FakeClient())
+    monkeypatch.setattr(
+        rc_runner,
+        "execute_pipeline",
+        lambda **kwargs: pytest.fail("pipeline must not start"),
+    )
+
+    args = argparse.Namespace(
+        config=str(config_path),
+        topic=None,
+        output=str(output_dir),
+        from_stage=None,
+        auto_approve=False,
+        skip_preflight=False,
+        resume=False,
+        skip_noncritical_stage=False,
+        no_graceful_degradation=False,
+    )
+    assert rc_cli.cmd_run(args) == 1
+    assert not output_dir.exists()
 
 
 def test_main_dispatches_run_command(monkeypatch: pytest.MonkeyPatch) -> None:

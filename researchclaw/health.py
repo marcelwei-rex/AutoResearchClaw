@@ -511,6 +511,30 @@ def check_experiment_mode(mode: str) -> CheckResult:
     )
 
 
+def check_sectional_critic_preflight(config: RCConfig) -> CheckResult:
+    """Verify the separately selected Stage 19 critic can complete a request."""
+
+    critic_model = config.paper_revision.critic_model.strip()
+    try:
+        from researchclaw.llm import create_llm_client
+
+        client = create_llm_client(config)
+        ok, message = client.preflight(model=critic_model)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        ok = False
+        message = str(exc)
+    return CheckResult(
+        name="sectional_critic_preflight",
+        status="pass" if ok else "fail",
+        detail=message,
+        fix=(
+            ""
+            if ok
+            else "Verify paper_revision.critic_model access and LLM credentials"
+        ),
+    )
+
+
 def check_acp_agent(agent_command: str) -> CheckResult:
     """Check that the ACP agent CLI is available on PATH."""
     resolved = shutil.which(agent_command)
@@ -573,6 +597,7 @@ def run_doctor(config_path: str | Path) -> DoctorReport:
     experiment_mode = ""
     provider = ""
     acp_agent_command = "claude"
+    config: RCConfig | None = None
 
     try:
         config = RCConfig.load(path, check_paths=False)
@@ -593,6 +618,8 @@ def run_doctor(config_path: str | Path) -> DoctorReport:
         checks.append(check_llm_connectivity(base_url, api_key))
         checks.append(check_api_key_valid(base_url, api_key))
         checks.append(check_model_chain(base_url, api_key, model, fallback_models))
+    if config is not None and config.paper_revision.sectional_enabled:
+        checks.append(check_sectional_critic_preflight(config))
     checks.append(check_sandbox_python(sandbox_python_path))
     checks.append(check_matplotlib())
     checks.append(check_experiment_mode(experiment_mode))

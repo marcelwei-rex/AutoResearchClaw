@@ -63,6 +63,109 @@ llm:
     )
 
 
+def _append_sectional_revision_config(path: Path) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "paper_revision:\n"
+            "  sectional_enabled: true\n"
+            "  critic_model: critic-model\n"
+        )
+
+
+def test_run_doctor_requires_sectional_critic_preflight(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_valid_config(config_path)
+    _append_sectional_revision_config(config_path)
+    expected = health.CheckResult(
+        "sectional_critic_preflight",
+        "fail",
+        "critic unavailable",
+        "Verify paper_revision.critic_model access",
+    )
+
+    with (
+        patch.object(
+            health,
+            "check_python_version",
+            return_value=health.CheckResult("python_version", "pass", "ok"),
+        ),
+        patch.object(
+            health,
+            "check_yaml_import",
+            return_value=health.CheckResult("yaml_import", "pass", "ok"),
+        ),
+        patch.object(
+            health,
+            "check_config_valid",
+            return_value=health.CheckResult("config_valid", "pass", "ok"),
+        ),
+        patch.object(
+            health,
+            "check_llm_connectivity",
+            return_value=health.CheckResult("llm_connectivity", "pass", "ok"),
+        ),
+        patch.object(
+            health,
+            "check_api_key_valid",
+            return_value=health.CheckResult("api_key_valid", "pass", "ok"),
+        ),
+        patch.object(
+            health,
+            "check_model_chain",
+            return_value=health.CheckResult("model_chain", "pass", "ok"),
+        ),
+        patch.object(
+            health,
+            "check_sectional_critic_preflight",
+            return_value=expected,
+        ) as critic_check,
+        patch.object(
+            health,
+            "check_sandbox_python",
+            return_value=health.CheckResult("sandbox_python", "pass", "ok"),
+        ),
+        patch.object(
+            health,
+            "check_matplotlib",
+            return_value=health.CheckResult("matplotlib", "pass", "ok"),
+        ),
+        patch.object(
+            health,
+            "check_experiment_mode",
+            return_value=health.CheckResult("experiment_mode", "pass", "ok"),
+        ),
+    ):
+        report = health.run_doctor(config_path)
+
+    critic_check.assert_called_once()
+    assert expected in report.checks
+    assert report.overall == "fail"
+
+
+def test_sectional_critic_preflight_uses_configured_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_valid_config(config_path)
+    _append_sectional_revision_config(config_path)
+    config = health.RCConfig.load(config_path, check_paths=False)
+    calls: list[str | None] = []
+
+    class FakeClient:
+        def preflight(self, model: str | None = None) -> tuple[bool, str]:
+            calls.append(model)
+            return True, "critic ok"
+
+    import researchclaw.llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "create_llm_client", lambda value: FakeClient())
+    result = health.check_sectional_critic_preflight(config)
+
+    assert result.status == "pass"
+    assert calls == ["critic-model"]
+
+
 def test_check_python_version_pass() -> None:
     with patch("sys.version_info", _VersionInfo(3, 11, 0, "final", 0)):
         result = health.check_python_version()

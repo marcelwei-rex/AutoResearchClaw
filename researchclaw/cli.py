@@ -260,6 +260,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         else:
             print(f"FAILED — {msg}", file=sys.stderr)
             return 1
+        if config.paper_revision.sectional_enabled:
+            print("Sectional critic preflight...", end=" ", flush=True)
+            try:
+                ok, msg = client.preflight(model=config.paper_revision.critic_model)
+            except TypeError:
+                ok = False
+                msg = "configured LLM transport cannot probe an explicit critic model"
+            if ok:
+                print(msg)
+            else:
+                print(f"FAILED — {msg}", file=sys.stderr)
+                return 1
 
     run_id = _generate_run_id(config.research.topic)
     run_dir = Path(output or f"artifacts/{run_id}")

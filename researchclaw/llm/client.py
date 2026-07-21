@@ -242,28 +242,32 @@ class LLMClient:
             f"All models failed. Last error: {last_error}"
         ) from last_error
 
-    def preflight(self) -> tuple[bool, str]:
+    def preflight(self, model: str | None = None) -> tuple[bool, str]:
         """Quick connectivity check - one minimal chat call.
 
         Returns (success, message).
         Distinguishes: 401 (bad key), 403 (model forbidden),
                        404 (bad endpoint), 429 (rate limited), timeout.
         """
-        is_reasoning = any(
-            self.config.primary_model.startswith(p) for p in _NEW_PARAM_MODELS
-        )
+        target_model = model or self.config.primary_model
+        is_reasoning = any(target_model.startswith(p) for p in _NEW_PARAM_MODELS)
         min_tokens = 64 if is_reasoning else 1
         try:
+            chat_kwargs: dict[str, Any] = {
+                "max_tokens": min_tokens,
+                "temperature": 0,
+            }
+            if model is not None:
+                chat_kwargs["model"] = target_model
             _ = self.chat(
                 [{"role": "user", "content": "ping"}],
-                max_tokens=min_tokens,
-                temperature=0,
+                **chat_kwargs,
             )
-            return True, f"OK - model {self.config.primary_model} responding"
+            return True, f"OK - model {target_model} responding"
         except urllib.error.HTTPError as e:
             status_map = {
                 401: "Invalid API key",
-                403: f"Model {self.config.primary_model} not allowed for this key",
+                403: f"Model {target_model} not allowed for this key",
                 404: f"Endpoint not found: {self._endpoint_url(self.config.base_url)}",
                 429: "Rate limited - try again in a moment",
             }
@@ -277,7 +281,7 @@ class LLMClient:
             if isinstance(cause, urllib.error.HTTPError):
                 status_map = {
                     401: "Invalid API key",
-                    403: f"Model {self.config.primary_model} not allowed for this key",
+                    403: f"Model {target_model} not allowed for this key",
                     404: f"Endpoint not found: {self._endpoint_url(self.config.base_url)}",
                     429: "Rate limited - try again in a moment",
                 }

@@ -71,6 +71,7 @@ _OWNED_FILES = (
     "unresolved_comments.json",
     "consistency_audit.json",
     "validation_context.json",
+    "sectional_llm_diagnostics.json",
 )
 _OWNED_DIRS = ("sections", "section_validation")
 
@@ -100,6 +101,7 @@ class ResolutionAssessment:
 class SectionalRevisionProvider(Protocol):
     writer_model: str
     critic_model: str
+    diagnostic_records: tuple[dict[str, Any], ...]
 
     def build_plan(
         self,
@@ -203,12 +205,18 @@ def execute_sectional_revision(
     )
     document = parse_manuscript(paper_text, strict=True)
     ledger = extract_review_ledger(reviews_text, source_path="stage-18/reviews.md")
-    plan = validate_revision_plan(
-        provider.build_plan(ledger=ledger, document=document),
-        ledger,
-        document,
-        reviews=reviews_text,
-    )
+    llm_call_limit = 2
+    try:
+        plan = validate_revision_plan(
+            provider.build_plan(ledger=ledger, document=document),
+            ledger,
+            document,
+            reviews=reviews_text,
+        )
+    except RuntimeError:
+        _write_sectional_llm_diagnostics(stage_dir, provider, llm_call_limit)
+        raise
+    _write_sectional_llm_diagnostics(stage_dir, provider, llm_call_limit)
 
     context_bundle = build_validation_context(
         document=document,
@@ -230,6 +238,11 @@ def execute_sectional_revision(
             assigned_by_section.setdefault(section_id, []).append(
                 comments_by_id[assignment.comment_id]
             )
+    llm_call_limit = _sectional_llm_call_limit(
+        assigned_by_section=assigned_by_section,
+        max_section_retries=config.max_section_retries,
+    )
+    _write_sectional_llm_diagnostics(stage_dir, provider, llm_call_limit)
 
     sections_dir = stage_dir / "sections"
     validation_dir = stage_dir / "section_validation"
@@ -272,6 +285,9 @@ def execute_sectional_revision(
                     context=context,
                 )
             except RuntimeError as exc:  # provider transport boundary
+                _write_sectional_llm_diagnostics(
+                    stage_dir, provider, llm_call_limit
+                )
                 attempts.append(
                     _transport_failure_attempt(
                         attempt_id=attempt_id,
@@ -286,6 +302,7 @@ def execute_sectional_revision(
                     )
                 )
                 continue
+            _write_sectional_llm_diagnostics(stage_dir, provider, llm_call_limit)
             _validate_proposal(proposal, section_id, assigned_comments)
             context = replace(
                 context,
@@ -316,6 +333,9 @@ def execute_sectional_revision(
                             attempt_id=attempt_id,
                             validator_codes=failed_codes,
                         )
+                        _write_sectional_llm_diagnostics(
+                            stage_dir, provider, llm_call_limit
+                        )
                         _validate_assessment(
                             assessment,
                             comment=comment,
@@ -326,6 +346,9 @@ def execute_sectional_revision(
                         )
                         attempt_assessments.append(assessment)
                 except RuntimeError as exc:  # isolated critic boundary
+                    _write_sectional_llm_diagnostics(
+                        stage_dir, provider, llm_call_limit
+                    )
                     assessment_error = exc
                     attempt_assessments = []
             all_resolved = bool(attempt_assessments) and all(
@@ -515,6 +538,7 @@ def execute_sectional_revision(
         "section_revision_manifest.json",
     )
     if not completed:
+        _write_sectional_llm_diagnostics(stage_dir, provider, llm_call_limit)
         _write_json_atomic(stage_dir / "section_revision_manifest.json", manifest.to_dict())
         return SectionalExecutionResult(False, None, error, artifacts)
     try:
@@ -544,7 +568,9 @@ def execute_sectional_revision(
         )
     except Exception:
         clean_sectional_outputs(stage_dir)
+        _write_sectional_llm_diagnostics(stage_dir, provider, llm_call_limit)
         raise
+    _write_sectional_llm_diagnostics(stage_dir, provider, llm_call_limit)
     return SectionalExecutionResult(
         True,
         merge_result.merged_text,
@@ -846,6 +872,64 @@ def clean_sectional_outputs(stage_dir: Path) -> None:
         path = stage_dir / name
         if path.exists():
             shutil.rmtree(path)
+
+
+def _sectional_llm_call_limit(
+    *,
+    assigned_by_section: Mapping[str, list[ReviewComment]],
+    max_section_retries: int,
+) -> int:
+    attempts = max_section_retries + 1
+    writer_calls = 2 * len(assigned_by_section) * attempts
+    critic_calls = 2 * sum(map(len, assigned_by_section.values())) * attempts
+    return 2 + writer_calls + critic_calls
+
+
+def _write_sectional_llm_diagnostics(
+    stage_dir: Path,
+    provider: SectionalRevisionProvider,
+    call_limit: int,
+) -> None:
+    records_obj = getattr(provider, "diagnostic_records", ())
+    if not isinstance(records_obj, (tuple, list)):
+        raise SectionalExecutionError("sectional LLM diagnostics must be a sequence")
+    records: list[dict[str, Any]] = []
+    has_failure = False
+    for index, item in enumerate(records_obj):
+        if not isinstance(item, dict):
+            raise SectionalExecutionError(
+                f"sectional LLM diagnostic {index} must be an object"
+            )
+        if "raw" in item or "content" in item:
+            raise SectionalExecutionError(
+                "sectional LLM diagnostics must not contain raw response text"
+            )
+        record = dict(item)
+        category = record.get("error_category")
+        if not isinstance(category, str) or not category:
+            raise SectionalExecutionError(
+                f"sectional LLM diagnostic {index} has invalid error_category"
+            )
+        has_failure = has_failure or category != "success"
+        records.append(record)
+    if len(records) > call_limit:
+        raise SectionalExecutionError(
+            "sectional LLM call limit exceeded: "
+            f"calls={len(records)}, limit={call_limit}"
+        )
+    diagnostic_path = stage_dir / "sectional_llm_diagnostics.json"
+    if not has_failure:
+        diagnostic_path.unlink(missing_ok=True)
+        return
+    _write_json_atomic(
+        diagnostic_path,
+        {
+            "schema_version": 1,
+            "llm_call_count": len(records),
+            "llm_call_limit": call_limit,
+            "calls": records,
+        },
+    )
 
 
 def _source_record(run_dir: Path, path: Path, kind: str) -> dict[str, str]:

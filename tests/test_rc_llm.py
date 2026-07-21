@@ -405,6 +405,22 @@ def test_preflight_404_reports_responses_endpoint():
     assert msg == "Endpoint not found: https://api.example.com/v1/responses"
 
 
+def test_preflight_can_probe_an_explicit_model() -> None:
+    client = _make_client(primary_model="writer-model")
+    captured: dict[str, Any] = {}
+
+    def fake_chat(*args: Any, **kwargs: Any) -> LLMResponse:
+        captured.update(kwargs)
+        return LLMResponse(content="ok", model="critic-model")
+
+    client.chat = fake_chat  # type: ignore[method-assign]
+    ok, msg = client.preflight(model="critic-model")
+
+    assert ok is True
+    assert captured["model"] == "critic-model"
+    assert "critic-model" in msg
+
+
 def test_from_rc_config_reads_api_key_from_env_when_missing(
     monkeypatch: pytest.MonkeyPatch,
 ):
