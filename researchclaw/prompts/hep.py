@@ -397,6 +397,7 @@ STAGES: dict[str, dict[str, Any]] = {
             "Shortlist:\n{shortlist}"
         ),
         "json_mode": True,
+        "max_tokens": 8192,
     },
     # ── Phase C: Knowledge Synthesis ────────────────────────────────────── #
     "synthesis": {

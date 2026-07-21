@@ -69,6 +69,11 @@ from researchclaw.pipeline._helpers import (
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
 
+
+_INITIAL_CARD_MAX_TOKENS = 4096
+_REPAIR_CARD_MAX_TOKENS = 8192
+_MAX_CARD_LLM_CALLS = 2
+
 logger = logging.getLogger(__name__)
 
 
@@ -1191,6 +1196,7 @@ def _execute_knowledge_extract(
 
     proposals: dict[str, CardProposal] = {}
     failures: dict[str, str] = {}
+    extraction_attempts: list[dict[str, Any]] = []
     batches = [
         inputs.shortlist[index:index + EXTRACTION_BATCH_SIZE]
         for index in range(0, len(inputs.shortlist), EXTRACTION_BATCH_SIZE)
@@ -1201,7 +1207,7 @@ def _execute_knowledge_extract(
             failures.update({identity: "LLM client unavailable" for identity in expected_ids})
             continue
         try:
-            batch_proposals = _extract_evidence_card_batch(
+            batch_proposals, batch_attempts = _extract_evidence_card_batch(
                 llm=llm,
                 prompts=prompts,
                 run_dir=run_dir,
@@ -1212,6 +1218,10 @@ def _execute_knowledge_extract(
             proposals.update(
                 {proposal.source_identity: proposal for proposal in batch_proposals}
             )
+            extraction_attempts.extend(batch_attempts)
+        except _CardBatchExtractionError as exc:
+            extraction_attempts.extend(exc.attempts)
+            failures.update({identity: str(exc)[:1000] for identity in expected_ids})
         except (RuntimeError, EvidenceCardContractError) as exc:
             failures.update({identity: str(exc)[:1000] for identity in expected_ids})
 
@@ -1237,6 +1247,9 @@ def _execute_knowledge_extract(
             "schema_version": 1,
             "status": "failed",
             "reason": "zero_eligible_evidence_cards",
+            "llm_call_count": len(extraction_attempts),
+            "llm_call_limit": _MAX_CARD_LLM_CALLS * len(inputs.shortlist),
+            "extraction_attempts": extraction_attempts,
             "cards": cards,
         }
         try:
@@ -1318,6 +1331,73 @@ def _execute_knowledge_extract(
     )
 
 
+class _CardBatchExtractionError(EvidenceCardContractError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: tuple[dict[str, Any], ...],
+    ) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+
+
+def _nonnegative_int(value: Any) -> int:
+    return value if type(value) is int and value >= 0 else 0
+
+
+def _card_response_attempt(
+    response: Any,
+    *,
+    source_identity: str,
+    batch_id: str,
+    attempt: str,
+    max_tokens: int,
+    error_category: str,
+) -> dict[str, Any]:
+    content = str(getattr(response, "content", "") or "")
+    finish_reason = str(getattr(response, "finish_reason", "") or "")
+    return {
+        "source_identity": source_identity,
+        "batch_id": batch_id,
+        "attempt": attempt,
+        "max_tokens": max_tokens,
+        "finish_reason": finish_reason,
+        "truncated": bool(getattr(response, "truncated", False)),
+        "prompt_tokens": _nonnegative_int(getattr(response, "prompt_tokens", 0)),
+        "completion_tokens": _nonnegative_int(
+            getattr(response, "completion_tokens", 0)
+        ),
+        "total_tokens": _nonnegative_int(getattr(response, "total_tokens", 0)),
+        "content_length": len(content),
+        "error_category": error_category,
+    }
+
+
+def _parse_card_response_attempt(
+    response: Any,
+    *,
+    expected_batch_id: str,
+    expected_source_ids: list[str],
+) -> tuple[tuple[CardProposal, ...] | None, str, EvidenceCardContractError | None]:
+    content = str(getattr(response, "content", "") or "")
+    if not content.strip():
+        error = EvidenceCardContractError("empty card batch response")
+        return None, "empty_response", error
+    if bool(getattr(response, "truncated", False)):
+        error = EvidenceCardContractError("truncated card batch response")
+        return None, "truncated_response", error
+    try:
+        proposals = parse_card_batch_response(
+            content,
+            expected_batch_id=expected_batch_id,
+            expected_source_ids=expected_source_ids,
+        )
+    except EvidenceCardContractError as exc:
+        return None, "malformed_response", exc
+    return proposals, "success", None
+
+
 def _extract_evidence_card_batch(
     *,
     llm: LLMClient,
@@ -1326,8 +1406,12 @@ def _extract_evidence_card_batch(
     config: RCConfig,
     batch_id: str,
     rows: list[dict[str, Any]],
-) -> tuple[CardProposal, ...]:
+) -> tuple[tuple[CardProposal, ...], tuple[dict[str, Any], ...]]:
     expected_ids = [str(row["source_identity"]) for row in rows]
+    if len(expected_ids) != 1:
+        raise EvidenceCardContractError(
+            "Stage 6 extraction batches must contain exactly one source"
+        )
     source_rows = [
         {
             "source_identity": row["source_identity"],
@@ -1355,42 +1439,98 @@ def _extract_evidence_card_batch(
         evolution_overlay=_get_pipeline_evolution_overlay(run_dir, "knowledge_extract"),
         shortlist="",
     )
-    response = _chat_with_prompt(
-        llm,
-        stage_prompt.system,
-        contract,
-        json_mode=True,
-        max_tokens=stage_prompt.max_tokens,
-        retries=1,
+    initial_max_tokens = _INITIAL_CARD_MAX_TOKENS
+    repair_max_tokens = max(
+        stage_prompt.max_tokens or 0,
+        _REPAIR_CARD_MAX_TOKENS,
     )
     try:
-        return parse_card_batch_response(
-            response.content,
-            expected_batch_id=batch_id,
-            expected_source_ids=expected_ids,
+        response = _chat_with_prompt(
+            llm,
+            stage_prompt.system,
+            contract,
+            json_mode=True,
+            max_tokens=initial_max_tokens,
+            retries=0,
         )
-    except EvidenceCardContractError as initial_error:
-        repair_prompt = (
-            contract
-            + "\n\nThe previous response violated the exact contract: "
-            + str(initial_error)
-            + "\nRegenerate the complete batch once."
+    except RuntimeError as exc:
+        attempt = _card_response_attempt(
+            None,
+            source_identity=expected_ids[0],
+            batch_id=batch_id,
+            attempt="initial",
+            max_tokens=initial_max_tokens,
+            error_category="transport_error",
         )
+        raise _CardBatchExtractionError(
+            f"initial_error={exc}", attempts=(attempt,)
+        ) from exc
+    proposals, initial_category, initial_error = _parse_card_response_attempt(
+        response,
+        expected_batch_id=batch_id,
+        expected_source_ids=expected_ids,
+    )
+    attempts = [
+        _card_response_attempt(
+            response,
+            source_identity=expected_ids[0],
+            batch_id=batch_id,
+            attempt="initial",
+            max_tokens=initial_max_tokens,
+            error_category=initial_category,
+        )
+    ]
+    if proposals is not None:
+        return proposals, tuple(attempts)
+
+    repair_prompt = (
+        contract
+        + "\n\nThe previous response violated the exact contract: "
+        + str(initial_error)
+        + "\nRegenerate the complete single-source batch once."
+    )
+    try:
         repaired = _chat_with_prompt(
             llm,
             stage_prompt.system,
             repair_prompt,
             json_mode=True,
-            max_tokens=stage_prompt.max_tokens,
+            max_tokens=repair_max_tokens,
             retries=0,
         )
-        try:
-            return parse_card_batch_response(
-                repaired.content,
-                expected_batch_id=batch_id,
-                expected_source_ids=expected_ids,
+    except RuntimeError as exc:
+        attempts.append(
+            _card_response_attempt(
+                None,
+                source_identity=expected_ids[0],
+                batch_id=batch_id,
+                attempt="repair",
+                max_tokens=repair_max_tokens,
+                error_category="transport_error",
             )
-        except EvidenceCardContractError as repair_error:
-            raise EvidenceCardContractError(
-                f"initial_error={initial_error}; repair_error={repair_error}"
-            ) from repair_error
+        )
+        raise _CardBatchExtractionError(
+            f"initial_error={initial_error}; repair_error={exc}",
+            attempts=tuple(attempts),
+        ) from exc
+    repaired_proposals, repair_category, repair_error = _parse_card_response_attempt(
+        repaired,
+        expected_batch_id=batch_id,
+        expected_source_ids=expected_ids,
+    )
+    attempts.append(
+        _card_response_attempt(
+            repaired,
+            source_identity=expected_ids[0],
+            batch_id=batch_id,
+            attempt="repair",
+            max_tokens=repair_max_tokens,
+            error_category=repair_category,
+        )
+    )
+    if repaired_proposals is not None:
+        return repaired_proposals, tuple(attempts)
+    raise _CardBatchExtractionError(
+        f"initial_error={initial_error}; repair_error={repair_error}",
+        attempts=tuple(attempts),
+    ) from repair_error

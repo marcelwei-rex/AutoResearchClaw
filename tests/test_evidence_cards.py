@@ -70,6 +70,7 @@ from researchclaw.literature.verify import (
     VerifyStatus,
     parse_bibtex_entries,
 )
+from researchclaw.llm.client import LLMResponse
 from researchclaw.pipeline.stage_impls._literature import (
     _execute_knowledge_extract,
     _execute_literature_screen,
@@ -96,17 +97,30 @@ from researchclaw.pipeline.stages import StageStatus
 
 
 class _SequenceLLM:
-    def __init__(self, responses: list[str]) -> None:
+    def __init__(self, responses: list[str | LLMResponse]) -> None:
         self.responses = list(responses)
         self.calls: list[str] = []
+        self.call_kwargs: list[dict[str, object]] = []
 
     def chat(
         self, messages: list[dict[str, str]], **_kwargs: object
     ) -> SimpleNamespace:
         self.calls.append(messages[0]["content"])
+        self.call_kwargs.append(dict(_kwargs))
         if not self.responses:
             raise RuntimeError("unexpected extra LLM call")
-        return SimpleNamespace(content=self.responses.pop(0))
+        response = self.responses.pop(0)
+        if isinstance(response, LLMResponse):
+            return response  # type: ignore[return-value]
+        return SimpleNamespace(
+            content=response,
+            model="fixture-model",
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            finish_reason="stop",
+            truncated=False,
+        )
 
 
 def _config(claim_scope: str = "pipeline_validation") -> SimpleNamespace:
@@ -158,11 +172,13 @@ def _screen_response(
     )
 
 
-def _card_response(rows: list[dict[str, Any]]) -> str:
+def _card_response(
+    rows: list[dict[str, Any]], *, batch_id: str = "card-batch-001"
+) -> str:
     return json.dumps(
         {
             "schema_version": 1,
-            "batch_id": "card-batch-001",
+            "batch_id": batch_id,
             "cards": [
                 {
                     "source_identity": row["source_identity"],
@@ -181,6 +197,13 @@ def _card_response(rows: list[dict[str, Any]]) -> str:
         },
         ensure_ascii=False,
     )
+
+
+def _card_responses(rows: list[dict[str, Any]]) -> list[str]:
+    return [
+        _card_response([row], batch_id=f"card-batch-{index:03d}")
+        for index, row in enumerate(rows, start=1)
+    ]
 
 
 def _prepare_stage5(
@@ -264,10 +287,7 @@ def _prepare_stage23_fixture(
     )
     stage6 = run_dir / "stage-06"
     stage6.mkdir()
-    card_responses = [
-        _card_response(shortlist[start:start + 4])
-        for start in range(0, len(shortlist), 4)
-    ]
+    card_responses = _card_responses(shortlist)
     if fail_last_card:
         card_responses[-1:] = ["{}", "{}"]
     extracted = _execute_knowledge_extract(
@@ -694,7 +714,7 @@ def test_stage6_writes_json_authority_and_deterministic_markdown(tmp_path: Path)
         run_dir,
         _config(),  # type: ignore[arg-type]
         AdapterBundle(),
-        llm=_SequenceLLM([_card_response(shortlist)]),  # type: ignore[arg-type]
+        llm=_SequenceLLM(_card_responses(shortlist)),  # type: ignore[arg-type]
     )
     assert result.status is StageStatus.DONE
     assert result.artifacts == (
@@ -743,13 +763,197 @@ def test_stage6_zero_evidence_fails_without_canonical_cards(tmp_path: Path) -> N
     assert diagnostic["cards"][0]["evidence_excerpts"] == []
 
 
+def test_stage6_truncated_initial_uses_one_larger_bounded_repair(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    shortlist = _prepare_stage5(run_dir, [_candidate(1)])
+    stage6 = run_dir / "stage-06"
+    stage6.mkdir()
+    llm = _SequenceLLM(
+        [
+            LLMResponse(
+                content='{"schema_version":1,"cards":[{"source_identity":"',
+                model="fixture-model",
+                prompt_tokens=300,
+                completion_tokens=4096,
+                total_tokens=4396,
+                finish_reason="length",
+                truncated=True,
+            ),
+            LLMResponse(
+                content=_card_response(shortlist),
+                model="fixture-model",
+                prompt_tokens=320,
+                completion_tokens=500,
+                total_tokens=820,
+                finish_reason="stop",
+            ),
+        ]
+    )
+
+    result = _execute_knowledge_extract(
+        stage6,
+        run_dir,
+        _config(),  # type: ignore[arg-type]
+        AdapterBundle(),
+        llm=llm,  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.DONE
+    assert [call["max_tokens"] for call in llm.call_kwargs] == [4096, 8192]
+    assert len(llm.calls) == 2
+
+
+def test_stage6_empty_repair_is_classified_without_raw_response(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    shortlist = _prepare_stage5(run_dir, [_candidate(1)])
+    identity = shortlist[0]["source_identity"]
+    stage6 = run_dir / "stage-06"
+    stage6.mkdir()
+    llm = _SequenceLLM(
+        [
+            LLMResponse(
+                content="not json",
+                model="fixture-model",
+                prompt_tokens=100,
+                completion_tokens=2,
+                total_tokens=102,
+                finish_reason="stop",
+            ),
+            LLMResponse(
+                content="",
+                model="fixture-model",
+                prompt_tokens=120,
+                completion_tokens=4096,
+                total_tokens=4216,
+                finish_reason="length",
+                truncated=True,
+            ),
+        ]
+    )
+
+    result = _execute_knowledge_extract(
+        stage6,
+        run_dir,
+        _config(),  # type: ignore[arg-type]
+        AdapterBundle(),
+        llm=llm,  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    diagnostic = json.loads((stage6 / "card_extraction_failures.json").read_text())
+    assert diagnostic["llm_call_count"] == 2
+    assert diagnostic["llm_call_limit"] == 2
+    assert diagnostic["extraction_attempts"] == [
+        {
+            "attempt": "initial",
+            "batch_id": "card-batch-001",
+            "completion_tokens": 2,
+            "content_length": 8,
+            "error_category": "malformed_response",
+            "finish_reason": "stop",
+            "max_tokens": 4096,
+            "prompt_tokens": 100,
+            "source_identity": identity,
+            "total_tokens": 102,
+            "truncated": False,
+        },
+        {
+            "attempt": "repair",
+            "batch_id": "card-batch-001",
+            "completion_tokens": 4096,
+            "content_length": 0,
+            "error_category": "empty_response",
+            "finish_reason": "length",
+            "max_tokens": 8192,
+            "prompt_tokens": 120,
+            "source_identity": identity,
+            "total_tokens": 4216,
+            "truncated": True,
+        },
+    ]
+    assert "not json" not in json.dumps(diagnostic)
+
+
+def test_stage6_second_truncated_response_fails_without_third_call(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    _prepare_stage5(run_dir, [_candidate(1)])
+    stage6 = run_dir / "stage-06"
+    stage6.mkdir()
+    llm = _SequenceLLM(
+        [
+            LLMResponse(
+                content="{\"schema_version\":",
+                model="fixture-model",
+                finish_reason="length",
+                truncated=True,
+            ),
+            LLMResponse(
+                content="{\"schema_version\":1,\"batch_id\":",
+                model="fixture-model",
+                finish_reason="length",
+                truncated=True,
+            ),
+        ]
+    )
+
+    result = _execute_knowledge_extract(
+        stage6,
+        run_dir,
+        _config(),  # type: ignore[arg-type]
+        AdapterBundle(),
+        llm=llm,  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert len(llm.calls) == 2
+    assert not (stage6 / "cards").exists()
+    assert not (stage6 / "cards_manifest.json").exists()
+    diagnostic = json.loads((stage6 / "card_extraction_failures.json").read_text())
+    assert [
+        attempt["error_category"] for attempt in diagnostic["extraction_attempts"]
+    ] == ["truncated_response", "truncated_response"]
+
+
+def test_stage6_enforces_two_calls_per_shortlist_identity(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    shortlist = _prepare_stage5(run_dir, [_candidate(1), _candidate(2)])
+    stage6 = run_dir / "stage-06"
+    stage6.mkdir()
+    llm = _SequenceLLM(["{}", "", "{}", ""])
+
+    result = _execute_knowledge_extract(
+        stage6,
+        run_dir,
+        _config(),  # type: ignore[arg-type]
+        AdapterBundle(),
+        llm=llm,  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    diagnostic = json.loads((stage6 / "card_extraction_failures.json").read_text())
+    assert len(llm.calls) == 4
+    assert diagnostic["llm_call_count"] == 4
+    assert diagnostic["llm_call_limit"] == 4
+    assert {
+        attempt["source_identity"] for attempt in diagnostic["extraction_attempts"]
+    } == {row["source_identity"] for row in shortlist}
+
+
 def test_stage6_mixed_success_keeps_failed_card_non_evidentiary(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     shortlist = _prepare_stage5(run_dir, [_candidate(1), _candidate(2)])
-    response = json.loads(_card_response(shortlist))
-    response["cards"][1]["evidence_excerpt_texts"] = [
+    responses = _card_responses(shortlist)
+    response = json.loads(responses[1])
+    response["cards"][0]["evidence_excerpt_texts"] = [
         "This substantive sentence is not in the abstract."
     ]
+    responses[1] = json.dumps(response)
     stage6 = run_dir / "stage-06"
     stage6.mkdir()
     result = _execute_knowledge_extract(
@@ -757,7 +961,7 @@ def test_stage6_mixed_success_keeps_failed_card_non_evidentiary(tmp_path: Path) 
         run_dir,
         _config(),  # type: ignore[arg-type]
         AdapterBundle(),
-        llm=_SequenceLLM([json.dumps(response)]),  # type: ignore[arg-type]
+        llm=_SequenceLLM(responses),  # type: ignore[arg-type]
     )
     assert result.status is StageStatus.DONE
     second = json.loads((stage6 / "cards" / "card-002.json").read_text())
@@ -828,7 +1032,7 @@ def test_cards_manifest_rejects_reordered_shortlist_identity(tmp_path: Path) -> 
         run_dir,
         _config(),  # type: ignore[arg-type]
         AdapterBundle(),
-        llm=_SequenceLLM([_card_response(shortlist)]),  # type: ignore[arg-type]
+        llm=_SequenceLLM(_card_responses(shortlist)),  # type: ignore[arg-type]
     )
     assert result.status is StageStatus.DONE
     manifest = json.loads((stage6 / "cards_manifest.json").read_text())
@@ -912,10 +1116,12 @@ def test_stage7_replays_manifest_before_consuming_markdown(tmp_path: Path) -> No
 def test_stage6_allowlist_is_recomputed_from_success_cards(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     shortlist = _prepare_stage5(run_dir, [_candidate(1), _candidate(2)])
-    response = json.loads(_card_response(shortlist))
-    response["cards"][1]["evidence_excerpt_texts"] = [
+    responses = _card_responses(shortlist)
+    response = json.loads(responses[1])
+    response["cards"][0]["evidence_excerpt_texts"] = [
         "This substantive sentence is absent from the retained abstract."
     ]
+    responses[1] = json.dumps(response)
     stage6 = run_dir / "stage-06"
     stage6.mkdir()
     result = _execute_knowledge_extract(
@@ -923,7 +1129,7 @@ def test_stage6_allowlist_is_recomputed_from_success_cards(tmp_path: Path) -> No
         run_dir,
         _config(),  # type: ignore[arg-type]
         AdapterBundle(),
-        llm=_SequenceLLM([json.dumps(response)]),  # type: ignore[arg-type]
+        llm=_SequenceLLM(responses),  # type: ignore[arg-type]
     )
     assert result.status is StageStatus.DONE
     allowlist_text = (stage6 / "citation_allowlist.json").read_text()
@@ -1652,9 +1858,7 @@ def test_stage20_22_and_23_reject_bibliography_key_outside_allowlist(
     shortlist = _prepare_stage5(run_dir, [_candidate(i) for i in range(1, 6)], config)
     stage6 = run_dir / "stage-06"
     stage6.mkdir()
-    llm = _SequenceLLM(
-        [_card_response(shortlist[:4]), "{}", "{}"]
-    )
+    llm = _SequenceLLM(_card_responses(shortlist[:4]) + ["{}", "{}"])
     assert _execute_knowledge_extract(
         stage6, run_dir, config, AdapterBundle(), llm=llm  # type: ignore[arg-type]
     ).status is StageStatus.DONE
