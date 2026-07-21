@@ -88,6 +88,7 @@ def _write_stage20_outputs(
     *,
     outcome: str = "passed",
     score: float = 8,
+    verdict: str = "proceed",
 ) -> None:
     stage_dir = run_dir / "stage-20"
     stage_dir.mkdir(parents=True)
@@ -102,7 +103,7 @@ def _write_stage20_outputs(
     }
     quality = {
         "score_1_to_10": score,
-        "verdict": "proceed",
+        "verdict": verdict,
         "strengths": ["bounded"],
         "weaknesses": [],
         "required_actions": [],
@@ -138,6 +139,29 @@ def _write_stage20_outputs(
     (stage_dir / "quality_gate_manifest.json").write_text(
         json.dumps(manifest), encoding="utf-8"
     )
+
+
+def test_stage21_rejects_passed_manifest_for_reject_verdict(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    evidence, stage20, config = _inputs()
+    _write_stage20_outputs(
+        run_dir,
+        evidence,
+        stage20,
+        config,
+        outcome="passed",
+        score=8,
+        verdict="reject",
+    )
+
+    with pytest.raises(Stage21InputBundleError, match="outcome mismatch"):
+        load_stage21_input_bundle(
+            run_dir,
+            stage20_inputs=stage20,
+            evidence=evidence,
+            canonical_config=config,
+        )
 
 
 def test_stage21_bundle_replays_stage20_bindings_and_fixpoint(tmp_path: Path) -> None:
@@ -316,7 +340,13 @@ def test_stage21_accepts_only_explicit_legal_degraded_manifest(tmp_path: Path) -
     evidence, stage20, _ = _inputs()
     config = _config(graceful=True)
     _write_stage20_outputs(
-        run_dir, evidence, stage20, config, outcome="degraded", score=2
+        run_dir,
+        evidence,
+        stage20,
+        config,
+        outcome="degraded",
+        score=2,
+        verdict="revise",
     )
 
     bundle = load_stage21_input_bundle(

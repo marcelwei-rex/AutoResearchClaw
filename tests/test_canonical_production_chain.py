@@ -29,7 +29,7 @@ from researchclaw.literature.verify import (
     VerifyStatus,
     parse_bibtex_entries,
 )
-from researchclaw.llm.client import LLMClient, LLMResponse
+from researchclaw.llm.client import LLMClient, LLMConfig, LLMResponse
 from researchclaw.evolution import EvolutionStore, extract_lessons
 from researchclaw.memory.experiment_memory import ExperimentMemory
 from researchclaw.pipeline.executor import execute_stage
@@ -81,12 +81,19 @@ class _NoLLM:
     config = SimpleNamespace(base_url="", api_key="")
 
 
-class _ProductionChainLLM:
+class _ProductionChainLLM(LLMClient):
     """Deterministic external transport; canonical producers remain unpatched."""
 
-    config = SimpleNamespace(base_url="test://production-chain", api_key="test-key")
-
     def __init__(self, run_dir: Path) -> None:
+        super().__init__(
+            LLMConfig(
+                base_url="test://production-chain",
+                api_key="test-key",
+                primary_model="production-chain",
+                fallback_models=[],
+                max_retries=1,
+            )
+        )
         self.run_dir = run_dir
 
     def chat(

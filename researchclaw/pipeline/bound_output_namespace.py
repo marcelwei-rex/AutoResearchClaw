@@ -236,6 +236,35 @@ class BoundOutputNamespace:
     def write_text_atomic(self, name: str, text: str) -> None:
         self.write_bytes_atomic(name, text.encode("utf-8"))
 
+    def write_new_text_atomic(self, name: str, text: str) -> None:
+        """Publish a complete new file and reject any target collision."""
+
+        _require_child_name(name)
+        if os.link not in os.supports_dir_fd:
+            raise OSError("collision-safe output publication is unsupported")
+        content = text.encode("utf-8")
+        temporary = f"{name}.tmp"
+        try:
+            _write_new_file(self._stage_fd, temporary, content)
+            os.link(
+                temporary,
+                name,
+                src_dir_fd=self._stage_fd,
+                dst_dir_fd=self._stage_fd,
+                follow_symlinks=False,
+            )
+            os.unlink(temporary, dir_fd=self._stage_fd)
+            temporary = ""
+            os.fsync(self._stage_fd)
+            self.assert_canonical()
+        except Exception:
+            if temporary:
+                try:
+                    os.unlink(temporary, dir_fd=self._stage_fd)
+                except FileNotFoundError:
+                    pass
+            raise
+
     def append_bytes(self, name: str, content: bytes) -> None:
         _require_child_name(name)
         flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW
@@ -661,6 +690,49 @@ class BoundOutputNamespace:
         finally:
             for opened_fd in reversed(opened):
                 os.close(opened_fd)
+
+    def invalidate_run_files(self, names: tuple[str, ...]) -> None:
+        """Remove owned direct run files through the held run fd."""
+
+        for name in names:
+            _require_child_name(name)
+            try:
+                info = os.stat(name, dir_fd=self._run_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError(f"run output collision is not a regular file: {name}")
+            os.unlink(name, dir_fd=self._run_fd)
+
+    def write_run_file_atomic(self, name: str, content: bytes) -> None:
+        """Atomically replace one owned direct run file via the held run fd."""
+
+        _require_child_name(name)
+        temporary = f"{name}.tmp"
+        try:
+            _write_new_file(self._run_fd, temporary, content)
+            try:
+                current = os.stat(name, dir_fd=self._run_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                current = None
+            if current is not None and not stat.S_ISREG(current.st_mode):
+                raise OSError(f"run output collision is not a regular file: {name}")
+            os.replace(
+                temporary,
+                name,
+                src_dir_fd=self._run_fd,
+                dst_dir_fd=self._run_fd,
+            )
+            temporary = ""
+            os.fsync(self._run_fd)
+            self.assert_canonical()
+        except Exception:
+            if temporary:
+                try:
+                    os.unlink(temporary, dir_fd=self._run_fd)
+                except FileNotFoundError:
+                    pass
+            raise
 
     def run_entries(self) -> tuple[str, ...]:
         """List direct entries of the held run directory."""

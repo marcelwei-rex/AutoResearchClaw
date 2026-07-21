@@ -7,8 +7,10 @@ import logging
 import math
 import re
 import hashlib
+import copy
 from collections.abc import Mapping
 from collections import Counter
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -72,6 +74,7 @@ from researchclaw.pipeline.stage21_input_bundle import (
     Stage21InputBundle,
     Stage21InputBundleError,
     load_stage21_input_bundle,
+    derive_quality_gate_outcome,
     replay_stage21_input_bundle,
     verify_stage21_input_bundle_unchanged,
     verify_stage21_output_artifacts,
@@ -1028,6 +1031,26 @@ _STAGE20_OWNED_OUTPUTS = (
     "quality_gate_manifest.json.tmp",
     "quality_report.json.tmp",
     "fabrication_flags.json.tmp",
+    "quality_gate_llm_diagnostics.json",
+    "quality_gate_llm_diagnostics.json.tmp",
+)
+
+_STAGE20_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "schema_version",
+        "call_index",
+        "call_role",
+        "model",
+        "max_tokens",
+        "finish_reason",
+        "truncated",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "content_length",
+        "error_category",
+        "repair_attempted",
+    }
 )
 
 
@@ -1113,6 +1136,89 @@ def _parse_quality_gate_response(text: str) -> dict[str, Any]:
             raise ValueError(f"quality response {field} must be a string array")
     return value
 
+
+def _constrain_stage20_llm(llm: object) -> LLMClient:
+    """Resolve one client whose chat call performs one provider request."""
+
+    resolver = getattr(llm, "resolve_for_legacy", None)
+    resolved = resolver() if callable(resolver) else llm
+    if not isinstance(resolved, LLMClient):
+        raise TypeError("Stage 20 requires a bounded OpenAI-compatible LLM client")
+    constrained = copy.copy(resolved)
+    constrained.config = replace(
+        resolved.config,
+        fallback_models=[],
+        max_retries=1,
+        fallback_url="",
+        fallback_api_key="",
+    )
+    constrained._model_chain = [constrained.config.primary_model]
+    return constrained
+
+
+def _quality_response_category(response: object) -> tuple[str, dict[str, Any] | None]:
+    content = str(getattr(response, "content", "") or "")
+    if not content.strip():
+        return "empty_response", None
+    if bool(getattr(response, "truncated", False)) or str(
+        getattr(response, "finish_reason", "") or ""
+    ) == "length":
+        return "truncated_response", None
+    try:
+        return "success", _parse_quality_gate_response(content)
+    except ValueError as exc:
+        message = str(exc)
+        if "duplicate" in message:
+            category = "duplicate_key"
+        elif "not strict JSON" in message:
+            category = "malformed_json"
+        elif "fields mismatch" in message:
+            category = "schema_fields"
+        elif "verdict" in message:
+            category = "invalid_verdict"
+        elif "score" in message or "nonfinite" in message:
+            category = "invalid_score"
+        else:
+            category = "invalid_list_field"
+        return category, None
+
+
+def _quality_diagnostic_record(
+    response: object | None,
+    *,
+    call_index: int,
+    call_role: str,
+    max_tokens: int,
+    error_category: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "call_index": call_index,
+        "call_role": call_role,
+        "model": str(getattr(response, "model", "") or ""),
+        "max_tokens": max_tokens,
+        "finish_reason": str(getattr(response, "finish_reason", "") or ""),
+        "truncated": bool(getattr(response, "truncated", False)),
+        "prompt_tokens": int(getattr(response, "prompt_tokens", 0) or 0),
+        "completion_tokens": int(getattr(response, "completion_tokens", 0) or 0),
+        "total_tokens": int(getattr(response, "total_tokens", 0) or 0),
+        "content_length": len(str(getattr(response, "content", "") or "")),
+        "error_category": error_category,
+        "repair_attempted": call_index == 2,
+    }
+
+
+def _write_quality_diagnostics(
+    output: BoundOutputNamespace, records: list[dict[str, object]]
+) -> None:
+    for record in records:
+        if set(record) != _STAGE20_DIAGNOSTIC_FIELDS:
+            raise OSError("Stage 20 diagnostic fields mismatch")
+    output.write_new_text_atomic(
+        "quality_gate_llm_diagnostics.json",
+        json.dumps(records, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+    )
+
 def _execute_quality_gate(
     stage_dir: Path,
     run_dir: Path,
@@ -1161,7 +1267,18 @@ def _execute_quality_gate_bound(
     prompts: PromptManager | None,
     output: BoundOutputNamespace,
 ) -> StageResult:
-    (run_dir / "degradation_signal.json").unlink(missing_ok=True)
+    try:
+        output.invalidate_run_files(
+            ("degradation_signal.json", "degradation_signal.json.tmp")
+        )
+    except OSError as exc:
+        return StageResult(
+            stage=Stage.QUALITY_GATE,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=f"Stage 20 degradation signal cleanup failed: {exc}",
+            decision="retry",
+        )
     try:
         evidence = load_canonical_experiment_evidence(run_dir)
         canonical_config_text = evidence.run_config_bytes.decode("utf-8")
@@ -1252,35 +1369,121 @@ def _execute_quality_gate_bound(
                 "fabrication. Penalize severely.\n"
             )
 
+        quality_prompt_input = (
+            paper_for_eval
+            + _exp_context
+            + "\n\nCitation policy: require at least "
+            + str(citation_authority.effective_policy["effective_min_unique_sources"])
+            + " unique eligible sources and target "
+            + str(citation_authority.effective_policy["effective_target_unique_sources"])
+            + ". Do not penalize the paper for not exceeding that target.\n"
+        )
         sp = _pm.for_stage(
             "quality_gate",
             evolution_overlay=None,
             quality_threshold=str(config.research.quality_threshold),
-            revised=(
-                paper_for_eval
-                + _exp_context
-                + "\n\nCitation policy: require at least "
-                + str(citation_authority.effective_policy["effective_min_unique_sources"])
-                + " unique eligible sources and target "
-                + str(citation_authority.effective_policy["effective_target_unique_sources"])
-                + ". Do not penalize the paper for not exceeding that target.\n"
-            ),
-        )
-        resp = _chat_with_prompt(
-            llm,
-            sp.system,
-            sp.user,
-            json_mode=sp.json_mode,
-            max_tokens=sp.max_tokens,
+            revised=quality_prompt_input,
         )
         try:
-            report = _parse_quality_gate_response(resp.content)
-        except ValueError as exc:
+            bounded_llm = _constrain_stage20_llm(llm)
+        except (TypeError, ValueError) as exc:
             return StageResult(
                 stage=Stage.QUALITY_GATE,
                 status=StageStatus.FAILED,
                 artifacts=(),
-                error=f"Stage 20 quality response is invalid: {exc}",
+                error=f"Stage 20 quality client is not bounded: {exc}",
+                decision="retry",
+            )
+        diagnostic_records: list[dict[str, object]] = []
+        last_category = "unknown"
+        last_response: object | None = None
+        for call_index in (1, 2):
+            call_role = "initial" if call_index == 1 else "repair"
+            current_prompt = sp
+            if call_index == 2:
+                current_prompt = _pm.for_stage(
+                    "quality_gate_repair",
+                    evolution_overlay=None,
+                    error_category=last_category,
+                    quality_threshold=str(config.research.quality_threshold),
+                    revised=quality_prompt_input,
+                )
+            effective_max_tokens = int(
+                current_prompt.max_tokens or bounded_llm.config.max_tokens
+            )
+            try:
+                last_response = _chat_with_prompt(
+                    bounded_llm,
+                    current_prompt.system,
+                    current_prompt.user,
+                    json_mode=current_prompt.json_mode,
+                    max_tokens=current_prompt.max_tokens,
+                    retries=0,
+                )
+            except Exception as exc:  # noqa: BLE001
+                diagnostic_records.append(
+                    _quality_diagnostic_record(
+                        None,
+                        call_index=call_index,
+                        call_role=call_role,
+                        max_tokens=effective_max_tokens,
+                        error_category="transport_error",
+                    )
+                )
+                try:
+                    _write_quality_diagnostics(output, diagnostic_records)
+                except OSError as diagnostic_exc:
+                    exc.add_note(
+                        f"Stage 20 diagnostic publication also failed: {diagnostic_exc}"
+                    )
+                return StageResult(
+                    stage=Stage.QUALITY_GATE,
+                    status=StageStatus.FAILED,
+                    artifacts=(),
+                    error=f"Stage 20 quality transport failed: {exc}",
+                    decision="retry",
+                )
+            last_category, parsed = _quality_response_category(last_response)
+            diagnostic_records.append(
+                _quality_diagnostic_record(
+                    last_response,
+                    call_index=call_index,
+                    call_role=call_role,
+                    max_tokens=effective_max_tokens,
+                    error_category=last_category,
+                )
+            )
+            if parsed is not None:
+                report = parsed
+                if call_index == 2:
+                    try:
+                        _write_quality_diagnostics(output, diagnostic_records)
+                    except OSError as exc:
+                        return StageResult(
+                            stage=Stage.QUALITY_GATE,
+                            status=StageStatus.FAILED,
+                            artifacts=(),
+                            error=f"Stage 20 diagnostic publication failed: {exc}",
+                            decision="retry",
+                        )
+                break
+        if report is None:
+            try:
+                _write_quality_diagnostics(output, diagnostic_records)
+            except OSError as diagnostic_exc:
+                diagnostic_suffix = (
+                    f"; diagnostic publication also failed: {diagnostic_exc}"
+                )
+            else:
+                diagnostic_suffix = ""
+            return StageResult(
+                stage=Stage.QUALITY_GATE,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=(
+                    f"Stage 20 quality response is invalid after bounded repair: "
+                    f"{last_category}{diagnostic_suffix}"
+                ),
                 decision="retry",
             )
     # BUG-25: If experiment failed with no metrics, cap the quality score
@@ -1384,6 +1587,13 @@ def _execute_quality_gate_bound(
             ),
             decision="retry",
         )
+    outcome = derive_quality_gate_outcome(
+        verdict=verdict,
+        score=Decimal(str(score)),
+        threshold=Decimal(str(threshold)),
+        graceful_degradation=config.research.graceful_degradation,
+        has_real_data=not _vr_zero_values,
+    )
     if _vr_zero_values:
         logger.error(
             "Stage 20 BLOCKED: VerifiedRegistry has zero real experiment values "
@@ -1401,72 +1611,83 @@ def _execute_quality_gate_bound(
                 "Pipeline must not proceed to export."
             ),
         )
-    if isinstance(score, (int, float)) and score < threshold:
-        if config.research.graceful_degradation:
-            logger.warning(
-                "Quality gate DEGRADED: score %.1f < threshold %.1f — "
-                "continuing with sanitization (graceful_degradation=True)",
-                score, threshold,
-            )
-            # Write degradation signal for downstream stages
-            signal = {
-                "score": score,
-                "threshold": threshold,
-                "verdict": verdict,
-                "weaknesses": report.get("weaknesses", []),
-                "generated": _utcnow_iso(),
-            }
-            (run_dir / "degradation_signal.json").write_text(
-                json.dumps(signal, indent=2), encoding="utf-8"
-            )
-            try:
-                _publish_stage20_gate_manifest(
-                    run_dir=run_dir,
-                    output=output,
-                    outcome="degraded",
-                    evidence=evidence,
-                    stage20_inputs=stage20_inputs,
-                    canonical_config=canonical_config,
-                    claim_scope=claim_scope,
-                    quality_report_text=quality_report_text,
-                    fabrication_flags_text=fabrication_flags_text,
-                    score=score,
-                    threshold=threshold,
-                )
-            except (OSError, TypeError, ValueError) as exc:
-                cleanup_suffix = _output_invalidation_suffix(
-                    output, _STAGE20_OWNED_OUTPUTS
-                )
-                (run_dir / "degradation_signal.json").unlink(missing_ok=True)
-                return StageResult(
-                    stage=Stage.QUALITY_GATE,
-                    status=StageStatus.FAILED,
-                    artifacts=("quality_report.json", "fabrication_flags.json"),
-                    error=f"Stage 20 gate publication failed: {exc}{cleanup_suffix}",
-                    decision="retry",
-                )
-            return StageResult(
-                stage=Stage.QUALITY_GATE,
-                status=StageStatus.DONE,
-                artifacts=(
-                    "quality_report.json",
-                    "fabrication_flags.json",
-                    "quality_gate_manifest.json",
-                ),
-                evidence_refs=("stage-20/quality_report.json",),
-                decision="degraded",
-            )
+    if outcome is None:
         logger.warning(
-            "Quality gate FAILED: score %.1f < threshold %.1f (verdict=%s)",
-            score, threshold, verdict,
+            "Quality gate FAILED: verdict=%s score=%.1f threshold=%.1f",
+            verdict,
+            score,
+            threshold,
         )
         return StageResult(
             stage=Stage.QUALITY_GATE,
             status=StageStatus.FAILED,
             artifacts=("quality_report.json", "fabrication_flags.json"),
             evidence_refs=("stage-20/quality_report.json",),
-            error=f"Quality score {score:.1f}/10 below threshold {threshold:.1f}. "
-                  f"Paper needs revision before export.",
+            error=(
+                "Quality verdict/score combination does not authorize publication: "
+                f"verdict={verdict}, score={score:.1f}, threshold={threshold:.1f}."
+            ),
+        )
+    if outcome == "degraded":
+        logger.warning(
+            "Quality gate DEGRADED: score %.1f < threshold %.1f — "
+            "continuing with sanitization (graceful_degradation=True)",
+            score, threshold,
+        )
+        signal = {
+            "score": score,
+            "threshold": threshold,
+            "verdict": verdict,
+            "weaknesses": report.get("weaknesses", []),
+            "generated": _utcnow_iso(),
+        }
+        try:
+            output.write_run_file_atomic(
+                "degradation_signal.json",
+                (json.dumps(signal, indent=2) + "\n").encode("utf-8"),
+            )
+            _publish_stage20_gate_manifest(
+                run_dir=run_dir,
+                output=output,
+                outcome="degraded",
+                evidence=evidence,
+                stage20_inputs=stage20_inputs,
+                canonical_config=canonical_config,
+                claim_scope=claim_scope,
+                quality_report_text=quality_report_text,
+                fabrication_flags_text=fabrication_flags_text,
+                score=score,
+                threshold=threshold,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            cleanup_suffix = _output_invalidation_suffix(
+                output, _STAGE20_OWNED_OUTPUTS
+            )
+            try:
+                output.invalidate_run_files(
+                    ("degradation_signal.json", "degradation_signal.json.tmp")
+                )
+            except OSError as cleanup_exc:
+                cleanup_suffix += (
+                    f"; degradation signal cleanup also failed: {cleanup_exc}"
+                )
+            return StageResult(
+                stage=Stage.QUALITY_GATE,
+                status=StageStatus.FAILED,
+                artifacts=("quality_report.json", "fabrication_flags.json"),
+                error=f"Stage 20 gate publication failed: {exc}{cleanup_suffix}",
+                decision="retry",
+            )
+        return StageResult(
+            stage=Stage.QUALITY_GATE,
+            status=StageStatus.DONE,
+            artifacts=(
+                "quality_report.json",
+                "fabrication_flags.json",
+                "quality_gate_manifest.json",
+            ),
+            evidence_refs=("stage-20/quality_report.json",),
+            decision="degraded",
         )
 
     logger.info(

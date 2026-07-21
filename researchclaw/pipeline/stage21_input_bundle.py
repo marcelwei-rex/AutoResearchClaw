@@ -160,6 +160,7 @@ def replay_stage21_input_bundle(
         quality_report=quality_report,
         fabrication_flags=fabrication_flags,
         quality_score=quality["score_1_to_10"],
+        quality_verdict=quality["verdict"],
         canonical_config=canonical_config,
         has_real_data=bool(expected_state["has_real_data"]),
     )
@@ -409,6 +410,7 @@ def _parse_quality_gate_manifest(
     quality_report: BoundArtifact,
     fabrication_flags: BoundArtifact,
     quality_score: object,
+    quality_verdict: object,
     canonical_config: RCConfig,
     has_real_data: bool,
 ) -> dict[str, object]:
@@ -445,16 +447,41 @@ def _parse_quality_gate_manifest(
         raise Stage21InputBundleError(
             "quality gate manifest cannot authorize zero-data evidence"
         )
-    expected_outcome = (
-        "passed"
-        if score_decimal >= threshold_decimal
-        else "degraded" if graceful else None
+    expected_outcome = derive_quality_gate_outcome(
+        verdict=quality_verdict,
+        score=score_decimal,
+        threshold=threshold_decimal,
+        graceful_degradation=graceful,
+        has_real_data=has_real_data,
     )
     if expected_outcome is None or value["outcome"] != expected_outcome:
         raise Stage21InputBundleError("quality gate manifest outcome mismatch")
     if not isinstance(value["generated"], str) or not value["generated"].strip():
         raise Stage21InputBundleError("quality gate manifest generated is invalid")
     return value
+
+
+def derive_quality_gate_outcome(
+    *,
+    verdict: object,
+    score: Decimal,
+    threshold: Decimal,
+    graceful_degradation: bool,
+    has_real_data: bool,
+) -> str | None:
+    """Derive the sole publishable outcome from strict quality semantics."""
+
+    if not has_real_data or verdict == "reject":
+        return None
+    if verdict == "proceed":
+        return "passed" if score >= threshold else None
+    if verdict == "revise":
+        return (
+            "degraded"
+            if score < threshold and graceful_degradation
+            else None
+        )
+    return None
 
 
 def _parse_object(text: str, label: str) -> dict[str, object]:

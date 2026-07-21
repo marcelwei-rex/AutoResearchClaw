@@ -1198,6 +1198,21 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
         ),
         "json_mode": True,
     },
+    "quality_gate_repair": {
+        "system": "You repair a final quality gate response under an exact JSON contract.",
+        "user": (
+            "Evaluate the same immutable revised paper again. The previous response "
+            "failed strict validation with category: {error_category}.\n"
+            "Return exactly one JSON object with these five fields and no others: "
+            "score_1_to_10, verdict, strengths, weaknesses, required_actions.\n"
+            "verdict must be exactly one of: proceed, revise, reject. "
+            "score_1_to_10 must be a finite number in [0,10]. The final three "
+            "fields must be arrays of nonempty strings.\n"
+            "Threshold: {quality_threshold}\n"
+            "Paper and immutable evaluation context:\n{revised}"
+        ),
+        "json_mode": True,
+    },
     "knowledge_archive": {
         "system": "You produce reproducibility-focused research retrospectives.",
         "user": (

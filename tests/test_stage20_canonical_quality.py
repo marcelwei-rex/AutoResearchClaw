@@ -10,6 +10,7 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 
 from researchclaw.adapters import AdapterBundle
+from researchclaw.llm.client import LLMClient, LLMConfig
 from researchclaw.pipeline import bound_output_namespace as output_namespace_module
 from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 from researchclaw.pipeline.stage19_input_bundle import (
@@ -29,6 +30,7 @@ from researchclaw.pipeline.stage20_publication import (
 from researchclaw.pipeline import stage20_input_bundle as stage20_bundle_module
 from researchclaw.pipeline.stage_impls import _review_publish
 from researchclaw.pipeline.stages import StageStatus
+from researchclaw.prompts import PromptManager
 
 
 def _bound(path: str, text: str) -> BoundArtifact:
@@ -257,8 +259,12 @@ def _run_quality_gate(
     mutate_during_fixpoint: bool = False,
     summary_override: dict | None = None,
     llm_response: str | None = None,
+    llm_responses: list[object] | None = None,
+    llm_call_log: list[dict[str, object]] | None = None,
     graceful_degradation: bool = False,
     replace_parent_during_chat: tuple[Path, Path] | None = None,
+    replace_run_during_chat: tuple[Path, Path] | None = None,
+    diagnostic_collision_target: Path | None = None,
 ) -> tuple[object, Path, str]:
     run_dir = tmp_path / "run"
     stage_dir = run_dir / "stage-20"
@@ -346,13 +352,26 @@ def _run_quality_gate(
             prompts.append(kwargs["revised"])
             return SimpleNamespace(system="system", user="user", json_mode=True, max_tokens=100)
 
-    def chat(*_args, **_kwargs):
+    responses = list(llm_responses or [])
+    def chat(*_args, **kwargs):
+        if llm_call_log is not None:
+            llm_call_log.append(dict(kwargs))
         if replace_parent_during_chat is not None:
             detached, outside = replace_parent_during_chat
             stage_dir.rename(detached)
             stage_dir.symlink_to(outside, target_is_directory=True)
+        if replace_run_during_chat is not None:
+            detached_run, replacement = replace_run_during_chat
+            run_dir.rename(detached_run)
+            run_dir.symlink_to(replacement, target_is_directory=True)
+        diagnostic_path = stage_dir / "quality_gate_llm_diagnostics.json"
+        if diagnostic_collision_target is not None and not diagnostic_path.exists():
+            diagnostic_path.symlink_to(diagnostic_collision_target)
+        response = responses.pop(0) if responses else llm_response
+        if response is not None and not isinstance(response, str):
+            return response
         return SimpleNamespace(
-            content=llm_response
+            content=response
             or json.dumps(
                 {
                     "score_1_to_10": 8,
@@ -361,10 +380,21 @@ def _run_quality_gate(
                     "weaknesses": [],
                     "required_actions": [],
                 }
-            )
+            ),
+            model="test-model",
+            finish_reason="stop",
+            truncated=False,
+            prompt_tokens=10,
+            completion_tokens=20,
+            total_tokens=30,
         )
 
     monkeypatch.setattr(_review_publish, "_chat_with_prompt", chat)
+    monkeypatch.setattr(
+        _review_publish,
+        "_constrain_stage20_llm",
+        lambda _value: SimpleNamespace(config=SimpleNamespace(max_tokens=4096)),
+    )
     (run_dir / "stage-14_v99").mkdir()
     (run_dir / "stage-14_v99/experiment_summary.json").write_text(
         json.dumps({"metrics_summary": {"shadow": {"mean": 999}}}),
@@ -641,6 +671,405 @@ def test_stage20_rejects_ambiguous_or_nonfinite_llm_json(
     assert "quality response is invalid" in (result.error or "")
     assert not (stage_dir / "quality_report.json").exists()
     assert not (stage_dir / "fabrication_flags.json").exists()
+
+
+def test_stage20_repairs_invalid_verdict_once_with_bounded_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+    invalid = SimpleNamespace(
+        content=json.dumps(
+            {
+                "score_1_to_10": 8,
+                "verdict": "APPROVE",
+                "strengths": ["bounded"],
+                "weaknesses": [],
+                "required_actions": [],
+            }
+        ),
+        model="deepseek-v4-flash",
+        finish_reason="stop",
+        truncated=False,
+        prompt_tokens=10,
+        completion_tokens=20,
+        total_tokens=30,
+    )
+    valid = SimpleNamespace(
+        content=json.dumps(
+            {
+                "score_1_to_10": 8,
+                "verdict": "proceed",
+                "strengths": ["bounded"],
+                "weaknesses": [],
+                "required_actions": [],
+            }
+        ),
+        model="deepseek-v4-flash",
+        finish_reason="stop",
+        truncated=False,
+        prompt_tokens=11,
+        completion_tokens=21,
+        total_tokens=32,
+    )
+
+    result, stage_dir, _ = _run_quality_gate(
+        tmp_path,
+        monkeypatch,
+        llm_responses=[invalid, valid],
+        llm_call_log=calls,
+    )
+
+    assert result.status is StageStatus.DONE
+    assert len(calls) == 2
+    diagnostics = json.loads(
+        (stage_dir / "quality_gate_llm_diagnostics.json").read_text()
+    )
+    assert [row["error_category"] for row in diagnostics] == [
+        "invalid_verdict",
+        "success",
+    ]
+    expected_fields = {
+        "schema_version",
+        "call_index",
+        "call_role",
+        "model",
+        "max_tokens",
+        "finish_reason",
+        "truncated",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "content_length",
+        "error_category",
+        "repair_attempted",
+    }
+    assert all(set(row) == expected_fields for row in diagnostics)
+    serialized = json.dumps(diagnostics)
+    assert "APPROVE" not in serialized
+    assert "bounded" not in serialized
+    assert "quality_gate_llm_diagnostics.json" not in result.artifacts
+
+
+def test_stage20_second_invalid_verdict_fails_without_third_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+    invalid = SimpleNamespace(
+        content='{"score_1_to_10":8,"verdict":"APPROVE",'
+        '"strengths":[],"weaknesses":[],"required_actions":[]}',
+        model="deepseek-v4-flash",
+        finish_reason="stop",
+        truncated=False,
+        prompt_tokens=1,
+        completion_tokens=1,
+        total_tokens=2,
+    )
+
+    result, stage_dir, _ = _run_quality_gate(
+        tmp_path,
+        monkeypatch,
+        llm_responses=[invalid, invalid],
+        llm_call_log=calls,
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert len(calls) == 2
+    assert not (stage_dir / "quality_report.json").exists()
+    assert not (stage_dir / "quality_gate_manifest.json").exists()
+    diagnostics = json.loads(
+        (stage_dir / "quality_gate_llm_diagnostics.json").read_text()
+    )
+    assert [row["call_role"] for row in diagnostics] == ["initial", "repair"]
+
+
+def test_stage20_high_score_reject_cannot_publish_passed_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    response = json.dumps(
+        {
+            "score_1_to_10": 8,
+            "verdict": "reject",
+            "strengths": [],
+            "weaknesses": ["fatal"],
+            "required_actions": ["reject"],
+        }
+    )
+
+    result, stage_dir, _ = _run_quality_gate(
+        tmp_path, monkeypatch, llm_response=response
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert (stage_dir / "quality_report.json").exists()
+    assert not (stage_dir / "quality_gate_manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("score", "verdict"),
+    [(2, "proceed"), (8, "revise")],
+)
+def test_stage20_contradictory_score_and_verdict_cannot_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    score: int,
+    verdict: str,
+) -> None:
+    response = json.dumps(
+        {
+            "score_1_to_10": score,
+            "verdict": verdict,
+            "strengths": [],
+            "weaknesses": ["inconsistent"],
+            "required_actions": ["repair"],
+        }
+    )
+
+    result, stage_dir, _ = _run_quality_gate(
+        tmp_path,
+        monkeypatch,
+        llm_response=response,
+        graceful_degradation=True,
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert not (stage_dir / "quality_gate_manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("initial", "expected_category"),
+    [
+        (
+            SimpleNamespace(
+                content="",
+                model="test",
+                finish_reason="stop",
+                truncated=False,
+            ),
+            "empty_response",
+        ),
+        (
+            SimpleNamespace(
+                content='{"score_1_to_10":',
+                model="test",
+                finish_reason="length",
+                truncated=True,
+            ),
+            "truncated_response",
+        ),
+        (
+            SimpleNamespace(
+                content="not-json",
+                model="test",
+                finish_reason="stop",
+                truncated=False,
+            ),
+            "malformed_json",
+        ),
+    ],
+)
+def test_stage20_repairs_each_response_class_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial: SimpleNamespace,
+    expected_category: str,
+) -> None:
+    valid = SimpleNamespace(
+        content='{"score_1_to_10":8,"verdict":"proceed",'
+        '"strengths":[],"weaknesses":[],"required_actions":[]}',
+        model="test",
+        finish_reason="stop",
+        truncated=False,
+    )
+    calls: list[dict[str, object]] = []
+
+    result, stage_dir, _ = _run_quality_gate(
+        tmp_path,
+        monkeypatch,
+        llm_responses=[initial, valid],
+        llm_call_log=calls,
+    )
+
+    assert result.status is StageStatus.DONE
+    assert len(calls) == 2
+    diagnostics = json.loads(
+        (stage_dir / "quality_gate_llm_diagnostics.json").read_text()
+    )
+    assert diagnostics[0]["error_category"] == expected_category
+
+
+def test_stage20_constrained_client_disables_all_hidden_fallbacks() -> None:
+    source = LLMClient(
+        LLMConfig(
+            base_url="https://example.invalid",
+            api_key="secret",
+            primary_model="primary",
+            fallback_models=["fallback"],
+            max_retries=4,
+            fallback_url="https://fallback.invalid",
+            fallback_api_key="fallback-secret",
+        )
+    )
+
+    constrained = _review_publish._constrain_stage20_llm(source)
+
+    assert constrained is not source
+    assert constrained.config.max_retries == 1
+    assert constrained.config.fallback_models == []
+    assert constrained.config.fallback_url == ""
+    assert constrained.config.fallback_api_key == ""
+    assert constrained._model_chain == ["primary"]
+
+
+def test_stage20_constrained_client_makes_one_outbound_attempt() -> None:
+    source = LLMClient(
+        LLMConfig(
+            base_url="https://example.invalid",
+            api_key="secret",
+            primary_model="primary",
+            fallback_models=["fallback"],
+            max_retries=4,
+            fallback_url="https://fallback.invalid",
+        )
+    )
+    calls = 0
+
+    def fail_once(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise TimeoutError("injected timeout")
+
+    source._raw_call = fail_once  # type: ignore[method-assign]
+    constrained = _review_publish._constrain_stage20_llm(source)
+
+    with pytest.raises(RuntimeError, match="All models failed"):
+        constrained.chat([{"role": "user", "content": "quality"}])
+    assert calls == 1
+
+
+@pytest.mark.parametrize("domain", ["ml", "hep_ph"])
+def test_stage20_repair_prompt_preserves_exact_verdict_contract(domain: str) -> None:
+    prompt = PromptManager(domain=domain).for_stage(
+        "quality_gate_repair",
+        error_category="invalid_verdict",
+        quality_threshold="6",
+        revised="immutable-paper",
+    )
+
+    assert "proceed, revise, reject" in prompt.user
+    assert "five fields and no others" in prompt.user
+    assert "immutable-paper" in prompt.user
+
+
+def test_stage20_degraded_parent_replacement_does_not_touch_external_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    external_signal = outside / "degradation_signal.json"
+    external_signal.write_text("keep", encoding="utf-8")
+    response = json.dumps(
+        {
+            "score_1_to_10": 2,
+            "verdict": "revise",
+            "strengths": [],
+            "weaknesses": ["weak"],
+            "required_actions": ["repair"],
+        }
+    )
+
+    result, _stage_dir, _ = _run_quality_gate(
+        tmp_path,
+        monkeypatch,
+        llm_response=response,
+        graceful_degradation=True,
+        replace_run_during_chat=(tmp_path / "detached-run", outside),
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert external_signal.read_text(encoding="utf-8") == "keep"
+    assert not (tmp_path / "detached-run" / "degradation_signal.json").exists()
+
+
+def test_stage20_diagnostic_directory_collision_fails_before_llm(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-20"
+    (stage_dir / "quality_gate_llm_diagnostics.json").mkdir(parents=True)
+
+    result = _review_publish._execute_quality_gate(
+        stage_dir, run_dir, SimpleNamespace(), AdapterBundle(), llm=object()
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert "output namespace is unsafe" in (result.error or "")
+
+
+def test_stage20_degradation_signal_symlink_collision_is_external_zero_write(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-20"
+    stage_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text("keep", encoding="utf-8")
+    (run_dir / "degradation_signal.json").symlink_to(outside)
+
+    result = _review_publish._execute_quality_gate(
+        stage_dir, run_dir, SimpleNamespace(), AdapterBundle(), llm=None
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.artifacts == ()
+    assert outside.read_text(encoding="utf-8") == "keep"
+
+
+def test_stage20_entry_removes_stale_degradation_signal_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-20"
+    stage_dir.mkdir(parents=True)
+    stale = run_dir / "degradation_signal.json.tmp"
+    stale.write_text("stale", encoding="utf-8")
+    monkeypatch.setattr(
+        _review_publish,
+        "load_canonical_experiment_evidence",
+        lambda _run_dir: (_ for _ in ()).throw(
+            _review_publish.CanonicalExperimentEvidenceError("missing")
+        ),
+    )
+
+    result = _review_publish._execute_quality_gate(
+        stage_dir, run_dir, SimpleNamespace(), AdapterBundle(), llm=None
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert not stale.exists()
+
+
+def test_stage20_diagnostic_symlink_collision_fails_without_external_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "outside.json"
+    outside.write_text("keep", encoding="utf-8")
+    invalid = SimpleNamespace(
+        content='{"score_1_to_10":8,"verdict":"APPROVE",'
+        '"strengths":[],"weaknesses":[],"required_actions":[]}',
+        model="test",
+        finish_reason="stop",
+        truncated=False,
+    )
+
+    result, _stage_dir, _ = _run_quality_gate(
+        tmp_path,
+        monkeypatch,
+        llm_responses=[invalid, invalid],
+        diagnostic_collision_target=outside,
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert "diagnostic publication also failed" in (result.error or "")
+    assert outside.read_text(encoding="utf-8") == "keep"
 
 
 @pytest.mark.parametrize(
