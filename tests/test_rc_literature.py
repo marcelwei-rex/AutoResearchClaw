@@ -716,6 +716,29 @@ class TestOpenAlex:
         assert p.source == "openalex"
         assert p.authors[0].name == "Ashish Vaswani"
 
+    def test_openalex_skips_work_with_empty_title(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from researchclaw.literature.openalex_client import search_openalex
+
+        payload = json.loads(json.dumps(SAMPLE_OPENALEX_RESPONSE))
+        invalid = dict(payload["results"][0])
+        invalid["id"] = "https://openalex.org/WEMPTY"
+        invalid["title"] = "   "
+        payload["results"].insert(0, invalid)
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+        mock_resp.__enter__ = lambda value: value
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        monkeypatch.setattr(
+            "researchclaw.literature.openalex_client.urllib.request.urlopen",
+            lambda *args, **kwargs: mock_resp,
+        )
+
+        papers = search_openalex("attention", limit=5)
+
+        assert [paper.paper_id for paper in papers] == ["oalex-W123456"]
+
     def test_abstract_reconstruction(self) -> None:
         from researchclaw.literature.openalex_client import _reconstruct_abstract
 
@@ -742,6 +765,23 @@ class TestOpenAlex:
 
         papers = search_openalex("test", limit=5)
         assert papers == []
+
+
+def test_search_filters_provider_paper_with_empty_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from researchclaw.literature.models import Paper
+    from researchclaw.literature.search import search_papers
+
+    monkeypatch.setattr(
+        "researchclaw.literature.search.search_openalex",
+        lambda *args, **kwargs: [
+            Paper(paper_id="oalex-empty", title="   ", source="openalex")
+        ],
+    )
+    monkeypatch.setattr("researchclaw.literature.search.time.sleep", lambda _: None)
+
+    assert search_papers("test", sources=("openalex",)) == []
 
 
 # ──────────────────────────────────────────────────────────────────────

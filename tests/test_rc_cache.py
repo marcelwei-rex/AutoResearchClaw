@@ -144,6 +144,35 @@ class TestSearchDegradation:
         assert len(results) >= 1
         assert results[0].title == "Cached Paper"
 
+    def test_search_rejects_cached_paper_with_empty_title(self, tmp_path):
+        put_cache(
+            "bad cached query",
+            "openalex",
+            20,
+            [
+                {
+                    "paper_id": "oalex-empty",
+                    "title": "",
+                    "authors": [],
+                    "source": "openalex",
+                }
+            ],
+            cache_base=tmp_path,
+        )
+
+        with patch(
+            "researchclaw.literature.search.search_openalex",
+            side_effect=RuntimeError("API down"),
+        ):
+            with patch(
+                "researchclaw.literature.cache._DEFAULT_CACHE_DIR", tmp_path
+            ):
+                results = search_papers(
+                    "bad cached query", limit=20, sources=("openalex",)
+                )
+
+        assert results == []
+
     def test_search_caches_successful_results(self, tmp_path):
         mock_paper = Paper(
             paper_id="s2-test",

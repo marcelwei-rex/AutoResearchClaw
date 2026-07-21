@@ -221,6 +221,8 @@ def _parse_openalex_work(item: dict[str, Any]) -> Paper:
     # Title
     title = str(item.get("title") or "").strip()
     title = re.sub(r"\s+", " ", title)
+    if not title:
+        raise ValueError("OpenAlex work title must be nonempty")
 
     # Authors
     authorships = item.get("authorships") or []

@@ -50,6 +50,25 @@ def _papers_to_dicts(papers: list[Paper]) -> list[dict[str, object]]:
     return [asdict(p) for p in papers]
 
 
+def _eligible_papers(papers: list[Paper], source: str) -> list[Paper]:
+    eligible = [
+        paper
+        for paper in papers
+        if isinstance(paper.paper_id, str)
+        and bool(paper.paper_id.strip())
+        and isinstance(paper.title, str)
+        and bool(paper.title.strip())
+    ]
+    rejected = len(papers) - len(eligible)
+    if rejected:
+        logger.warning(
+            "Rejected %d %s paper(s) with missing identity fields",
+            rejected,
+            source,
+        )
+    return eligible
+
+
 def _as_int(value: object, default: int = 0) -> int:
     if isinstance(value, int):
         return value
@@ -79,12 +98,19 @@ def _dicts_to_papers(dicts: list[dict[str, object]]) -> list[Paper]:
                 for a in authors_raw
                 if isinstance(a, dict)
             )
-            paper_id = cast(str, d["paper_id"])
-            title = cast(str, d["title"])
+            paper_id_obj = d["paper_id"]
+            title_obj = d["title"]
+            if (
+                not isinstance(paper_id_obj, str)
+                or not paper_id_obj.strip()
+                or not isinstance(title_obj, str)
+                or not title_obj.strip()
+            ):
+                raise ValueError("cached paper identity fields must be nonempty strings")
             papers.append(
                 Paper(
-                    paper_id=paper_id,
-                    title=title,
+                    paper_id=paper_id_obj,
+                    title=title_obj,
                     authors=authors,
                     year=_as_int(d.get("year", 0), 0),
                     abstract=str(d.get("abstract", "")),
@@ -147,10 +173,13 @@ def search_papers(
         )
         try:
             if src_lower == "openalex":
-                papers = search_openalex(
-                    query,
-                    limit=limit,
-                    year_min=year_min,
+                papers = _eligible_papers(
+                    search_openalex(
+                        query,
+                        limit=limit,
+                        year_min=year_min,
+                    ),
+                    "openalex",
                 )
                 all_papers.extend(papers)
                 cache_put(query, "openalex", limit, _papers_to_dicts(papers))
@@ -161,11 +190,14 @@ def search_papers(
                 time.sleep(0.5)
 
             elif src_lower in ("semantic_scholar", "s2"):
-                papers = search_semantic_scholar(
-                    query,
-                    limit=limit,
-                    year_min=year_min,
-                    api_key=s2_api_key,
+                papers = _eligible_papers(
+                    search_semantic_scholar(
+                        query,
+                        limit=limit,
+                        year_min=year_min,
+                        api_key=s2_api_key,
+                    ),
+                    "semantic_scholar",
                 )
                 all_papers.extend(papers)
                 cache_put(query, "semantic_scholar", limit, _papers_to_dicts(papers))
@@ -177,7 +209,10 @@ def search_papers(
                 time.sleep(1.0)
 
             elif src_lower == "arxiv":
-                papers = search_arxiv(query, limit=limit, year_min=year_min)
+                papers = _eligible_papers(
+                    search_arxiv(query, limit=limit, year_min=year_min),
+                    "arxiv",
+                )
                 all_papers.extend(papers)
                 cache_put(query, "arxiv", limit, _papers_to_dicts(papers))
                 source_stats["arxiv"] = len(papers)
