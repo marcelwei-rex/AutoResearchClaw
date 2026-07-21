@@ -1425,6 +1425,8 @@ def _snapshot_accessor(
     project_artifacts = _domain_project_artifacts(snapshot, source)
     candidate_manifest = tree["experiment_evidence_candidate.json"]
     contract = _bytes_from_ref(source, source["baseline"]["experiment_contract"])
+    execution_policy_ref = source["baseline"]["execution_policy"]
+    execution_policy = _bytes_from_ref(source, execution_policy_ref)
     return CanonicalExperimentEvidence(
         manifest_path="canonical_experiment_evidence.json",
         manifest_sha256=hashlib.sha256(snapshot.root_manifest or b"").hexdigest(),
@@ -1455,6 +1457,12 @@ def _snapshot_accessor(
         structured_results=_freeze_authority_value(results),
         artifacts=artifacts,
         project_artifacts=project_artifacts,
+        execution_policy_artifact=CanonicalEvidenceArtifact(
+            role="execution_policy",
+            path=execution_policy_ref["path"],
+            sha256=execution_policy_ref["sha256"],
+            content=execution_policy,
+        ),
     )
 
 

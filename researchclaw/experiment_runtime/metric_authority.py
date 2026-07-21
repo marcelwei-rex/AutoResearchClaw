@@ -1434,6 +1434,12 @@ def _load_execution_policy_bytes(data: bytes) -> dict[str, Any]:
     return value
 
 
+def parse_domain_execution_policy_bytes(data: bytes) -> dict[str, Any]:
+    """Strictly replay captured domain execution-policy bytes without disk access."""
+
+    return _load_execution_policy_bytes(data)
+
+
 def _load_domain_selector_policy(path: Path) -> tuple[bytes, dict[str, Any]]:
     data, value = _load_json_object(path, "domain selector policy")
     _exact_keys(value, {"schema_version", "selector_policy_version", "normalization", "no_match", "rules"}, "domain selector policy")

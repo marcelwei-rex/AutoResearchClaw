@@ -3955,3 +3955,17 @@ def test_stage15_17_authoritative_functions_have_no_legacy_selectors() -> None:
     for function in functions:
         source = inspect.getsource(function)
         assert all(pattern not in source for pattern in forbidden), function.__name__
+
+
+def test_generic_v1_accessor_has_no_execution_policy_artifact(
+    tmp_path: Path,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    """Generic v1 evidence has no domain execution-policy artifact."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_canonical_bundle(run_dir)
+
+    evidence = load_canonical_experiment_evidence(run_dir)
+
+    assert evidence.execution_policy_artifact is None

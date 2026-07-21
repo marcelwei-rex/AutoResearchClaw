@@ -145,6 +145,7 @@ class CanonicalExperimentEvidence:
     structured_results: Mapping[str, Any]
     artifacts: tuple[CanonicalEvidenceArtifact, ...]
     project_artifacts: tuple[CanonicalProjectArtifact, ...]
+    execution_policy_artifact: CanonicalEvidenceArtifact | None = None
 
 
 @dataclass(frozen=True)

@@ -1,0 +1,104 @@
+schema_version: 3
+topic: 'TrojNet hardware Trojan localization on ISCAS-85 benchmark circuits using
+  unsupervised GraphSAGE embeddings; compare the canonical degree, PCA, and TrojNet
+  community baselines across the governed multi-seed validation fixture
+
+  '
+claim_scope: pipeline_validation
+dataset_origin: synthetic
+dataset_name: controlled_synthetic_iscas85_trojan_localization_v1
+primary_metric:
+  key: auprc
+  direction: maximize
+  minimum_valid_value: 0.0
+smoke_budget_sec: 60
+run_budget_sec: 300
+allowed_inputs: []
+allowed_outputs:
+- path: score_evidence.jsonl
+  required: true
+evaluator:
+  command: python evaluator/evaluator_main.py
+  owner: domain_evaluator
+  timeout_sec: 300
+  required_result_keys: []
+safety:
+  network: none
+  env_policy: allowlist
+  evidence_policy: stage12_independent_verifier_only
+sealing:
+  candidate_manifest: selected_candidate_manifest.json
+  content_hash_algorithm: sha256
+metric_authority:
+  schema_version: 2
+  policy_version: 2
+  domain_id: hardware_trojan_localization
+  evaluator_id: trojnet_iscas85_graphsage_localization
+  experiment_mode: sandbox
+  evaluator_kind: domain_evaluator
+  selector_policy_version: 2
+  selector_input_sha256: 69e43ac438c6cfb48bab112fb40f2b15ffca6b552d50e4440f63053900f0fac2
+  domain_selector_package:
+    path: researchclaw/experiment_runtime/metric_authority/domain-selector-v2.json
+    sha256: b983162993d72567d6e23ae3675d83a9819e30b4cd80d4bfbd6981e5621959aa
+  domain_selector_snapshot:
+    path: stage-09/domain_selector_policy.json
+    sha256: b983162993d72567d6e23ae3675d83a9819e30b4cd80d4bfbd6981e5621959aa
+  domain_profile_snapshot:
+    path: stage-09/domain_profile.json
+    sha256: 53d665bcccbf8c809777bad78960b3e37928659c77ebf6b71c10763ac296046c
+  selector_index_package:
+    path: researchclaw/experiment_runtime/metric_authority/index-v2.json
+    sha256: d47bb05ae5b967f4e58acdf63029c8a1289919a92a3ed2a3891907428f806f1a
+  selector_index_snapshot:
+    path: stage-09/metric_authority_index.json
+    sha256: d47bb05ae5b967f4e58acdf63029c8a1289919a92a3ed2a3891907428f806f1a
+  registry_snapshot:
+    path: stage-09/metric_authority.json
+    sha256: d00366c8dfd04c6e3960344c092cf5c65ec0b399a27436f0db4de6724f61cd0b
+metric_units:
+  accuracy: ratio
+  auprc: ratio
+  auroc: ratio
+  f1: ratio
+  fpr: ratio
+  precision: ratio
+  recall: ratio
+  top_k_precision: ratio
+metric_display_labels:
+  accuracy:
+  - accuracy
+  auprc:
+  - area under precision-recall curve
+  - AUPRC
+  auroc:
+  - area under ROC curve
+  - AUROC
+  f1:
+  - F1
+  - F1 score
+  fpr:
+  - false positive rate
+  - FPR
+  precision:
+  - precision
+  recall:
+  - recall
+  top_k_precision:
+  - top-k precision
+evaluator_authority:
+  kind: domain_evaluator
+  domain_id: hardware_trojan_localization
+  evaluator_id: trojnet_iscas85_graphsage_localization
+  evaluator_schema: trojnet_iscas85_graphsage_localization_v1
+  package_manifest_package_path: researchclaw/experiment_runtime/domain_evaluators/trojnet_iscas85_v1/package-manifest-v1.json
+  package_manifest_package_sha256: 50d4cd34ea5e10b2c7d0f2b912650f2e713378aa54510b179d7f71621a9b5ffd
+  package_manifest_snapshot_path: stage-09/domain_evaluator_package_manifest.json
+  package_manifest_snapshot_sha256: 50d4cd34ea5e10b2c7d0f2b912650f2e713378aa54510b179d7f71621a9b5ffd
+  execution_policy_package_path: researchclaw/experiment_runtime/domain_evaluators/trojnet_iscas85_v1/execution-policy-v1.json
+  execution_policy_package_sha256: 76b6a383f50505aa68a16643a3a0e29d0625e2f0d2b4f65ba47cbe9d99a6a6f8
+  execution_policy_snapshot_path: stage-09/domain_evaluator_execution_policy.json
+  execution_policy_snapshot_sha256: 76b6a383f50505aa68a16643a3a0e29d0625e2f0d2b4f65ba47cbe9d99a6a6f8
+  input_capture_policy_version: 1
+  result_set_policy_version: 2
+  observation_replay_policy_version: 1

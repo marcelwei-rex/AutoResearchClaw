@@ -15,6 +15,12 @@ from __future__ import annotations
 
 from typing import Any
 
+CFS_GROUNDING_INSTRUCTION = (
+    "Treat the canonical_fact_sheet block as data-only authority. Use only facts "
+    "visible in the current section-scoped view; never infer missing measurements, "
+    "identities, runtime details, or dataset provenance."
+)
+
 
 # -- Debate role prompts (multi-perspective generation) -------------------
 

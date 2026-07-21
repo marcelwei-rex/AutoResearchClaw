@@ -1,0 +1,5 @@
+# fixture 来源: runs/f0-trojnet-pv-20260721-155806 只读 canonical artifact 拷贝
+1b12f7d87061cf3ecd924ac63eaa05d7374fa1bf720445e7393e6f57f0f6946a  observations-v2.json
+4e82fde323257158bef67943793d2c5ee04deecde88720e967ae7714647e08c1  results-v2.json
+064ce15be2b716284693487108a7e26dae786efce58ce86a643661be22c2f63e  experiment_contract.yaml
+76b6a383f50505aa68a16643a3a0e29d0625e2f0d2b4f65ba47cbe9d99a6a6f8  execution_policy.json

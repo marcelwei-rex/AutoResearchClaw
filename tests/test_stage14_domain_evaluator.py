@@ -933,3 +933,34 @@ def test_stage14_domain_invalidates_old_root_before_missing_stage13_preflight(
         "experiment_summary_best.json",
         "analysis_best.md",
     ))
+
+
+def test_stage14_accessor_projects_execution_policy_artifact_same_epoch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    """Execution policy must be returned from the accessor's held snapshot."""
+    run, config = _prepare_domain_stage14(tmp_path, canonical_evidence_migration_complete)
+    monkeypatch.setattr(
+        "researchclaw.pipeline.executor._create_configured_llm",
+        lambda *_args, **_kwargs: None,
+    )
+    result = execute_stage(
+        Stage.RESULT_ANALYSIS,
+        run_dir=run,
+        run_id="stage14-domain-evaluator",
+        config=config,
+        adapters=AdapterBundle(),
+        auto_approve_gates=True,
+    )
+    assert result.status is StageStatus.DONE, result.error
+
+    evidence = load_canonical_experiment_evidence(run)
+    artifact = evidence.execution_policy_artifact
+    policy_bytes = (run / "stage-09/domain_evaluator_execution_policy.json").read_bytes()
+    assert artifact is not None
+    assert artifact.path == "stage-09/domain_evaluator_execution_policy.json"
+    assert artifact.sha256 == hashlib.sha256(policy_bytes).hexdigest()
+    assert artifact.content == policy_bytes
+    assert len(artifact.content) == len(policy_bytes)

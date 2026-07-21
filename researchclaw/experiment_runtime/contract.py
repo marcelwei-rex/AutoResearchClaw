@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -110,6 +111,68 @@ def _validate_evaluator_authority(
             errors.append(f"evaluator_authority.{field} must be a nonempty string")
 
 
+def _validate_metric_authority_v2_shape(
+    value: dict[str, Any], errors: list[str]
+) -> None:
+    expected_fields = {
+        "schema_version",
+        "policy_version",
+        "domain_id",
+        "evaluator_id",
+        "experiment_mode",
+        "evaluator_kind",
+        "selector_policy_version",
+        "selector_input_sha256",
+        "domain_selector_package",
+        "domain_selector_snapshot",
+        "domain_profile_snapshot",
+        "selector_index_package",
+        "selector_index_snapshot",
+        "registry_snapshot",
+    }
+    _require_exact_fields(value, expected_fields, "metric_authority", errors)
+    for field in ("schema_version", "policy_version", "selector_policy_version"):
+        if type(value.get(field)) is not int:
+            errors.append(f"metric_authority.{field} must be a true integer")
+    if (
+        value.get("schema_version") != 2
+        or value.get("policy_version") != 2
+        or value.get("selector_policy_version") != 2
+    ):
+        errors.append("metric_authority v2 policy versions mismatch")
+    for field in ("domain_id", "evaluator_id", "experiment_mode", "evaluator_kind"):
+        if not isinstance(value.get(field), str) or not value[field]:
+            errors.append(f"metric_authority.{field} must be a nonempty string")
+    selector_sha = value.get("selector_input_sha256")
+    if (
+        not isinstance(selector_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", selector_sha) is None
+    ):
+        errors.append("metric_authority.selector_input_sha256 must be sha256")
+    if value.get("experiment_mode") != "sandbox":
+        errors.append("metric_authority experiment_mode mismatch")
+    if value.get("evaluator_kind") != "domain_evaluator":
+        errors.append("metric_authority evaluator_kind mismatch")
+    for field in (
+        "domain_selector_package",
+        "domain_selector_snapshot",
+        "domain_profile_snapshot",
+        "selector_index_package",
+        "selector_index_snapshot",
+        "registry_snapshot",
+    ):
+        ref = value.get(field)
+        if not isinstance(ref, dict):
+            errors.append(f"metric_authority.{field} must be an object")
+            continue
+        _require_exact_fields(ref, {"path", "sha256"}, f"metric_authority.{field}", errors)
+        if not isinstance(ref.get("path"), str) or not ref["path"]:
+            errors.append(f"metric_authority.{field}.path must be a nonempty string")
+        sha = ref.get("sha256")
+        if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{64}", sha) is None:
+            errors.append(f"metric_authority.{field}.sha256 must be sha256")
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -128,6 +191,7 @@ def validate_contract_dict(
     data: dict[str, Any],
     *,
     authority_selection: MetricAuthoritySelection | None = None,
+    replay_trusted_authority: bool = True,
 ) -> ExperimentContract:
     errors: list[str] = []
 
@@ -300,8 +364,37 @@ def validate_contract_dict(
         errors.append("evaluator_authority is forbidden for schema v2")
     if schema_version == 3 and isinstance(evaluator_authority, dict):
         _validate_evaluator_authority(evaluator_authority, errors)
+        _validate_metric_authority_v2_shape(metric_authority, errors)
+        if any(
+            evaluator_authority.get(field) != metric_authority.get(field)
+            for field in ("domain_id", "evaluator_id")
+        ):
+            errors.append("metric and evaluator authority identities mismatch")
+        if evaluator_authority.get("kind") != "domain_evaluator":
+            errors.append("evaluator_authority kind mismatch")
+        if set(metric_display_labels) != set(metric_units):
+            errors.append("metric_display_labels must match metric_units exactly")
+        for key, unit in metric_units.items():
+            if (
+                not isinstance(key, str)
+                or not key
+                or not isinstance(unit, str)
+                or not unit
+            ):
+                errors.append("metric_units entries must be nonempty strings")
+        for key, labels in metric_display_labels.items():
+            if (
+                not isinstance(key, str)
+                or not key
+                or not isinstance(labels, list)
+                or not labels
+                or any(not isinstance(label, str) or not label for label in labels)
+            ):
+                errors.append(
+                    "metric_display_labels entries must be nonempty string arrays"
+                )
 
-    if not errors:
+    if not errors and replay_trusted_authority:
         try:
             experiment_mode = metric_authority.get("experiment_mode")
             selected = authority_selection or select_metric_authority(
@@ -377,6 +470,12 @@ def validate_contract_dict(
             dict(evaluator_authority) if isinstance(evaluator_authority, dict) else None
         ),
     )
+
+
+def validate_contract_structure_dict(data: dict[str, Any]) -> ExperimentContract:
+    """Validate captured contract structure without reopening trusted selectors."""
+
+    return validate_contract_dict(data, replay_trusted_authority=False)
 
 
 def load_contract(
