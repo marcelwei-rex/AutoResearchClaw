@@ -127,6 +127,24 @@ def canonical_fact_sheet_sha256(cfs: Mapping[str, Any]) -> str:
 def render_fact_sheet_text(cfs: Mapping[str, Any], *, view: str) -> str:
     """Render one section-scoped, data-only grounding view."""
 
+    payload = fact_sheet_view_payload(cfs, view=view)
+    body = canonical_authority_json_text(_thaw_authority_value(payload)).rstrip("\n")
+    text = f"canonical_fact_sheet view={view}\n```json\n{body}\n```"
+    if view == "results":
+        projection = render_observation_projection(
+            cfs["observation_rows"],
+            primary_metric_key=cfs["primary_metric"]["key"],
+            metric_keys=cfs["metric_keys"],
+        )
+        text += f"\n```text\n{projection}\n```"
+    return text
+
+
+def fact_sheet_view_payload(
+    cfs: Mapping[str, Any], *, view: str
+) -> Mapping[str, Any]:
+    """Return the exact deterministic authority exposed to one heading view."""
+
     if view not in _VIEWS:
         raise ValueError(f"unsupported canonical fact sheet view: {view}")
     common = {
@@ -137,7 +155,11 @@ def render_fact_sheet_text(cfs: Mapping[str, Any], *, view: str) -> str:
         "conditions": cfs["conditions"],
     }
     if view == "introduction":
-        payload = common
+        payload = {
+            **common,
+            "seeds": cfs["seeds"],
+            "counts": cfs["counts"],
+        }
     elif view == "method":
         payload = {
             **common,
@@ -161,18 +183,33 @@ def render_fact_sheet_text(cfs: Mapping[str, Any], *, view: str) -> str:
             **common,
             "primary_metric": cfs["primary_metric"],
             "counts": cfs["counts"],
+            "seeds": cfs["seeds"],
+            "circuit_families": cfs["circuit_families"],
+            "variant_ids": cfs["variant_ids"],
+            "variants_per_family": cfs["variants_per_family"],
+            "scale": cfs["scale"],
             "derived_facts": cfs["derived_facts"],
         }
-    body = canonical_authority_json_text(_thaw_authority_value(payload)).rstrip("\n")
-    text = f"canonical_fact_sheet view={view}\n```json\n{body}\n```"
-    if view == "results":
-        projection = render_observation_projection(
-            cfs["observation_rows"],
-            primary_metric_key=cfs["primary_metric"]["key"],
-            metric_keys=cfs["metric_keys"],
-        )
-        text += f"\n```text\n{projection}\n```"
-    return text
+    return _freeze_authority_value(payload)
+
+
+def fact_sheet_numeric_authority(
+    cfs: Mapping[str, Any], *, view: str
+) -> tuple[int | Decimal, ...]:
+    """Return only metric values explicitly authoritative for one heading view."""
+
+    if view not in _VIEWS:
+        raise ValueError(f"unsupported canonical fact sheet view: {view}")
+    if view != "results":
+        return ()
+    values: list[int | Decimal] = []
+    for condition in cfs["condition_aggregates"]:
+        for key in cfs["metric_keys"]:
+            summary = condition["metrics"][key]
+            values.extend(summary[name] for name in ("mean", "std", "min", "max"))
+    for row in cfs["per_seed_aggregates"]:
+        values.extend(row["metrics"][key] for key in cfs["metric_keys"])
+    return tuple(_metric_value(value) for value in values)
 
 
 def render_observation_projection(
@@ -227,6 +264,44 @@ def compose_grounding_context(cfs: Mapping[str, Any] | None, *, view: str) -> st
     if cfs is None:
         raise ValueError("canonical fact sheet is required")
     return render_fact_sheet_text(cfs, view=view)
+
+
+def fact_sheet_view_for_heading(heading: str) -> str:
+    """Map an active template heading to one deterministic grounding view."""
+
+    normalized = heading.casefold()
+    if any(token in normalized for token in ("result", "discussion")):
+        return "results"
+    if any(
+        token in normalized
+        for token in (
+            "method",
+            "experiment",
+            "model",
+            "theoretical",
+            "phenomenology",
+            "computational",
+        )
+    ):
+        return "method"
+    if any(token in normalized for token in ("limitation", "conclusion")):
+        return "limitations"
+    return "introduction"
+
+
+def build_heading_grounding_contexts(
+    cfs: Mapping[str, Any], headings: Sequence[str]
+) -> Mapping[str, str]:
+    """Render exact section-scoped contexts for one active heading template."""
+
+    if not headings or any(not isinstance(heading, str) or not heading for heading in headings):
+        raise ValueError("grounding headings must be non-empty strings")
+    return {
+        heading: compose_grounding_context(
+            cfs, view=fact_sheet_view_for_heading(heading)
+        )
+        for heading in headings
+    }
 
 
 def _is_domain_evaluator_v2(evidence: Any) -> bool:

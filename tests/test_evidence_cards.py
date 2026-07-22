@@ -35,10 +35,13 @@ from researchclaw.literature.citation_identity import seal_citation_collection
 from researchclaw.literature.citation_plan import (
     CitationPlanContractError,
     build_citation_closure_report,
+    build_citation_closure_from_texts,
     build_citation_writer_instruction,
     build_citation_writer_instruction_from_authority,
     load_final_citation_plan,
     parse_citation_plan,
+    parse_citation_closure_report,
+    validate_citation_closure_report,
     validate_paper_citation_minimum,
 )
 from researchclaw.literature.citation_support import (
@@ -310,9 +313,17 @@ def _prepare_stage23_fixture(
         for claim in plan["claims"]
         for citation in claim["planned_citations"]
     )
-    planned_section = str(plan["claims"][0]["section_path"][0])
-    paper_text = f"## {planned_section}\n\n" + " ".join(
-        f"Evidence [{key}]." for key in planned_keys
+    by_section: dict[str, list[str]] = {}
+    for claim in plan["claims"]:
+        section = str(claim["section_path"][0])
+        key = str(claim["planned_citations"][0]["cite_key"])
+        claim_text = str(claim["claim_text"])
+        insertion = len(claim_text) - 1 if claim_text[-1] in ".!?" else len(claim_text)
+        bound_sentence = claim_text[:insertion] + f" [{key}]" + claim_text[insertion:]
+        by_section.setdefault(section, []).append(bound_sentence)
+    paper_text = "\n\n".join(
+        f"## {section}\n\n" + " ".join(sentences)
+        for section, sentences in by_section.items()
     )
     stage22 = run_dir / "stage-22"
     stage22.mkdir()
@@ -1344,6 +1355,133 @@ def test_citation_closure_rejects_key_outside_assigned_section(
     assert report["valid"] is False
 
 
+def test_citation_closure_rejects_key_on_unbound_sentence_in_assigned_heading(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    config = _real_config_snapshot(run_dir)
+    shortlist = _prepare_stage5(run_dir, [_candidate(1)], config)
+    stage6 = run_dir / "stage-06"
+    stage6.mkdir()
+    assert _execute_knowledge_extract(
+        stage6,
+        run_dir,
+        config,
+        AdapterBundle(),
+        llm=_SequenceLLM([_card_response(shortlist)]),  # type: ignore[arg-type]
+    ).status is StageStatus.DONE
+    stage16 = run_dir / "stage-16"
+    stage16.mkdir()
+    assert _execute_paper_outline(
+        stage16, run_dir, config, AdapterBundle(), llm=None
+    ).status is StageStatus.DONE
+    key = shortlist[0]["cite_key"]
+    paper = f"## Related Work\n\nFabricated unsupported prose [{key}].\n"
+    stage9 = run_dir / "stage-09"
+    stage9.mkdir()
+    dump_contract(derive_contract(config, None), stage9 / "experiment_contract.yaml")
+    metric_path = run_dir / "stage-12" / "runs" / "results.json"
+    metric_path.parent.mkdir(parents=True)
+    metric_path.write_text(
+        json.dumps({"metrics": {"detection_f1": 0.95}}), encoding="utf-8"
+    )
+    structure = canonical_json_text(
+        {
+            "schema_version": 1,
+            "valid": True,
+            "source_sha256": sha256_text(paper),
+            "section_count": 1,
+            "issues": [],
+        }
+    )
+    experiment = canonical_experiment_fact_json_text(
+        build_experiment_fact_closure_report(run_dir, paper_text=paper)
+    )
+
+    report = build_citation_closure_report(
+        run_dir,
+        config,
+        paper_text=paper,
+        structure_report_text=structure,
+        experiment_fact_report_text=experiment,
+    )
+
+    assert report["misplaced_planned_keys"] == [key]
+    assert report["citation_occurrences"] == []
+    assert report["valid"] is False
+    stage17 = run_dir / "stage-17"
+    stage17.mkdir()
+    (stage17 / "paper_draft.md").write_text(paper, encoding="utf-8")
+    (stage17 / "paper_structure_report.json").write_text(
+        structure, encoding="utf-8"
+    )
+    (stage17 / "experiment_fact_closure_report.json").write_text(
+        experiment, encoding="utf-8"
+    )
+    (stage17 / "citation_closure_report.json").write_text(
+        canonical_json_text(report), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="replay failed"):
+        validate_citation_closure_report(run_dir, config)
+
+
+@pytest.mark.parametrize("separator", ["  ", "\t", "\N{NO-BREAK SPACE}"])
+def test_citation_closure_requires_exact_plan_claim_bytes(
+    tmp_path: Path, separator: str
+) -> None:
+    run_dir = tmp_path / "run"
+    config = _real_config_snapshot(run_dir)
+    shortlist = _prepare_stage5(run_dir, [_candidate(1)], config)
+    stage6 = run_dir / "stage-06"
+    stage6.mkdir()
+    assert _execute_knowledge_extract(
+        stage6, run_dir, config, AdapterBundle(),
+        llm=_SequenceLLM([_card_response(shortlist)]),  # type: ignore[arg-type]
+    ).status is StageStatus.DONE
+    stage16 = run_dir / "stage-16"
+    stage16.mkdir()
+    assert _execute_paper_outline(
+        stage16, run_dir, config, AdapterBundle(), llm=None
+    ).status is StageStatus.DONE
+    plan = json.loads((stage16 / "citation_plan.json").read_text(encoding="utf-8"))
+    key = plan["claims"][0]["planned_citations"][0]["cite_key"]
+    plan["claims"][0]["claim_text"] = f"A{separator}bounded claim."
+    plan_text = canonical_json_text(plan)
+    parsed_plan = parse_citation_plan(plan_text)
+    allowlist_text = (run_dir / "stage-06/citation_allowlist.json").read_text(
+        encoding="utf-8"
+    )
+    allowlist = parse_citation_allowlist(allowlist_text)
+    paper = f"## Related Work\n\nA bounded claim [{key}].\n"
+    structure = canonical_json_text(
+        {"schema_version": 1, "valid": True, "source_sha256": sha256_text(paper),
+         "section_count": 1, "issues": []}
+    )
+    stage9 = run_dir / "stage-09"
+    stage9.mkdir()
+    dump_contract(derive_contract(config, None), stage9 / "experiment_contract.yaml")
+    metric_path = run_dir / "stage-12/runs/results.json"
+    metric_path.parent.mkdir(parents=True)
+    metric_path.write_text(json.dumps({"metrics": {"detection_f1": 0.95}}))
+    experiment = canonical_experiment_fact_json_text(
+        build_experiment_fact_closure_report(run_dir, paper_text=paper)
+    )
+
+    report = build_citation_closure_from_texts(
+        paper_text=paper,
+        structure_report_text=structure,
+        experiment_fact_report_text=experiment,
+        citation_plan_text=plan_text,
+        citation_allowlist_text=allowlist_text,
+        plan=parsed_plan,
+        allowlist=allowlist,
+    )
+
+    assert report["misplaced_planned_keys"] == [key]
+    assert report["citation_occurrences"] == []
+    assert report["valid"] is False
+
+
 def test_experiment_fact_closure_binds_metrics_and_synthetic_origin(
     tmp_path: Path,
 ) -> None:
@@ -1660,19 +1798,19 @@ def test_stage17_uses_final_plan_only_and_writes_replayable_closure(
         run_dir, config
     )
     key = shortlist[0]["cite_key"]
+    claim_text = plan["claims"][0]["claim_text"]
     llm = _SequenceLLM(
         [
-                (
-                    "## Title\n\nBounded Study\n\n## Abstract\n\nAbstract.\n\n"
-                    "## Introduction\n\nIntroduction."
-                ),
-                "## Related Work\n\n### Theme\n\nEvidence-backed context.",
-                "## Method\n\nMethod.\n\n## Experiments\n\nExperiment setup.",
-                "## Results\n\nDetection F1 was 95%.\n\n"
-                "## Discussion\n\nDiscussion.\n\n"
-                "## Limitations\n\nLimitations.\n\n"
-                "## Conclusion\n\nConclusion.",
-                f"## Related Work\n\n### Theme\n\nEvidence-backed context [{key}].",
+            (
+                "## Title\n\nBounded Study\n\n## Abstract\n\nAbstract.\n\n"
+                "## Introduction\n\nIntroduction."
+            ),
+            f"## Related Work\n\n### Theme\n\n{claim_text}",
+            "## Method\n\nMethod.\n\n## Experiments\n\nExperiment setup.",
+            "## Results\n\nDetection F1 was 95%.\n\n"
+            "## Discussion\n\nDiscussion.\n\n"
+            "## Limitations\n\nLimitations.\n\n"
+            "## Conclusion\n\nConclusion.",
         ]
     )
     stage17 = run_dir / "stage-17"
@@ -1694,6 +1832,44 @@ def test_stage17_uses_final_plan_only_and_writes_replayable_closure(
     closure = json.loads((stage17 / "citation_closure_report.json").read_text())
     assert closure["valid"] is True
     assert closure["experiment_fact_closure_valid"] is True
+    assert len(closure["citation_occurrences"]) == 1
+    occurrence = closure["citation_occurrences"][0]
+    assert occurrence["claim_id"] == plan["claims"][0]["claim_id"]
+    assert occurrence["cite_key"] == key
+    assert occurrence["sentence_text"] == claim_text
+    assert occurrence["claim_text_sha256"] == sha256_text(claim_text)
+    missing_occurrence = json.loads(json.dumps(closure))
+    missing_occurrence["citation_occurrences"] = []
+    with pytest.raises(ValueError, match="occurrence"):
+        parse_citation_closure_report(canonical_json_text(missing_occurrence))
+    original_closure = json.loads(json.dumps(closure))
+    for field, value in (
+        ("claim_id", "planned-claim-999"),
+        ("claim_text_sha256", "f" * 64),
+        ("citation_plan_sha256", "f" * 64),
+        ("sentence_ordinal", 99),
+        ("char_start", True),
+    ):
+        tampered = json.loads(json.dumps(original_closure))
+        tampered["citation_occurrences"][0][field] = value
+        (stage17 / "citation_closure_report.json").write_text(
+            canonical_json_text(tampered), encoding="utf-8"
+        )
+        with pytest.raises(ValueError):
+            validate_citation_closure_report(run_dir, config)
+    synchronized_hash_tamper = json.loads(json.dumps(original_closure))
+    synchronized_hash_tamper["citation_plan_sha256"] = "f" * 64
+    synchronized_hash_tamper["citation_occurrences"][0][
+        "citation_plan_sha256"
+    ] = "f" * 64
+    (stage17 / "citation_closure_report.json").write_text(
+        canonical_json_text(synchronized_hash_tamper), encoding="utf-8"
+    )
+    with pytest.raises(ValueError):
+        validate_citation_closure_report(run_dir, config)
+    (stage17 / "citation_closure_report.json").write_text(
+        canonical_json_text(original_closure), encoding="utf-8"
+    )
     draft_text = (stage17 / "paper_draft.md").read_text(encoding="utf-8")
     assert validate_paper_citation_minimum(
         run_dir, config, draft_text, minimum=1
@@ -1724,8 +1900,9 @@ def test_stage17_uses_final_plan_only_and_writes_replayable_closure(
     assert "closure" in (review.error or "").lower()
 
 
-def test_stage17_rejects_foreign_key_from_heading_repair(
-    tmp_path: Path,
+@pytest.mark.parametrize("repair_kind", ["foreign_key", "numeric_rewrite"])
+def test_stage17_rejects_non_marker_heading_repair(
+    tmp_path: Path, repair_kind: str,
 ) -> None:
     run_dir = tmp_path / "run"
     config = _real_config_snapshot(run_dir)
@@ -1760,17 +1937,28 @@ def test_stage17_rejects_foreign_key_from_heading_repair(
     assert _execute_paper_outline(
         stage16, run_dir, config, AdapterBundle(), llm=None
     ).status is StageStatus.DONE
+    key = shortlist[0]["cite_key"]
+    related_work = (
+        "Prior work reported 91.5%."
+        if repair_kind == "numeric_rewrite"
+        else "Evidence-backed context."
+    )
+    repair = (
+        f"## Related Work\n\nPrior work reported 92.5% [{key}]."
+        if repair_kind == "numeric_rewrite"
+        else "## Related Work\n\nForeign repair [foreign2024]."
+    )
     llm = _SequenceLLM(
         [
             "## Title\n\nBounded Study\n\n## Abstract\n\nAbstract.\n\n"
             "## Introduction\n\nIntroduction.",
-            "## Related Work\n\nEvidence-backed context.",
+            f"## Related Work\n\n{related_work}",
             "## Method\n\nMethod.\n\n## Experiments\n\nExperiment setup.",
             "## Results\n\nDetection F1 was 95%.\n\n"
             "## Discussion\n\nDiscussion.\n\n"
             "## Limitations\n\nLimitations.\n\n"
             "## Conclusion\n\nConclusion.",
-            "## Related Work\n\nForeign repair [foreign2024].",
+            repair,
         ]
     )
     stage17 = run_dir / "stage-17"
@@ -1786,6 +1974,7 @@ def test_stage17_rejects_foreign_key_from_heading_repair(
     assert "heading citation closure failed" in (result.error or "").lower()
     assert (stage17 / "paper_draft_invalid.md").is_file()
     assert not (stage17 / "paper_draft.md").exists()
+    assert not (stage17 / "experiment_fact_closure_report.json").exists()
     assert not (stage17 / "citation_closure_report.json").exists()
 
 

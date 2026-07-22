@@ -4271,6 +4271,62 @@ class TestDataIntegrityBlock:
             issue["code"] for issue in report["issues"]
         }
 
+    def test_domain_stage17_rejects_unscoped_hitl_without_rewrite_call(
+        self,
+        run_dir: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.pipeline.stage_impls import _paper_writing
+
+        _write_prior_artifact(run_dir, 16, "outline.md", "# Outline\n## Abstract\n")
+        runs_dir = run_dir / "stage-12" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        (runs_dir / "results.json").write_text(
+            json.dumps({"metrics": {"detection_f1": 0.4753327669}}),
+            encoding="utf-8",
+        )
+        stage_dir = run_dir / "stage-17"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        (stage_dir / "hitl_guidance.md").write_text(
+            "Rewrite all result claims.", encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            _paper_writing, "build_canonical_fact_sheet", lambda _evidence: {"active": True}
+        )
+        monkeypatch.setattr(
+            _paper_writing,
+            "build_heading_grounding_contexts",
+            lambda _cfs, headings: {heading: "CFS_BOUND" for heading in headings},
+        )
+
+        class DomainHitlLLM(FakeLLMClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.responses = iter(
+                    (
+                        "## Title\n\nPaper.\n\n## Abstract\n\nA.\n\n## Introduction\n\nI.\n\n## Related Work\n\nR.",
+                        "## Method\n\nM.\n\n## Experiments\n\nE.",
+                        "## Results\n\nR.\n\n## Discussion\n\nD.",
+                        "## Limitations\n\nL.\n\n## Conclusion\n\nC.",
+                    )
+                )
+
+            def chat(self, messages: list[dict[str, str]], **kwargs: object):
+                self.response_text = next(self.responses)
+                return super().chat(messages, **kwargs)
+
+        llm = DomainHitlLLM()
+        result = rc_executor._execute_paper_draft(
+            stage_dir, run_dir, rc_config, adapters, llm=llm
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert "does not accept unscoped HITL" in str(result.error)
+        assert len(llm.calls) == 4
+        assert not (stage_dir / "paper_draft.md").exists()
+
     def test_paper_draft_closure_failure_removes_canonical_artifacts(
         self,
         run_dir: Path,

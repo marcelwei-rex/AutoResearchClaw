@@ -40,6 +40,17 @@ from typing import Any, Mapping
 import pytest
 import yaml
 
+from researchclaw.experiment_runtime.contract import (
+    parse_contract_bytes,
+    validate_contract_dict,
+)
+from researchclaw.literature.experiment_fact_closure import (
+    build_experiment_fact_closure_from_text,
+    canonical_experiment_fact_json_text,
+    parse_experiment_fact_closure_report,
+    remove_unsupported_experiment_fact_blocks,
+    replay_experiment_fact_closure,
+)
 from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalEvidenceArtifact,
     CanonicalExperimentEvidence,
@@ -49,6 +60,7 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     canonical_authority_json_text,
     canonical_decimal,
 )
+from researchclaw.pipeline.manuscript_sections import parse_manuscript
 from researchclaw.pipeline.canonical_fact_sheet import (  # noqa: F401
     CFSIntegrityError,
     MAX_PROJECTION_ROWS,
@@ -1069,3 +1081,452 @@ class TestCFSImmutabilityAndSerialization:
             cfs
         )
         assert canonical_fact_sheet_sha256(cfs) == canonical_fact_sheet_sha256(cfs)
+
+
+def _fact_closure(paper_text: str, evidence: CanonicalExperimentEvidence | None = None):
+    selected = evidence or _make_evidence()
+    return build_experiment_fact_closure_from_text(
+        paper_text=paper_text,
+        evidence=selected,
+        contract=validate_contract_dict(
+            parse_contract_bytes(selected.experiment_contract_bytes)
+        ),
+    )
+
+
+def _paper(body: str, *, heading: str = "Results") -> str:
+    sections = {
+        "Title": "Canonical grounding test.",
+        "Abstract": "A bounded validation study.",
+        "Introduction": "The evaluation scope is fixed.",
+        "Related Work": "Prior methods are discussed without new facts.",
+        "Method": "The canonical evaluator is replayed.",
+        "Experiments": "The fixed design is used.",
+        "Results": "The evidence is summarized.",
+        "Discussion": "The evidence boundary is retained.",
+        "Limitations": "Claims remain within pipeline validation.",
+        "Conclusion": "The bounded result is summarized.",
+    }
+    sections[heading] = body
+    return "\n\n".join(f"## {name}\n\n{text}" for name, text in sections.items()) + "\n"
+
+
+class TestExperimentFactClosureV3:
+    def test_domain_evaluator_report_binds_fact_sheet(self) -> None:
+        evidence = _make_evidence()
+        cfs = _build_cfs(evidence)
+        report = _fact_closure(
+            _paper(
+                "There were 162 observations in total. The evaluation used 3 seeds. "
+                "It covered 3 conditions. It used 6 families. "
+                "The design contained 18 variants. It used 2 invocations."
+            ),
+            evidence,
+        )
+
+        assert report["schema_version"] == 3
+        assert report["fact_sheet_schema_version"] == 1
+        assert report["canonical_fact_sheet_sha256"] == canonical_fact_sheet_sha256(cfs)
+        assert report["structured_fact_violations"] == []
+        assert report["valid"] is True
+
+    @pytest.mark.parametrize(
+        ("claim", "kind"),
+        [
+            ("The evaluation used 2 seeds.", "count_mismatch"),
+            ("The evaluation included 10 circuits.", "ambiguous_count_claim"),
+            ("We completed 20 experimental runs.", "ambiguous_count_claim"),
+            ("There were 38 individual observations.", "ambiguous_count_claim"),
+            ("Seven were summarized as 7 perfect runs.", "unsupported_derived_count"),
+        ],
+    )
+    def test_count_claims_fail_closed(self, claim: str, kind: str) -> None:
+        report = _fact_closure(_paper(claim, heading="Introduction"))
+        assert kind in {item["kind"] for item in report["structured_fact_violations"]}
+        assert report["valid"] is False
+
+    @pytest.mark.parametrize(
+        ("claim", "kind"),
+        [
+            ("The study recorded 3 conditions failed.", "unsupported_derived_count"),
+            ("The study had 2 comparators successful.", "unsupported_derived_count"),
+            ("We recorded 161 overall observations.", "count_mismatch"),
+            ("We recorded 99 complete observations.", "count_mismatch"),
+        ],
+    )
+    def test_post_unit_predicates_and_global_qualifiers_fail_closed(
+        self, claim: str, kind: str
+    ) -> None:
+        report = _fact_closure(_paper(claim))
+        assert kind in {item["kind"] for item in report["structured_fact_violations"]}
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "We used the Trust-HUB benchmark suite.",
+            "The data came from Trust-HUB.",
+            "We evaluated on ISCAS-89.",
+            "We used c1355 as the benchmark.",
+            "The evaluation used Trust-HUB data.",
+            "We trained with Trust-HUB samples.",
+            "The results on Trust-HUB were strong.",
+        ],
+    )
+    def test_unbound_source_names_are_rejected(self, claim: str) -> None:
+        report = _fact_closure(_paper(claim))
+        assert "provenance_violation" in {
+            item["kind"] for item in report["structured_fact_violations"]
+        }
+
+    def test_bound_source_name_is_allowed(self) -> None:
+        for claim in (
+            "We evaluated on ISCAS-85 benchmark circuits.",
+            "We evaluated ISCAS-85.",
+            "We evaluated performance.",
+        ):
+            report = _fact_closure(_paper(claim))
+            assert not any(
+                item["kind"] == "provenance_violation"
+                for item in report["structured_fact_violations"]
+            )
+
+    @pytest.mark.parametrize("metric", ["F1", "AUPRC"])
+    def test_evaluated_metric_is_not_a_source_claim(self, metric: str) -> None:
+        report = _fact_closure(_paper(f"We evaluated {metric}."))
+        assert not any(
+            item["kind"] == "provenance_violation"
+            for item in report["structured_fact_violations"]
+        )
+
+    def test_runtime_and_comparator_claims_are_checked(self) -> None:
+        report = _fact_closure(
+            _paper(
+                "Training used PyTorch 2.1.0 on MPS for 45 seconds. "
+                "Comparator results were left for future work."
+            )
+        )
+        kinds = {item["kind"] for item in report["structured_fact_violations"]}
+        assert "runtime_violation" in kinds
+        assert "comparator_presence_violation" in kinds
+
+    def test_bound_runtime_is_allowed(self) -> None:
+        report = _fact_closure(
+            _paper("Execution used Python 3.11 with PyTorch 2.12.1 on CPU.")
+        )
+        assert not any(
+            item["kind"] == "runtime_violation"
+            for item in report["structured_fact_violations"]
+        )
+
+    def test_negated_foreign_devices_do_not_trigger_runtime_violation(self) -> None:
+        report = _fact_closure(
+            _paper("No GPU or MPS was used; execution was CPU-only.")
+        )
+        assert not any(
+            item["kind"] == "runtime_violation"
+            for item in report["structured_fact_violations"]
+        )
+
+    def test_explicit_global_circuit_variants_are_allowed(self) -> None:
+        report = _fact_closure(_paper("The design used 18 circuit variants."))
+        assert not any(
+            item["kind"] in {"ambiguous_count_claim", "count_mismatch"}
+            for item in report["structured_fact_violations"]
+        )
+
+    def test_citation_bound_literature_number_remains_invalid_under_policy_a(self) -> None:
+        cited = _fact_closure(
+            _paper("Prior work reported 99.9% [smith2024deep].", heading="Related Work")
+        )
+        assert cited["unknown_numeric_values"] == [Decimal("0.999")]
+        assert cited["citation_bound_numeric_claims"]
+        assert cited["valid"] is False
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "The study recorded 3 conditions passed.",
+            "The study recorded 3 conditions succeeded.",
+            "The study recorded 2 comparator failures.",
+            "The study recorded 2 comparator successes.",
+        ],
+    )
+    def test_derived_count_predicates_are_default_denied(self, claim: str) -> None:
+        report = _fact_closure(_paper(claim))
+        assert "unsupported_derived_count" in {
+            item["kind"] for item in report["structured_fact_violations"]
+        }
+
+    def test_neutral_count_is_allowed_without_masking_following_metric(self) -> None:
+        neutral = _fact_closure(_paper("Across 3 seeds, the evaluation was repeated."))
+        with_metric = _fact_closure(
+            _paper("Across 3 seeds, AUPRC reached 0.999.")
+        )
+
+        assert neutral["valid"] is True
+        assert not neutral["structured_fact_violations"]
+        assert with_metric["unknown_numeric_values"] == [Decimal("0.999")]
+        assert with_metric["valid"] is False
+
+    def test_bare_global_observation_count_is_allowed(self) -> None:
+        valid = _fact_closure(_paper("The evaluation contains 162 observations."))
+        invalid = _fact_closure(_paper("The evaluation contains 161 observations."))
+
+        assert valid["valid"] is True
+        assert not valid["structured_fact_violations"]
+        assert "count_mismatch" in {
+            item["kind"] for item in invalid["structured_fact_violations"]
+        }
+
+    def test_count_clause_accepts_optional_article_before_bound_metric(self) -> None:
+        cfs = _build_cfs(_make_evidence())
+        value = canonical_decimal(cfs["primary_metric"]["value"])
+        report = _fact_closure(
+            _paper(f"Across 3 seeds, the AUPRC reached {value}.")
+        )
+
+        assert report["valid"] is True
+        assert not report["structured_fact_violations"]
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "The study covered 3 conditions, all failed.",
+            "The study covered 3 conditions, all succeeded.",
+            "The study covered 3 conditions, all were flawless.",
+            "The study covered 3 conditions, all outperformed the baseline.",
+        ],
+    )
+    def test_comma_count_predicates_are_rejected(self, claim: str) -> None:
+        report = _fact_closure(_paper(claim))
+        assert "unsupported_derived_count" in {
+            item["kind"] for item in report["structured_fact_violations"]
+        }
+
+    def test_introduction_schema_number_is_not_metric_authority(self) -> None:
+        report = _fact_closure(
+            _paper("Our method achieved 1.0.", heading="Introduction")
+        )
+        assert report["unknown_numeric_values"] == [Decimal("1.0")]
+        assert report["valid"] is False
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "We used the Trust-HUB dataset.",
+            "We are using the Trust-HUB dataset.",
+            "We evaluated on the Trust-HUB dataset.",
+            "We evaluated with the Trust-HUB dataset.",
+            "We evaluated Trust-HUB.",
+            "We trained with the Trust-HUB dataset.",
+            "We sourced from the Trust-HUB dataset.",
+            "We sourced samples from Trust-HUB.",
+            "We obtained from the Trust-HUB dataset.",
+            "We drew on the Trust-HUB data.",
+            "We leveraged the Trust-HUB dataset.",
+            "The present study used the Trust-HUB dataset.",
+            "The current evaluation trained on the Trust-HUB dataset.",
+            "The data came from the Trust-HUB dataset.",
+            "The results on the Trust-HUB dataset were strong.",
+        ],
+    )
+    def test_optional_article_unbound_experiment_sources_are_rejected(
+        self, claim: str
+    ) -> None:
+        report = _fact_closure(_paper(claim, heading="Experiments"))
+        assert "provenance_violation" in {
+            item["kind"] for item in report["structured_fact_violations"]
+        }
+
+    def test_citation_never_exempts_unbound_source_use(self) -> None:
+        literature = _fact_closure(
+            _paper(
+                "Prior work evaluated on the Trust-HUB dataset [smith2024deep].",
+                heading="Related Work",
+            )
+        )
+        ours = _fact_closure(
+            _paper(
+                "Our method used Trust-HUB [smith2024deep].",
+                heading="Introduction",
+            )
+        )
+
+        for report in (literature, ours):
+            assert "provenance_violation" in {
+                item["kind"] for item in report["structured_fact_violations"]
+            }
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "The results on average remained stable.",
+            "The evaluation was evaluated on Monday.",
+        ],
+    )
+    def test_non_source_phrases_are_not_provenance_claims(self, claim: str) -> None:
+        report = _fact_closure(_paper(claim))
+        assert not any(
+            item["kind"] == "provenance_violation"
+            for item in report["structured_fact_violations"]
+        )
+
+    @pytest.mark.parametrize(
+        ("claim", "kind"),
+        [
+            ("The GraphSAGE-XL condition was evaluated.", "condition_violation"),
+            ("Graphs contained nodes 160 to 3,512.", "scale_violation"),
+            (
+                "Table 2 lists all per-run values from the evaluation.",
+                "table_completeness_violation",
+            ),
+        ],
+    )
+    def test_other_structured_claims_fail_closed(self, claim: str, kind: str) -> None:
+        report = _fact_closure(_paper(claim))
+        assert kind in {item["kind"] for item in report["structured_fact_violations"]}
+
+    def test_bound_condition_and_scale_are_allowed(self) -> None:
+        report = _fact_closure(
+            _paper(
+                "The trojnet community GraphSAGE condition was evaluated. "
+                "Graphs contained nodes 196 to 2,480."
+            )
+        )
+        kinds = {item["kind"] for item in report["structured_fact_violations"]}
+        assert "condition_violation" not in kinds
+        assert "scale_violation" not in kinds
+
+    def test_parser_rejects_fact_sheet_binding_tamper(self) -> None:
+        evidence = _make_evidence()
+        paper = _paper("The evaluation used 3 seeds.")
+        report = _fact_closure(paper, evidence)
+        report["canonical_fact_sheet_sha256"] = "f" * 64
+        parsed = parse_experiment_fact_closure_report(
+            canonical_experiment_fact_json_text(report)
+        )
+        assert parsed["canonical_fact_sheet_sha256"] == "f" * 64
+        with pytest.raises(ValueError, match="replay failed"):
+            replay_experiment_fact_closure(
+                paper_bytes=paper.encode("utf-8"),
+                stored_report_bytes=canonical_experiment_fact_json_text(report).encode(
+                    "utf-8"
+                ),
+                evidence=evidence,
+            )
+
+    def test_generic_v1_keeps_schema_v2(self) -> None:
+        evidence = _make_evidence(manifest=_make_manifest(generation_kind="generic"))
+        report = _fact_closure(_paper("The rate was 1."), evidence)
+        assert report["schema_version"] == 2
+        assert "canonical_fact_sheet_sha256" not in report
+
+    def test_structured_violation_repair_removes_only_bound_sentence(self) -> None:
+        source = _paper(
+            "The evidence remains canonical. We completed 20 experimental runs. "
+            "The primary aggregate is retained."
+        )
+        initial = _fact_closure(source)
+        repaired, log = remove_unsupported_experiment_fact_blocks(
+            source,
+            grounded_numeric_values=initial["grounded_numeric_values"],
+            dataset_origin=initial["dataset_origin"],
+            structured_fact_violations=initial["structured_fact_violations"],
+            canonical_fact_sheet=_build_cfs(_make_evidence()),
+        )
+        after = _fact_closure(repaired)
+
+        assert "20 experimental runs" not in repaired
+        assert "The evidence remains canonical." in repaired
+        assert "The primary aggregate is retained." in repaired
+        assert after["valid"] is True
+        assert log["operations"][0]["block_type"] == "sentence"
+
+    def test_duplicate_structured_claims_bind_distinct_occurrences(self) -> None:
+        source = _paper(
+            "We completed 20 experimental runs. The evidence remains canonical. "
+            "We completed 20 experimental runs."
+        )
+        initial = _fact_closure(source)
+        violations = [
+            item
+            for item in initial["structured_fact_violations"]
+            if item["kind"] == "ambiguous_count_claim"
+        ]
+        assert len(violations) == 2
+        assert violations[0]["char_start"] != violations[1]["char_start"]
+        repaired, _log = remove_unsupported_experiment_fact_blocks(
+            source,
+            grounded_numeric_values=initial["grounded_numeric_values"],
+            dataset_origin=initial["dataset_origin"],
+            structured_fact_violations=violations,
+            canonical_fact_sheet=_build_cfs(_make_evidence()),
+        )
+        assert "20 experimental runs" not in repaired
+        assert "The evidence remains canonical." in repaired
+
+    def test_structured_repair_rejects_oversize_char_end(self) -> None:
+        source = _paper("We completed 20 experimental runs.")
+        initial = _fact_closure(source)
+        violation = dict(initial["structured_fact_violations"][0])
+        document = parse_manuscript(source, strict=True)
+        section = next(item for item in document.sections if item.section_id == violation["section_id"])
+        start = violation["char_start"]
+        violation["char_end"] = len(section.body) + 1
+        violation["claim"] = section.body[start:]
+        violation["claim_sha256"] = hashlib.sha256(
+            violation["claim"].encode("utf-8")
+        ).hexdigest()
+
+        with pytest.raises(ValueError, match="invalid structured repair claim"):
+            remove_unsupported_experiment_fact_blocks(
+                source,
+                grounded_numeric_values=initial["grounded_numeric_values"],
+                dataset_origin=initial["dataset_origin"],
+                structured_fact_violations=[violation],
+                canonical_fact_sheet=_build_cfs(_make_evidence()),
+            )
+
+    @pytest.mark.parametrize("bad_span", [True, 1.0])
+    def test_structured_repair_rejects_non_true_int_span(
+        self, bad_span: object
+    ) -> None:
+        source = _paper("We completed 20 experimental runs.")
+        initial = _fact_closure(source)
+        violation = dict(initial["structured_fact_violations"][0])
+        violation["char_start"] = bad_span
+
+        with pytest.raises(ValueError, match="invalid structured repair claim"):
+            remove_unsupported_experiment_fact_blocks(
+                source,
+                grounded_numeric_values=initial["grounded_numeric_values"],
+                dataset_origin=initial["dataset_origin"],
+                structured_fact_violations=[violation],
+                canonical_fact_sheet=_build_cfs(_make_evidence()),
+            )
+
+    def test_structured_repair_rejects_synchronized_innocent_sentence_binding(self) -> None:
+        source = _paper(
+            "The innocent sentence remains. We completed 20 experimental runs."
+        )
+        initial = _fact_closure(source)
+        document = parse_manuscript(source, strict=True)
+        section = next(item for item in document.sections if item.path[0] == "Results")
+        innocent = "The innocent sentence remains."
+        start = section.body.index(innocent)
+        forged = dict(initial["structured_fact_violations"][0])
+        forged.update(
+            char_start=start,
+            char_end=start + len(innocent),
+            claim=innocent,
+            claim_sha256=hashlib.sha256(innocent.encode("utf-8")).hexdigest(),
+        )
+
+        with pytest.raises(ValueError, match="fresh replay"):
+            remove_unsupported_experiment_fact_blocks(
+                source,
+                grounded_numeric_values=initial["grounded_numeric_values"],
+                dataset_origin=initial["dataset_origin"],
+                structured_fact_violations=[forged],
+                canonical_fact_sheet=_build_cfs(_make_evidence()),
+            )

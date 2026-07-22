@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -38,7 +39,6 @@ from researchclaw.literature.citation_identity import (
     validate_registry_artifacts,
 )
 from researchclaw.literature.screening import sha256_text
-from researchclaw.pipeline.sectional_validation import extract_citation_keys
 from researchclaw.pipeline.manuscript_sections import (
     ManuscriptStructureError,
     parse_manuscript,
@@ -51,10 +51,203 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
 
 CITATION_PLAN_SCHEMA_VERSION = 1
 CITATION_PLAN_VERSION = 2
+_STRICT_CITE_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\d{4}[A-Za-z0-9_-]*")
+_MARKDOWN_CITATION_CANDIDATE_RE = re.compile(r"\[([^\[\]\n]+)\]")
+_LATEX_CITATION_CANDIDATE_RE = re.compile(
+    r"\\(?:cite|citep|citet)\*?(?:\[[^\]\n]*\]){0,2}\{([^{}\n]+)\}"
+)
 
 
 class CitationPlanContractError(ValueError):
     """Raised when a citation plan is not closed over retained evidence."""
+
+
+@dataclass(frozen=True)
+class CitationOccurrence:
+    """One strict, unescaped citation marker bound to its prose sentence."""
+
+    syntax: str
+    keys: tuple[str, ...]
+    char_start: int
+    char_end: int
+    sentence_start: int
+    sentence_end: int
+    sentence_sha256: str
+    sentence_ordinal: int
+    occurrence_ordinal: int
+
+
+def strict_sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Return deterministic non-empty prose sentence spans."""
+
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for index, character in enumerate(text):
+        boundary = character == "\n" or (
+            character in ".!?"
+            and (index + 1 == len(text) or text[index + 1].isspace())
+        )
+        if not boundary:
+            continue
+        end = index if character == "\n" else index + 1
+        left, right = _trim_span(text, start, end)
+        if left < right:
+            spans.append((left, right))
+        start = index + 1
+    left, right = _trim_span(text, start, len(text))
+    if left < right:
+        spans.append((left, right))
+    return tuple(spans)
+
+
+def parse_strict_citation_occurrences(text: str) -> tuple[CitationOccurrence, ...]:
+    """Parse only grammar-valid, unescaped Markdown and LaTeX citations."""
+
+    candidates: list[tuple[int, int, str, tuple[str, ...]]] = []
+    for syntax, pattern in (
+        ("markdown", _MARKDOWN_CITATION_CANDIDATE_RE),
+        ("latex", _LATEX_CITATION_CANDIDATE_RE),
+    ):
+        for match in pattern.finditer(text):
+            if _is_escaped_marker(text, match.start(), syntax):
+                continue
+            keys = _parse_marker_keys(match.group(1))
+            if keys is None:
+                continue
+            candidates.append((match.start(), match.end(), syntax, keys))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    if any(left[1] > right[0] for left, right in zip(candidates, candidates[1:])):
+        raise CitationPlanContractError("overlapping citation occurrences")
+
+    sentence_spans = strict_sentence_spans(text)
+    ordinals: dict[tuple[int, int], int] = {}
+    sentence_hash_ordinals: dict[str, int] = {}
+    occurrences: list[CitationOccurrence] = []
+    for start, end, syntax, keys in candidates:
+        sentence = next(
+            (
+                span for span in sentence_spans
+                if span[0] <= start and end <= span[1]
+            ),
+            None,
+        )
+        if sentence is None:
+            raise CitationPlanContractError("citation occurrence lacks sentence anchor")
+        ordinal = ordinals.get(sentence, 0)
+        ordinals[sentence] = ordinal + 1
+        sentence_markers = [
+            item for item in candidates
+            if sentence[0] <= item[0] and item[1] <= sentence[1]
+        ]
+        anchor = _remove_spans(
+            text[sentence[0]:sentence[1]],
+            [
+                (item[0] - sentence[0], item[1] - sentence[0])
+                for item in sentence_markers
+            ],
+            remove_leading_space=True,
+        )
+        sentence_sha256 = hashlib.sha256(anchor.encode("utf-8")).hexdigest()
+        sentence_ordinal = sentence_hash_ordinals.get(sentence_sha256, 0)
+        if ordinal == 0:
+            sentence_hash_ordinals[sentence_sha256] = sentence_ordinal + 1
+        occurrences.append(
+            CitationOccurrence(
+                syntax=syntax,
+                keys=keys,
+                char_start=start,
+                char_end=end,
+                sentence_start=sentence[0],
+                sentence_end=sentence[1],
+                sentence_sha256=sentence_sha256,
+                sentence_ordinal=sentence_ordinal,
+                occurrence_ordinal=ordinal,
+            )
+        )
+    return tuple(occurrences)
+
+
+def strict_citation_keys(text: str) -> frozenset[str]:
+    return frozenset(
+        key for occurrence in parse_strict_citation_occurrences(text)
+        for key in occurrence.keys
+    )
+
+
+def extract_citation_keys(text: str) -> frozenset[str]:
+    """Compatibility entry point backed by the strict shared parser."""
+
+    return strict_citation_keys(text)
+
+
+def filter_strict_citation_markers(
+    text: str, allowed_keys: frozenset[str]
+) -> str:
+    """Filter only strict citation occurrences; preserve all other brackets."""
+
+    replacements: list[tuple[int, int, str]] = []
+    for occurrence in parse_strict_citation_occurrences(text):
+        retained = tuple(key for key in occurrence.keys if key in allowed_keys)
+        if retained == occurrence.keys:
+            continue
+        if not retained:
+            replacement = ""
+        elif occurrence.syntax == "markdown":
+            replacement = f"[{', '.join(retained)}]"
+        else:
+            marker = text[occurrence.char_start:occurrence.char_end]
+            replacement = marker[:marker.index("{") + 1] + ",".join(retained) + "}"
+        replacements.append((occurrence.char_start, occurrence.char_end, replacement))
+    for start, end, replacement in reversed(replacements):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
+def strip_strict_citation_markers(text: str) -> str:
+    occurrences = parse_strict_citation_occurrences(text)
+    return _remove_spans(
+        text,
+        [(item.char_start, item.char_end) for item in occurrences],
+        remove_leading_space=True,
+    )
+
+
+def _parse_marker_keys(value: str) -> tuple[str, ...] | None:
+    parts = tuple(item.strip() for item in re.split(r"[,;]", value))
+    if (
+        not parts
+        or any(not item or _STRICT_CITE_KEY_RE.fullmatch(item) is None for item in parts)
+        or len(parts) != len(set(parts))
+    ):
+        return None
+    return parts
+
+
+def _is_escaped_marker(text: str, start: int, syntax: str) -> bool:
+    slash_count = 0
+    index = start - 1 if syntax == "markdown" else start
+    while index >= 0 and text[index] == "\\":
+        slash_count += 1
+        index -= 1
+    return slash_count % 2 == 1 if syntax == "markdown" else slash_count % 2 == 0
+
+
+def _trim_span(text: str, start: int, end: int) -> tuple[int, int]:
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return start, end
+
+
+def _remove_spans(
+    text: str, spans: list[tuple[int, int]], *, remove_leading_space: bool
+) -> str:
+    for start, end in sorted(spans, reverse=True):
+        if remove_leading_space and start > 0 and text[start - 1] == " ":
+            start -= 1
+        text = text[:start] + text[end:]
+    return text
 
 
 @dataclass(frozen=True)
@@ -471,7 +664,7 @@ def attribute_citation_keys_to_top_level_headings(
     attributed: dict[str, set[str]] = {}
     for section in document.sections:
         top_level = section.path[0]
-        attributed.setdefault(top_level, set()).update(extract_citation_keys(section.body))
+        attributed.setdefault(top_level, set()).update(strict_citation_keys(section.body))
     return {
         heading: frozenset(keys)
         for heading, keys in attributed.items()
@@ -517,7 +710,7 @@ def validate_final_paper_citations(
         raise CitationPlanContractError(
             f"cannot validate final paper citations: {exc}"
         ) from exc
-    cited = set(extract_citation_keys(paper_text))
+    cited = set(strict_citation_keys(paper_text))
     eligible = set(allowlist["eligible_keys"])
     planned = {
         citation["cite_key"]
@@ -576,7 +769,7 @@ def validate_paper_citation_minimum_from_authority(
 
     if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 0:
         raise CitationPlanContractError("citation minimum must be a nonnegative integer")
-    cited = set(extract_citation_keys(paper_text))
+    cited = set(strict_citation_keys(paper_text))
     eligible = set(allowlist["eligible_keys"])
     planned = {
         citation["cite_key"]
@@ -668,13 +861,14 @@ def build_citation_closure_from_texts(
         for claim in plan["claims"]
         for citation in claim["planned_citations"]
     ]
-    cited = sorted(extract_citation_keys(paper_text))
+    cited = sorted(strict_citation_keys(paper_text))
     unknown = sorted(set(cited) - set(allowlist["eligible_keys"]))
     unplanned = sorted(set(cited) - set(planned))
     missing = sorted(set(planned) - set(cited))
     structure_valid = False
     experiment_valid = experiment.get("valid") is True
     misplaced: list[str] = []
+    citation_occurrences: list[dict[str, Any]] = []
     try:
         document = parse_manuscript(paper_text, strict=True)
     except ManuscriptStructureError:
@@ -691,20 +885,14 @@ def build_citation_closure_from_texts(
             and structure.get("issues") == []
         )
         if structure_valid:
-            section_keys = {
-                heading.casefold(): keys
-                for heading, keys in attribute_citation_keys_to_top_level_headings(
-                    paper_text
-                ).items()
-            }
-            for claim in plan["claims"]:
-                assigned = claim["section_path"][-1].casefold()
-                for citation in claim["planned_citations"]:
-                    if citation["cite_key"] not in section_keys.get(assigned, set()):
-                        misplaced.append(citation["cite_key"])
+            citation_occurrences, misplaced = _bind_plan_citation_occurrences(
+                document=document,
+                plan=plan,
+                citation_plan_sha256=sha256_text(citation_plan_text),
+            )
     misplaced = sorted(set(misplaced))
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "paper_path": "stage-17/paper_draft.md",
         "paper_sha256": sha256_text(paper_text),
         "citation_plan_path": "stage-16/citation_plan.json",
@@ -714,6 +902,7 @@ def build_citation_closure_from_texts(
         "unplanned_keys": unplanned,
         "missing_planned_keys": missing,
         "misplaced_planned_keys": misplaced,
+        "citation_occurrences": citation_occurrences,
         "structure_report_path": "stage-17/paper_structure_report.json",
         "structure_report_sha256": sha256_text(structure_report_text),
         "structure_valid": structure_valid,
@@ -784,7 +973,7 @@ def parse_citation_closure_report(text: str) -> dict[str, Any]:
             "schema_version", "paper_path", "paper_sha256",
             "citation_plan_path", "citation_plan_sha256", "cited_keys",
             "unknown_keys", "unplanned_keys", "missing_planned_keys",
-            "misplaced_planned_keys",
+            "misplaced_planned_keys", "citation_occurrences",
             "structure_report_path", "structure_report_sha256",
             "structure_valid", "experiment_fact_closure_report_path",
             "experiment_fact_closure_report_sha256",
@@ -792,7 +981,7 @@ def parse_citation_closure_report(text: str) -> dict[str, Any]:
         },
         "citation closure report",
     )
-    if payload["schema_version"] != 1:
+    if payload["schema_version"] != 2:
         raise CitationPlanContractError("unsupported citation closure schema")
     expected_paths = {
         "paper_path": "stage-17/paper_draft.md",
@@ -817,12 +1006,45 @@ def parse_citation_closure_report(text: str) -> dict[str, Any]:
             not isinstance(item, str) or not item.strip() for item in value
         ) or value != sorted(set(value)):
             raise CitationPlanContractError(f"invalid closure {field}")
+    occurrences = payload["citation_occurrences"]
+    if not isinstance(occurrences, list):
+        raise CitationPlanContractError("citation_occurrences must be a list")
+    parsed_occurrences = [
+        _parse_citation_occurrence_record(
+            item,
+            citation_plan_sha256=payload["citation_plan_sha256"],
+        )
+        for item in occurrences
+    ]
+    if parsed_occurrences != sorted(
+        parsed_occurrences,
+        key=lambda item: (item["claim_id"], item["cite_key"]),
+    ):
+        raise CitationPlanContractError("citation occurrence records are not canonical")
+    if len({item["claim_id"] for item in parsed_occurrences}) != len(
+        parsed_occurrences
+    ):
+        raise CitationPlanContractError("duplicate citation occurrence claim binding")
     if (
         not isinstance(payload["structure_valid"], bool)
         or not isinstance(payload["experiment_fact_closure_valid"], bool)
         or not isinstance(payload["valid"], bool)
     ):
         raise CitationPlanContractError("closure validity fields must be booleans")
+    if payload["valid"]:
+        occurrence_keys = sorted(item["cite_key"] for item in parsed_occurrences)
+        if not parsed_occurrences or occurrence_keys != payload["cited_keys"]:
+            raise CitationPlanContractError(
+                "valid citation closure occurrence keys do not match cited_keys"
+            )
+        expected_claim_ids = [
+            f"planned-claim-{index:03d}"
+            for index in range(1, len(parsed_occurrences) + 1)
+        ]
+        if [item["claim_id"] for item in parsed_occurrences] != expected_claim_ids:
+            raise CitationPlanContractError(
+                "valid citation closure claim IDs are not canonical"
+            )
     expected_valid = (
         payload["structure_valid"]
         and payload["experiment_fact_closure_valid"]
@@ -834,6 +1056,121 @@ def parse_citation_closure_report(text: str) -> dict[str, Any]:
     if payload["valid"] is not expected_valid:
         raise CitationPlanContractError("citation closure valid mismatch")
     return payload
+
+
+def _bind_plan_citation_occurrences(
+    *,
+    document: Any,
+    plan: Mapping[str, Any],
+    citation_plan_sha256: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    indexed: dict[str, list[tuple[Any, CitationOccurrence, str]]] = {}
+    for section in document.sections:
+        for occurrence in parse_strict_citation_occurrences(section.body):
+            sentence = section.body[
+                occurrence.sentence_start:occurrence.sentence_end
+            ]
+            marker_free_sentence = strip_strict_citation_markers(sentence)
+            for key in occurrence.keys:
+                indexed.setdefault(key, []).append(
+                    (section, occurrence, marker_free_sentence)
+                )
+
+    records: list[dict[str, Any]] = []
+    misplaced: list[str] = []
+    for claim in plan["claims"]:
+        citation = claim["planned_citations"][0]
+        key = citation["cite_key"]
+        assigned = claim["section_path"][-1].casefold()
+        candidates = indexed.get(key, [])
+        exact = [
+            item
+            for item in candidates
+            if item[0].path[0].casefold() == assigned
+            and item[2] == claim["claim_text"]
+        ]
+        if len(candidates) != 1 or len(exact) != 1:
+            misplaced.append(key)
+            continue
+        section, occurrence, sentence = exact[0]
+        records.append(
+            {
+                "claim_id": claim["claim_id"],
+                "claim_text_sha256": sha256_text(claim["claim_text"]),
+                "cite_key": key,
+                "heading": section.path[0],
+                "section_id": section.section_id,
+                "syntax": occurrence.syntax,
+                "marker_keys": list(occurrence.keys),
+                "char_start": occurrence.char_start,
+                "char_end": occurrence.char_end,
+                "sentence_start": occurrence.sentence_start,
+                "sentence_end": occurrence.sentence_end,
+                "sentence_text": sentence,
+                "sentence_sha256": sha256_text(sentence),
+                "sentence_ordinal": occurrence.sentence_ordinal,
+                "occurrence_ordinal": occurrence.occurrence_ordinal,
+                "citation_plan_path": "stage-16/citation_plan.json",
+                "citation_plan_sha256": citation_plan_sha256,
+            }
+        )
+    return sorted(records, key=lambda item: (item["claim_id"], item["cite_key"])), sorted(
+        set(misplaced)
+    )
+
+
+def _parse_citation_occurrence_record(
+    value: Any, *, citation_plan_sha256: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CitationPlanContractError("citation occurrence must be an object")
+    expected = {
+        "claim_id", "claim_text_sha256", "cite_key", "heading", "section_id",
+        "syntax", "marker_keys",
+        "char_start", "char_end", "sentence_start", "sentence_end", "sentence_text",
+        "sentence_sha256", "sentence_ordinal", "occurrence_ordinal",
+        "citation_plan_path", "citation_plan_sha256",
+    }
+    _exact_keys(value, expected, "citation occurrence")
+    for field in ("claim_id", "cite_key", "heading", "section_id", "sentence_text"):
+        _required_string(value, field)
+    if _STRICT_CITE_KEY_RE.fullmatch(value["cite_key"]) is None:
+        raise CitationPlanContractError("invalid citation occurrence cite_key")
+    _sha256_field(value, "claim_text_sha256")
+    if value["syntax"] not in {"markdown", "latex"}:
+        raise CitationPlanContractError("invalid citation occurrence syntax")
+    marker_keys = value["marker_keys"]
+    if (
+        not isinstance(marker_keys, list)
+        or not marker_keys
+        or any(
+            not isinstance(key, str) or _STRICT_CITE_KEY_RE.fullmatch(key) is None
+            for key in marker_keys
+        )
+        or len(marker_keys) != len(set(marker_keys))
+        or value["cite_key"] not in marker_keys
+    ):
+        raise CitationPlanContractError("invalid citation occurrence marker_keys")
+    for field in (
+        "char_start", "char_end", "sentence_start", "sentence_end",
+        "sentence_ordinal", "occurrence_ordinal",
+    ):
+        if type(value[field]) is not int or value[field] < 0:
+            raise CitationPlanContractError(f"invalid citation occurrence {field}")
+    if not (
+        value["sentence_start"] <= value["char_start"]
+        < value["char_end"] <= value["sentence_end"]
+    ):
+        raise CitationPlanContractError("invalid citation occurrence spans")
+    if value["citation_plan_path"] != "stage-16/citation_plan.json":
+        raise CitationPlanContractError("invalid citation occurrence plan path")
+    _sha256_field(value, "sentence_sha256")
+    _sha256_field(value, "citation_plan_sha256")
+    if value["sentence_sha256"] != sha256_text(value["sentence_text"]):
+        raise CitationPlanContractError("citation occurrence sentence hash mismatch")
+    if value["citation_plan_sha256"] != citation_plan_sha256:
+        raise CitationPlanContractError("citation occurrence plan hash mismatch")
+    return value
 
 
 def validate_citation_closure_report(

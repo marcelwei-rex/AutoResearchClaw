@@ -30,7 +30,12 @@ from researchclaw.literature.citation_plan import (
     build_citation_plan,
     # Stable monkeypatch seam for legacy executor fixtures.
     build_citation_writer_instruction,
+    filter_strict_citation_markers,
     load_final_citation_plan,
+    parse_strict_citation_occurrences,
+    strict_citation_keys,
+    strict_sentence_spans,
+    strip_strict_citation_markers,
     validate_citation_closure_report,
     validate_citation_plan,
 )
@@ -64,12 +69,17 @@ from researchclaw.pipeline.manuscript_sections import (
     merge_manuscript,
     parse_manuscript,
 )
-from researchclaw.pipeline.sectional_validation import extract_citation_keys
 from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidence,
     CanonicalExperimentEvidenceError,
     canonical_decimal,
     load_canonical_experiment_evidence,
+)
+from researchclaw.pipeline.canonical_fact_sheet import (
+    CFSIntegrityError,
+    build_canonical_fact_sheet,
+    build_heading_grounding_contexts,
+    fact_sheet_view_for_heading,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.pipeline.stage15_decision_projection import (
@@ -82,13 +92,6 @@ from researchclaw.pipeline.stage15_decision_projection import (
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
-
-_WRITER_CITE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*\d{4}[A-Za-z0-9_-]*$")
-_WRITER_MARKDOWN_CITATION_RE = re.compile(r"\[([^\[\]]{4,300})\]")
-_WRITER_LATEX_CITATION_RE = re.compile(
-    r"(\\cite[a-zA-Z*]*(?:\[[^\]]*\])*)\{([^}]+)\}"
-)
-
 
 _SECTION_OUTPUT_CONTRACT = """
 
@@ -426,6 +429,13 @@ def _write_experiment_fact_invalid(
         "unknown_numeric_values": report["unknown_numeric_values"],
         "dataset_claim_violations": report["dataset_claim_violations"],
     }
+    if report.get("schema_version") == 3:
+        payload.update(
+            canonical_fact_sheet_sha256=report["canonical_fact_sheet_sha256"],
+            fact_sheet_schema_version=report["fact_sheet_schema_version"],
+            structured_fact_violations=report["structured_fact_violations"],
+            citation_bound_numeric_claims=report["citation_bound_numeric_claims"],
+        )
     (stage_dir / "experiment_fact_closure_invalid.json").write_text(
         canonical_experiment_fact_json_text(payload), encoding="utf-8"
     )
@@ -455,6 +465,7 @@ def _validate_or_regenerate_paper_part(
     max_tokens: int,
     report_entries: list[dict[str, Any]],
     stage_dir: Path | None,
+    grounding_context: str = "",
 ) -> str:
     text = initial_text.strip()
     attempts: list[dict[str, Any]] = []
@@ -527,6 +538,9 @@ Rules:
 Validated citation claims assigned to this part:
 {citation_repair_context}
 
+Canonical fact authority assigned to this part:
+{grounding_context or 'None (legacy generic path)'}
+
 <previous_invalid_response>
 {safe_previous_text}
 </previous_invalid_response>
@@ -534,7 +548,12 @@ Validated citation claims assigned to this part:
         try:
             regenerated = _chat_with_prompt(
                 llm,
-                _SECTION_REPAIR_SYSTEM,
+                _SECTION_REPAIR_SYSTEM
+                + (
+                    "\n\nCANONICAL FACT AUTHORITY:\n" + grounding_context
+                    if grounding_context
+                    else ""
+                ),
                 repair_prompt,
                 max_tokens=max_tokens,
                 retries=1,
@@ -952,22 +971,13 @@ def _citation_free_prior_context(text: str) -> str:
 def _filter_citation_markers(text: str, allowed_keys: frozenset[str]) -> str:
     """Keep only authorized citation keys while preserving non-citation brackets."""
 
-    def _strip_markdown(match: re.Match[str]) -> str:
-        keys = [item.strip() for item in re.split(r"[,;]", match.group(1))]
-        if keys and all(_WRITER_CITE_KEY_RE.fullmatch(key) for key in keys):
-            retained = [key for key in keys if key in allowed_keys]
-            return f"[{', '.join(retained)}]" if retained else ""
-        return match.group(0)
+    return filter_strict_citation_markers(text, allowed_keys)
 
-    def _strip_latex(match: re.Match[str]) -> str:
-        keys = [item.strip() for item in match.group(2).split(",")]
-        if not keys or not all(_WRITER_CITE_KEY_RE.fullmatch(key) for key in keys):
-            return match.group(0)
-        retained = [key for key in keys if key in allowed_keys]
-        return f"{match.group(1)}{{{','.join(retained)}}}" if retained else ""
 
-    text = _WRITER_MARKDOWN_CITATION_RE.sub(_strip_markdown, text)
-    return _WRITER_LATEX_CITATION_RE.sub(_strip_latex, text)
+def _citation_marker_free_bytes(text: str) -> bytes:
+    """Remove only citation syntax and its conventional leading ASCII space."""
+
+    return strip_strict_citation_markers(text).encode("utf-8")
 
 
 def _section_scoped_writer_system(system: str, citation_instruction: str) -> str:
@@ -1002,6 +1012,7 @@ def _write_paper_sections(
     citation_repair_claims: tuple[dict[str, str], ...] = (),
     part_citation_instructions: Mapping[str, str] | None = None,
     heading_citation_instructions: Mapping[str, str] | None = None,
+    canonical_fact_sheet: Mapping[str, Any] | None = None,
 ) -> str:
     """Write a conference-grade paper in 3 sequential LLM calls.
 
@@ -1022,6 +1033,7 @@ def _write_paper_sections(
             model_name=model_name, is_hep=is_hep, stage_dir=stage_dir,
             citation_repair_claims=citation_repair_claims,
             heading_citation_instructions=heading_citation_instructions,
+            canonical_fact_sheet=canonical_fact_sheet,
         )
 
     # Render writing_structure block for injection
@@ -1486,6 +1498,7 @@ def _write_heading_scoped_paper_sections(
     stage_dir: Path | None,
     citation_repair_claims: tuple[dict[str, str], ...],
     heading_citation_instructions: Mapping[str, str],
+    canonical_fact_sheet: Mapping[str, Any] | None,
 ) -> str:
     """Write only contiguous zero-authority or single authority-heading groups."""
 
@@ -1502,6 +1515,26 @@ def _write_heading_scoped_paper_sections(
     if set(heading_citation_instructions) != set(headings):
         raise ValueError("heading citation authority must cover the active template")
     groups = _heading_writer_groups(base_groups, citation_repair_claims)
+    if canonical_fact_sheet is not None:
+        split_groups: list[tuple[str, ...]] = []
+        for group in groups:
+            pending: list[str] = []
+            current_view = ""
+            for heading in group:
+                view = fact_sheet_view_for_heading(heading)
+                if pending and view != current_view:
+                    split_groups.append(tuple(pending))
+                    pending = []
+                pending.append(heading)
+                current_view = view
+            if pending:
+                split_groups.append(tuple(pending))
+        groups = tuple(split_groups)
+    grounding_contexts = (
+        build_heading_grounding_contexts(canonical_fact_sheet, headings)
+        if canonical_fact_sheet is not None
+        else None
+    )
     system = pm.for_stage(
         "paper_draft", evolution_overlay="", preamble="", topic_constraint="",
         exp_metrics_instruction="", citation_instruction="", writing_structure="",
@@ -1515,15 +1548,30 @@ def _write_heading_scoped_paper_sections(
             if claim["section"] in group
         )
         authority = "\n\n".join(heading_citation_instructions[heading] for heading in group)
-        safe_outline = _filter_citation_markers(outline, allowed)
-        safe_prior = _citation_free_prior_context("\n\n".join(generated))
+        safe_outline = (
+            "\n".join(f"## {heading}" for heading in group)
+            if grounding_contexts is not None
+            else _filter_citation_markers(outline, allowed)
+        )
+        safe_prior = (
+            ""
+            if grounding_contexts is not None
+            else _citation_free_prior_context("\n\n".join(generated))
+        )
+        grounding = (
+            "\n\n".join(
+                dict.fromkeys(grounding_contexts[heading] for heading in group)
+            )
+            if grounding_contexts is not None
+            else _filter_citation_markers(exp_metrics_instruction, allowed)
+        )
         title_slot = index == 0
         requested = (("Title",) if title_slot else ()) + group
         heading_lines = "\n".join(f"- ## {heading}" for heading in requested)
         user = (
-            f"{_filter_citation_markers(preamble, allowed)}\n"
-            f"{_filter_citation_markers(topic_constraint, allowed)}\n"
-            f"{_filter_citation_markers(exp_metrics_instruction, allowed)}\n\n"
+            f"{'' if grounding_contexts is not None else _filter_citation_markers(preamble, allowed)}\n"
+            f"{'' if grounding_contexts is not None else _filter_citation_markers(topic_constraint, allowed)}\n"
+            f"{grounding}\n\n"
             f"Write exactly these manuscript headings:\n{heading_lines}\n\n"
             f"{authority}\n\n"
             "Prior context is citation-free and may not be repeated:\n"
@@ -1533,7 +1581,17 @@ def _write_heading_scoped_paper_sections(
             + _SECTION_OUTPUT_CONTRACT
         )
         response = _chat_with_prompt(
-            llm, _citation_safe_system(system, authority), user,
+            llm,
+            _citation_safe_system(
+                system,
+                authority
+                + (
+                    "\n\nCANONICAL FACT AUTHORITY:\n" + grounding
+                    if grounding_contexts is not None
+                    else ""
+                ),
+            ),
+            user,
             max_tokens=24000 if model_name.startswith(("gpt-5", "o3", "o4")) else 12000,
             retries=1,
         ).content.strip()
@@ -1543,6 +1601,7 @@ def _write_heading_scoped_paper_sections(
             citation_repair_context=_compact_part_citation_context(citation_repair_claims, group),
             allowed_citation_keys=allowed, max_tokens=12000,
             report_entries=report_entries, stage_dir=stage_dir,
+            grounding_context=grounding,
         )
         generated.append(part)
     return "\n\n".join(generated)
@@ -1559,7 +1618,7 @@ def _heading_citation_state(
     attributed = attribute_citation_keys_to_top_level_headings(paper_text)
     actual = {heading: set(keys) for heading, keys in attributed.items()}
     all_expected = set().union(*assigned.values()) if assigned else set()
-    all_actual = set(extract_citation_keys(paper_text))
+    all_actual = set(strict_citation_keys(paper_text))
     missing = {
         heading: keys - actual.get(heading, set())
         for heading, keys in assigned.items()
@@ -1600,68 +1659,110 @@ def _repair_heading_citation_closure(
     claims: tuple[dict[str, str], ...],
     heading_citation_instructions: Mapping[str, str],
     system: str,
+    canonical_fact_sheet: Mapping[str, Any] | None = None,
 ) -> str:
-    """Apply one bounded repair per missing heading before fact repair freezes bytes."""
+    """Insert missing plan markers deterministically; never rewrite prose."""
 
-    document = parse_manuscript(paper_text, strict=True)
-    allowed_by_heading: dict[str, frozenset[str]] = {}
-    for heading in heading_citation_instructions:
-        allowed_by_heading[heading] = frozenset(
-            claim["cite_key"] for claim in claims if claim["section"] == heading
+    del llm, run_dir, evidence, heading_citation_instructions, system, canonical_fact_sheet
+    state = _heading_citation_state(paper_text, claims)
+    if state["unknown_or_unplanned"] or state["misplaced"]:
+        raise CitationPlanContractError(
+            "existing citation occurrence is unknown or has a misplaced anchor"
         )
-    replacements = {
-        section.section_id: _filter_citation_markers(
-            section.body, allowed_by_heading.get(section.path[0], frozenset())
-        )
-        for section in document.sections
-    }
-    cleaned = merge_manuscript(document, replacements)
-    baseline = build_experiment_fact_closure_report(
-        run_dir, paper_text=cleaned, evidence=evidence
-    )["manuscript_numeric_values"]
-    operations: list[dict[str, Any]] = [{
-        "kind": "unauthorized_marker_removal",
-        "source_sha256": hashlib.sha256(paper_text.encode("utf-8")).hexdigest(),
-        "cleaned_sha256": hashlib.sha256(cleaned.encode("utf-8")).hexdigest(),
-    }]
-    current = cleaned
-    state = _heading_citation_state(current, claims)
+    claim_by_key = {claim["cite_key"]: claim for claim in claims}
+    if len(claim_by_key) != len(claims):
+        raise CitationPlanContractError("citation repair claims contain duplicate keys")
+
+    blocks = _top_level_heading_blocks(paper_text)
+    baseline_occurrences = parse_strict_citation_occurrences(paper_text)
+    for occurrence in baseline_occurrences:
+        for key in occurrence.keys:
+            claim = claim_by_key.get(key)
+            if claim is None:
+                raise CitationPlanContractError("existing citation key lacks plan claim")
+            sentence = paper_text[occurrence.sentence_start:occurrence.sentence_end]
+            if strip_strict_citation_markers(sentence) != claim["claim_text"]:
+                raise CitationPlanContractError(
+                    "existing citation occurrence moved from its plan sentence anchor"
+                )
+            block = blocks.get(claim["section"])
+            if block is None:
+                raise CitationPlanContractError("existing citation heading is missing")
+            anchor_matches = [
+                (start, end)
+                for start, end in strict_sentence_spans(block)
+                if strip_strict_citation_markers(block[start:end])
+                == claim["claim_text"]
+            ]
+            if len(anchor_matches) != 1:
+                raise CitationPlanContractError(
+                    "existing citation plan sentence anchor is not unique"
+                )
+
+    insertions: list[tuple[int, tuple[str, ...], str]] = []
     for heading, missing_keys in state["missing_by_heading"].items():
-        block = _top_level_heading_blocks(current).get(heading)
+        block = blocks.get(heading)
         if block is None:
             raise CitationPlanContractError(f"required citation heading is missing: {heading}")
-        authority = heading_citation_instructions[heading]
-        prompt = (
-            f"Repair only this exact top-level heading block: {heading}.\n"
-            f"It must contain each missing authorized key exactly as needed: "
-            f"{', '.join(f'[{key}]' for key in sorted(missing_keys))}.\n"
-            "Do not add any other citation key. Preserve every numeric literal exactly. "
-            "Return only the replacement heading block.\n\n"
-            f"{authority}\n\n<heading_block>\n{block}</heading_block>"
+        block_start = paper_text.index(block)
+        by_position: dict[int, list[str]] = {}
+        for key in sorted(missing_keys):
+            claim = claim_by_key[key]
+            if claim["section"] != heading:
+                raise CitationPlanContractError("citation repair heading binding mismatch")
+            matches = [
+                (start, end)
+                for start, end in strict_sentence_spans(block)
+                if strip_strict_citation_markers(block[start:end])
+                == claim["claim_text"]
+            ]
+            if len(matches) != 1:
+                raise CitationPlanContractError(
+                    "citation repair claim sentence anchor is not unique"
+                )
+            _start, end = matches[0]
+            insert_at = end - 1 if block[end - 1] in ".!?" else end
+            by_position.setdefault(insert_at, []).append(key)
+        for position, keys in by_position.items():
+            insertions.append((block_start + position, tuple(sorted(keys)), heading))
+
+    current = paper_text
+    for position, keys, _heading in sorted(insertions, reverse=True):
+        current = current[:position] + f" [{', '.join(keys)}]" + current[position:]
+    _assert_marker_only_citation_delta(paper_text, current)
+
+    repaired_occurrences = parse_strict_citation_occurrences(current)
+    repaired_signatures = {
+        (
+            item.syntax,
+            item.keys,
+            item.sentence_sha256,
+            item.sentence_ordinal,
+            item.occurrence_ordinal,
         )
-        repaired = _chat_with_prompt(
-            llm, _citation_safe_system(system, authority), prompt,
-            max_tokens=12000, retries=1,
-        ).content.strip()
-        if not repaired.startswith(f"## {heading}"):
-            raise CitationPlanContractError("heading-local citation repair returned wrong heading")
-        repaired_headings = _top_level_heading_blocks(repaired)
-        if set(repaired_headings) != {heading}:
+        for item in repaired_occurrences
+    }
+    for item in baseline_occurrences:
+        signature = (
+            item.syntax,
+            item.keys,
+            item.sentence_sha256,
+            item.sentence_ordinal,
+            item.occurrence_ordinal,
+        )
+        if signature not in repaired_signatures:
             raise CitationPlanContractError(
-                "heading-local citation repair returned extra top-level headings"
+                "existing citation occurrence key, anchor, or ordinal changed"
             )
-        current = current.replace(block, repaired + "\n", 1)
-        operations.append({
-            "kind": "bounded_heading_repair",
+    operations = [
+        {
+            "kind": "deterministic_marker_insertion",
             "heading": heading,
-            "missing_keys": sorted(missing_keys),
-        })
-    after = build_experiment_fact_closure_report(
-        run_dir, paper_text=current, evidence=evidence
-    )["manuscript_numeric_values"]
+            "missing_keys": list(keys),
+        }
+        for _position, keys, heading in sorted(insertions)
+    ]
     state = _heading_citation_state(current, claims)
-    if baseline != after:
-        raise CitationPlanContractError("heading-local citation repair changed numeric tokens")
     if state["unknown_or_unplanned"] or state["misplaced"] or state["missing"]:
         raise CitationPlanContractError("heading-local citation repair did not close citations")
     (stage_dir / "citation_heading_repair_log.json").write_text(
@@ -1669,6 +1770,13 @@ def _repair_heading_citation_closure(
         encoding="utf-8",
     )
     return current
+
+
+def _assert_marker_only_citation_delta(before: str, after: str) -> None:
+    """Reject citation repair that changes any non-marker manuscript byte."""
+
+    if _citation_marker_free_bytes(before) != _citation_marker_free_bytes(after):
+        raise CitationPlanContractError("citation repair violated marker-only delta")
 
 
 # ---------------------------------------------------------------------------
@@ -2406,10 +2514,12 @@ def _execute_paper_draft(
         (stage_dir / owned_name).unlink(missing_ok=True)
     try:
         evidence = load_canonical_experiment_evidence(run_dir)
+        canonical_fact_sheet = build_canonical_fact_sheet(evidence)
         outline = _load_bound_stage16_outline(run_dir, evidence)
         effective_citation_policy = load_effective_citation_policy(run_dir, config)
     except (
         CanonicalExperimentEvidenceError,
+        CFSIntegrityError,
         CitationPolicyContractError,
         OSError,
         UnicodeDecodeError,
@@ -2431,8 +2541,8 @@ def _execute_paper_draft(
         canonical_evidence=evidence,
         include_goal=True,
         include_hypotheses=True,
-        include_analysis=True,
-        include_experiment_data=True,  # WS-5.1: inject real experiment data
+        include_analysis=canonical_fact_sheet is None,
+        include_experiment_data=canonical_fact_sheet is None,
     )
 
     exp_summary_text = evidence.summary_bytes.decode("utf-8")
@@ -2972,6 +3082,8 @@ def _execute_paper_draft(
 
         # --- Section-by-section writing (3 calls) for conference-grade depth ---
         try:
+            if canonical_fact_sheet is not None:
+                exp_metrics_instruction = ""
             draft = _write_paper_sections(
                 llm=llm,
                 pm=_pm,
@@ -2988,6 +3100,7 @@ def _execute_paper_draft(
                 stage_dir=stage_dir,
                 citation_repair_claims=citation_repair_claims,
                 heading_citation_instructions=heading_citation_instructions,
+                canonical_fact_sheet=canonical_fact_sheet,
             )
         except PaperSectionContractError as exc:
             (stage_dir / "paper_draft_invalid.md").write_text(
@@ -3076,6 +3189,17 @@ Generated: {_utcnow_iso()}
     if guidance_file.exists():
         try:
             guidance = guidance_file.read_text(encoding="utf-8").strip()
+            if guidance and canonical_fact_sheet is not None:
+                return StageResult(
+                    stage=Stage.PAPER_DRAFT,
+                    status=StageStatus.FAILED,
+                    artifacts=(),
+                    error=(
+                        "Canonical domain-evaluator Stage 17 does not accept "
+                        "unscoped HITL rewrite guidance"
+                    ),
+                    decision="retry",
+                )
             if guidance and llm is not None:
                 logger.info("Applying HITL guidance to paper draft")
                 resp = llm.chat(
@@ -3132,7 +3256,7 @@ Generated: {_utcnow_iso()}
             ),
         )
 
-    if llm is not None and citation_repair_claims:
+    if citation_repair_claims:
         repair_system = _pm.for_stage(
             "paper_draft", evolution_overlay="", preamble="", topic_constraint="",
             exp_metrics_instruction="", citation_instruction="", writing_structure="",
@@ -3148,6 +3272,7 @@ Generated: {_utcnow_iso()}
                 claims=citation_repair_claims,
                 heading_citation_instructions=heading_citation_instructions,
                 system=repair_system,
+                canonical_fact_sheet=canonical_fact_sheet,
             )
             structure_report = _validate_stage17_manuscript_structure(
                 final_draft, stage_dir=stage_dir
@@ -3184,6 +3309,10 @@ Generated: {_utcnow_iso()}
                         "grounded_numeric_values"
                     ],
                     dataset_origin=experiment_report["dataset_origin"],
+                    structured_fact_violations=experiment_report.get(
+                        "structured_fact_violations", []
+                    ),
+                    canonical_fact_sheet=canonical_fact_sheet,
                 )
             except Exception as exc:  # noqa: BLE001
                 raise ExperimentFactClosureError(

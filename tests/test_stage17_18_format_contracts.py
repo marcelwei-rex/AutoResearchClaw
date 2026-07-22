@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import pytest
 
+from researchclaw.literature import citation_plan as citation_plan_module
 pytestmark = pytest.mark.usefixtures(
     "canonical_evidence_migration_complete",
     "consumer_evidence_fixture",
@@ -17,6 +18,8 @@ pytestmark = pytest.mark.usefixtures(
 from researchclaw.pipeline.stage_impls import _review_publish
 from researchclaw.pipeline.stage_impls._paper_writing import (
     PaperSectionContractError,
+    _repair_heading_citation_closure,
+    _assert_marker_only_citation_delta,
     _validate_paper_part_sections,
     _validate_stage17_manuscript_structure,
     _write_paper_sections,
@@ -104,6 +107,94 @@ class _SequentialLLM:
         self.calls.append(messages)
         self.systems.append(str(kwargs.get("system", "")))
         return SimpleNamespace(content=self.responses.pop(0))
+
+
+def test_strict_citation_occurrence_parser_handles_syntax_matrix() -> None:
+    text = (
+        "Prior [important context] \\[escaped2024key] "
+        "[smith2024deep] [smith2024deep, jones2023graph] "
+        "[smith2024deep;  jones2023graph] "
+        "[smith2024deep, smith2024deep] "
+        r"\cite{smith2024deep,jones2023graph} "
+        r"\\cite{escaped2024key}."
+    )
+
+    occurrences = citation_plan_module.parse_strict_citation_occurrences(text)
+
+    assert [item.syntax for item in occurrences] == [
+        "markdown", "markdown", "markdown", "latex"
+    ]
+    assert occurrences[0].keys == ("smith2024deep",)
+    assert occurrences[1].keys == ("smith2024deep", "jones2023graph")
+    assert occurrences[2].keys == ("smith2024deep", "jones2023graph")
+    assert occurrences[3].keys == ("smith2024deep", "jones2023graph")
+    assert all(item.char_start < item.char_end for item in occurrences)
+    assert all(item.sentence_start < item.sentence_end for item in occurrences)
+    assert all(len(item.sentence_sha256) == 64 for item in occurrences)
+
+
+def test_strict_parser_preserves_noncitation_and_escaped_brackets() -> None:
+    text = r"Keep [important context] and \[smith2024deep]."
+    assert citation_plan_module.parse_strict_citation_occurrences(text) == ()
+    assert citation_plan_module.filter_strict_citation_markers(
+        text, frozenset()
+    ) == text
+
+
+def _minimal_cfs() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "claim_scope": "pipeline_validation",
+        "dataset_origin": "synthetic",
+        "bound_labels": {
+            "dataset": "controlled_synthetic_iscas85",
+            "evaluator_schema": "trojnet_iscas85_v1",
+            "evaluator_id": "trojnet_iscas85",
+            "benchmark_tokens": ("iscas85",),
+            "circuit_tokens": ("c1355",),
+        },
+        "conditions": (
+            {"id": "primary", "role": "primary"},
+            {"id": "raw_cc1", "role": "comparator"},
+        ),
+        "seeds": (0, 1, 2),
+        "circuit_families": ("c1355",),
+        "variant_ids": ("c1355_ht1",),
+        "variants_per_family": 1,
+        "counts": {
+            "observations": 1,
+            "observations_per_condition": 1,
+            "observations_per_condition_seed": 1,
+            "invocations": 2,
+        },
+        "scale": {"n_total_min": 196, "n_total_max": 2480},
+        "runtime": {
+            "device": "cpu",
+            "python": "3.11",
+            "packages": {"torch": "2.12.1"},
+            "torch_deterministic_algorithms": True,
+            "torch_num_threads": 1,
+        },
+        "metric_keys": ("auprc",),
+        "primary_metric": {
+            "key": "auprc",
+            "condition": "primary",
+            "aggregation": "mean",
+            "observation_set": "all",
+            "value": 1,
+        },
+        "condition_aggregates": (),
+        "per_seed_aggregates": (),
+        "derived_facts": {},
+        "observation_rows": (
+            {
+                "condition": "primary",
+                "seed": 0,
+                "circuit_variant": "c1355_ht1",
+                "metrics": {"auprc": 1},
+            },
+        ),
+    }
 
 
 def _assert_fixture_canonical_binding(report: dict[str, Any]) -> None:
@@ -538,6 +629,311 @@ def test_stage17_part_contract_regenerates_once_and_records_attempts(
     assert len(report["parts"][0]["attempts"]) == 2
     assert report["parts"][0]["attempts"][0]["valid"] is False
     assert report["parts"][0]["attempts"][1]["valid"] is True
+
+
+def test_stage17_cfs_prompts_are_split_and_section_scoped(tmp_path: Path) -> None:
+    llm = _SequentialLLM(
+        [
+            "## Title\n\nPaper.\n\n## Abstract\n\nA.\n\n## Introduction\n\nI.\n\n## Related Work\n\nR.",
+            "## Method\n\nM.\n\n## Experiments\n\nE.",
+            "## Results\n\nR.\n\n## Discussion\n\nD.",
+            "## Limitations\n\nL.\n\n## Conclusion\n\nC.",
+        ]
+    )
+    headings = (
+        "Abstract",
+        "Introduction",
+        "Related Work",
+        "Method",
+        "Experiments",
+        "Results",
+        "Discussion",
+        "Limitations",
+        "Conclusion",
+    )
+    draft = _write_paper_sections(
+        llm=cast(Any, llm),
+        pm=cast(Any, _PromptManagerStub()),
+        preamble="PREAMBLE_WITH_FOREIGN_FACT 999 runs",
+        topic_constraint="TOPIC_WITH_FOREIGN_FACT 888 seeds",
+        exp_metrics_instruction="LEGACY_GLOBAL_METRIC auprc=0.123",
+        citation_instruction="",
+        outline="OUTLINE_WITH_FOREIGN_FACT 777 observations",
+        stage_dir=tmp_path,
+        heading_citation_instructions={
+            heading: "No citation authority assigned to this heading."
+            for heading in headings
+        },
+        canonical_fact_sheet=_minimal_cfs(),
+    )
+
+    assert "## Conclusion" in draft
+    assert len(llm.calls) == 4
+    prompts = ["\n".join(item["content"] for item in call) for call in llm.calls]
+    assert all("LEGACY_GLOBAL_METRIC" not in prompt for prompt in prompts)
+    assert all("FOREIGN_FACT" not in prompt for prompt in prompts)
+    assert "pipeline_validation" in prompts[0]
+    assert '"seeds"' in prompts[0]
+    assert '"counts"' in prompts[0]
+    assert '"runtime"' not in prompts[0]
+    assert '"primary_metric"' not in prompts[0]
+    assert '"runtime"' in prompts[1]
+    assert '"primary_metric"' not in prompts[1]
+    assert '"primary_metric"' in prompts[2]
+    assert "projection mode=" in prompts[2]
+    assert '"runtime"' not in prompts[3]
+    assert "projection mode=" not in prompts[3]
+    assert '"seeds"' in prompts[3]
+    assert '"variant_ids"' in prompts[3]
+
+
+def test_stage17_structure_repair_inherits_group_cfs(tmp_path: Path) -> None:
+    llm = _SequentialLLM(
+        [
+            "## Method\n\nWrong group.",
+            "## Title\n\nPaper.\n\n## Abstract\n\nA.\n\n## Introduction\n\nI.\n\n## Related Work\n\nR.",
+            "## Method\n\nM.\n\n## Experiments\n\nE.",
+            "## Results\n\nR.\n\n## Discussion\n\nD.",
+            "## Limitations\n\nL.\n\n## Conclusion\n\nC.",
+        ]
+    )
+    headings = (
+        "Abstract", "Introduction", "Related Work", "Method", "Experiments",
+        "Results", "Discussion", "Limitations", "Conclusion",
+    )
+    _write_paper_sections(
+        llm=cast(Any, llm),
+        pm=cast(Any, _PromptManagerStub()),
+        preamble="",
+        topic_constraint="",
+        exp_metrics_instruction="",
+        citation_instruction="",
+        outline="",
+        stage_dir=tmp_path,
+        heading_citation_instructions={heading: "No citation authority." for heading in headings},
+        canonical_fact_sheet=_minimal_cfs(),
+    )
+    repair_prompt = "\n".join(item["content"] for item in llm.calls[1])
+    assert "canonical_fact_sheet" in repair_prompt
+    assert "pipeline_validation" in repair_prompt
+
+
+def test_stage17_citation_repair_is_deterministic_and_uses_no_llm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper = (
+        "## Title\n\nPaper.\n\n## Abstract\n\nA.\n\n"
+        "## Introduction\n\nI.\n\n## Related Work\n\nBounded prior work.\n\n"
+        "## Method\n\nM.\n\n## Experiments\n\nE.\n\n"
+        "## Results\n\nR.\n\n## Discussion\n\nD.\n\n"
+        "## Limitations\n\nL.\n\n## Conclusion\n\nC."
+    )
+    llm = _SequentialLLM(
+        ["## Related Work\n\nBounded prior work [smith2024deep]."]
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._paper_writing.build_experiment_fact_closure_report",
+        lambda *_args, **_kwargs: {"manuscript_numeric_values": []},
+    )
+    repaired = _repair_heading_citation_closure(
+        llm=cast(Any, llm),
+        run_dir=tmp_path,
+        stage_dir=tmp_path,
+        paper_text=paper,
+        evidence=cast(Any, SimpleNamespace()),
+        claims=(
+            {
+                "section": "Related Work",
+                "claim_text": "Bounded prior work.",
+                "cite_key": "smith2024deep",
+            },
+        ),
+        heading_citation_instructions={
+            "Related Work": "Required citation key: [smith2024deep]"
+        },
+        system="system",
+        canonical_fact_sheet=_minimal_cfs(),
+    )
+    assert "[smith2024deep]" in repaired
+    assert llm.calls == []
+
+
+def test_stage17_missing_citation_is_inserted_deterministically_without_llm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper = (
+        "## Title\n\nPaper.\n\n## Abstract\n\nA.\n\n"
+        "## Introduction\n\nI.\n\n## Related Work\n\nExact bounded claim.\n\n"
+        "## Method\n\nM.\n\n## Experiments\n\nE.\n\n"
+        "## Results\n\nR.\n\n## Discussion\n\nD.\n\n"
+        "## Limitations\n\nL.\n\n## Conclusion\n\nC."
+    )
+    llm = _SequentialLLM([])
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._paper_writing.build_experiment_fact_closure_report",
+        lambda *_args, **_kwargs: {"manuscript_numeric_values": []},
+    )
+
+    repaired = _repair_heading_citation_closure(
+        llm=cast(Any, llm), run_dir=tmp_path, stage_dir=tmp_path,
+        paper_text=paper, evidence=cast(Any, SimpleNamespace()),
+        claims=({"section": "Related Work", "claim_text": "Exact bounded claim.",
+                 "cite_key": "smith2024deep"},),
+        heading_citation_instructions={"Related Work": "Required: [smith2024deep]"},
+        system="system", canonical_fact_sheet=_minimal_cfs(),
+    )
+
+    assert "Exact bounded claim [smith2024deep]." in repaired
+    assert llm.calls == []
+
+
+def test_stage17_existing_marker_cannot_move_across_sentences(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper = (
+        "## Title\n\nPaper.\n\n## Abstract\n\nA.\n\n"
+        "## Introduction\n\nI.\n\n## Related Work\n\n"
+        "Exact bounded claim. Different sentence [smith2024deep].\n\n"
+        "## Method\n\nM.\n\n## Experiments\n\nE.\n\n"
+        "## Results\n\nR.\n\n## Discussion\n\nD.\n\n"
+        "## Limitations\n\nL.\n\n## Conclusion\n\nC."
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_impls._paper_writing.build_experiment_fact_closure_report",
+        lambda *_args, **_kwargs: {"manuscript_numeric_values": []},
+    )
+
+    with pytest.raises(ValueError, match="anchor"):
+        _repair_heading_citation_closure(
+            llm=cast(Any, _SequentialLLM([])), run_dir=tmp_path, stage_dir=tmp_path,
+            paper_text=paper, evidence=cast(Any, SimpleNamespace()),
+            claims=({"section": "Related Work", "claim_text": "Exact bounded claim.",
+                     "cite_key": "smith2024deep"},),
+            heading_citation_instructions={"Related Work": "Required: [smith2024deep]"},
+            system="system", canonical_fact_sheet=_minimal_cfs(),
+        )
+
+
+def test_stage17_duplicate_claim_sentence_is_not_a_repair_anchor(
+    tmp_path: Path,
+) -> None:
+    paper = (
+        "## Title\n\nPaper.\n\n## Abstract\n\nA.\n\n"
+        "## Introduction\n\nI.\n\n## Related Work\n\n"
+        "Repeated bounded claim. Repeated bounded claim.\n\n"
+        "## Method\n\nM.\n\n## Experiments\n\nE.\n\n"
+        "## Results\n\nR.\n\n## Discussion\n\nD.\n\n"
+        "## Limitations\n\nL.\n\n## Conclusion\n\nC."
+    )
+
+    with pytest.raises(ValueError, match="not unique"):
+        _repair_heading_citation_closure(
+            llm=cast(Any, _SequentialLLM([])), run_dir=tmp_path, stage_dir=tmp_path,
+            paper_text=paper, evidence=cast(Any, SimpleNamespace()),
+            claims=({"section": "Related Work", "claim_text": "Repeated bounded claim.",
+                     "cite_key": "smith2024deep"},),
+            heading_citation_instructions={"Related Work": "Required: [smith2024deep]"},
+            system="system", canonical_fact_sheet=_minimal_cfs(),
+        )
+
+
+def _citation_anchor_paper(sentence: str) -> str:
+    return (
+        "## Title\n\nPaper.\n\n## Abstract\n\nA.\n\n"
+        "## Introduction\n\nI.\n\n## Related Work\n\n"
+        f"{sentence}\n\n"
+        "## Method\n\nM.\n\n## Experiments\n\nE.\n\n"
+        "## Results\n\nR.\n\n## Discussion\n\nD.\n\n"
+        "## Limitations\n\nL.\n\n## Conclusion\n\nC."
+    )
+
+
+@pytest.mark.parametrize(
+    ("claim_text", "paper_sentence"),
+    [
+        ("A  bounded claim.", "A bounded claim."),
+        ("A\tbounded claim.", "A bounded claim."),
+        ("A\N{NO-BREAK SPACE}bounded claim.", "A bounded claim."),
+        ("A bounded claim!", "A bounded claim."),
+    ],
+    ids=["double-space", "tab", "nbsp", "punctuation"],
+)
+@pytest.mark.parametrize("existing_marker", [False, True], ids=["missing", "existing"])
+def test_stage17_citation_repair_requires_exact_anchor_bytes(
+    tmp_path: Path,
+    claim_text: str,
+    paper_sentence: str,
+    existing_marker: bool,
+) -> None:
+    if existing_marker:
+        paper_sentence = paper_sentence[:-1] + " [smith2024deep]."
+    paper = _citation_anchor_paper(paper_sentence)
+
+    with pytest.raises(ValueError, match="anchor"):
+        _repair_heading_citation_closure(
+            llm=cast(Any, _SequentialLLM([])), run_dir=tmp_path, stage_dir=tmp_path,
+            paper_text=paper, evidence=cast(Any, SimpleNamespace()),
+            claims=({"section": "Related Work", "claim_text": claim_text,
+                     "cite_key": "smith2024deep"},),
+            heading_citation_instructions={"Related Work": "Required: [smith2024deep]"},
+            system="system", canonical_fact_sheet=_minimal_cfs(),
+        )
+
+    for name in (
+        "citation_heading_repair_log.json",
+        "paper_draft.md",
+        "experiment_fact_closure_report.json",
+        "citation_closure_report.json",
+    ):
+        assert not (tmp_path / name).exists()
+
+
+@pytest.mark.parametrize("existing_marker", [False, True], ids=["missing", "existing"])
+def test_stage17_citation_repair_accepts_exact_anchor_bytes(
+    tmp_path: Path, existing_marker: bool
+) -> None:
+    sentence = "Exact bounded claim."
+    if existing_marker:
+        sentence = "Exact bounded claim [smith2024deep]."
+    repaired = _repair_heading_citation_closure(
+        llm=cast(Any, _SequentialLLM([])), run_dir=tmp_path, stage_dir=tmp_path,
+        paper_text=_citation_anchor_paper(sentence),
+        evidence=cast(Any, SimpleNamespace()),
+        claims=({"section": "Related Work", "claim_text": "Exact bounded claim.",
+                 "cite_key": "smith2024deep"},),
+        heading_citation_instructions={"Related Work": "Required: [smith2024deep]"},
+        system="system", canonical_fact_sheet=_minimal_cfs(),
+    )
+
+    assert "Exact bounded claim [smith2024deep]." in repaired
+
+
+def test_stage17_citation_repair_rejects_non_marker_numeric_change(
+) -> None:
+    with pytest.raises(ValueError, match="marker-only"):
+        _assert_marker_only_citation_delta(
+            "Prior work reported 91.5%.",
+            "Prior work reported 92.5% [smith2024deep].",
+        )
+
+
+def test_stage17_citation_repair_rejects_noncitation_bracket_replacement() -> None:
+    with pytest.raises(ValueError, match="marker-only"):
+        _assert_marker_only_citation_delta(
+            "Claim [important context].",
+            "Claim [smith2024deep].",
+        )
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [("Claim.\n", "Claim.\n\n"), ("Claim.\n\n", "Claim.\n")],
+)
+def test_stage17_marker_only_delta_preserves_trailing_newlines(
+    before: str, after: str
+) -> None:
+    with pytest.raises(ValueError, match="marker-only"):
+        _assert_marker_only_citation_delta(before, after)
 
 
 def test_stage17_full_paper_response_uses_isolated_bounded_repair(
