@@ -250,6 +250,166 @@ def _config() -> PaperRevisionConfig:
     )
 
 
+def test_not_actionable_plan_does_not_invoke_writer(tmp_path: Path) -> None:
+    run_dir, stage_dir = _prepare_run(tmp_path)
+
+    class _OutOfScopeProvider(_FakeProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.propose_calls = 0
+
+        def build_plan(self, *, ledger, document):
+            return {
+                "schema_version": 1,
+                "planner_version": 1,
+                "source_paper_sha256": document.source_sha256,
+                "source_reviews_sha256": ledger.source_reviews_sha256,
+                "section_model_version": 1,
+                "assignments": [
+                    {
+                        "comment_id": comment.comment_id,
+                        "target_section_ids": [],
+                        "disposition": "not_actionable_with_reason",
+                        "reason": "Ten seeds exceed the canonical contract.",
+                    }
+                    for comment in ledger.comments
+                ],
+            }
+
+        def propose(self, **kwargs):
+            self.propose_calls += 1
+            raise AssertionError("writer must not run for out-of-scope comments")
+
+    provider = _OutOfScopeProvider()
+    result = _execute_sectional_revision(
+        run_dir=run_dir,
+        stage_dir=stage_dir,
+        config=_config(),
+        claim_scope="pipeline_validation",
+        provider=provider,
+        evidence=_evidence(),
+    )
+
+    assert result.completed is True
+    assert provider.propose_calls == 0
+    unresolved = json.loads((stage_dir / "unresolved_comments.json").read_text())
+    assert [item["final_status"] for item in unresolved["comments"]] == [
+        "not_actionable_with_reason"
+    ]
+
+
+@pytest.mark.parametrize(
+    "review_text",
+    (
+        "Use eleven seeds.",
+        "Increase the seed count to ten.",
+        "Add more seeds.",
+        "Evaluate with ten random seeds.",
+    ),
+)
+def test_assigned_out_of_scope_plan_is_closed_before_writer(
+    tmp_path: Path, review_text: str
+) -> None:
+    run_dir, stage_dir = _prepare_run(tmp_path)
+
+    class _WrongPlanner(_FakeProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.propose_calls = 0
+
+        def propose(self, **kwargs):
+            self.propose_calls += 1
+            raise AssertionError("writer must not run for a ten-seed request")
+
+    provider = _WrongPlanner()
+    reviews = (run_dir / "stage-18" / "reviews.md").read_text(encoding="utf-8")
+    reviews = reviews.replace(
+        "Clarify how the recorded metric is reported.",
+        review_text,
+    )
+    (run_dir / "stage-18" / "reviews.md").write_text(reviews, encoding="utf-8")
+    report_path = run_dir / "stage-18" / "review_structure_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["source_reviews_sha256"] = hashlib.sha256(reviews.encode()).hexdigest()
+    report_path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
+    cfs = {
+        "seeds": (0, 1, 2),
+        "conditions": (
+            {"id": "proposed", "role": "primary"},
+            {"id": "baseline", "role": "comparator"},
+        ),
+        "variant_ids": ("c1355_v1",),
+        "metric_keys": ("auprc",),
+    }
+
+    result = _execute_sectional_revision(
+        run_dir=run_dir,
+        stage_dir=stage_dir,
+        config=_config(),
+        claim_scope="pipeline_validation",
+        provider=provider,
+        evidence=_evidence(),
+        canonical_fact_sheet=cfs,
+    )
+
+    assert result.completed is True
+    assert provider.propose_calls == 0
+    unresolved = json.loads((stage_dir / "unresolved_comments.json").read_text())
+    assert unresolved["comments"][0]["final_status"] == "not_actionable_with_reason"
+
+
+@pytest.mark.parametrize(
+    "review_text",
+    ("Use proposed condition.", "Use c1355_v1 variant."),
+)
+def test_bound_identity_request_reaches_writer(
+    tmp_path: Path, review_text: str
+) -> None:
+    run_dir, stage_dir = _prepare_run(tmp_path)
+
+    class _CountingProvider(_FakeProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.propose_calls = 0
+
+        def propose(self, **kwargs):
+            self.propose_calls += 1
+            return super().propose(**kwargs)
+
+    provider = _CountingProvider()
+    reviews = (run_dir / "stage-18" / "reviews.md").read_text(encoding="utf-8")
+    reviews = reviews.replace(
+        "Clarify how the recorded metric is reported.", review_text
+    )
+    (run_dir / "stage-18" / "reviews.md").write_text(reviews, encoding="utf-8")
+    report_path = run_dir / "stage-18" / "review_structure_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["source_reviews_sha256"] = hashlib.sha256(reviews.encode()).hexdigest()
+    report_path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
+    cfs = {
+        "seeds": (0, 1, 2),
+        "conditions": (
+            {"id": "proposed", "role": "primary"},
+            {"id": "baseline", "role": "comparator"},
+        ),
+        "variant_ids": ("c1355_v1",),
+        "metric_keys": ("auprc",),
+    }
+
+    result = _execute_sectional_revision(
+        run_dir=run_dir,
+        stage_dir=stage_dir,
+        config=_config(),
+        claim_scope="pipeline_validation",
+        provider=provider,
+        evidence=_evidence(),
+        canonical_fact_sheet=cfs,
+    )
+
+    assert result.completed is True
+    assert provider.propose_calls == 1
+
+
 def _evidence(claim_scope: str = "pipeline_validation") -> SimpleNamespace:
     dataset_origin = "public" if claim_scope == "research_release" else "synthetic"
     topic = (

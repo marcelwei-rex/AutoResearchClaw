@@ -265,6 +265,7 @@ def _run_quality_gate(
     replace_parent_during_chat: tuple[Path, Path] | None = None,
     replace_run_during_chat: tuple[Path, Path] | None = None,
     diagnostic_collision_target: Path | None = None,
+    canonical_fact_sheet: object | None = None,
 ) -> tuple[object, Path, str]:
     run_dir = tmp_path / "run"
     stage_dir = run_dir / "stage-20"
@@ -316,6 +317,11 @@ def _run_quality_gate(
         },
     )
     monkeypatch.setattr(_review_publish, "load_canonical_experiment_evidence", lambda _: evidence)
+    monkeypatch.setattr(
+        _review_publish,
+        "build_canonical_fact_sheet",
+        lambda _evidence: canonical_fact_sheet,
+    )
     monkeypatch.setattr(_review_publish, "parse_config_snapshot_text", lambda *_a, **_k: config)
     monkeypatch.setattr(_review_publish, "semantic_config_sha256", lambda _: "same")
     monkeypatch.setattr(_review_publish, "_load_bound_stage19_inputs", lambda *_a: sources)
@@ -432,6 +438,272 @@ def test_stage20_uses_only_canonical_summary_and_preserves_decimal(
     ).hexdigest()
     manifest = json.loads((stage_dir / "quality_gate_manifest.json").read_text())
     assert manifest["outcome"] == "passed"
+
+
+def test_stage20_prompt_includes_complete_cfs_contract_without_schema_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfs = {
+        "claim_scope": "pipeline_validation",
+        "seeds": (0, 1, 2),
+        "conditions": (
+            {"id": "proposed", "role": "primary"},
+            {"id": "baseline", "role": "comparator"},
+        ),
+    }
+    monkeypatch.setattr(
+        _review_publish,
+        "render_complete_fact_sheet_text",
+        lambda value, *, include_projection: (
+            "COMPLETE_CFS_WITH_PROJECTION" if include_projection else "COMPLETE_CFS"
+        ),
+    )
+
+    result, stage_dir, prompt = _run_quality_gate(
+        tmp_path, monkeypatch, canonical_fact_sheet=cfs
+    )
+
+    assert result.status is StageStatus.DONE
+    assert "COMPLETE_CFS_WITH_PROJECTION" in prompt
+    assert "out_of_scope" in prompt
+    assert "not alone justify reject" in prompt
+    report = json.loads((stage_dir / "quality_report.json").read_text())
+    manifest = json.loads((stage_dir / "quality_gate_manifest.json").read_text())
+    assert "canonical_fact_sheet" not in report
+    assert "canonical_fact_sheet_sha256" not in report
+    assert "canonical_fact_sheet" not in manifest
+    assert "canonical_fact_sheet_sha256" not in manifest
+
+
+def test_stage20_repairs_out_of_scope_only_reject_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reject = SimpleNamespace(
+        content=json.dumps(
+            {
+                "score_1_to_10": 8,
+                "verdict": "reject",
+                "strengths": [],
+                "weaknesses": ["Only three seeds were used."],
+                "required_actions": ["Re-run with ten seeds."],
+            }
+        ),
+        model="test",
+        finish_reason="stop",
+        truncated=False,
+    )
+    proceed = SimpleNamespace(
+        content=json.dumps(
+            {
+                "score_1_to_10": 8,
+                "verdict": "proceed",
+                "strengths": ["Contract-bounded."],
+                "weaknesses": [],
+                "required_actions": [],
+            }
+        ),
+        model="test",
+        finish_reason="stop",
+        truncated=False,
+    )
+    calls: list[dict[str, object]] = []
+    cfs = {
+        "seeds": (0, 1, 2),
+        "conditions": (
+            {"id": "proposed", "role": "primary"},
+            {"id": "baseline", "role": "comparator"},
+        ),
+        "variant_ids": ("c1355_v1",),
+        "metric_keys": ("auprc",),
+    }
+    monkeypatch.setattr(
+        _review_publish,
+        "render_complete_fact_sheet_text",
+        lambda _cfs, *, include_projection: "COMPLETE_CFS_WITH_PROJECTION",
+    )
+
+    result, stage_dir, _ = _run_quality_gate(
+        tmp_path,
+        monkeypatch,
+        llm_responses=[reject, proceed],
+        llm_call_log=calls,
+        canonical_fact_sheet=cfs,
+    )
+
+    assert result.status is StageStatus.DONE
+    assert len(calls) == 2
+    diagnostic = json.loads(
+        (stage_dir / "quality_gate_llm_diagnostics.json").read_text()
+    )
+    assert diagnostic[0]["error_category"] == "out_of_scope_only_reject"
+
+
+def test_stage20_second_out_of_scope_only_reject_fails_without_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reject = SimpleNamespace(
+        content=json.dumps(
+            {
+                "score_1_to_10": 8,
+                "verdict": "reject",
+                "strengths": [],
+                "weaknesses": ["Only three seeds were used."],
+                "required_actions": ["Re-run with 10 seeds."],
+            }
+        ),
+        model="test",
+        finish_reason="stop",
+        truncated=False,
+    )
+    calls: list[dict[str, object]] = []
+    cfs = {
+        "seeds": (0, 1, 2),
+        "conditions": ({"id": "proposed", "role": "primary"},),
+        "variant_ids": ("c1355_v1",),
+        "metric_keys": ("auprc",),
+    }
+    monkeypatch.setattr(
+        _review_publish,
+        "render_complete_fact_sheet_text",
+        lambda _cfs, *, include_projection: "COMPLETE_CFS_WITH_PROJECTION",
+    )
+
+    result, stage_dir, _ = _run_quality_gate(
+        tmp_path,
+        monkeypatch,
+        llm_responses=[reject, reject],
+        llm_call_log=calls,
+        canonical_fact_sheet=cfs,
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert len(calls) == 2
+    assert not (stage_dir / "quality_gate_manifest.json").exists()
+    assert "out_of_scope_only_reject" in (result.error or "")
+
+
+def test_stage20_mixed_real_defect_preserves_reject_without_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reject = SimpleNamespace(
+        content=json.dumps(
+            {
+                "score_1_to_10": 8,
+                "verdict": "reject",
+                "strengths": [],
+                "weaknesses": [
+                    "Only three seeds were used.",
+                    "The manuscript contradicts the observed AUPRC.",
+                ],
+                "required_actions": ["Correct the factual contradiction."],
+            }
+        ),
+        model="test",
+        finish_reason="stop",
+        truncated=False,
+    )
+    calls: list[dict[str, object]] = []
+    cfs = {
+        "seeds": (0, 1, 2),
+        "conditions": ({"id": "proposed", "role": "primary"},),
+        "variant_ids": ("c1355_v1",),
+        "metric_keys": ("auprc",),
+    }
+    monkeypatch.setattr(
+        _review_publish,
+        "render_complete_fact_sheet_text",
+        lambda _cfs, *, include_projection: "COMPLETE_CFS_WITH_PROJECTION",
+    )
+
+    result, stage_dir, _ = _run_quality_gate(
+        tmp_path,
+        monkeypatch,
+        llm_responses=[reject],
+        llm_call_log=calls,
+        canonical_fact_sheet=cfs,
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert len(calls) == 1
+    assert (stage_dir / "quality_report.json").exists()
+    assert not (stage_dir / "quality_gate_manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    "weakness",
+    (
+        "Re-run with 10 seeds with AUPRC score 1,",
+        "Re-run with 10 seeds with AUPRC score 99.9%,",
+        "Re-run with 10 seeds with AUPRC score 1e-3,",
+        "Re-run with 10 seeds with AUPRC score one,",
+        "Re-run with 10 seeds with AUPRC score ten,",
+        "Re-run with 10 seeds because the manuscript fabricates the observed AUPRC.",
+    ),
+    ids=(
+        "integer",
+        "percentage",
+        "scientific",
+        "word-one",
+        "word-ten",
+        "fabrication",
+    ),
+)
+def test_stage20_numeric_metric_conflict_preserves_reject_without_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, weakness: str
+) -> None:
+    reject = SimpleNamespace(
+        content=json.dumps(
+            {
+                "score_1_to_10": 2,
+                "verdict": "reject",
+                "strengths": [],
+                "weaknesses": [weakness],
+                "required_actions": [],
+            }
+        ),
+        model="test",
+        finish_reason="stop",
+        truncated=False,
+    )
+    proceed = SimpleNamespace(
+        content=json.dumps(
+            {
+                "score_1_to_10": 8,
+                "verdict": "proceed",
+                "strengths": ["bounded"],
+                "weaknesses": [],
+                "required_actions": [],
+            }
+        ),
+        model="test",
+        finish_reason="stop",
+        truncated=False,
+    )
+    calls: list[dict[str, object]] = []
+    cfs = {
+        "seeds": (0, 1, 2),
+        "conditions": ({"id": "proposed", "role": "primary"},),
+        "variant_ids": ("c1355_v1",),
+        "metric_keys": ("auprc",),
+    }
+    monkeypatch.setattr(
+        _review_publish,
+        "render_complete_fact_sheet_text",
+        lambda _cfs, *, include_projection: "COMPLETE_CFS_WITH_PROJECTION",
+    )
+
+    result, stage_dir, _ = _run_quality_gate(
+        tmp_path,
+        monkeypatch,
+        llm_responses=[reject, proceed],
+        llm_call_log=calls,
+        canonical_fact_sheet=cfs,
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert len(calls) == 1
+    assert (stage_dir / "quality_report.json").exists()
+    assert not (stage_dir / "quality_gate_manifest.json").exists()
 
 
 def test_stage20_fixpoint_failure_removes_success_named_outputs(

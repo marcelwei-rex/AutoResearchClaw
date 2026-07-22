@@ -1177,6 +1177,9 @@ def test_stage18_uses_one_canonical_snapshot_and_binds_review_report(
             return super().for_stage(*_args, **kwargs)
 
     monkeypatch.setattr(_review_publish, "load_canonical_experiment_evidence", load_once)
+    monkeypatch.setattr(
+        _review_publish, "build_canonical_fact_sheet", lambda _evidence: None
+    )
     prompts = CapturingPrompts()
     llm = _SequentialLLM(
         [
@@ -1417,6 +1420,9 @@ def test_stage18_passes_one_snapshot_to_both_closure_replays(
 
     monkeypatch.setattr(
         _review_publish, "load_canonical_experiment_evidence", lambda _run_dir: evidence
+    )
+    monkeypatch.setattr(
+        _review_publish, "build_canonical_fact_sheet", lambda _evidence: None
     )
 
     def fact_closure(

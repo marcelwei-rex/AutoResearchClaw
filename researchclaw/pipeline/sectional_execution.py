@@ -31,6 +31,7 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidence,
     canonical_decimal,
 )
+from researchclaw.pipeline.canonical_fact_sheet import classify_out_of_scope_request
 from researchclaw.pipeline.sectional_revision import (
     ReviewComment,
     ReviewLedger,
@@ -161,6 +162,7 @@ def execute_sectional_revision(
     review_structure_report_text: str,
     bibliography_text: str,
     bibliography_sha256: str,
+    canonical_fact_sheet: Mapping[str, Any] | None = None,
 ) -> SectionalExecutionResult:
     """Execute B2 using an explicitly injected provider and deterministic gates."""
 
@@ -213,6 +215,24 @@ def execute_sectional_revision(
             document,
             reviews=reviews_text,
         )
+        if canonical_fact_sheet is not None:
+            comments_by_id = {comment.comment_id: comment for comment in ledger.comments}
+            assignments = []
+            for assignment in plan.assignments:
+                codes = classify_out_of_scope_request(
+                    comments_by_id[assignment.comment_id].exact_text,
+                    canonical_fact_sheet,
+                )
+                if assignment.disposition == "assigned" and codes:
+                    assignment = replace(
+                        assignment,
+                        target_section_ids=(),
+                        disposition="not_actionable_with_reason",
+                        reason="Canonical contract boundary: " + ", ".join(codes),
+                    )
+                assignments.append(assignment)
+            plan = replace(plan, assignments=tuple(assignments))
+            validate_revision_plan(plan, ledger, document, reviews=reviews_text)
     except RuntimeError:
         _write_sectional_llm_diagnostics(stage_dir, provider, llm_call_limit)
         raise

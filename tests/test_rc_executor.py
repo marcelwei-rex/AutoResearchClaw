@@ -492,6 +492,7 @@ class TestPaperRevisionRecovery:
         assert result.artifacts == ()
         assert "must differ" in (result.error or "")
 
+
     @pytest.mark.parametrize(
         ("claim_scope", "invalid_contract"),
         (
@@ -1190,6 +1191,109 @@ def test_execute_stage_executor_exception_returns_failed(
 )
 def test_stage_executor_mapping_values_are_callable(stage: Stage) -> None:
     assert callable(rc_executor._STAGE_EXECUTORS[stage])
+
+
+def test_stage18_prompt_receives_complete_cfs_contract(
+    tmp_path: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-18"
+    stage17 = run_dir / "stage-17"
+    stage_dir.mkdir(parents=True)
+    stage17.mkdir()
+    (stage17 / "citation_closure_report.json").write_text("{}", encoding="utf-8")
+    draft = "## Title\n\nBounded study.\n"
+    draft_sha = __import__("hashlib").sha256(draft.encode()).hexdigest()
+    evidence = SimpleNamespace(manifest_path="canonical.json", manifest_sha256="a" * 64)
+    closure = {
+        "paper_sha256": draft_sha,
+        "canonical_experiment_evidence_path": "canonical.json",
+        "canonical_experiment_evidence_sha256": "a" * 64,
+        "structure_report_sha256": "b" * 64,
+        "experiment_fact_closure_report_sha256": "c" * 64,
+    }
+    monkeypatch.setattr(_review_publish, "load_canonical_experiment_evidence", lambda _: evidence)
+    monkeypatch.setattr(_review_publish, "_read_bound_stage17_draft", lambda _: (draft, draft_sha))
+    monkeypatch.setattr(
+        _review_publish,
+        "load_effective_citation_policy",
+        lambda *_a: {"effective_min_unique_sources": 0, "effective_target_unique_sources": 0},
+    )
+    monkeypatch.setattr(_review_publish, "validate_experiment_fact_closure_report", lambda *_a, **_k: closure)
+    monkeypatch.setattr(_review_publish, "validate_citation_closure_report", lambda *_a, **_k: closure)
+    monkeypatch.setattr(_review_publish, "_collect_experiment_evidence", lambda _e: "legacy evidence")
+    monkeypatch.setattr(_review_publish, "build_canonical_fact_sheet", lambda _e: {"active": True})
+    monkeypatch.setattr(
+        _review_publish,
+        "render_complete_fact_sheet_text",
+        lambda _cfs, *, include_projection: "COMPLETE_CFS_WITH_PROJECTION",
+    )
+
+    class _Prompts:
+        def for_stage(self, _name: str, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                system="review system",
+                user=str(kwargs["experiment_evidence"]),
+                json_mode=False,
+                max_tokens=4096,
+            )
+
+    captured: list[str] = []
+    reviews = """## Reviewer A
+
+### Strengths
+Bounded.
+
+### Weaknesses
+None.
+
+### Actionable Revisions
+1. Clarify wording.
+
+## Reviewer B
+
+### Strengths
+Bounded.
+
+### Weaknesses
+None.
+
+### Actionable Revisions
+1. Clarify wording.
+
+## Reviewer C
+
+### Strengths
+Bounded.
+
+### Weaknesses
+None.
+
+### Actionable Revisions
+1. Clarify wording.
+"""
+
+    def chat(_llm: object, _system: str, user: str, **_kwargs: object) -> SimpleNamespace:
+        captured.append(user)
+        return SimpleNamespace(content=reviews)
+
+    monkeypatch.setattr(_review_publish, "_chat_with_prompt", chat)
+    result = _review_publish._execute_peer_review(
+        stage_dir,
+        run_dir,
+        rc_config,
+        adapters,
+        llm=object(),  # type: ignore[arg-type]
+        prompts=_Prompts(),  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.DONE
+    assert "COMPLETE_CFS_WITH_PROJECTION" in captured[0]
+    assert "out_of_scope" in captured[0]
+    assert "not alone justify reject" in captured[0]
 
 
 class TestStageHealth:

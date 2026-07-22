@@ -40,6 +40,99 @@ _VIEWS = frozenset({"introduction", "method", "results", "limitations"})
 _BENCHMARK_TOKEN = re.compile(r"[a-z]{2,}[0-9]+[a-z0-9]*")
 _VERSION_TOKEN = re.compile(r"v[0-9]+")
 _PROMPT_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+:/-]*")
+_COUNT_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+}
+_COUNT_TOKEN_PATTERN = "|".join((r"[0-9]+", *map(re.escape, _COUNT_WORDS)))
+_REQUEST_COUNT = re.compile(
+    rf"\b(?P<count>{_COUNT_TOKEN_PATTERN})"
+    r"\s+(?P<kind>seeds?|conditions?|variants?)\b",
+    re.IGNORECASE,
+)
+_NEW_EXPERIMENT_REQUEST = re.compile(
+    r"\b(?:re-?run|rerun|conduct|perform)\b.{0,80}"
+    r"\b(?:experiment|evaluation|ablation|benchmark|trial|results?)\b",
+    re.IGNORECASE,
+)
+_NEW_RESULTS_REQUEST = re.compile(
+    r"\b(?:new|additional)\s+(?:experiment|evaluation|ablation|results?)\b",
+    re.IGNORECASE,
+)
+_STATISTICAL_REQUEST = re.compile(
+    r"\b(?:p[- ]?values?|confidence intervals?|statistical significance|"
+    r"significance tests?|hypothesis tests?)\b",
+    re.IGNORECASE,
+)
+_METRIC_REQUEST = re.compile(
+    r"\b(?:report|compute|provide|include|add)\s+(?:the\s+)?"
+    r"(?P<metric>[A-Za-z][A-Za-z0-9_-]*)\s+(?:metric|score)\b",
+    re.IGNORECASE,
+)
+_CONDITION_NAME_REQUEST = re.compile(
+    r"\b(?:add|include|use|evaluate|test|compare\s+(?:against|with|to))\s+"
+    r"(?:an?\s+|the\s+)?(?P<name>[A-Za-z][A-Za-z0-9_.-]*)\s+"
+    r"(?:condition|comparator|baseline)\b",
+    re.IGNORECASE,
+)
+_NEW_CONDITION_REQUEST = re.compile(
+    r"\b(?:new|additional|stronger)\s+(?:condition|comparator|baseline)\b",
+    re.IGNORECASE,
+)
+_VARIANT_NAME_REQUEST = re.compile(
+    r"\b(?:add|include|use|evaluate|test)\s+(?:the\s+)?"
+    r"(?P<name>[A-Za-z][A-Za-z0-9_.-]*)\s+variant\b",
+    re.IGNORECASE,
+)
+_COUNT_CHANGE_INTENT = re.compile(
+    r"\b(?:use|add|include|increase|decrease|expand|reduce|raise|change|"
+    r"evaluate|test|run|re-?run|rerun)\b"
+    r"(?P<body>[^.!?\n]{0,100})\b(?P<kind>seeds?|conditions?|variants?)\b"
+    r"(?:\s+count\s+(?:to|of)\s+[A-Za-z0-9]+)?",
+    re.IGNORECASE,
+)
+_SUBSTANTIVE_CLAUSE_SPLIT = re.compile(
+    r"(?<!\d)[.;!?]+(?!\d)|\b(?:because|but|although|while|whereas|since)\b",
+    re.IGNORECASE,
+)
+_REQUEST_TOKEN = re.compile(
+    r"[A-Za-z][A-Za-z0-9_]*(?:[.-][A-Za-z0-9_]+)*|"
+    r"[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?%?"
+)
+_EXCLUSIVE_REQUEST_WORDS = frozenset(
+    {
+        "a", "add", "additional", "against", "an", "are", "baseline",
+        "benchmark", "change", "compute", "condition", "conditions",
+        "confidence", "conduct", "count", "decrease", "evaluate",
+        "evaluated", "evaluation", "experiment", "expand", "for",
+        "hypothesis", "include", "included", "increase", "interval",
+        "intervals", "is", "metric", "more", "new", "of", "only",
+        "perform", "please", "provide", "p-value", "p-values", "random",
+        "raise", "re-run", "reduce", "report", "rerun", "result",
+        "results", "run", "score", "seed", "seeds", "significance",
+        "statistical", "stronger", "test", "tested", "tests", "the",
+        "to", "trial", "use", "used", "variant", "variants", "was",
+        "were", "with",
+    }
+)
 
 
 class CFSIntegrityError(ValueError):
@@ -138,6 +231,160 @@ def render_fact_sheet_text(cfs: Mapping[str, Any], *, view: str) -> str:
         )
         text += f"\n```text\n{projection}\n```"
     return text
+
+
+def render_complete_fact_sheet_text(
+    cfs: Mapping[str, Any], *, include_projection: bool
+) -> str:
+    """Render the complete CFS, optionally with the bounded observation projection."""
+
+    payload = {key: value for key, value in cfs.items() if key != "observation_rows"}
+    body = canonical_authority_json_text(_thaw_authority_value(payload)).rstrip("\n")
+    text = f"canonical_fact_sheet view=complete\n```json\n{body}\n```"
+    if include_projection:
+        projection = render_observation_projection(
+            cfs["observation_rows"],
+            primary_metric_key=cfs["primary_metric"]["key"],
+            metric_keys=cfs["metric_keys"],
+        )
+        text += f"\n```text\n{projection}\n```"
+    return text
+
+
+def classify_out_of_scope_request(
+    text: str, cfs: Mapping[str, Any]
+) -> tuple[str, ...]:
+    """Classify explicit review requests that exceed one canonical CFS."""
+
+    if not isinstance(text, str) or not text.strip():
+        return ()
+    allowed_counts = {
+        "seed": len(cfs["seeds"]),
+        "condition": len(cfs["conditions"]),
+        "variant": len(cfs["variant_ids"]),
+    }
+    codes: set[str] = set()
+    for match in _REQUEST_COUNT.finditer(text):
+        kind = match.group("kind").casefold().removesuffix("s")
+        count_text = match.group("count").casefold()
+        count = int(count_text) if count_text.isdigit() else _COUNT_WORDS[count_text]
+        prefix = text[max(0, match.start() - 12) : match.start()].casefold()
+        if count != allowed_counts[kind]:
+            codes.add(f"{kind}_count_out_of_scope")
+        elif re.search(r"\bonly\s*$", prefix):
+            codes.add(f"{kind}_contract_limit_criticism")
+    for match in _COUNT_CHANGE_INTENT.finditer(text):
+        kind = match.group("kind").casefold().removesuffix("s")
+        if kind == "condition" and _CONDITION_NAME_REQUEST.search(match.group(0)):
+            continue
+        if kind == "variant" and _VARIANT_NAME_REQUEST.search(match.group(0)):
+            continue
+        count = _requested_count(match.group(0), kind)
+        if count is None or count != allowed_counts[kind]:
+            codes.add(f"{kind}_count_out_of_scope")
+    if _NEW_EXPERIMENT_REQUEST.search(text) or _NEW_RESULTS_REQUEST.search(text):
+        codes.add("new_experiment_request")
+    if _STATISTICAL_REQUEST.search(text):
+        codes.add("unsupported_statistical_request")
+    metric_keys = {str(item).casefold() for item in cfs["metric_keys"]}
+    for match in _METRIC_REQUEST.finditer(text):
+        if match.group("metric").casefold() not in metric_keys:
+            codes.add("unknown_metric_request")
+    condition_ids = {str(item["id"]).casefold() for item in cfs["conditions"]}
+    for match in _CONDITION_NAME_REQUEST.finditer(text):
+        if match.group("name").casefold() not in condition_ids:
+            codes.add("unknown_condition_request")
+    if _NEW_CONDITION_REQUEST.search(text):
+        codes.add("new_condition_request")
+    variant_ids = {str(item).casefold() for item in cfs["variant_ids"]}
+    for match in _VARIANT_NAME_REQUEST.finditer(text):
+        if match.group("name").casefold() not in variant_ids:
+            codes.add("unknown_variant_request")
+    return tuple(sorted(codes))
+
+
+def is_exclusively_out_of_scope_request(
+    text: str, cfs: Mapping[str, Any]
+) -> bool:
+    """Return true only when every substantive token is a classified request."""
+
+    if not isinstance(text, str) or not text.strip():
+        return False
+    clauses = [
+        clause.strip()
+        for clause in _SUBSTANTIVE_CLAUSE_SPLIT.split(text)
+        if clause.strip()
+    ]
+    if not clauses:
+        return False
+    for clause in clauses:
+        if not classify_out_of_scope_request(clause, cfs):
+            return False
+        allowed = set(_EXCLUSIVE_REQUEST_WORDS)
+        allowed.update(str(item).casefold() for item in cfs["metric_keys"])
+        allowed.update(str(item["id"]).casefold() for item in cfs["conditions"])
+        allowed.update(str(item).casefold() for item in cfs["variant_ids"])
+        allowed.update(
+            match.group("metric").casefold()
+            for match in _METRIC_REQUEST.finditer(clause)
+        )
+        allowed.update(
+            match.group("name").casefold()
+            for pattern in (_CONDITION_NAME_REQUEST, _VARIANT_NAME_REQUEST)
+            for match in pattern.finditer(clause)
+        )
+        allowed_count_spans = {
+            match.span("count") for match in _REQUEST_COUNT.finditer(clause)
+        }
+        for match in _COUNT_CHANGE_INTENT.finditer(clause):
+            kind = match.group("kind").casefold().removesuffix("s")
+            count = _requested_count_token(match.group(0), kind)
+            if count is not None:
+                allowed_count_spans.add(
+                    (match.start() + count[1], match.start() + count[2])
+                )
+        for match in _REQUEST_TOKEN.finditer(clause):
+            token = match.group(0).casefold()
+            if token[0].isdigit() or token in _COUNT_WORDS:
+                if match.span() not in allowed_count_spans:
+                    return False
+            elif token not in allowed:
+                return False
+    return True
+
+
+def _requested_count(fragment: str, kind: str) -> int | None:
+    token = _requested_count_token(fragment, kind)
+    if token is None:
+        return None
+    return int(token[0]) if token[0].isdigit() else _COUNT_WORDS[token[0]]
+
+
+def _requested_count_token(
+    fragment: str, kind: str
+) -> tuple[str, int, int] | None:
+    kind_pattern = rf"{re.escape(kind)}s?"
+    after_kind = re.search(
+        rf"\b{kind_pattern}\s+count\s+(?:to|of)\s+"
+        rf"(?P<count>{_COUNT_TOKEN_PATTERN})\b",
+        fragment,
+        re.IGNORECASE,
+    )
+    if after_kind is not None:
+        token = after_kind.group("count").casefold()
+        start, end = after_kind.span("count")
+        return token, start, end
+    before_kind = re.search(
+        rf"\b(?P<count>{_COUNT_TOKEN_PATTERN})\b"
+        rf"(?:\s+[A-Za-z-]+){{0,2}}\s+{kind_pattern}\b",
+        fragment,
+        re.IGNORECASE,
+    )
+    if before_kind is None:
+        return None
+    token = before_kind.group("count").casefold()
+    start, end = before_kind.span("count")
+    return token, start, end
 
 
 def fact_sheet_view_payload(

@@ -69,7 +69,10 @@ from researchclaw.pipeline.canonical_fact_sheet import (  # noqa: F401
     _benchmark_tokens,
     build_canonical_fact_sheet,
     canonical_fact_sheet_sha256,
+    classify_out_of_scope_request,
     compose_grounding_context,
+    is_exclusively_out_of_scope_request,
+    render_complete_fact_sheet_text,
     render_fact_sheet_text,
     render_observation_projection,
 )
@@ -898,6 +901,84 @@ class TestMetricValueDomain:
 
 # 覆盖 7：section-scoped prompt 视图隔离。
 class TestSectionScopedViews:
+    def test_complete_reviewer_view_includes_projection_and_contract(self) -> None:
+        cfs = _build_cfs()
+        text = render_complete_fact_sheet_text(cfs, include_projection=True)
+
+        assert CLAIM_SCOPE in text
+        assert '"seeds"' in text
+        assert '"runtime"' in text
+        assert '"condition_aggregates"' in text
+        assert "projection mode=full" in text
+        assert text.index("canonical_fact_sheet view=complete") < text.index(
+            "projection mode="
+        )
+
+    def test_complete_planner_view_omits_observation_projection(self) -> None:
+        text = render_complete_fact_sheet_text(
+            _build_cfs(), include_projection=False
+        )
+
+        assert CLAIM_SCOPE in text
+        assert '"condition_aggregates"' in text
+        assert '"observation_rows"' not in text
+        assert "projection mode=" not in text
+
+    @pytest.mark.parametrize(
+        ("request_text", "expected_code"),
+        (
+            ("Re-run with 10 seeds.", "seed_count_out_of_scope"),
+            ("Use 4 conditions.", "condition_count_out_of_scope"),
+            ("Include 20 variants.", "variant_count_out_of_scope"),
+            ("Report MCC score.", "unknown_metric_request"),
+            ("Include unknown_x comparator.", "unknown_condition_request"),
+            ("Add a stronger baseline.", "new_condition_request"),
+            ("Evaluate c9999_v1 variant.", "unknown_variant_request"),
+            ("Conduct an additional experiment.", "new_experiment_request"),
+            ("Only three seeds were used.", "seed_contract_limit_criticism"),
+            ("Use eleven seeds.", "seed_count_out_of_scope"),
+            ("Increase the seed count to ten.", "seed_count_out_of_scope"),
+            ("Add more seeds.", "seed_count_out_of_scope"),
+            ("Use several seeds.", "seed_count_out_of_scope"),
+            ("Evaluate with ten random seeds.", "seed_count_out_of_scope"),
+        ),
+    )
+    def test_out_of_scope_request_classifier(
+        self, request_text: str, expected_code: str
+    ) -> None:
+        assert expected_code in classify_out_of_scope_request(
+            request_text, _build_cfs()
+        )
+
+    @pytest.mark.parametrize(
+        "request_text",
+        (
+            "The evaluation used 3 seeds.",
+            "Use three seeds.",
+            "Evaluate with three random seeds.",
+            "Change the seed count to three.",
+            "The evaluation used 3 conditions.",
+            "The evaluation included 18 variants.",
+            "Report AUPRC score.",
+            f"Include {PRIMARY_CONDITION} comparator.",
+            f"Use {PRIMARY_CONDITION} condition.",
+            f"Evaluate {VARIANT_IDS[0]} variant.",
+            f"Use {VARIANT_IDS[0]} variant.",
+        ),
+    )
+    def test_in_scope_request_classifier_is_empty(self, request_text: str) -> None:
+        assert classify_out_of_scope_request(request_text, _build_cfs()) == ()
+
+    def test_word_count_must_be_bound_to_count_occurrence(self) -> None:
+        cfs = _build_cfs()
+        assert is_exclusively_out_of_scope_request("Re-run with ten seeds.", cfs)
+        assert not is_exclusively_out_of_scope_request(
+            "Re-run with 10 seeds with AUPRC score one,", cfs
+        )
+        assert not is_exclusively_out_of_scope_request(
+            "Re-run with 10 seeds with AUPRC score ten,", cfs
+        )
+
     def test_introduction_view_scope_without_metrics_or_runtime(self) -> None:
         text = render_fact_sheet_text(_build_cfs(), view="introduction")
         for condition in CONDITIONS:
