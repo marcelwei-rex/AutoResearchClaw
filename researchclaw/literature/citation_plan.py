@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -58,6 +59,8 @@ from researchclaw.pipeline.release_graph_lock import (
 
 CITATION_PLAN_SCHEMA_VERSION = 1
 CITATION_PLAN_VERSION = 2
+DOMAIN_V2_CITATION_BATCH_MAX_ANCHORS = 5
+DOMAIN_V2_CITATION_BATCH_MAX_PROMPT_UTF8_BYTES = 16_384
 _STRICT_CITE_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\d{4}[A-Za-z0-9_-]*")
 _MARKDOWN_CITATION_CANDIDATE_RE = re.compile(r"\[([^\[\]\n]+)\]")
 _LATEX_CITATION_CANDIDATE_RE = re.compile(
@@ -72,10 +75,36 @@ _AUTHOR_YEAR_CITATION_RE = re.compile(
     r"[^]\n]{0,32}\b(?:18|19|20|21)\d{2}[a-z]?\b",
     re.IGNORECASE,
 )
+_BARE_AUTHOR_YEAR_CITATION_RE = re.compile(
+    r"""
+    (?:\(\s*|\b)
+    [A-Za-z][A-Za-z'_-]*
+    (?:
+        \s+et\s+al\.
+        |
+        \s+(?:and|&)\s+[A-Za-z][A-Za-z'_-]*
+    )?
+    \s*
+    (?:
+        ,\s*(?:18|19|20|21)\d{2}[a-z]?
+        |
+        \(\s*(?:18|19|20|21)\d{2}[a-z]?
+    )
+    (?:
+        \s*\)
+        |
+        (?=\s*(?:[.;:!?\n]|$))
+        |
+        (?=\s+(?:reported|showed|found|proposed|demonstrated)\b)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 _NUMERIC_CITATION_RE = re.compile(
     r"\s*\d+(?:\s*(?:[-–,;]\s*)\d+)*\s*"
 )
 _AT_CITATION_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_:-]*")
+_HTML_HEADING_RE = re.compile(r"</?h[1-6]\b[^>]*>", re.IGNORECASE)
 
 
 class CitationPlanContractError(ValueError):
@@ -106,6 +135,17 @@ class CitationAnchor:
     claim_text: str
     cite_key: str
     boundary_kind: str = "standalone_line"
+
+
+@dataclass(frozen=True)
+class CitationAnchorBatch:
+    """One precomputed provider-visible prompt for contiguous plan anchors."""
+
+    ordinal: int
+    anchors: tuple[CitationAnchor, ...]
+    system_prompt: str
+    user_prompt: str
+    prompt_utf8_bytes: int
 
 
 def _is_standalone_citation_claim(text: object) -> bool:
@@ -146,11 +186,158 @@ def project_citation_anchors(plan: Mapping[str, Any]) -> tuple[CitationAnchor, .
     return tuple(anchors)
 
 
+def project_contiguous_citation_anchor_batches(
+    anchors: tuple[CitationAnchor, ...],
+    *,
+    render_prompt: Callable[[tuple[CitationAnchor, ...]], tuple[str, str]],
+    max_anchors: int = DOMAIN_V2_CITATION_BATCH_MAX_ANCHORS,
+    max_prompt_utf8_bytes: int = DOMAIN_V2_CITATION_BATCH_MAX_PROMPT_UTF8_BYTES,
+) -> tuple[CitationAnchorBatch, ...]:
+    """Greedily freeze contiguous batches using final provider-visible bytes."""
+
+    if type(max_anchors) is not int or max_anchors <= 0:
+        raise CitationPlanContractError("citation batch anchor budget is invalid")
+    if type(max_prompt_utf8_bytes) is not int or max_prompt_utf8_bytes <= 0:
+        raise CitationPlanContractError("citation batch prompt budget is invalid")
+    if not anchors:
+        return ()
+    heading = anchors[0].heading
+    if any(anchor.heading != heading for anchor in anchors):
+        raise CitationPlanContractError(
+            "citation anchor batch cannot span multiple headings"
+        )
+
+    frozen: list[CitationAnchorBatch] = []
+    pending: tuple[CitationAnchor, ...] = ()
+    pending_prompts: tuple[str, str] | None = None
+    pending_bytes = 0
+
+    def render(candidate: tuple[CitationAnchor, ...]) -> tuple[str, str, int]:
+        prompts = render_prompt(candidate)
+        if (
+            not isinstance(prompts, tuple)
+            or len(prompts) != 2
+            or any(type(prompt) is not str for prompt in prompts)
+        ):
+            raise CitationPlanContractError(
+                "citation batch prompt renderer returned invalid prompts"
+            )
+        size = sum(len(prompt.encode("utf-8")) for prompt in prompts)
+        return prompts[0], prompts[1], size
+
+    def append_pending() -> None:
+        nonlocal pending, pending_prompts, pending_bytes
+        if not pending or pending_prompts is None:
+            return
+        frozen.append(
+            CitationAnchorBatch(
+                ordinal=len(frozen) + 1,
+                anchors=pending,
+                system_prompt=pending_prompts[0],
+                user_prompt=pending_prompts[1],
+                prompt_utf8_bytes=pending_bytes,
+            )
+        )
+        pending = ()
+        pending_prompts = None
+        pending_bytes = 0
+
+    for anchor in anchors:
+        candidate = pending + (anchor,)
+        if len(candidate) > max_anchors:
+            append_pending()
+            candidate = (anchor,)
+        system_prompt, user_prompt, size = render(candidate)
+        if size > max_prompt_utf8_bytes:
+            if pending:
+                append_pending()
+                candidate = (anchor,)
+                system_prompt, user_prompt, size = render(candidate)
+            if size > max_prompt_utf8_bytes:
+                raise CitationPlanContractError(
+                    "single citation anchor exceeds prompt budget"
+                )
+        pending = candidate
+        pending_prompts = (system_prompt, user_prompt)
+        pending_bytes = size
+    append_pending()
+    return tuple(frozen)
+
+
+def validate_citation_free_anchor_fragment(
+    text: str,
+    *,
+    anchors: tuple[CitationAnchor, ...],
+    all_anchors: tuple[CitationAnchor, ...],
+) -> None:
+    """Validate one headingless domain-v2 fragment against a contiguous batch."""
+
+    if not anchors:
+        raise CitationPlanContractError("citation fragment has no active anchors")
+    if len(set(all_anchors)) != len(all_anchors):
+        raise CitationPlanContractError(
+            "full citation anchor authority contains duplicates"
+        )
+    matches = tuple(
+        start
+        for start in range(0, len(all_anchors) - len(anchors) + 1)
+        if all_anchors[start:start + len(anchors)] == anchors
+    )
+    if len(matches) != 1:
+        raise CitationPlanContractError(
+            "citation fragment anchors are not one exact contiguous authority slice"
+        )
+    if "\r" in text:
+        raise CitationPlanContractError(
+            "domain-v2 citation fragment must use LF newlines"
+        )
+    require_citation_candidate_free(text)
+    if _HTML_HEADING_RE.search(text):
+        raise CitationPlanContractError(
+            "domain-v2 citation fragment contains an HTML heading"
+        )
+    document = parse_manuscript(text, strict=False)
+    if document.sections:
+        raise CitationPlanContractError("domain-v2 citation fragment contains a heading")
+    if re.search(r"(?m)^[ \t]{0,3}(?:`{3,}|~{3,})", text):
+        raise CitationPlanContractError(
+            "domain-v2 citation fragment contains a code fence"
+        )
+
+    active = set(anchors)
+    positions: list[int] = []
+    for anchor in all_anchors:
+        if anchor.cite_key in text:
+            raise CitationPlanContractError(
+                "domain-v2 citation fragment exposes a citation key literal"
+            )
+        if anchor not in active:
+            if anchor.claim_text in text:
+                raise CitationPlanContractError(
+                    "domain-v2 citation fragment exposes a foreign claim anchor"
+                )
+            continue
+        exact_lines = [line for line in text.split("\n") if line == anchor.claim_text]
+        if len(exact_lines) != 1 or text.count(anchor.claim_text) != 1:
+            raise CitationPlanContractError(
+                "domain-v2 citation anchor is missing, changed, or not unique"
+            )
+        positions.append(text.index(anchor.claim_text))
+    if positions != sorted(positions):
+        raise CitationPlanContractError(
+            "domain-v2 citation anchors are out of plan order"
+        )
+
+
 def require_citation_candidate_free(text: str) -> None:
     """Reject every citation-like candidate, including escaped or malformed forms."""
 
     if _LATEX_CITATION_LIKE_RE.search(text):
         raise CitationPlanContractError("initial domain-v2 draft contains citation candidate")
+    if _BARE_AUTHOR_YEAR_CITATION_RE.search(text):
+        raise CitationPlanContractError(
+            "initial domain-v2 draft contains citation candidate"
+        )
     for line in text.splitlines():
         bracket = line.find("[")
         while bracket >= 0:

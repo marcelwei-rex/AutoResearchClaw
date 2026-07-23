@@ -4500,6 +4500,173 @@ class TestDataIntegrityBlock:
         ):
             assert not (stage_dir / name).exists()
 
+    def test_domain_v2_batch_preflight_failure_clears_success_authority(
+        self,
+        run_dir: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.literature.citation_plan import CitationPlanContractError
+        from researchclaw.pipeline.stage_impls import _paper_writing
+
+        _write_prior_artifact(run_dir, 16, "outline.md", "# Outline\n## Abstract\n")
+        runs_dir = run_dir / "stage-12" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        (runs_dir / "results.json").write_text(
+            json.dumps(
+                {
+                    "claim_scope": "pipeline_validation",
+                    "dataset_origin": "synthetic",
+                    "evaluator_owner": "scaffold",
+                    "metrics": {"detection_f1": 0.4753327669},
+                }
+            ),
+            encoding="utf-8",
+        )
+        stage_dir = run_dir / "stage-17"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "paper_draft.md",
+            "experiment_fact_closure_report.json",
+            "citation_closure_report.json",
+        ):
+            (stage_dir / name).write_text("stale authority", encoding="utf-8")
+
+        def fail_preflight(*_args: object, **_kwargs: object) -> str:
+            raise CitationPlanContractError(
+                "single citation anchor exceeds prompt budget"
+            )
+
+        monkeypatch.setattr(_paper_writing, "_write_paper_sections", fail_preflight)
+        llm = FakeLLMClient("must not be called")
+
+        result = rc_executor._execute_paper_draft(
+            stage_dir, run_dir, rc_config, adapters, llm=llm
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert "citation batch preflight failed" in (result.error or "").lower()
+        assert llm.calls == []
+        for name in (
+            "paper_draft.md",
+            "experiment_fact_closure_report.json",
+            "citation_closure_report.json",
+        ):
+            assert not (stage_dir / name).exists()
+
+    def test_domain_v2_post_generation_authority_drift_clears_success_authority(
+        self,
+        run_dir: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from researchclaw.literature.citation_plan import CitationPlanContractError
+        from researchclaw.pipeline.stage_impls import _paper_writing
+
+        _write_prior_artifact(run_dir, 16, "outline.md", "# Outline\n## Abstract\n")
+        runs_dir = run_dir / "stage-12" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        (runs_dir / "results.json").write_text(
+            json.dumps(
+                {
+                    "claim_scope": "pipeline_validation",
+                    "dataset_origin": "synthetic",
+                    "evaluator_owner": "scaffold",
+                    "metrics": {"detection_f1": 0.4753327669},
+                }
+            ),
+            encoding="utf-8",
+        )
+        stage_dir = run_dir / "stage-17"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        captured = SimpleNamespace(
+            replayed=SimpleNamespace(
+                effective_policy={
+                    "effective_min_unique_sources": 1,
+                    "effective_target_unique_sources": 1,
+                },
+                plan={"claims": []},
+                cards=(),
+            )
+        )
+        draft = (
+            "## Title\n\nPaper.\n\n"
+            "## Abstract\n\nA.\n\n"
+            "## Introduction\n\nI.\n\n"
+            "## Related Work\n\nR.\n\n"
+            "## Method\n\nM.\n\n"
+            "## Experiments\n\nE.\n\n"
+            "## Results\n\nR.\n\n"
+            "## Discussion\n\nD.\n\n"
+            "## Limitations\n\nL.\n\n"
+            "## Conclusion\n\nC."
+        )
+
+        monkeypatch.setattr(
+            _paper_writing, "build_canonical_fact_sheet", lambda _evidence: {"active": True}
+        )
+        monkeypatch.setattr(
+            _paper_writing,
+            "capture_replayed_citation_authority",
+            lambda *_args, **_kwargs: captured,
+        )
+        monkeypatch.setattr(
+            _paper_writing,
+            "build_heading_citation_writer_instructions_from_authority",
+            lambda *_args, heading_names, **_kwargs: {
+                heading: "None. Do not add citation markers."
+                for heading in heading_names
+            },
+        )
+        monkeypatch.setattr(
+            _paper_writing,
+            "project_citation_anchors",
+            lambda _plan: (),
+        )
+
+        def write_draft(*_args: object, **kwargs: object) -> str:
+            target = cast(Path, kwargs["stage_dir"])
+            (target / "section_generation_report.json").write_text(
+                json.dumps({"schema_version": 1, "parts": []}),
+                encoding="utf-8",
+            )
+            return draft
+
+        monkeypatch.setattr(_paper_writing, "_write_paper_sections", write_draft)
+        verify_calls = 0
+
+        def reject_drift(*_args: object, **_kwargs: object) -> None:
+            nonlocal verify_calls
+            verify_calls += 1
+            raise CitationPlanContractError("captured citation authority changed")
+
+        monkeypatch.setattr(
+            _paper_writing,
+            "verify_captured_citation_authority_unchanged",
+            reject_drift,
+        )
+
+        result = rc_executor._execute_paper_draft(
+            stage_dir,
+            run_dir,
+            rc_config,
+            adapters,
+            llm=FakeLLMClient("unused"),
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert "authority changed" in (result.error or "").lower()
+        assert verify_calls == 1
+        assert (stage_dir / "paper_draft_invalid.md").exists()
+        for name in (
+            "paper_draft.md",
+            "experiment_fact_closure_report.json",
+            "citation_closure_report.json",
+        ):
+            assert not (stage_dir / name).exists()
+
     def test_paper_draft_fact_repair_closes_before_publish(
         self,
         run_dir: Path,

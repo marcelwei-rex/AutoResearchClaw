@@ -40,10 +40,12 @@ from researchclaw.literature.citation_plan import (
     capture_replayed_citation_authority,
     parse_strict_citation_occurrences,
     project_citation_anchors,
+    project_contiguous_citation_anchor_batches,
     require_citation_candidate_free,
     strict_citation_keys,
     strict_sentence_spans,
     strip_strict_citation_markers,
+    validate_citation_free_anchor_fragment,
     validate_citation_free_anchor_draft,
     validate_citation_closure_report,
     validate_citation_plan,
@@ -1030,17 +1032,19 @@ def _write_paper_sections(
     canonical_fact_sheet: Mapping[str, Any] | None = None,
     citation_anchors: tuple[CitationAnchor, ...] = (),
 ) -> str:
-    """Write a conference-grade paper in 3 sequential LLM calls.
+    """Write a paper with generic parts or bounded domain-v2 citation batches.
 
-    ML path (default):
+    Generic ML path:
       Call 1: Title + Abstract + Introduction + Related Work
       Call 2: Method + Experiments
       Call 3: Results + Discussion + Limitations + Conclusion
 
-    HEP path (when ``is_hep=True``, i.e. hep_ph domain detected):
+    Generic HEP path:
       Call 1: Title + Abstract + Introduction
       Call 2: Model / Theoretical framework + Phenomenology / Computational setup
       Call 3: Results + Discussion + Conclusions (no Broader Impact, no Related Work block)
+
+    Canonical domain-v2 citation headings use precomputed contiguous batches.
     """
     if heading_citation_instructions is not None:
         return _write_heading_scoped_paper_sections(
@@ -1502,6 +1506,315 @@ def _heading_writer_groups(
     return tuple(result)
 
 
+def _render_domain_v2_anchor_authority(
+    anchors: tuple[CitationAnchor, ...],
+) -> str:
+    lines = [
+        "DOMAIN-V2 CITATION ANCHOR CONTRACT:",
+        "- Output a headingless prose fragment. Do not output any Markdown heading.",
+        "- Do not output any Markdown, LaTeX, escaped, malformed, or unknown citation marker.",
+        "- Copy every EXACT ANCHOR below as its own physical line, byte for byte.",
+        "- Do not paraphrase, extend, merge, punctuate, or reorder an anchor.",
+        "- Deterministic code will insert citation markers after validation.",
+    ]
+    for anchor in anchors:
+        lines.extend(
+            (
+                f"- claim_id: {anchor.claim_id}",
+                f"  heading: {anchor.heading}",
+                f"  cite_key (input authority only; never output it): {anchor.cite_key}",
+                "  EXACT ANCHOR START",
+                anchor.claim_text,
+                "  EXACT ANCHOR END",
+            )
+        )
+    return "\n".join(lines)
+
+
+def _domain_v2_fragment_system(
+    system: str,
+    *,
+    authority: str,
+    grounding: str,
+) -> str:
+    retained = [
+        line for line in system.splitlines()
+        if "cite" not in line.casefold() and "citation" not in line.casefold()
+    ]
+    return (
+        "\n".join(retained).rstrip()
+        + "\n\nSECTION-SCOPED CITATION OVERRIDE:\n"
+        + authority
+        + "\nThese batch-scoped rules override every earlier citation and section-format "
+        "instruction. Output no heading, preamble, explanation, or code fence."
+        + (
+            "\n\nCANONICAL FACT AUTHORITY:\n" + grounding
+            if grounding
+            else ""
+        )
+    )
+
+
+def _write_batched_domain_v2_paper_sections(
+    *,
+    llm: LLMClient,
+    system: str,
+    groups: tuple[tuple[str, ...], ...],
+    grounding_contexts: Mapping[str, str],
+    citation_anchors: tuple[CitationAnchor, ...],
+    model_name: str,
+    stage_dir: Path | None,
+) -> str:
+    """Precompute every prompt, then generate and replay contiguous anchor batches."""
+
+    prepared: list[dict[str, Any]] = []
+    for index, group in enumerate(groups):
+        grounding = "\n\n".join(
+            dict.fromkeys(grounding_contexts[heading] for heading in group)
+        )
+        active_anchors = tuple(
+            anchor for anchor in citation_anchors if anchor.heading in group
+        )
+        title_slot = index == 0
+        if active_anchors:
+            if len(group) != 1:
+                raise CitationPlanContractError(
+                    "citation-bearing domain-v2 group must own exactly one heading"
+                )
+
+            def render_prompt(
+                batch: tuple[CitationAnchor, ...],
+                *,
+                batch_group: tuple[str, ...] = group,
+                batch_grounding: str = grounding,
+            ) -> tuple[str, str]:
+                authority = _render_domain_v2_anchor_authority(batch)
+                batch_system = _domain_v2_fragment_system(
+                    system,
+                    authority=authority,
+                    grounding=batch_grounding,
+                )
+                batch_user = (
+                    f"{batch_grounding}\n\n"
+                    f"Write one headingless prose fragment for {batch_group[0]}.\n"
+                    "Use only the batch authority below. Do not output a heading, "
+                    "citation marker, code fence, preamble, or explanation.\n\n"
+                    f"{authority}"
+                )
+                return batch_system, batch_user
+
+            batches = project_contiguous_citation_anchor_batches(
+                active_anchors,
+                render_prompt=render_prompt,
+            )
+            prepared.append(
+                {
+                    "kind": "citation",
+                    "index": index,
+                    "group": group,
+                    "batches": batches,
+                }
+            )
+            continue
+
+        requested = (("Title",) if title_slot else ()) + group
+        heading_lines = "\n".join(f"- ## {heading}" for heading in requested)
+        authority = (
+            "DOMAIN-V2 CITATION ANCHOR CONTRACT:\n"
+            "- This call has no citation anchors or citation authority.\n"
+            "- Do not output any citation marker, citation key, or foreign anchor."
+        )
+        user = (
+            f"{grounding}\n\n"
+            f"Write exactly these manuscript headings:\n{heading_lines}\n\n"
+            f"{authority}\n\n"
+            "Prior context is empty and may not be invented:\n---\n\n---\n\n"
+            f"Outline:\n{chr(10).join(f'## {heading}' for heading in group)}\n"
+            "Do not output a References section."
+            + _SECTION_OUTPUT_CONTRACT
+        )
+        prepared.append(
+            {
+                "kind": "section",
+                "index": index,
+                "group": group,
+                "title_slot": title_slot,
+                "grounding": grounding,
+                "system": _citation_safe_system(
+                    system,
+                    authority + "\n\nCANONICAL FACT AUTHORITY:\n" + grounding,
+                ),
+                "user": user,
+            }
+        )
+
+    report_entries: list[dict[str, Any]] = []
+    generated: list[str] = []
+    max_tokens = 24000 if model_name.startswith(("gpt-5", "o3", "o4")) else 12000
+    for item in prepared:
+        index = int(item["index"])
+        group = tuple(item["group"])
+        part_name = f"heading-group-{index + 1}"
+        if item["kind"] == "section":
+            response = _chat_with_prompt(
+                llm,
+                str(item["system"]),
+                str(item["user"]),
+                max_tokens=max_tokens,
+                retries=1,
+            ).content.strip()
+
+            def validate_candidate(candidate: str) -> None:
+                try:
+                    validate_citation_free_anchor_draft(
+                        candidate,
+                        anchors=citation_anchors,
+                        active_headings=group,
+                    )
+                except (CitationPlanContractError, ManuscriptStructureError) as exc:
+                    raise PaperSectionContractError(
+                        part_name,
+                        (f"citation_anchor:{exc}",),
+                        candidate,
+                    ) from exc
+
+            validate_candidate(response)
+            part = _validate_or_regenerate_paper_part(
+                llm=llm,
+                initial_text=response,
+                part_name=part_name,
+                expected_major_sections=group,
+                title_slot=bool(item["title_slot"]),
+                citation_repair_context="None. Do not add citation markers.",
+                allowed_citation_keys=frozenset(),
+                max_tokens=12000,
+                report_entries=report_entries,
+                stage_dir=stage_dir,
+                grounding_context=str(item["grounding"]),
+            )
+            validate_candidate(part)
+            generated.append(part)
+            continue
+
+        fragments: list[str] = []
+        batch_entries: list[dict[str, Any]] = []
+        for batch in item["batches"]:
+            response = ""
+            failure_exc: Exception | None = None
+            try:
+                response = _chat_with_prompt(
+                    llm,
+                    batch.system_prompt,
+                    batch.user_prompt,
+                    max_tokens=max_tokens,
+                    retries=0,
+                ).content.strip()
+            except Exception as exc:  # noqa: BLE001
+                violation = "citation_batch_transport_error"
+                failure_exc = exc
+            else:
+                try:
+                    validate_citation_free_anchor_fragment(
+                        response,
+                        anchors=batch.anchors,
+                        all_anchors=citation_anchors,
+                    )
+                except (CitationPlanContractError, ManuscriptStructureError) as exc:
+                    violation = "citation_batch_contract_error"
+                    failure_exc = exc
+                else:
+                    violation = ""
+            if violation:
+                batch_entries.append(
+                    {
+                        "batch_ordinal": batch.ordinal,
+                        "first_claim_id": batch.anchors[0].claim_id,
+                        "last_claim_id": batch.anchors[-1].claim_id,
+                        "anchor_count": len(batch.anchors),
+                        "prompt_utf8_bytes": batch.prompt_utf8_bytes,
+                        "raw_response_sha256": hashlib.sha256(
+                            response.encode("utf-8")
+                        ).hexdigest(),
+                        "valid": False,
+                        "violations": [violation],
+                    }
+                )
+                report_entries.append(
+                    {
+                        "part": part_name,
+                        "title_slot": False,
+                        "expected_major_sections": list(group),
+                        "batches": batch_entries,
+                    }
+                )
+                _persist_section_generation_report(stage_dir, report_entries)
+                raise PaperSectionContractError(
+                    part_name,
+                    (f"citation_anchor:{failure_exc}",),
+                    response,
+                ) from failure_exc
+            batch_entries.append(
+                {
+                    "batch_ordinal": batch.ordinal,
+                    "first_claim_id": batch.anchors[0].claim_id,
+                    "last_claim_id": batch.anchors[-1].claim_id,
+                    "anchor_count": len(batch.anchors),
+                    "prompt_utf8_bytes": batch.prompt_utf8_bytes,
+                    "raw_response_sha256": hashlib.sha256(
+                        response.encode("utf-8")
+                    ).hexdigest(),
+                    "valid": True,
+                    "violations": [],
+                }
+            )
+            fragments.append(response)
+
+        part = f"## {group[0]}\n\n" + "\n\n".join(fragments)
+        try:
+            validate_citation_free_anchor_draft(
+                part,
+                anchors=citation_anchors,
+                active_headings=group,
+            )
+            structure_violations = _validate_paper_part_sections(
+                part,
+                expected_major_sections=group,
+                title_slot=False,
+            )
+            if structure_violations:
+                raise CitationPlanContractError(
+                    "batched citation heading violates section structure"
+                )
+        except (CitationPlanContractError, ManuscriptStructureError) as exc:
+            report_entries.append(
+                {
+                    "part": part_name,
+                    "title_slot": False,
+                    "expected_major_sections": list(group),
+                    "batches": batch_entries,
+                    "full_replay_valid": False,
+                }
+            )
+            _persist_section_generation_report(stage_dir, report_entries)
+            raise PaperSectionContractError(
+                part_name,
+                (f"citation_anchor:{exc}",),
+                part,
+            ) from exc
+        report_entries.append(
+            {
+                "part": part_name,
+                "title_slot": False,
+                "expected_major_sections": list(group),
+                "batches": batch_entries,
+                "full_replay_valid": True,
+            }
+        )
+        _persist_section_generation_report(stage_dir, report_entries)
+        generated.append(part)
+    return "\n\n".join(generated)
+
+
 def _write_heading_scoped_paper_sections(
     *,
     llm: LLMClient,
@@ -1558,6 +1871,18 @@ def _write_heading_scoped_paper_sections(
         exp_metrics_instruction="", citation_instruction="", writing_structure="",
         outline="", venue_guidance="",
     ).system
+    if canonical_fact_sheet is not None and citation_anchors:
+        if grounding_contexts is None:
+            raise ValueError("domain-v2 citation batching requires grounding contexts")
+        return _write_batched_domain_v2_paper_sections(
+            llm=llm,
+            system=system,
+            groups=groups,
+            grounding_contexts=grounding_contexts,
+            citation_anchors=citation_anchors,
+            model_name=model_name,
+            stage_dir=stage_dir,
+        )
     report_entries: list[dict[str, Any]] = []
     generated: list[str] = []
     for index, group in enumerate(groups):
@@ -3248,6 +3573,42 @@ def _execute_paper_draft_under_release_epoch(
                 ),
                 decision="retry",
             )
+        except CitationPlanContractError as exc:
+            return StageResult(
+                stage=Stage.PAPER_DRAFT,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"Domain-v2 citation batch preflight failed: {exc}",
+                decision="retry",
+            )
+        if captured_citation_authority is not None:
+            try:
+                verify_captured_citation_authority_unchanged(
+                    run_dir,
+                    captured_citation_authority,
+                    release_lock=release_lock,
+                )
+            except CitationPlanContractError as exc:
+                (stage_dir / "paper_draft_invalid.md").write_text(
+                    draft, encoding="utf-8"
+                )
+                _validate_stage17_manuscript_structure(draft, stage_dir=stage_dir)
+                return StageResult(
+                    stage=Stage.PAPER_DRAFT,
+                    status=StageStatus.FAILED,
+                    artifacts=(
+                        "paper_draft_invalid.md",
+                        "paper_structure_report.json",
+                        "section_generation_report.json",
+                    ),
+                    error=f"Citation authority changed after batched generation: {exc}",
+                    evidence_refs=(
+                        "stage-17/paper_draft_invalid.md",
+                        "stage-17/paper_structure_report.json",
+                        "stage-17/section_generation_report.json",
+                    ),
+                    decision="retry",
+                )
 
         # R7: Strip LLM-generated References section — it often fabricates arXiv IDs.
         import re as _re_r7
