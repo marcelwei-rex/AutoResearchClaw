@@ -59,8 +59,9 @@ from researchclaw.pipeline.release_graph_lock import (
 
 CITATION_PLAN_SCHEMA_VERSION = 1
 CITATION_PLAN_VERSION = 2
-DOMAIN_V2_CITATION_BATCH_MAX_ANCHORS = 5
+DOMAIN_V2_CITATION_BATCH_MAX_ANCHORS = 1
 DOMAIN_V2_CITATION_BATCH_MAX_PROMPT_UTF8_BYTES = 16_384
+DOMAIN_V2_CITATION_FRAGMENT_MAX_UTF8_BYTES = 8_192
 _STRICT_CITE_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\d{4}[A-Za-z0-9_-]*")
 _MARKDOWN_CITATION_CANDIDATE_RE = re.compile(r"\[([^\[\]\n]+)\]")
 _LATEX_CITATION_CANDIDATE_RE = re.compile(
@@ -193,10 +194,14 @@ def project_contiguous_citation_anchor_batches(
     max_anchors: int = DOMAIN_V2_CITATION_BATCH_MAX_ANCHORS,
     max_prompt_utf8_bytes: int = DOMAIN_V2_CITATION_BATCH_MAX_PROMPT_UTF8_BYTES,
 ) -> tuple[CitationAnchorBatch, ...]:
-    """Greedily freeze contiguous batches using final provider-visible bytes."""
+    """Freeze single-anchor calls using final provider-visible bytes."""
 
     if type(max_anchors) is not int or max_anchors <= 0:
         raise CitationPlanContractError("citation batch anchor budget is invalid")
+    if max_anchors != 1:
+        raise CitationPlanContractError(
+            "domain-v2 citation projection requires single-anchor batches"
+        )
     if type(max_prompt_utf8_bytes) is not int or max_prompt_utf8_bytes <= 0:
         raise CitationPlanContractError("citation batch prompt budget is invalid")
     if not anchors:
@@ -272,6 +277,10 @@ def validate_citation_free_anchor_fragment(
 ) -> None:
     """Validate one headingless domain-v2 fragment against a contiguous batch."""
 
+    if len(text.encode("utf-8")) > DOMAIN_V2_CITATION_FRAGMENT_MAX_UTF8_BYTES:
+        raise CitationPlanContractError(
+            "domain-v2 citation fragment exceeds response budget"
+        )
     if not anchors:
         raise CitationPlanContractError("citation fragment has no active anchors")
     if len(set(all_anchors)) != len(all_anchors):
@@ -307,6 +316,10 @@ def validate_citation_free_anchor_fragment(
     active = set(anchors)
     positions: list[int] = []
     for anchor in all_anchors:
+        if anchor.claim_id in text:
+            raise CitationPlanContractError(
+                "domain-v2 citation fragment exposes a claim id literal"
+            )
         if anchor.cite_key in text:
             raise CitationPlanContractError(
                 "domain-v2 citation fragment exposes a citation key literal"

@@ -713,6 +713,7 @@ def _chat_with_prompt(
     system: str,
     user: str,
     *,
+    model: str | None = None,
     json_mode: bool = False,
     max_tokens: int | None = None,
     retries: int = 0,
@@ -737,13 +738,17 @@ def _chat_with_prompt(
     _effective_json_mode = json_mode
     for attempt in range(1 + retries):
         try:
-            if _effective_json_mode and max_tokens is not None:
-                return llm.chat(messages, system=system, json_mode=True, max_tokens=max_tokens, strip_thinking=strip_thinking)
+            chat_kwargs: dict[str, Any] = {
+                "system": system,
+                "strip_thinking": strip_thinking,
+            }
+            if model is not None:
+                chat_kwargs["model"] = model
             if _effective_json_mode:
-                return llm.chat(messages, system=system, json_mode=True, strip_thinking=strip_thinking)
+                chat_kwargs["json_mode"] = True
             if max_tokens is not None:
-                return llm.chat(messages, system=system, max_tokens=max_tokens, strip_thinking=strip_thinking)
-            return llm.chat(messages, system=system, strip_thinking=strip_thinking)
+                chat_kwargs["max_tokens"] = max_tokens
+            return llm.chat(messages, **chat_kwargs)
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             # Auto-disable json_mode on HTTP 400 — likely provider incompatibility

@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
 import math
 import re
 from collections.abc import Mapping
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import yaml
@@ -26,6 +29,7 @@ from researchclaw.literature.citation_policy import (
 from researchclaw.literature.citation_plan import (
     CitationAnchor,
     CitationPlanContractError,
+    DOMAIN_V2_CITATION_BATCH_MAX_PROMPT_UTF8_BYTES,
     attribute_citation_keys_to_top_level_headings,
     build_citation_closure_from_texts,
     # Stable monkeypatch seam for legacy executor fixtures.
@@ -109,6 +113,9 @@ from researchclaw.pipeline.stage15_decision_projection import (
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
+
+_DOMAIN_V2_CITATION_MAX_TOKENS = 2_048
+_DOMAIN_V2_CITATION_MAX_ATTEMPTS = 2
 
 _SECTION_OUTPUT_CONTRACT = """
 
@@ -1555,6 +1562,49 @@ def _domain_v2_fragment_system(
     )
 
 
+def _constrain_stage17_citation_llm(llm: object) -> LLMClient:
+    """Resolve one client whose citation chat performs one provider request."""
+
+    resolver = getattr(llm, "resolve_for_legacy", None)
+    resolved = resolver() if callable(resolver) else llm
+    if not isinstance(resolved, LLMClient):
+        raise CitationPlanContractError(
+            "domain-v2 citation generation requires a bounded LLM client"
+        )
+    constrained = copy.copy(resolved)
+    constrained.config = replace(
+        resolved.config,
+        fallback_models=[],
+        max_retries=1,
+        fallback_url="",
+        fallback_api_key="",
+    )
+    constrained._model_chain = [constrained.config.primary_model]
+    return constrained
+
+
+def _domain_v2_repair_prompt(
+    *,
+    batch: Any,
+) -> tuple[str, str]:
+    """Render one bounded repair without exposing the invalid response."""
+
+    repair_rule = (
+        "\n\nBOUNDED REPAIR ATTEMPT:\n"
+        "- The previous response failed citation_fragment_contract_error.\n"
+        "- Regenerate from the same anchor authority only.\n"
+        "- Do not infer, quote, or discuss the previous response."
+    )
+    system = batch.system_prompt + repair_rule
+    user = batch.user_prompt + repair_rule
+    size = len(system.encode("utf-8")) + len(user.encode("utf-8"))
+    if size > DOMAIN_V2_CITATION_BATCH_MAX_PROMPT_UTF8_BYTES:
+        raise CitationPlanContractError(
+            "single citation anchor repair exceeds prompt budget"
+        )
+    return system, user
+
+
 def _write_batched_domain_v2_paper_sections(
     *,
     llm: LLMClient,
@@ -1648,6 +1698,19 @@ def _write_batched_domain_v2_paper_sections(
             }
         )
 
+    repair_prompts = {
+        batch.ordinal: _domain_v2_repair_prompt(batch=batch)
+        for item in prepared
+        if item["kind"] == "citation"
+        for batch in item["batches"]
+    }
+    citation_llm = (
+        _constrain_stage17_citation_llm(llm) if citation_anchors else None
+    )
+    citation_outbound_limit = (
+        _DOMAIN_V2_CITATION_MAX_ATTEMPTS * len(citation_anchors)
+    )
+    citation_outbound_count = 0
     report_entries: list[dict[str, Any]] = []
     generated: list[str] = []
     max_tokens = 24000 if model_name.startswith(("gpt-5", "o3", "o4")) else 12000
@@ -1701,18 +1764,43 @@ def _write_batched_domain_v2_paper_sections(
         for batch in item["batches"]:
             response = ""
             failure_exc: Exception | None = None
-            try:
-                response = _chat_with_prompt(
-                    llm,
-                    batch.system_prompt,
-                    batch.user_prompt,
-                    max_tokens=max_tokens,
-                    retries=0,
-                ).content.strip()
-            except Exception as exc:  # noqa: BLE001
-                violation = "citation_batch_transport_error"
-                failure_exc = exc
-            else:
+            attempt_entries: list[dict[str, Any]] = []
+            violation = ""
+            prompts = (
+                (batch.system_prompt, batch.user_prompt),
+                repair_prompts[batch.ordinal],
+            )
+            for attempt, (call_system, call_user) in enumerate(prompts, start=1):
+                if citation_outbound_count >= citation_outbound_limit:
+                    raise CitationPlanContractError(
+                        "domain-v2 citation outbound request budget exceeded"
+                    )
+                citation_outbound_count += 1
+                started = perf_counter()
+                try:
+                    response = _chat_with_prompt(
+                        citation_llm,
+                        call_system,
+                        call_user,
+                        model=citation_llm.config.primary_model,
+                        max_tokens=_DOMAIN_V2_CITATION_MAX_TOKENS,
+                        retries=0,
+                    ).content
+                except Exception as exc:  # noqa: BLE001
+                    violation = "citation_batch_transport_error"
+                    failure_exc = exc
+                    attempt_entries.append(
+                        {
+                            "attempt": attempt,
+                            "call_role": "initial" if attempt == 1 else "repair",
+                            "validated_response_sha256": hashlib.sha256(b"").hexdigest(),
+                            "response_utf8_bytes": 0,
+                            "wall_time_ms": int((perf_counter() - started) * 1000),
+                            "valid": False,
+                            "violation": violation,
+                        }
+                    )
+                    break
                 try:
                     validate_citation_free_anchor_fragment(
                         response,
@@ -1722,8 +1810,38 @@ def _write_batched_domain_v2_paper_sections(
                 except (CitationPlanContractError, ManuscriptStructureError) as exc:
                     violation = "citation_batch_contract_error"
                     failure_exc = exc
+                    attempt_entries.append(
+                        {
+                            "attempt": attempt,
+                            "call_role": "initial" if attempt == 1 else "repair",
+                            "validated_response_sha256": hashlib.sha256(
+                                response.encode("utf-8")
+                            ).hexdigest(),
+                            "response_utf8_bytes": len(response.encode("utf-8")),
+                            "wall_time_ms": int((perf_counter() - started) * 1000),
+                            "valid": False,
+                            "violation": violation,
+                        }
+                    )
+                    if attempt < _DOMAIN_V2_CITATION_MAX_ATTEMPTS:
+                        continue
                 else:
                     violation = ""
+                    attempt_entries.append(
+                        {
+                            "attempt": attempt,
+                            "call_role": "initial" if attempt == 1 else "repair",
+                            "validated_response_sha256": hashlib.sha256(
+                                response.encode("utf-8")
+                            ).hexdigest(),
+                            "response_utf8_bytes": len(response.encode("utf-8")),
+                            "wall_time_ms": int((perf_counter() - started) * 1000),
+                            "valid": True,
+                            "violation": "",
+                        }
+                    )
+                    response = response.strip()
+                break
             if violation:
                 batch_entries.append(
                     {
@@ -1732,9 +1850,11 @@ def _write_batched_domain_v2_paper_sections(
                         "last_claim_id": batch.anchors[-1].claim_id,
                         "anchor_count": len(batch.anchors),
                         "prompt_utf8_bytes": batch.prompt_utf8_bytes,
-                        "raw_response_sha256": hashlib.sha256(
+                        "validated_response_sha256": hashlib.sha256(
                             response.encode("utf-8")
                         ).hexdigest(),
+                        "attempt_count": len(attempt_entries),
+                        "attempts": attempt_entries,
                         "valid": False,
                         "violations": [violation],
                     }
@@ -1745,6 +1865,8 @@ def _write_batched_domain_v2_paper_sections(
                         "title_slot": False,
                         "expected_major_sections": list(group),
                         "batches": batch_entries,
+                        "citation_outbound_count": citation_outbound_count,
+                        "citation_outbound_limit": citation_outbound_limit,
                     }
                 )
                 _persist_section_generation_report(stage_dir, report_entries)
@@ -1760,9 +1882,11 @@ def _write_batched_domain_v2_paper_sections(
                     "last_claim_id": batch.anchors[-1].claim_id,
                     "anchor_count": len(batch.anchors),
                     "prompt_utf8_bytes": batch.prompt_utf8_bytes,
-                    "raw_response_sha256": hashlib.sha256(
+                    "validated_response_sha256": hashlib.sha256(
                         response.encode("utf-8")
                     ).hexdigest(),
+                    "attempt_count": len(attempt_entries),
+                    "attempts": attempt_entries,
                     "valid": True,
                     "violations": [],
                 }
@@ -1793,6 +1917,8 @@ def _write_batched_domain_v2_paper_sections(
                     "expected_major_sections": list(group),
                     "batches": batch_entries,
                     "full_replay_valid": False,
+                    "citation_outbound_count": citation_outbound_count,
+                    "citation_outbound_limit": citation_outbound_limit,
                 }
             )
             _persist_section_generation_report(stage_dir, report_entries)
@@ -1808,6 +1934,8 @@ def _write_batched_domain_v2_paper_sections(
                 "expected_major_sections": list(group),
                 "batches": batch_entries,
                 "full_replay_valid": True,
+                "citation_outbound_count": citation_outbound_count,
+                "citation_outbound_limit": citation_outbound_limit,
             }
         )
         _persist_section_generation_report(stage_dir, report_entries)

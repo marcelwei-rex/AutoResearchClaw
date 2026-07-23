@@ -31,6 +31,7 @@ from researchclaw.literature.citation_plan import (
     require_citation_candidate_free,
     validate_citation_free_anchor_draft,
 )
+from researchclaw.llm.client import LLMClient, LLMConfig
 from researchclaw.pipeline.stage_impls._review_publish import (
     _citation_count_policy_violations,
     _execute_peer_review,
@@ -101,16 +102,48 @@ class _PromptManagerStub:
         )
 
 
-class _SequentialLLM:
-    def __init__(self, responses: list[str]):
+class _SequentialLLM(LLMClient):
+    def __init__(self, responses: list[str | Exception]):
+        super().__init__(
+            LLMConfig(
+                base_url="https://primary.invalid/v1",
+                api_key="test-key",
+                primary_model="primary-model",
+                fallback_models=["fallback-model"],
+                max_retries=3,
+                fallback_url="https://fallback.invalid/v1",
+                fallback_api_key="fallback-key",
+            )
+        )
         self.responses = responses
         self.calls: list[list[dict[str, str]]] = []
         self.systems: list[str] = []
+        self.call_kwargs: list[dict[str, object]] = []
+        self.config_snapshots: list[tuple[int, tuple[str, ...], str]] = []
 
     def chat(self, messages: list[dict[str, str]], **kwargs: object) -> SimpleNamespace:
         self.calls.append(messages)
         self.systems.append(str(kwargs.get("system", "")))
-        return SimpleNamespace(content=self.responses.pop(0))
+        self.call_kwargs.append(dict(kwargs))
+        self.config_snapshots.append(
+            (
+                self.config.max_retries,
+                tuple(self.config.fallback_models),
+                self.config.fallback_url,
+            )
+        )
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return SimpleNamespace(
+            content=response,
+            model=str(kwargs.get("model", self.config.primary_model)),
+            prompt_tokens=1,
+            completion_tokens=1,
+            total_tokens=2,
+            finish_reason="stop",
+            truncated=False,
+        )
 
 
 def test_strict_citation_occurrence_parser_handles_syntax_matrix() -> None:
@@ -219,12 +252,23 @@ def test_domain_v2_anchor_batches_are_contiguous_and_bounded() -> None:
     )
 
     assert [tuple(anchor.claim_id for anchor in batch.anchors) for batch in batches] == [
-        tuple(f"planned-claim-{ordinal:03d}" for ordinal in range(1, 6)),
-        tuple(f"planned-claim-{ordinal:03d}" for ordinal in range(6, 11)),
-        ("planned-claim-011",),
+        (f"planned-claim-{ordinal:03d}",) for ordinal in range(1, 12)
     ]
     assert all(batch.prompt_utf8_bytes <= 16_384 for batch in batches)
-    assert all(len(batch.anchors) <= 5 for batch in batches)
+    assert all(len(batch.anchors) == 1 for batch in batches)
+
+
+def test_domain_v2_anchor_projection_rejects_multi_anchor_configuration() -> None:
+    anchors = project_citation_anchors(_many_anchor_plan(2))
+    with pytest.raises(CitationPlanContractError, match="single-anchor"):
+        citation_plan_module.project_contiguous_citation_anchor_batches(
+            anchors,
+            render_prompt=lambda batch: (
+                "system",
+                "\n".join(anchor.claim_text for anchor in batch),
+            ),
+            max_anchors=2,
+        )
 
 
 def test_domain_v2_anchor_batch_oversize_fails_before_writer_call() -> None:
@@ -245,23 +289,23 @@ def test_domain_v2_anchor_batch_oversize_fails_before_writer_call() -> None:
 
 
 def test_domain_v2_anchor_batch_byte_boundary_is_exact() -> None:
-    anchors = project_citation_anchors(_many_anchor_plan(2))
+    anchors = project_citation_anchors(_anchor_plan())
 
     exact = citation_plan_module.project_contiguous_citation_anchor_batches(
         anchors,
-        render_prompt=lambda batch: ("", "x" * (5 if len(batch) == 2 else 2)),
-        max_anchors=5,
-        max_prompt_utf8_bytes=5,
-    )
-    split = citation_plan_module.project_contiguous_citation_anchor_batches(
-        anchors,
-        render_prompt=lambda batch: ("", "x" * (6 if len(batch) == 2 else 2)),
-        max_anchors=5,
+        render_prompt=lambda _batch: ("", "x" * 5),
+        max_anchors=1,
         max_prompt_utf8_bytes=5,
     )
 
-    assert [len(batch.anchors) for batch in exact] == [2]
-    assert [len(batch.anchors) for batch in split] == [1, 1]
+    assert [len(batch.anchors) for batch in exact] == [1]
+    with pytest.raises(CitationPlanContractError, match="prompt budget"):
+        citation_plan_module.project_contiguous_citation_anchor_batches(
+            anchors,
+            render_prompt=lambda _batch: ("", "x" * 6),
+            max_anchors=1,
+            max_prompt_utf8_bytes=5,
+        )
 
 
 def test_domain_v2_headingless_fragment_rejects_heading_and_foreign_anchor() -> None:
@@ -380,15 +424,33 @@ def test_domain_v2_fragment_allows_plain_year_prose() -> None:
         )
 
 
+def test_domain_v2_fragment_rejects_response_over_byte_budget() -> None:
+    anchors = project_citation_anchors(_anchor_plan())
+    oversized = anchors[0].claim_text + "\n" + ("bounded prose " * 700)
+    with pytest.raises(CitationPlanContractError, match="response budget"):
+        citation_plan_module.validate_citation_free_anchor_fragment(
+            oversized,
+            anchors=anchors,
+            all_anchors=anchors,
+        )
+
+
+def test_domain_v2_fragment_rejects_claim_id_literal() -> None:
+    anchors = project_citation_anchors(_anchor_plan())
+    with pytest.raises(CitationPlanContractError, match="claim id"):
+        citation_plan_module.validate_citation_free_anchor_fragment(
+            f"{anchors[0].claim_id}\n{anchors[0].claim_text}\n",
+            anchors=anchors,
+            all_anchors=anchors,
+        )
+
+
 def test_domain_v2_related_work_uses_isolated_contiguous_batches(
     tmp_path: Path,
 ) -> None:
     anchors = project_citation_anchors(_many_anchor_plan(6))
     responses = _domain_v2_zero_authority_responses()
-    responses[1:1] = [
-        "\n".join(anchor.claim_text for anchor in anchors[:5]),
-        anchors[5].claim_text,
-    ]
+    responses[1:1] = [anchor.claim_text for anchor in anchors]
     llm = _SequentialLLM(responses)
 
     draft = _write_paper_sections(
@@ -416,21 +478,158 @@ def test_domain_v2_related_work_uses_isolated_contiguous_batches(
     assert draft.count("## Related Work") == 1
     positions = [draft.index(anchor.claim_text) for anchor in anchors]
     assert positions == sorted(positions)
-    assert len(llm.calls) == 6
+    assert len(llm.calls) == 10
     batch_prompts = [
         "\n".join(message["content"] for message in llm.calls[index])
-        for index in (1, 2)
+        for index in range(1, 7)
     ]
-    assert all(anchor.claim_id in batch_prompts[0] for anchor in anchors[:5])
-    assert all(anchor.claim_id not in batch_prompts[0] for anchor in anchors[5:])
-    assert anchors[5].claim_id in batch_prompts[1]
-    assert all(anchor.claim_id not in batch_prompts[1] for anchor in anchors[:5])
+    for ordinal, prompt in enumerate(batch_prompts):
+        assert anchors[ordinal].claim_id in prompt
+        assert all(
+            anchor.claim_id not in prompt
+            for index, anchor in enumerate(anchors)
+            if index != ordinal
+        )
     report = json.loads(
         (tmp_path / "section_generation_report.json").read_text(encoding="utf-8")
     )
     related = next(item for item in report["parts"] if item["part"] == "heading-group-2")
-    assert [batch["anchor_count"] for batch in related["batches"]] == [5, 1]
+    assert [batch["anchor_count"] for batch in related["batches"]] == [1] * 6
     assert all("prompt" not in batch and "response" not in batch for batch in related["batches"])
+    assert all(
+        snapshot == (1, (), "")
+        for snapshot in llm.config_snapshots[1:7]
+    )
+    assert all(
+        call["model"] == "primary-model" and call["max_tokens"] == 2048
+        for call in llm.call_kwargs[1:7]
+    )
+
+
+def test_domain_v2_single_anchor_contract_repair_is_bounded(
+    tmp_path: Path,
+) -> None:
+    anchor = project_citation_anchors(_anchor_plan())[0]
+    responses = _domain_v2_zero_authority_responses()
+    responses[1:1] = ["Paraphrased claim.", anchor.claim_text]
+    llm = _SequentialLLM(responses)
+
+    draft = _write_paper_sections(
+        llm=cast(Any, llm),
+        pm=cast(Any, _PromptManagerStub()),
+        preamble="",
+        topic_constraint="",
+        exp_metrics_instruction="",
+        citation_instruction="",
+        outline="",
+        stage_dir=tmp_path,
+        citation_repair_claims=(
+            {
+                "section": anchor.heading,
+                "claim_text": anchor.claim_text,
+                "cite_key": anchor.cite_key,
+            },
+        ),
+        heading_citation_instructions=_domain_v2_heading_instructions(),
+        canonical_fact_sheet=_minimal_cfs(),
+        citation_anchors=(anchor,),
+    )
+
+    assert anchor.claim_text in draft
+    assert len(llm.calls) == 6
+    report = json.loads(
+        (tmp_path / "section_generation_report.json").read_text(encoding="utf-8")
+    )
+    related = next(item for item in report["parts"] if item["part"] == "heading-group-2")
+    assert related["batches"][0]["attempt_count"] == 2
+    assert related["citation_outbound_count"] == 2
+    repair_prompt = "\n".join(
+        message["content"] for message in llm.calls[2]
+    )
+    assert "Paraphrased claim." not in repair_prompt
+    assert anchor.claim_text in repair_prompt
+
+
+def test_domain_v2_constrained_client_disables_retry_and_fallback() -> None:
+    class CountingRawLLM(LLMClient):
+        def __init__(self) -> None:
+            super().__init__(
+                LLMConfig(
+                    base_url="https://primary.invalid/v1",
+                    api_key="test-key",
+                    primary_model="primary-model",
+                    fallback_models=["fallback-model"],
+                    max_retries=3,
+                    fallback_url="https://fallback.invalid/v1",
+                    fallback_api_key="fallback-key",
+                )
+            )
+            self.raw_models: list[str] = []
+
+        def _raw_call(
+            self,
+            model: str,
+            messages: list[dict[str, str]],
+            max_tokens: int,
+            temperature: float,
+            json_mode: bool,
+        ) -> Any:
+            del messages, max_tokens, temperature, json_mode
+            self.raw_models.append(model)
+            raise OSError("forced transport failure")
+
+    llm = CountingRawLLM()
+    constrained = _paper_writing._constrain_stage17_citation_llm(llm)
+
+    with pytest.raises(RuntimeError, match="All models failed"):
+        constrained.chat(
+            [{"role": "user", "content": "test"}],
+            model=constrained.config.primary_model,
+            max_tokens=2048,
+        )
+
+    assert llm.raw_models == ["primary-model"]
+    assert constrained.config.max_retries == 1
+    assert constrained.config.fallback_models == []
+    assert constrained.config.fallback_url == ""
+
+
+def test_domain_v2_single_anchor_transport_failure_is_not_repaired(
+    tmp_path: Path,
+) -> None:
+    anchor = project_citation_anchors(_anchor_plan())[0]
+    llm = _SequentialLLM(
+        [
+            _domain_v2_zero_authority_responses()[0],
+            RuntimeError("transport failed"),
+            anchor.claim_text,
+        ]
+    )
+
+    with pytest.raises(PaperSectionContractError, match="citation_anchor"):
+        _write_paper_sections(
+            llm=cast(Any, llm),
+            pm=cast(Any, _PromptManagerStub()),
+            preamble="",
+            topic_constraint="",
+            exp_metrics_instruction="",
+            citation_instruction="",
+            outline="",
+            stage_dir=tmp_path,
+            citation_repair_claims=(
+                {
+                    "section": anchor.heading,
+                    "claim_text": anchor.claim_text,
+                    "cite_key": anchor.cite_key,
+                },
+            ),
+            heading_citation_instructions=_domain_v2_heading_instructions(),
+            canonical_fact_sheet=_minimal_cfs(),
+            citation_anchors=(anchor,),
+        )
+
+    assert len(llm.calls) == 2
+    assert len(llm.responses) == 1
 
 
 def test_domain_v2_precomputes_every_batch_before_first_llm_call(
@@ -481,7 +680,7 @@ def test_domain_v2_full_replay_rejects_cross_batch_missing_and_duplicate(
     anchors = project_citation_anchors(_many_anchor_plan(6))
     responses = _domain_v2_zero_authority_responses()
     responses[1:1] = [
-        "\n".join(anchor.claim_text for anchor in anchors[:5]),
+        *(anchor.claim_text for anchor in anchors[:5]),
         anchors[4].claim_text,
     ]
     llm = _SequentialLLM(responses)
@@ -514,7 +713,7 @@ def test_domain_v2_full_replay_rejects_cross_batch_missing_and_duplicate(
             citation_anchors=anchors,
         )
 
-    assert len(llm.calls) == 3
+    assert len(llm.calls) == 7
     report = json.loads(
         (tmp_path / "section_generation_report.json").read_text(encoding="utf-8")
     )
@@ -525,13 +724,13 @@ def test_domain_v2_full_replay_rejects_cross_batch_missing_and_duplicate(
 def test_domain_v2_failed_batch_stops_before_later_batches(
     tmp_path: Path,
 ) -> None:
-    anchors = project_citation_anchors(_many_anchor_plan(11))
+    anchors = project_citation_anchors(_many_anchor_plan(3))
     llm = _SequentialLLM(
         [
             _domain_v2_zero_authority_responses()[0],
-            "\n".join(anchor.claim_text for anchor in anchors[:5]),
             "Foreign response.",
-            "\n".join(anchor.claim_text for anchor in anchors[10:]),
+            "Still foreign.",
+            anchors[1].claim_text,
         ]
     )
 
@@ -563,7 +762,9 @@ def test_domain_v2_failed_batch_stops_before_later_batches(
         (tmp_path / "section_generation_report.json").read_text(encoding="utf-8")
     )
     related = next(item for item in report["parts"] if item["part"] == "heading-group-2")
-    assert [batch["valid"] for batch in related["batches"]] == [True, False]
+    assert [batch["valid"] for batch in related["batches"]] == [False]
+    assert related["batches"][0]["attempt_count"] == 2
+    assert related["citation_outbound_count"] == 2
 
 
 def test_domain_v2_realistic_25_anchor_plan_forms_five_batches(
@@ -571,10 +772,7 @@ def test_domain_v2_realistic_25_anchor_plan_forms_five_batches(
 ) -> None:
     anchors = project_citation_anchors(_many_anchor_plan(25))
     responses = [_domain_v2_zero_authority_responses()[0]]
-    responses.extend(
-        "\n".join(anchor.claim_text for anchor in anchors[start:start + 5])
-        for start in range(0, 25, 5)
-    )
+    responses.extend(anchor.claim_text for anchor in anchors)
     responses.extend(_domain_v2_zero_authority_responses()[1:])
     llm = _SequentialLLM(responses)
 
@@ -601,7 +799,7 @@ def test_domain_v2_realistic_25_anchor_plan_forms_five_batches(
     )
 
     assert draft.count("## Related Work") == 1
-    assert len(llm.calls) == 9
+    assert len(llm.calls) == 29
     report = json.loads(
         (tmp_path / "section_generation_report.json").read_text(encoding="utf-8")
     )
@@ -610,8 +808,8 @@ def test_domain_v2_realistic_25_anchor_plan_forms_five_batches(
         (batch["first_claim_id"], batch["last_claim_id"])
         for batch in related["batches"]
     ] == [
-        (f"planned-claim-{start:03d}", f"planned-claim-{start + 4:03d}")
-        for start in range(1, 26, 5)
+        (f"planned-claim-{ordinal:03d}", f"planned-claim-{ordinal:03d}")
+        for ordinal in range(1, 26)
     ]
     assert all(batch["prompt_utf8_bytes"] <= 16_384 for batch in related["batches"])
 
@@ -775,7 +973,7 @@ def test_domain_v2_paraphrased_anchor_fails_before_free_structure_repair(
             citation_anchors=anchors,
         )
 
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 3
 
 
 def test_domain_v2_structure_repair_cannot_reintroduce_citation_marker(
@@ -821,7 +1019,7 @@ def test_domain_v2_structure_repair_cannot_reintroduce_citation_marker(
             citation_anchors=anchors,
         )
 
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 3
 
 
 def _minimal_cfs() -> dict[str, Any]:
