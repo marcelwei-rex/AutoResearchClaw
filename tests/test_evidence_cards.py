@@ -40,6 +40,7 @@ from researchclaw.literature.citation_plan import (
     CitationPlanContractError,
     build_citation_closure_report,
     build_citation_closure_from_texts,
+    build_citation_plan_from_replayed_inputs,
     build_citation_writer_instruction,
     build_citation_writer_instruction_from_authority,
     capture_replayed_citation_authority,
@@ -1305,6 +1306,75 @@ def test_stage16_effective_policy_binds_run_local_config(tmp_path: Path) -> None
     (run_dir / "config.yaml").write_text("tampered: true\n", encoding="utf-8")
     with pytest.raises(CitationPolicyContractError, match="hash mismatch"):
         load_effective_citation_policy(run_dir, config)
+
+
+def test_stage16_plan_selects_first_complete_standalone_excerpt() -> None:
+    card = {
+        "cite_key": "smith2024deep",
+        "extraction_status": "success",
+        "evidence_excerpts": [
+            {
+                "excerpt_id": "ev-multi",
+                "excerpt_text": "First bounded sentence. Second bounded sentence.",
+            },
+            {
+                "excerpt_id": "ev-single",
+                "excerpt_text": "Single bounded sentence.",
+            },
+        ],
+    }
+
+    plan = build_citation_plan_from_replayed_inputs(
+        config=_config(),  # type: ignore[arg-type]
+        plan_status="final",
+        allowlist={"eligible_keys": ["smith2024deep"]},
+        allowlist_text="allowlist",
+        cards_manifest_text="manifest",
+        effective_policy={
+            "effective_target_unique_sources": 1,
+            "effective_min_unique_sources": 1,
+        },
+        effective_policy_text="policy",
+        cards=(card,),
+    )
+
+    assert plan["claims"][0]["claim_text"] == "Single bounded sentence."
+    assert plan["claims"][0]["planned_citations"][0]["evidence_excerpt_ids"] == [
+        "ev-multi",
+        "ev-single",
+    ]
+
+
+def test_stage16_plan_rejects_card_without_standalone_excerpt() -> None:
+    card = {
+        "cite_key": "smith2024deep",
+        "extraction_status": "success",
+        "evidence_excerpts": [
+            {
+                "excerpt_id": "ev-multi",
+                "excerpt_text": "First bounded sentence. Second bounded sentence.",
+            },
+            {
+                "excerpt_id": "ev-newline",
+                "excerpt_text": "Line one.\nLine two.",
+            },
+        ],
+    }
+
+    with pytest.raises(CitationPlanContractError, match="standalone"):
+        build_citation_plan_from_replayed_inputs(
+            config=_config(),  # type: ignore[arg-type]
+            plan_status="final",
+            allowlist={"eligible_keys": ["smith2024deep"]},
+            allowlist_text="allowlist",
+            cards_manifest_text="manifest",
+            effective_policy={
+                "effective_target_unique_sources": 1,
+                "effective_min_unique_sources": 1,
+            },
+            effective_policy_text="policy",
+            cards=(card,),
+        )
 
 
 def test_research_release_fails_below_citation_minimum(tmp_path: Path) -> None:

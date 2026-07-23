@@ -108,6 +108,18 @@ class CitationAnchor:
     boundary_kind: str = "standalone_line"
 
 
+def _is_standalone_citation_claim(text: object) -> bool:
+    return (
+        type(text) is str
+        and bool(text)
+        and "\x00" not in text
+        and "\r" not in text
+        and "\n" not in text
+        and text == text.strip()
+        and strict_sentence_spans(text) == ((0, len(text)),)
+    )
+
+
 def project_citation_anchors(plan: Mapping[str, Any]) -> tuple[CitationAnchor, ...]:
     """Derive strict sentence anchors without changing final-plan bytes."""
 
@@ -116,13 +128,7 @@ def project_citation_anchors(plan: Mapping[str, Any]) -> tuple[CitationAnchor, .
     seen_texts: set[str] = set()
     for claim in parsed["claims"]:
         text = claim["claim_text"]
-        if (
-            "\x00" in text
-            or "\r" in text
-            or "\n" in text
-            or text != text.strip()
-            or strict_sentence_spans(text) != ((0, len(text)),)
-        ):
+        if not _is_standalone_citation_claim(text):
             raise CitationPlanContractError(
                 "citation claim cannot form one exact standalone-line anchor"
             )
@@ -599,11 +605,23 @@ def build_citation_plan_from_replayed_inputs(
         excerpts = card["evidence_excerpts"]
         if not excerpts:
             raise CitationPlanContractError("eligible key lacks retained excerpt")
+        claim_text = next(
+            (
+                excerpt["excerpt_text"]
+                for excerpt in excerpts
+                if _is_standalone_citation_claim(excerpt["excerpt_text"])
+            ),
+            None,
+        )
+        if claim_text is None:
+            raise CitationPlanContractError(
+                "eligible key lacks standalone citation excerpt"
+            )
         claims.append(
             {
                 "claim_id": f"planned-claim-{ordinal:03d}",
                 "section_path": [citation_section],
-                "claim_text": excerpts[0]["excerpt_text"],
+                "claim_text": claim_text,
                 "claim_type": "background",
                 "planned_citations": [
                     {
