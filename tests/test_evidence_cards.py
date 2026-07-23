@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
+import time
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +20,7 @@ pytestmark = pytest.mark.usefixtures(
 )
 import yaml
 
+from researchclaw.literature import citation_plan as citation_plan_module
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
 from researchclaw.domains.detector import set_forced_profile
@@ -38,11 +42,13 @@ from researchclaw.literature.citation_plan import (
     build_citation_closure_from_texts,
     build_citation_writer_instruction,
     build_citation_writer_instruction_from_authority,
+    capture_replayed_citation_authority,
     load_final_citation_plan,
     parse_citation_plan,
     parse_citation_closure_report,
     validate_citation_closure_report,
     validate_paper_citation_minimum,
+    verify_captured_citation_authority_unchanged,
 )
 from researchclaw.literature.citation_support import (
     CitationSupportContractError,
@@ -329,6 +335,81 @@ def _prepare_stage23_fixture(
     stage22.mkdir()
     (stage22 / "paper_final.md").write_text(paper_text, encoding="utf-8")
     return config, paper_text, planned_keys
+
+
+def test_stage17_citation_authority_uses_captured_generation_and_rejects_late_plan(
+    tmp_path: Path,
+) -> None:
+    config, _paper, _keys = _prepare_stage23_fixture(tmp_path)
+    captured = capture_replayed_citation_authority(tmp_path, config)
+    plan_path = tmp_path / "stage-16" / "citation_plan.json"
+    original = plan_path.read_text(encoding="utf-8")
+    tampered = json.loads(original)
+    tampered["claims"][0]["claim_text"] += " changed"
+    plan_path.write_text(canonical_json_text(tampered), encoding="utf-8")
+
+    with pytest.raises(CitationPlanContractError, match="changed after"):
+        verify_captured_citation_authority_unchanged(tmp_path, captured)
+    assert captured.inputs.citation_plan_text == original
+    assert captured.replayed.plan["claims"][0]["claim_text"] != tampered["claims"][0][
+        "claim_text"
+    ]
+
+
+def test_stage17_citation_capture_rejects_fifo_without_blocking(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    config, _paper, _keys = _prepare_stage23_fixture(run_dir)
+    plan_path = run_dir / "stage-16" / "citation_plan.json"
+    plan_path.unlink()
+    os.mkfifo(plan_path)
+
+    def timeout_handler(_signum: int, _frame: object) -> None:
+        raise TimeoutError("citation capture blocked on FIFO")
+
+    previous = signal.signal(signal.SIGALRM, timeout_handler)
+    started = time.monotonic()
+    signal.setitimer(signal.ITIMER_REAL, 1.0)
+    try:
+        with pytest.raises(CitationPlanContractError, match="cannot read"):
+            capture_replayed_citation_authority(run_dir, config)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous)
+    assert time.monotonic() - started < 0.5
+
+
+def test_stage17_citation_capture_reads_held_inode_after_parent_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    detached = tmp_path / "run-detached"
+    config, _paper, _keys = _prepare_stage23_fixture(run_dir)
+    original_read = citation_plan_module._CitationAuthorityReader.read_text
+    replaced = False
+
+    def replace_before_first_read(
+        reader: object, relative_path: str
+    ) -> str:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            run_dir.rename(detached)
+            replacement_stage = run_dir / "stage-04"
+            replacement_stage.mkdir(parents=True)
+            os.mkfifo(replacement_stage / "candidates.jsonl")
+        return original_read(reader, relative_path)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        citation_plan_module._CitationAuthorityReader,
+        "read_text",
+        replace_before_first_read,
+    )
+    with pytest.raises(RuntimeError, match="release_graph_run_directory_changed"):
+        capture_replayed_citation_authority(run_dir, config)
+    assert (run_dir / "stage-04" / "candidates.jsonl").is_fifo()
 
 
 def _patch_stage23_canonical_input(

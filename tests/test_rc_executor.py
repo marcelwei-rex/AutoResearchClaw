@@ -4428,7 +4428,7 @@ class TestDataIntegrityBlock:
 
         assert result.status == StageStatus.FAILED
         assert "does not accept unscoped HITL" in str(result.error)
-        assert len(llm.calls) == 4
+        assert len(llm.calls) == 0
         assert not (stage_dir / "paper_draft.md").exists()
 
     def test_paper_draft_closure_failure_removes_canonical_artifacts(

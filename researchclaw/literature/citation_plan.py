@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -24,6 +26,7 @@ from researchclaw.literature.citation_policy import (
 from researchclaw.literature.evidence_cards import (
     canonical_json_text,
     load_validated_cards,
+    parse_cards_manifest,
     validate_card_inputs_from_texts,
     validate_cards_artifacts_from_texts,
 )
@@ -47,6 +50,10 @@ from researchclaw.pipeline._domain import _prompt_bank_domain_from_config
 from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidence,
 )
+from researchclaw.pipeline.release_graph_lock import (
+    ReleaseGraphLock,
+    require_active_release_graph_epoch,
+)
 
 
 CITATION_PLAN_SCHEMA_VERSION = 1
@@ -56,6 +63,19 @@ _MARKDOWN_CITATION_CANDIDATE_RE = re.compile(r"\[([^\[\]\n]+)\]")
 _LATEX_CITATION_CANDIDATE_RE = re.compile(
     r"\\(?:cite|citep|citet)\*?(?:\[[^\]\n]*\]){0,2}\{([^{}\n]+)\}"
 )
+_CITATION_LIKE_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\d{4}[A-Za-z0-9_-]*")
+_LATEX_CITATION_LIKE_RE = re.compile(
+    r"\\+[A-Za-z]*cite[A-Za-z]*\*?", re.IGNORECASE
+)
+_AUTHOR_YEAR_CITATION_RE = re.compile(
+    r"\b[A-Za-z][A-Za-z'_-]*(?:\s+et\s+al\.)?"
+    r"[^]\n]{0,32}\b(?:18|19|20|21)\d{2}[a-z]?\b",
+    re.IGNORECASE,
+)
+_NUMERIC_CITATION_RE = re.compile(
+    r"\s*\d+(?:\s*(?:[-–,;]\s*)\d+)*\s*"
+)
+_AT_CITATION_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_:-]*")
 
 
 class CitationPlanContractError(ValueError):
@@ -75,6 +95,112 @@ class CitationOccurrence:
     sentence_sha256: str
     sentence_ordinal: int
     occurrence_ordinal: int
+
+
+@dataclass(frozen=True)
+class CitationAnchor:
+    """Code-owned standalone-line projection of one final-plan claim."""
+
+    claim_id: str
+    heading: str
+    claim_text: str
+    cite_key: str
+    boundary_kind: str = "standalone_line"
+
+
+def project_citation_anchors(plan: Mapping[str, Any]) -> tuple[CitationAnchor, ...]:
+    """Derive strict sentence anchors without changing final-plan bytes."""
+
+    parsed = parse_citation_plan(canonical_json_text(plan))
+    anchors: list[CitationAnchor] = []
+    seen_texts: set[str] = set()
+    for claim in parsed["claims"]:
+        text = claim["claim_text"]
+        if (
+            "\x00" in text
+            or "\r" in text
+            or "\n" in text
+            or text != text.strip()
+            or strict_sentence_spans(text) != ((0, len(text)),)
+        ):
+            raise CitationPlanContractError(
+                "citation claim cannot form one exact standalone-line anchor"
+            )
+        if text in seen_texts:
+            raise CitationPlanContractError("duplicate citation claim anchor text")
+        seen_texts.add(text)
+        anchors.append(
+            CitationAnchor(
+                claim_id=claim["claim_id"],
+                heading=claim["section_path"][0],
+                claim_text=text,
+                cite_key=claim["planned_citations"][0]["cite_key"],
+            )
+        )
+    return tuple(anchors)
+
+
+def require_citation_candidate_free(text: str) -> None:
+    """Reject every citation-like candidate, including escaped or malformed forms."""
+
+    if _LATEX_CITATION_LIKE_RE.search(text):
+        raise CitationPlanContractError("initial domain-v2 draft contains citation candidate")
+    for line in text.splitlines():
+        bracket = line.find("[")
+        while bracket >= 0:
+            close = line.find("]", bracket + 1)
+            candidate = line[bracket + 1 :] if close < 0 else line[bracket + 1 : close]
+            if (
+                _CITATION_LIKE_KEY_RE.search(candidate)
+                or _AUTHOR_YEAR_CITATION_RE.search(candidate)
+                or _NUMERIC_CITATION_RE.fullmatch(candidate)
+                or _AT_CITATION_RE.search(candidate)
+            ):
+                raise CitationPlanContractError(
+                    "initial domain-v2 draft contains citation candidate"
+                )
+            bracket = line.find("[", bracket + 1 if close < 0 else close + 1)
+
+
+def validate_citation_free_anchor_draft(
+    text: str,
+    *,
+    anchors: tuple[CitationAnchor, ...],
+    active_headings: tuple[str, ...],
+) -> None:
+    """Validate one domain-v2 writer response before any free-form repair."""
+
+    if "\r" in text:
+        raise CitationPlanContractError("domain-v2 draft must use LF newlines")
+    require_citation_candidate_free(text)
+    document = parse_manuscript(text, strict=True)
+    sections = {
+        section.path[0]: section
+        for section in document.sections
+        if len(section.path) == 1
+    }
+    active = set(active_headings)
+    positions: list[int] = []
+    for anchor in anchors:
+        if anchor.cite_key in text:
+            raise CitationPlanContractError("domain-v2 draft exposes a citation key literal")
+        if anchor.heading not in active:
+            if anchor.claim_text in text:
+                raise CitationPlanContractError("domain-v2 draft exposes a foreign claim anchor")
+            continue
+        section = sections.get(anchor.heading)
+        if section is None:
+            raise CitationPlanContractError("domain-v2 citation heading is missing")
+        exact_lines = [
+            line for line in section.body.split("\n") if line == anchor.claim_text
+        ]
+        if len(exact_lines) != 1 or text.count(anchor.claim_text) != 1:
+            raise CitationPlanContractError(
+                "domain-v2 citation anchor is missing, changed, or not unique"
+            )
+        positions.append(text.index(anchor.claim_text))
+    if positions != sorted(positions):
+        raise CitationPlanContractError("domain-v2 citation anchors are out of plan order")
 
 
 def strict_sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
@@ -274,6 +400,132 @@ class ReplayedCitationAuthority:
     allowlist: Mapping[str, Any]
     effective_policy: Mapping[str, Any]
     plan: Mapping[str, Any]
+    cards: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class CapturedCitationAuthority:
+    """Immutable Stage 17 citation generation captured before its first LLM call."""
+
+    inputs: CitationPlanReplayInputs
+    replayed: ReplayedCitationAuthority
+    run_identity: tuple[int, int]
+
+
+class _CitationAuthorityReader:
+    """Read one citation generation only through a held run-directory fd."""
+
+    def __init__(self, run_fd: int) -> None:
+        self._run_fd = run_fd
+        info = os.fstat(run_fd)
+        if not stat.S_ISDIR(info.st_mode):
+            os.close(run_fd)
+            self._run_fd = -1
+            raise CitationPlanContractError("citation authority run fd is not a directory")
+        self.run_identity = (info.st_dev, info.st_ino)
+
+    def close(self) -> None:
+        if self._run_fd >= 0:
+            os.close(self._run_fd)
+            self._run_fd = -1
+
+    def __enter__(self) -> "_CitationAuthorityReader":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def read_text(self, relative_path: str) -> str:
+        try:
+            content = self._read_bytes(relative_path)
+        except OSError as exc:
+            raise CitationPlanContractError(
+                f"cannot read citation authority: {relative_path}"
+            ) from exc
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CitationPlanContractError(
+                f"citation authority is not UTF-8: {relative_path}"
+            ) from exc
+
+    def read_optional_text(self, relative_path: str) -> str | None:
+        try:
+            content = self._read_bytes(relative_path)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise CitationPlanContractError(
+                f"cannot read citation authority: {relative_path}"
+            ) from exc
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CitationPlanContractError(
+                f"citation authority is not UTF-8: {relative_path}"
+            ) from exc
+
+    def directory_entries(self, relative_path: str) -> tuple[str, ...]:
+        parts = _citation_relative_parts(relative_path)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.dup(self._run_fd)
+        opened = [descriptor]
+        try:
+            for part in parts:
+                descriptor = os.open(part, flags, dir_fd=descriptor)
+                opened.append(descriptor)
+            return tuple(sorted(os.listdir(descriptor)))
+        except OSError as exc:
+            raise CitationPlanContractError(
+                f"cannot enumerate citation authority: {relative_path}"
+            ) from exc
+        finally:
+            for opened_fd in reversed(opened):
+                os.close(opened_fd)
+
+    def _read_bytes(self, relative_path: str) -> bytes:
+        parts = _citation_relative_parts(relative_path)
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.dup(self._run_fd)
+        opened = [descriptor]
+        try:
+            for part in parts[:-1]:
+                descriptor = os.open(part, directory_flags, dir_fd=descriptor)
+                opened.append(descriptor)
+            file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            file_flags |= getattr(os, "O_CLOEXEC", 0)
+            leaf = os.open(parts[-1], file_flags, dir_fd=descriptor)
+            try:
+                info = os.fstat(leaf)
+                if not stat.S_ISREG(info.st_mode):
+                    raise OSError(
+                        f"citation authority is not a regular file: {relative_path}"
+                    )
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(leaf, 1024 * 1024)
+                    if not chunk:
+                        return b"".join(chunks)
+                    chunks.append(chunk)
+            finally:
+                os.close(leaf)
+        finally:
+            for opened_fd in reversed(opened):
+                os.close(opened_fd)
+
+
+def _citation_relative_parts(relative_path: str) -> tuple[str, ...]:
+    relative = Path(relative_path)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or ".." in relative.parts
+        or any(part in {"", "."} for part in relative.parts)
+    ):
+        raise CitationPlanContractError("noncanonical citation authority path")
+    return relative.parts
 
 
 def _citation_section_for_config(config: RCConfig) -> str:
@@ -445,6 +697,124 @@ def replay_citation_plan_provenance(
         allowlist=stored_allowlist,
         effective_policy=stored_policy,
         plan=stored_plan,
+        cards=cards,
+    )
+
+
+def capture_replayed_citation_authority(
+    run_dir: Path, config: RCConfig, *, release_lock: object | None = None
+) -> CapturedCitationAuthority:
+    """Capture A, replay only A, then require an immediate identical snapshot B."""
+
+    if release_lock is None:
+        with ReleaseGraphLock.acquire(
+            run_dir, "capture_replayed_citation_authority", mode="read"
+        ) as owned_epoch:
+            return capture_replayed_citation_authority(
+                run_dir, config, release_lock=owned_epoch
+            )
+    epoch = require_active_release_graph_epoch(run_dir, release_lock)
+    with _CitationAuthorityReader(epoch.duplicate_run_fd()) as reader:
+        first = _capture_citation_plan_inputs(reader)
+        replayed = replay_citation_plan_provenance(
+            first, config, project_root=run_dir
+        )
+        if _capture_citation_plan_inputs(reader) != first:
+            raise CitationPlanContractError(
+                "citation authority changed during initial capture replay"
+            )
+        epoch.assert_canonical()
+        return CapturedCitationAuthority(
+            inputs=first,
+            replayed=replayed,
+            run_identity=reader.run_identity,
+        )
+
+
+def verify_captured_citation_authority_unchanged(
+    run_dir: Path,
+    captured: CapturedCitationAuthority,
+    *,
+    release_lock: object | None = None,
+) -> None:
+    """Compare fresh bytes without replacing the captured generation."""
+
+    if release_lock is None:
+        with ReleaseGraphLock.acquire(
+            run_dir, "verify_captured_citation_authority_unchanged", mode="read"
+        ) as owned_epoch:
+            verify_captured_citation_authority_unchanged(
+                run_dir, captured, release_lock=owned_epoch
+            )
+            return
+    epoch = require_active_release_graph_epoch(run_dir, release_lock)
+    with _CitationAuthorityReader(epoch.duplicate_run_fd()) as reader:
+        if reader.run_identity != captured.run_identity:
+            raise CitationPlanContractError(
+                "citation authority run identity changed after capture"
+            )
+        if _capture_citation_plan_inputs(reader) != captured.inputs:
+            raise CitationPlanContractError(
+                "citation authority changed after Stage 17 generation"
+            )
+        epoch.assert_canonical()
+
+
+def _capture_citation_plan_inputs(
+    reader: _CitationAuthorityReader,
+) -> CitationPlanReplayInputs:
+    paths = {
+        "candidates_text": "stage-04/candidates.jsonl",
+        "registry_text": "stage-04/cite_key_registry.json",
+        "bibliography_text": "stage-04/references.bib",
+        "shortlist_text": "stage-05/shortlist.jsonl",
+        "screening_report_text": "stage-05/screening_report.json",
+        "cards_manifest_text": "stage-06/cards_manifest.json",
+        "citation_allowlist_text": "stage-06/citation_allowlist.json",
+        "effective_policy_text": "stage-16/citation_policy_effective.json",
+        "citation_plan_text": "stage-16/citation_plan.json",
+    }
+    texts = {
+        field: reader.read_text(path)
+        for field, path in paths.items()
+    }
+    manifest = parse_cards_manifest(texts["cards_manifest_text"])
+    card_paths = sorted(
+        str(entry[field])
+        for entry in manifest["cards"]
+        for field in ("json_path", "markdown_path")
+    )
+    actual_card_paths = [
+        f"stage-06/cards/{entry}"
+        for entry in reader.directory_entries("stage-06/cards")
+    ]
+    if actual_card_paths != card_paths:
+        raise CitationPlanContractError("canonical cards namespace is not exact")
+    card_texts = {
+        path: reader.read_text(path) for path in card_paths
+    }
+
+    pointer_text = reader.read_optional_text("active_config_snapshot.json")
+    history_text = reader.read_optional_text("config_snapshot_history.jsonl")
+    checkpoint_text = reader.read_optional_text("checkpoint.json")
+    if pointer_text is None:
+        config_path = "config.yaml"
+    else:
+        pointer = _parse_object(pointer_text, "active config pointer")
+        config_path = pointer.get("config_source_path")
+        if not isinstance(config_path, str):
+            raise CitationPlanContractError("active config pointer has no source path")
+    config_text = reader.read_text(config_path)
+    return CitationPlanReplayInputs(
+        **texts,
+        card_texts=card_texts,
+        active_config=ActiveConfigSnapshotInputs(
+            config_source_path=config_path,
+            config_source_text=config_text,
+            pointer_text=pointer_text,
+            history_text=history_text,
+            checkpoint_text=checkpoint_text,
+        ),
     )
 
 

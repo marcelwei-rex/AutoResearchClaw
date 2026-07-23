@@ -20,26 +20,40 @@ from researchclaw.llm.client import LLMClient
 from researchclaw.literature.citation_policy import (
     CitationPolicyContractError,
     build_effective_citation_policy,
+    # Stable monkeypatch seam for legacy executor fixtures.
     load_effective_citation_policy,
 )
 from researchclaw.literature.citation_plan import (
+    CitationAnchor,
     CitationPlanContractError,
     attribute_citation_keys_to_top_level_headings,
-    build_heading_citation_writer_instructions_from_authority,
+    build_citation_closure_from_texts,
+    # Stable monkeypatch seam for legacy executor fixtures.
     build_citation_closure_report,
+    build_heading_citation_writer_instructions_from_authority,
     build_citation_plan,
     # Stable monkeypatch seam for legacy executor fixtures.
     build_citation_writer_instruction,
     filter_strict_citation_markers,
+    # Stable monkeypatch seam for legacy executor fixtures.
     load_final_citation_plan,
+    capture_replayed_citation_authority,
     parse_strict_citation_occurrences,
+    project_citation_anchors,
+    require_citation_candidate_free,
     strict_citation_keys,
     strict_sentence_spans,
     strip_strict_citation_markers,
+    validate_citation_free_anchor_draft,
     validate_citation_closure_report,
     validate_citation_plan,
+    verify_captured_citation_authority_unchanged,
 )
-from researchclaw.literature.evidence_cards import canonical_json_text, load_validated_cards
+from researchclaw.literature.evidence_cards import (
+    canonical_json_text,
+    # Stable monkeypatch seam for legacy executor fixtures.
+    load_validated_cards,
+)
 from researchclaw.literature.experiment_fact_closure import (
     ExperimentFactClosureError,
     build_experiment_fact_closure_report,
@@ -69,6 +83,7 @@ from researchclaw.pipeline.manuscript_sections import (
     merge_manuscript,
     parse_manuscript,
 )
+from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
 from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidence,
     CanonicalExperimentEvidenceError,
@@ -1013,6 +1028,7 @@ def _write_paper_sections(
     part_citation_instructions: Mapping[str, str] | None = None,
     heading_citation_instructions: Mapping[str, str] | None = None,
     canonical_fact_sheet: Mapping[str, Any] | None = None,
+    citation_anchors: tuple[CitationAnchor, ...] = (),
 ) -> str:
     """Write a conference-grade paper in 3 sequential LLM calls.
 
@@ -1034,6 +1050,7 @@ def _write_paper_sections(
             citation_repair_claims=citation_repair_claims,
             heading_citation_instructions=heading_citation_instructions,
             canonical_fact_sheet=canonical_fact_sheet,
+            citation_anchors=citation_anchors,
         )
 
     # Render writing_structure block for injection
@@ -1499,6 +1516,7 @@ def _write_heading_scoped_paper_sections(
     citation_repair_claims: tuple[dict[str, str], ...],
     heading_citation_instructions: Mapping[str, str],
     canonical_fact_sheet: Mapping[str, Any] | None,
+    citation_anchors: tuple[CitationAnchor, ...],
 ) -> str:
     """Write only contiguous zero-authority or single authority-heading groups."""
 
@@ -1548,6 +1566,31 @@ def _write_heading_scoped_paper_sections(
             if claim["section"] in group
         )
         authority = "\n\n".join(heading_citation_instructions[heading] for heading in group)
+        if canonical_fact_sheet is not None:
+            active_anchors = tuple(
+                anchor for anchor in citation_anchors if anchor.heading in group
+            )
+            anchor_lines = [
+                "DOMAIN-V2 CITATION ANCHOR CONTRACT:",
+                "- Do not output any Markdown, LaTeX, escaped, malformed, or unknown citation marker.",
+                "- Copy every EXACT ANCHOR below as its own physical line, byte for byte.",
+                "- Do not paraphrase, extend, merge, punctuate, or reorder an anchor.",
+                "- Deterministic code will insert citation markers after validation.",
+            ]
+            for anchor in active_anchors:
+                anchor_lines.extend(
+                    (
+                        f"- claim_id: {anchor.claim_id}",
+                        f"  heading: {anchor.heading}",
+                        f"  cite_key (input authority only; never output it): {anchor.cite_key}",
+                        "  EXACT ANCHOR START",
+                        anchor.claim_text,
+                        "  EXACT ANCHOR END",
+                    )
+                )
+            if not active_anchors:
+                anchor_lines.append("- This call has no citation anchors.")
+            authority = "\n".join(anchor_lines)
         safe_outline = (
             "\n".join(f"## {heading}" for heading in group)
             if grounding_contexts is not None
@@ -1595,6 +1638,22 @@ def _write_heading_scoped_paper_sections(
             max_tokens=24000 if model_name.startswith(("gpt-5", "o3", "o4")) else 12000,
             retries=1,
         ).content.strip()
+        def validate_domain_v2_candidate(candidate: str) -> None:
+            if canonical_fact_sheet is None:
+                return
+            try:
+                validate_citation_free_anchor_draft(
+                    candidate,
+                    anchors=citation_anchors,
+                    active_headings=group,
+                )
+            except (CitationPlanContractError, ManuscriptStructureError) as exc:
+                raise PaperSectionContractError(
+                    f"heading-group-{index + 1}",
+                    (f"citation_anchor:{exc}",),
+                    candidate,
+                ) from exc
+        validate_domain_v2_candidate(response)
         part = _validate_or_regenerate_paper_part(
             llm=llm, initial_text=response, part_name=f"heading-group-{index + 1}",
             expected_major_sections=group, title_slot=title_slot,
@@ -1603,6 +1662,7 @@ def _write_heading_scoped_paper_sections(
             report_entries=report_entries, stage_dir=stage_dir,
             grounding_context=grounding,
         )
+        validate_domain_v2_candidate(part)
         generated.append(part)
     return "\n\n".join(generated)
 
@@ -2494,6 +2554,32 @@ def _execute_paper_draft(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    with ReleaseGraphLock.acquire(
+        run_dir, "stage17_paper_draft", mode="write"
+    ) as release_lock:
+        result = _execute_paper_draft_under_release_epoch(
+            stage_dir,
+            run_dir,
+            config,
+            adapters,
+            llm=llm,
+            prompts=prompts,
+            release_lock=release_lock,
+        )
+        release_lock.assert_canonical()
+        return result
+
+
+def _execute_paper_draft_under_release_epoch(
+    stage_dir: Path,
+    run_dir: Path,
+    config: RCConfig,
+    adapters: AdapterBundle,
+    *,
+    llm: LLMClient | None = None,
+    prompts: PromptManager | None = None,
+    release_lock: object,
+) -> StageResult:
     for owned_name in (
         "paper_draft.md",
         "paper_draft_invalid.md",
@@ -2516,7 +2602,34 @@ def _execute_paper_draft(
         evidence = load_canonical_experiment_evidence(run_dir)
         canonical_fact_sheet = build_canonical_fact_sheet(evidence)
         outline = _load_bound_stage16_outline(run_dir, evidence)
-        effective_citation_policy = load_effective_citation_policy(run_dir, config)
+        guidance_file = stage_dir / "hitl_guidance.md"
+        if (
+            canonical_fact_sheet is not None
+            and guidance_file.is_file()
+            and guidance_file.read_text(encoding="utf-8").strip()
+        ):
+            return StageResult(
+                stage=Stage.PAPER_DRAFT,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=(
+                    "Canonical domain-evaluator Stage 17 does not accept "
+                    "unscoped HITL rewrite guidance"
+                ),
+                decision="retry",
+            )
+        captured_citation_authority = (
+            capture_replayed_citation_authority(
+                run_dir, config, release_lock=release_lock
+            )
+            if canonical_fact_sheet is not None
+            else None
+        )
+        effective_citation_policy = (
+            captured_citation_authority.replayed.effective_policy
+            if captured_citation_authority is not None
+            else load_effective_citation_policy(run_dir, config)
+        )
     except (
         CanonicalExperimentEvidenceError,
         CFSIntegrityError,
@@ -2878,13 +2991,24 @@ def _execute_paper_draft(
             )
 
     try:
-        final_citation_plan = load_final_citation_plan(run_dir, config)
-        # An empty final plan grants no citation authority, so no card bytes are
-        # needed to render the corresponding no-citation heading instructions.
+        final_citation_plan = (
+            captured_citation_authority.replayed.plan
+            if captured_citation_authority is not None
+            else load_final_citation_plan(run_dir, config)
+        )
         citation_cards = (
-            load_validated_cards(run_dir, config)
-            if final_citation_plan["claims"]
-            else {}
+            captured_citation_authority.replayed.cards
+            if captured_citation_authority is not None
+            else (
+                load_validated_cards(run_dir, config)
+                if final_citation_plan["claims"]
+                else ()
+            )
+        )
+        citation_anchors = (
+            project_citation_anchors(final_citation_plan)
+            if canonical_fact_sheet is not None
+            else ()
         )
     except CitationPlanContractError as exc:
         return StageResult(
@@ -3101,6 +3225,7 @@ def _execute_paper_draft(
                 citation_repair_claims=citation_repair_claims,
                 heading_citation_instructions=heading_citation_instructions,
                 canonical_fact_sheet=canonical_fact_sheet,
+                citation_anchors=citation_anchors,
             )
         except PaperSectionContractError as exc:
             (stage_dir / "paper_draft_invalid.md").write_text(
@@ -3356,22 +3481,50 @@ Generated: {_utcnow_iso()}
         (stage_dir / "experiment_fact_closure_report.json").write_text(
             experiment_report_text, encoding="utf-8"
         )
-        citation_report = build_citation_closure_report(
-            run_dir,
-            config,
-            paper_text=final_draft,
-            structure_report_text=(stage_dir / "paper_structure_report.json").read_text(
-                encoding="utf-8"
-            ),
-            experiment_fact_report_text=experiment_report_text,
-            evidence=evidence,
-        )
+        if captured_citation_authority is not None:
+            verify_captured_citation_authority_unchanged(
+                run_dir,
+                captured_citation_authority,
+                release_lock=release_lock,
+            )
+            citation_report = build_citation_closure_from_texts(
+                paper_text=final_draft,
+                structure_report_text=(
+                    stage_dir / "paper_structure_report.json"
+                ).read_text(encoding="utf-8"),
+                experiment_fact_report_text=experiment_report_text,
+                citation_plan_text=(
+                    captured_citation_authority.inputs.citation_plan_text
+                ),
+                citation_allowlist_text=(
+                    captured_citation_authority.inputs.citation_allowlist_text
+                ),
+                plan=captured_citation_authority.replayed.plan,
+                allowlist=captured_citation_authority.replayed.allowlist,
+            )
+        else:
+            citation_report = build_citation_closure_report(
+                run_dir,
+                config,
+                paper_text=final_draft,
+                structure_report_text=(
+                    stage_dir / "paper_structure_report.json"
+                ).read_text(encoding="utf-8"),
+                experiment_fact_report_text=experiment_report_text,
+                evidence=evidence,
+            )
         (stage_dir / "citation_closure_report.json").write_text(
             canonical_json_text(citation_report), encoding="utf-8"
         )
         draft_path.write_text(final_draft, encoding="utf-8")
         validate_experiment_fact_closure_report(run_dir, evidence=evidence)
         validate_citation_closure_report(run_dir, config, evidence=evidence)
+        if captured_citation_authority is not None:
+            verify_captured_citation_authority_unchanged(
+                run_dir,
+                captured_citation_authority,
+                release_lock=release_lock,
+            )
     except (
         CitationPlanContractError,
         ExperimentFactClosureError,

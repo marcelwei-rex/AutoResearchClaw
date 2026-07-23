@@ -25,7 +25,11 @@ from researchclaw.pipeline.stage_impls._paper_writing import (
     _write_paper_sections,
 )
 from researchclaw.literature.citation_plan import (
+    CitationPlanContractError,
     build_heading_citation_writer_instructions_from_authority,
+    project_citation_anchors,
+    require_citation_candidate_free,
+    validate_citation_free_anchor_draft,
 )
 from researchclaw.pipeline.stage_impls._review_publish import (
     _citation_count_policy_violations,
@@ -139,6 +143,244 @@ def test_strict_parser_preserves_noncitation_and_escaped_brackets() -> None:
     assert citation_plan_module.filter_strict_citation_markers(
         text, frozenset()
     ) == text
+
+
+def _anchor_plan(claim_text: str = "Exact bounded claim.") -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "plan_version": 2,
+        "plan_status": "final",
+        "claim_scope": "pipeline_validation",
+        "citation_allowlist_path": "stage-06/citation_allowlist.json",
+        "citation_allowlist_sha256": "a" * 64,
+        "cards_manifest_path": "stage-06/cards_manifest.json",
+        "cards_manifest_sha256": "b" * 64,
+        "effective_policy_path": "stage-16/citation_policy_effective.json",
+        "effective_policy_sha256": "c" * 64,
+        "claims": [
+            {
+                "claim_id": "planned-claim-001",
+                "section_path": ["Related Work"],
+                "claim_text": claim_text,
+                "claim_type": "background",
+                "planned_citations": [
+                    {
+                        "cite_key": "smith2024deep",
+                        "evidence_excerpt_ids": ["ev-1"],
+                        "support_status": "abstract_sufficient",
+                    }
+                ],
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "Claim [smith2024deep].",
+        r"Claim \[smith2024deep].",
+        "Claim [smith2024deep, jones2023graph].",
+        "Claim [smith2024deep, ].",
+        "Claim [smith2024deep",
+        r"Claim \cite{smith2024deep}.",
+        r"Claim \\cite{smith2024deep}.",
+        r"Claim \cite{smith2024deep.",
+        "Claim [Smith et al., 2024].",
+        "Claim [smith et al., 2024].",
+        "Claim [Smith et al., 2024a].",
+        "Claim [1].",
+        "Claim [1, 3-5].",
+        "Claim [@smith2024deep].",
+        "Claim [Smith et al., 2024",
+        "Claim [smith et al., 2024a",
+        r"Claim \parencite{foreign2024paper}.",
+        r"Claim \autocite{foreign2024paper}.",
+    ],
+)
+def test_domain_v2_initial_draft_rejects_every_citation_candidate(
+    candidate: str,
+) -> None:
+    with pytest.raises(CitationPlanContractError, match="citation candidate"):
+        require_citation_candidate_free(candidate)
+
+
+def test_domain_v2_initial_draft_preserves_noncitation_brackets() -> None:
+    require_citation_candidate_free("Keep [important context] in the prose.")
+
+
+def test_domain_v2_noncitation_bracket_does_not_absorb_later_text() -> None:
+    require_citation_candidate_free(
+        "Keep [important context] before the literal smith2024deep token."
+    )
+
+
+def test_citation_anchor_without_terminal_punctuation_requires_own_line() -> None:
+    anchors = project_citation_anchors(_anchor_plan("No terminator"))
+    validate_citation_free_anchor_draft(
+        "## Related Work\n\nNo terminator\n",
+        anchors=anchors,
+        active_headings=("Related Work",),
+    )
+    with pytest.raises(CitationPlanContractError, match="missing, changed"):
+        validate_citation_free_anchor_draft(
+            "## Related Work\n\nNo terminator Next sentence.\n",
+            anchors=anchors,
+            active_headings=("Related Work",),
+        )
+
+
+@pytest.mark.parametrize(
+    "claim_text",
+    [" leading", "trailing ", "line\nbreak", "carriage\rreturn", "nul\x00byte"],
+)
+def test_citation_anchor_projection_rejects_unsafe_boundaries(
+    claim_text: str,
+) -> None:
+    with pytest.raises(CitationPlanContractError, match="standalone-line"):
+        project_citation_anchors(_anchor_plan(claim_text))
+
+
+def test_domain_v2_anchor_draft_requires_exact_unique_ordered_claims() -> None:
+    plan = _anchor_plan("First exact claim.")
+    second = json.loads(json.dumps(plan["claims"][0]))
+    second["claim_id"] = "planned-claim-002"
+    second["claim_text"] = "Second exact claim."
+    second["planned_citations"][0]["cite_key"] = "jones2023graph"
+    plan["claims"].append(second)
+    anchors = project_citation_anchors(plan)
+
+    validate_citation_free_anchor_draft(
+        "## Related Work\n\nFirst exact claim.\nSecond exact claim.\n",
+        anchors=anchors,
+        active_headings=("Related Work",),
+    )
+    for invalid in (
+        "## Related Work\n\nFirst paraphrased claim.\nSecond exact claim.\n",
+        "## Related Work\n\nFirst exact claim.\nFirst exact claim.\nSecond exact claim.\n",
+        "## Related Work\n\nSecond exact claim.\nFirst exact claim.\n",
+        "## Related Work\n\nFirst exact claim.\nSecond exact claim.\nsmith2024deep\n",
+    ):
+        with pytest.raises(CitationPlanContractError):
+            validate_citation_free_anchor_draft(
+                invalid,
+                anchors=anchors,
+                active_headings=("Related Work",),
+            )
+
+
+@pytest.mark.parametrize(
+    "foreign",
+    ("Exact bounded claim.", "smith2024deep"),
+)
+def test_domain_v2_zero_authority_heading_rejects_foreign_anchor_or_key(
+    foreign: str,
+) -> None:
+    anchors = project_citation_anchors(_anchor_plan())
+    with pytest.raises(CitationPlanContractError):
+        validate_citation_free_anchor_draft(
+            f"## Method\n\n{foreign}\n",
+            anchors=anchors,
+            active_headings=("Method",),
+        )
+
+
+def test_domain_v2_empty_plan_still_rejects_citation_candidate() -> None:
+    with pytest.raises(CitationPlanContractError, match="citation candidate"):
+        validate_citation_free_anchor_draft(
+            "## Method\n\nClaim [1].\n",
+            anchors=(),
+            active_headings=("Method",),
+        )
+
+
+def test_domain_v2_paraphrased_anchor_fails_before_free_structure_repair(
+    tmp_path: Path,
+) -> None:
+    anchors = project_citation_anchors(_anchor_plan())
+    headings = (
+        "Abstract", "Introduction", "Related Work", "Method", "Experiments",
+        "Results", "Discussion", "Limitations", "Conclusion",
+    )
+    llm = _SequentialLLM(
+        [
+            "## Title\n\nPaper.\n\n## Abstract\n\nA.\n\n## Introduction\n\nI.",
+            "## Related Work\n\nA paraphrase of the bounded claim.",
+            "## Related Work\n\nExact bounded claim.",
+        ]
+    )
+
+    with pytest.raises(PaperSectionContractError, match="citation_anchor"):
+        _write_paper_sections(
+            llm=cast(Any, llm),
+            pm=cast(Any, _PromptManagerStub()),
+            preamble="",
+            topic_constraint="",
+            exp_metrics_instruction="",
+            citation_instruction="",
+            outline="",
+            stage_dir=tmp_path,
+            citation_repair_claims=(
+                {
+                    "section": "Related Work",
+                    "claim_text": "Exact bounded claim.",
+                    "cite_key": "smith2024deep",
+                },
+            ),
+            heading_citation_instructions={
+                heading: "No citation authority." for heading in headings
+            },
+            canonical_fact_sheet=_minimal_cfs(),
+            citation_anchors=anchors,
+        )
+
+    assert len(llm.calls) == 2
+
+
+def test_domain_v2_structure_repair_cannot_reintroduce_citation_marker(
+    tmp_path: Path,
+) -> None:
+    anchors = project_citation_anchors(_anchor_plan())
+    headings = (
+        "Abstract", "Introduction", "Related Work", "Method", "Experiments",
+        "Results", "Discussion", "Limitations", "Conclusion",
+    )
+    llm = _SequentialLLM(
+        [
+            "## Title\n\nPaper.\n\n## Abstract\n\nA.\n\n## Introduction\n\nI.",
+            (
+                "## Related Work\n\nExact bounded claim.\n\n"
+                "## Foreign Heading\n\nInvalid structure."
+            ),
+            "## Related Work\n\nExact bounded claim [smith2024deep].",
+        ]
+    )
+
+    with pytest.raises(PaperSectionContractError, match="citation_anchor"):
+        _write_paper_sections(
+            llm=cast(Any, llm),
+            pm=cast(Any, _PromptManagerStub()),
+            preamble="",
+            topic_constraint="",
+            exp_metrics_instruction="",
+            citation_instruction="",
+            outline="",
+            stage_dir=tmp_path,
+            citation_repair_claims=(
+                {
+                    "section": "Related Work",
+                    "claim_text": "Exact bounded claim.",
+                    "cite_key": "smith2024deep",
+                },
+            ),
+            heading_citation_instructions={
+                heading: "No citation authority." for heading in headings
+            },
+            canonical_fact_sheet=_minimal_cfs(),
+            citation_anchors=anchors,
+        )
+
+    assert len(llm.calls) == 3
 
 
 def _minimal_cfs() -> dict[str, Any]:
