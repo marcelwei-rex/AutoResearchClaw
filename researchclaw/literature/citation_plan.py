@@ -325,7 +325,7 @@ def validate_citation_free_anchor_fragment(
                 "domain-v2 citation fragment exposes a citation key literal"
             )
         if anchor not in active:
-            if anchor.claim_text in text:
+            if _exact_physical_line_offsets(text, anchor.claim_text):
                 raise CitationPlanContractError(
                     "domain-v2 citation fragment exposes a foreign claim anchor"
                 )
@@ -340,6 +340,18 @@ def validate_citation_free_anchor_fragment(
         raise CitationPlanContractError(
             "domain-v2 citation anchors are out of plan order"
         )
+
+
+def _exact_physical_line_offsets(text: str, expected: str) -> tuple[int, ...]:
+    """Return byte-preserving character offsets for exact LF-delimited lines."""
+
+    offsets: list[int] = []
+    offset = 0
+    for line in text.split("\n"):
+        if line == expected:
+            offsets.append(offset)
+        offset += len(line) + 1
+    return tuple(offsets)
 
 
 def require_citation_candidate_free(text: str) -> None:
@@ -391,20 +403,21 @@ def validate_citation_free_anchor_draft(
         if anchor.cite_key in text:
             raise CitationPlanContractError("domain-v2 draft exposes a citation key literal")
         if anchor.heading not in active:
-            if anchor.claim_text in text:
+            if _exact_physical_line_offsets(text, anchor.claim_text):
                 raise CitationPlanContractError("domain-v2 draft exposes a foreign claim anchor")
             continue
         section = sections.get(anchor.heading)
         if section is None:
             raise CitationPlanContractError("domain-v2 citation heading is missing")
-        exact_lines = [
-            line for line in section.body.split("\n") if line == anchor.claim_text
-        ]
-        if len(exact_lines) != 1 or text.count(anchor.claim_text) != 1:
+        section_offsets = _exact_physical_line_offsets(
+            section.body, anchor.claim_text
+        )
+        document_offsets = _exact_physical_line_offsets(text, anchor.claim_text)
+        if len(section_offsets) != 1 or len(document_offsets) != 1:
             raise CitationPlanContractError(
                 "domain-v2 citation anchor is missing, changed, or not unique"
             )
-        positions.append(text.index(anchor.claim_text))
+        positions.append(document_offsets[0])
     if positions != sorted(positions):
         raise CitationPlanContractError("domain-v2 citation anchors are out of plan order")
 

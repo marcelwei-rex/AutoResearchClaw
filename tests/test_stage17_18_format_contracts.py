@@ -327,6 +327,66 @@ def test_domain_v2_headingless_fragment_rejects_heading_and_foreign_anchor() -> 
             )
 
 
+def test_domain_v2_fragment_allows_foreign_anchor_only_as_nested_substring() -> None:
+    active = citation_plan_module.CitationAnchor(
+        claim_id="planned-claim-001",
+        heading="Related Work",
+        claim_text=(
+            "This work advances hardware security by formally defining the "
+            "realistic problem of Hardware Trojan detection."
+        ),
+        cite_key="active2024key",
+    )
+    nested = citation_plan_module.CitationAnchor(
+        claim_id="planned-claim-002",
+        heading="Related Work",
+        claim_text="formally defining the realistic problem of Hardware Trojan detection",
+        cite_key="nested2024key",
+    )
+
+    citation_plan_module.validate_citation_free_anchor_fragment(
+        active.claim_text + "\n",
+        anchors=(active,),
+        all_anchors=(active, nested),
+    )
+    with pytest.raises(CitationPlanContractError, match="foreign claim anchor"):
+        citation_plan_module.validate_citation_free_anchor_fragment(
+            active.claim_text + "\n" + nested.claim_text + "\n",
+            anchors=(active,),
+            all_anchors=(active, nested),
+        )
+
+
+def test_domain_v2_full_replay_orders_nested_anchor_by_exact_physical_line() -> None:
+    outer = citation_plan_module.CitationAnchor(
+        claim_id="planned-claim-001",
+        heading="Related Work",
+        claim_text=(
+            "This work advances hardware security by formally defining the "
+            "realistic problem of Hardware Trojan detection."
+        ),
+        cite_key="outer2024key",
+    )
+    nested = citation_plan_module.CitationAnchor(
+        claim_id="planned-claim-002",
+        heading="Related Work",
+        claim_text="formally defining the realistic problem of Hardware Trojan detection",
+        cite_key="nested2024key",
+    )
+
+    validate_citation_free_anchor_draft(
+        f"## Related Work\n\n{outer.claim_text}\n{nested.claim_text}\n",
+        anchors=(outer, nested),
+        active_headings=("Related Work",),
+    )
+    with pytest.raises(CitationPlanContractError, match="out of plan order"):
+        validate_citation_free_anchor_draft(
+            f"## Related Work\n\n{nested.claim_text}\n{outer.claim_text}\n",
+            anchors=(outer, nested),
+            active_headings=("Related Work",),
+        )
+
+
 def test_domain_v2_fragment_batch_must_be_exact_contiguous_authority_slice() -> None:
     anchors = project_citation_anchors(_many_anchor_plan(3))
     forged = type(anchors[0])(
