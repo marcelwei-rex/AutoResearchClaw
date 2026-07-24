@@ -1056,6 +1056,100 @@ def test_domain_v2_initial_draft_preserves_noncitation_brackets() -> None:
     require_citation_candidate_free("Keep [important context] in the prose.")
 
 
+@pytest.mark.parametrize(
+    "interval",
+    (
+        "[0,1]",
+        "[0, 1]",
+        "[-1,1]",
+        r"\([0,1]\)",
+        "$[0,1]$",
+    ),
+)
+def test_domain_v2_initial_draft_preserves_unambiguous_numeric_intervals(
+    interval: str,
+) -> None:
+    require_citation_candidate_free(f"Features are normalized to {interval}.")
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    (
+        "Prior work [0,1].",
+        "Earlier studies [+1,2].",
+        "Smith reported [-1,1].",
+        "Prior work interrange [0,1].",
+        "Earlier studies domainwithin [+1,2].",
+        "Smith reported superinterval [-1,1].",
+        "Prior work normalnormalized to [0,1].",
+    ),
+)
+def test_domain_v2_initial_draft_rejects_numeric_interval_without_math_context(
+    candidate: str,
+) -> None:
+    with pytest.raises(CitationPlanContractError, match="citation candidate"):
+        require_citation_candidate_free(candidate)
+
+
+def test_domain_v2_initial_draft_accepts_explicit_interval_contexts() -> None:
+    require_citation_candidate_free("The values lie within [-1,1].")
+    require_citation_candidate_free("The supported range [0,1] is closed.")
+    require_citation_candidate_free("The domain is $[0,1]$.")
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    (
+        "[1]",
+        "[1,2]",
+        "[1, 2, 3]",
+        "[1-3]",
+    ),
+)
+def test_domain_v2_initial_draft_still_rejects_numeric_citations(
+    candidate: str,
+) -> None:
+    with pytest.raises(CitationPlanContractError, match="citation candidate"):
+        require_citation_candidate_free(f"Prior work supports this {candidate}.")
+
+
+def test_domain_v2_zero_authority_section_accepts_bounded_numeric_interval(
+    tmp_path: Path,
+) -> None:
+    anchor = project_citation_anchors(_anchor_plan())[0]
+    responses = _domain_v2_zero_authority_responses()
+    responses.insert(1, anchor.claim_text)
+    responses[2] = (
+        "## Method\n\nFeatures are normalized to \\([0,1]\\).\n\n"
+        "## Experiments\n\nThe bounded fixture is evaluated deterministically."
+    )
+    llm = _SequentialLLM(responses)
+
+    draft = _write_paper_sections(
+        llm=cast(Any, llm),
+        pm=cast(Any, _PromptManagerStub()),
+        preamble="",
+        topic_constraint="",
+        exp_metrics_instruction="",
+        citation_instruction="",
+        outline="",
+        stage_dir=tmp_path,
+        citation_repair_claims=(
+            {
+                "section": anchor.heading,
+                "claim_text": anchor.claim_text,
+                "cite_key": anchor.cite_key,
+            },
+        ),
+        heading_citation_instructions=_domain_v2_heading_instructions(),
+        canonical_fact_sheet=_minimal_cfs(),
+        citation_anchors=(anchor,),
+    )
+
+    assert "Features are normalized to \\([0,1]\\)." in draft
+    assert len(llm.calls) == 5
+
+
 def test_domain_v2_noncitation_bracket_does_not_absorb_later_text() -> None:
     require_citation_candidate_free(
         "Keep [important context] before the literal smith2024deep token."

@@ -110,6 +110,13 @@ _BARE_AUTHOR_YEAR_CITATION_RE = re.compile(
 _NUMERIC_CITATION_RE = re.compile(
     r"\s*\d+(?:\s*(?:[-–,;]\s*)\d+)*\s*"
 )
+_UNAMBIGUOUS_NUMERIC_INTERVAL_RE = re.compile(
+    r"\s*([+-]?\d+)\s*,\s*([+-]?\d+)\s*"
+)
+_NUMERIC_INTERVAL_CONTEXT_RE = re.compile(
+    r"\b(?:normalized\s+to|bounded\s+to|lies?\s+in|within|range|interval)\s*$",
+    re.IGNORECASE,
+)
 _AT_CITATION_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_:-]*")
 _HTML_HEADING_RE = re.compile(r"</?h[1-6]\b[^>]*>", re.IGNORECASE)
 _CITATION_PLAN_V3_COMPATIBILITY: Mapping[str, frozenset[str]] = {
@@ -375,6 +382,37 @@ def _exact_physical_line_offsets(text: str, expected: str) -> tuple[int, ...]:
     return tuple(offsets)
 
 
+def _is_unambiguous_numeric_interval(
+    candidate: str,
+    *,
+    line: str,
+    bracket: int,
+    close: int,
+) -> bool:
+    """Return true only for an unambiguous interval in explicit math context."""
+
+    match = _UNAMBIGUOUS_NUMERIC_INTERVAL_RE.fullmatch(candidate)
+    if match is None or close < 0:
+        return False
+    endpoints = match.groups()
+    shape_is_unambiguous = any(
+        int(endpoint) == 0 or endpoint.startswith(("+", "-"))
+        for endpoint in endpoints
+    )
+    if not shape_is_unambiguous:
+        return False
+    prefix = line[:bracket]
+    suffix = line[close + 1 :]
+    delimited = (
+        prefix.rstrip().endswith(r"\(")
+        and suffix.lstrip().startswith(r"\)")
+    ) or (
+        prefix.rstrip().endswith("$")
+        and suffix.lstrip().startswith("$")
+    )
+    return delimited or _NUMERIC_INTERVAL_CONTEXT_RE.search(prefix) is not None
+
+
 def require_citation_candidate_free(text: str) -> None:
     """Reject every citation-like candidate, including escaped or malformed forms."""
 
@@ -389,10 +427,22 @@ def require_citation_candidate_free(text: str) -> None:
         while bracket >= 0:
             close = line.find("]", bracket + 1)
             candidate = line[bracket + 1 :] if close < 0 else line[bracket + 1 : close]
+            numeric_candidate = (
+                _NUMERIC_CITATION_RE.fullmatch(candidate) is not None
+                or _UNAMBIGUOUS_NUMERIC_INTERVAL_RE.fullmatch(candidate) is not None
+            )
             if (
                 _CITATION_LIKE_KEY_RE.search(candidate)
                 or _AUTHOR_YEAR_CITATION_RE.search(candidate)
-                or _NUMERIC_CITATION_RE.fullmatch(candidate)
+                or (
+                    numeric_candidate
+                    and not _is_unambiguous_numeric_interval(
+                        candidate,
+                        line=line,
+                        bracket=bracket,
+                        close=close,
+                    )
+                )
                 or _AT_CITATION_RE.search(candidate)
             ):
                 raise CitationPlanContractError(
