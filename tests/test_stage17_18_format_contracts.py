@@ -544,9 +544,11 @@ def test_domain_v2_related_work_uses_isolated_contiguous_batches(
         for index in range(1, 7)
     ]
     for ordinal, prompt in enumerate(batch_prompts):
-        assert anchors[ordinal].claim_id in prompt
+        assert anchors[ordinal].claim_text in prompt
+        assert anchors[ordinal].claim_id not in prompt
+        assert anchors[ordinal].cite_key not in prompt
         assert all(
-            anchor.claim_id not in prompt
+            anchor.claim_text not in prompt
             for index, anchor in enumerate(anchors)
             if index != ordinal
         )
@@ -608,6 +610,29 @@ def test_domain_v2_single_anchor_contract_repair_is_bounded(
     )
     assert "Paraphrased claim." not in repair_prompt
     assert anchor.claim_text in repair_prompt
+    assert anchor.claim_id not in repair_prompt
+    assert anchor.cite_key not in repair_prompt
+
+
+def test_domain_v2_provider_prompt_hides_citation_identity() -> None:
+    anchor = citation_plan_module.CitationAnchor(
+        claim_id="planned-claim-014",
+        heading="Related Work",
+        claim_text=(
+            "formally defining the realistic problem of Hardware Trojan "
+            "(HT) detection"
+        ),
+        cite_key="sarihi2024hiding",
+    )
+
+    authority = _paper_writing._render_domain_v2_anchor_authority((anchor,))
+
+    assert "heading: Related Work" in authority
+    assert anchor.claim_text in authority
+    assert anchor.claim_id not in authority
+    assert anchor.cite_key not in authority
+    assert "Sarihi" not in authority
+    assert "2024" not in authority
 
 
 def test_domain_v2_zero_authority_section_regenerates_once_without_old_text(

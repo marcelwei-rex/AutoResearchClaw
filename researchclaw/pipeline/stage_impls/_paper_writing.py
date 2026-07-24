@@ -1536,9 +1536,7 @@ def _render_domain_v2_anchor_authority(
     for anchor in anchors:
         lines.extend(
             (
-                f"- claim_id: {anchor.claim_id}",
-                f"  heading: {anchor.heading}",
-                f"  cite_key (input authority only; never output it): {anchor.cite_key}",
+                f"- heading: {anchor.heading}",
                 "  EXACT ANCHOR START",
                 anchor.claim_text,
                 "  EXACT ANCHOR END",
