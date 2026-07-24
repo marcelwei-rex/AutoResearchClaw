@@ -192,6 +192,30 @@ class _ProductionChainLLM(LLMClient):
                 "## Evidence\nThe immutable evaluator projection is complete.\n\n"
                 "## Next Actions\nProceed with the canonical release path.\n"
             )
+        elif (
+            "DOMAIN-V2 CITATION ANCHOR CONTRACT:" in user
+            and "EXACT ANCHOR START" in user
+        ):
+            anchors = re.findall(
+                r"  EXACT ANCHOR START\n([^\r\n]+)\n  EXACT ANCHOR END",
+                user,
+            )
+            assert len(anchors) == 1
+            headings = re.findall(r"  heading: ([^\r\n]+)", user)
+            assert len(set(headings)) == 1
+            filler_count = {
+                "Related Work": 120,
+                "Method": 200,
+                "Experiments": 160,
+            }.get(headings[0], 120)
+            response = (
+                anchors[0]
+                + "\n\n"
+                + " ".join(
+                    "Bounded evidence supports clear scope."
+                    for _ in range(filler_count)
+                )
+            )
         elif "SECTION OUTPUT CONTRACT" in user:
             response = self._paper_part(user)
         elif "You assess citation relevance" in system:
@@ -284,18 +308,65 @@ class _ProductionChainLLM(LLMClient):
     def _paper_part(cls, user: str) -> str:
         requested_headings = re.findall(r"^- ## (.+)$", user, flags=re.MULTILINE)
         if requested_headings:
-            allowed_keys = re.findall(r"Required citation key: \[([^]]+)]", user)
+            claims = re.findall(
+                r"- CLAIM [^\n]+ \(section: ([^)]+)\)\n"
+                r"  Allowed wording ceiling: ([^\n]+)\n"
+                r"  Required citation key: \[([^]]+)]",
+                user,
+            )
+            by_section: dict[str, list[str]] = {}
+            for section, wording, cite_key in claims:
+                insertion = (
+                    len(wording) - 1
+                    if wording.endswith((".", "!", "?"))
+                    else len(wording)
+                )
+                sentence = (
+                    wording[:insertion]
+                    + f" [{cite_key}]"
+                    + wording[insertion:]
+                )
+                by_section.setdefault(section, []).append(sentence)
             parts: list[str] = []
             for heading in requested_headings:
                 if heading == "Title":
                     parts.append("## Title\nCounterGuard: Runtime Detection from Hardware Events")
                     continue
-                prose = ""
-                if heading == "Related Work" and allowed_keys:
-                    prose = " ".join(
-                        f"Bounded related-work evidence [{key}]."
-                        for key in allowed_keys
-                    )
+                prose = " ".join(by_section.get(heading, ()))
+                if not prose:
+                    word_budget = {
+                        "Abstract": 12,
+                        "Introduction": 56,
+                        "Limitations": 13,
+                        "Conclusion": 13,
+                    }.get(heading, 20)
+                    if heading in {"Results", "Discussion"}:
+                        primary_block = re.search(
+                            r'"primary_metric":\{([^{}]+)\}',
+                            user,
+                        )
+                        assert primary_block is not None
+                        metric_key = re.search(
+                            r'"key":"([^"]+)"', primary_block.group(1)
+                        )
+                        metric_value = re.search(
+                            r'"value":([^,}]+)', primary_block.group(1)
+                        )
+                        assert metric_key is not None
+                        assert metric_value is not None
+                        phrase_count = 98 if heading == "Results" else 65
+                        prose = (
+                            "The canonical evaluation records "
+                            f"{metric_key.group(1).upper()} {metric_value.group(1)} "
+                            "under bounded evidence, "
+                            + " and ".join(
+                                "with clear scope and documented limitations"
+                                for _ in range(phrase_count)
+                            )
+                            + "."
+                        )
+                    else:
+                        prose = cls._prose(heading.casefold(), word_budget, "")
                 parts.append(f"## {heading}\n{prose}")
             return "\n\n".join(parts)
 
@@ -467,7 +538,11 @@ def _papers(count: int = 3) -> list[Paper]:
             title=f"Hardware Counter Detection Study {index}",
             authors=(Author(f"Researcher {family_names[index - 1]}"),),
             year=2020 + index,
-            abstract=abstract,
+            abstract=(
+                f"The {family_names[index - 1]} study reports that "
+                + abstract[0].lower()
+                + abstract[1:]
+            ),
             venue="Security Conference",
             citation_count=20 - index,
             doi=f"10.5555/production-chain-{index}",
@@ -669,6 +744,21 @@ def test_stage04_through_stage25_uses_real_canonical_production_chain(
         )
 
     assert [result.stage for result in results] == list(Stage)[3:]
+    citation_plan = json.loads(
+        (run_dir / "stage-16/citation_plan.json").read_text(encoding="utf-8")
+    )
+    assert citation_plan["plan_version"] == 2
+    assert all(
+        set(claim)
+        == {
+            "claim_id",
+            "section_path",
+            "claim_text",
+            "claim_type",
+            "planned_citations",
+        }
+        for claim in citation_plan["claims"]
+    )
     stage23_inputs = load_stage23_input_bundle(run_dir, config)
     stage23 = load_stage23_verification_publication(run_dir, stage23_inputs)
     stage24 = load_stage24_publication_snapshot(run_dir, config)

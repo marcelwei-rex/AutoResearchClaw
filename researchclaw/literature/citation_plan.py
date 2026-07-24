@@ -50,6 +50,10 @@ from researchclaw.pipeline.manuscript_sections import (
 from researchclaw.pipeline._domain import _prompt_bank_domain_from_config
 from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidence,
+    load_canonical_experiment_evidence,
+)
+from researchclaw.pipeline.canonical_fact_sheet import (
+    build_citation_usage_authority,
 )
 from researchclaw.pipeline.release_graph_lock import (
     ReleaseGraphLock,
@@ -59,6 +63,8 @@ from researchclaw.pipeline.release_graph_lock import (
 
 CITATION_PLAN_SCHEMA_VERSION = 1
 CITATION_PLAN_VERSION = 2
+CITATION_PLAN_DOMAIN_VERSION = 3
+_CITATION_USAGE_POLICY_VERSION = 1
 DOMAIN_V2_CITATION_BATCH_MAX_ANCHORS = 1
 DOMAIN_V2_CITATION_BATCH_MAX_PROMPT_UTF8_BYTES = 16_384
 DOMAIN_V2_CITATION_FRAGMENT_MAX_UTF8_BYTES = 8_192
@@ -106,6 +112,21 @@ _NUMERIC_CITATION_RE = re.compile(
 )
 _AT_CITATION_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_:-]*")
 _HTML_HEADING_RE = re.compile(r"</?h[1-6]\b[^>]*>", re.IGNORECASE)
+_CITATION_PLAN_V3_COMPATIBILITY: Mapping[str, frozenset[str]] = {
+    "Introduction": frozenset({"background", "problem_context", "prior_work"}),
+    "Related Work": frozenset({"prior_work", "method_comparison"}),
+    "Method": frozenset({"method_origin", "algorithm_definition"}),
+    "Experiments": frozenset(
+        {"dataset_origin", "benchmark_definition", "evaluation_protocol"}
+    ),
+}
+_CLAIM_TYPE_USAGE_KIND: Mapping[str, str] = {
+    "method_origin": "method",
+    "algorithm_definition": "method",
+    "dataset_origin": "dataset",
+    "benchmark_definition": "benchmark",
+    "evaluation_protocol": "evaluation_protocol",
+}
 
 
 class CitationPlanContractError(ValueError):
@@ -629,6 +650,7 @@ class CapturedCitationAuthority:
     inputs: CitationPlanReplayInputs
     replayed: ReplayedCitationAuthority
     run_identity: tuple[int, int]
+    citation_usage_authority: Mapping[str, Any] | None = None
 
 
 class _CitationAuthorityReader:
@@ -756,9 +778,264 @@ def _citation_section_for_config(config: RCConfig) -> str:
     )
 
 
+def _load_citation_usage_authority(
+    run_dir: Path,
+) -> Mapping[str, Any] | None:
+    """Load domain-v2 usage authority without changing legacy fixture behavior."""
+
+    selected_manifest = run_dir / "stage-10" / "selected_candidate_manifest.json"
+    if not selected_manifest.exists():
+        return None
+    if selected_manifest.is_symlink() or not selected_manifest.is_file():
+        raise CitationPlanContractError(
+            "selected candidate manifest is missing or unsafe"
+        )
+    return build_citation_usage_authority(
+        load_canonical_experiment_evidence(run_dir)
+    )
+
+
+def _validate_citation_usage_authority(
+    authority: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    if authority is None:
+        return None
+    if not isinstance(authority, Mapping):
+        raise CitationPlanContractError("citation usage authority must be an object")
+    _exact_keys(
+        authority,
+        {
+            "schema_version",
+            "policy_version",
+            "canonical_fact_sheet_sha256",
+            "execution_policy_sha256",
+            "tokens",
+        },
+        "citation usage authority",
+    )
+    if (
+        type(authority["schema_version"]) is not int
+        or authority["schema_version"] != 1
+        or type(authority["policy_version"]) is not int
+        or authority["policy_version"] != _CITATION_USAGE_POLICY_VERSION
+    ):
+        raise CitationPlanContractError("unsupported citation usage authority")
+    _sha256_field(authority, "canonical_fact_sheet_sha256")
+    _sha256_field(authority, "execution_policy_sha256")
+    raw_tokens = authority["tokens"]
+    if not isinstance(raw_tokens, (list, tuple)) or not raw_tokens:
+        raise CitationPlanContractError("citation usage authority tokens are missing")
+    seen: set[str] = set()
+    observed_order: list[str] = []
+    for token in raw_tokens:
+        if not isinstance(token, Mapping):
+            raise CitationPlanContractError("citation usage token must be an object")
+        _exact_keys(
+            token,
+            {
+                "usage_token",
+                "usage_kind",
+                "section",
+                "claim_type",
+                "source_kind",
+                "source_identity",
+                "evidence_terms",
+            },
+            "citation usage token",
+        )
+        usage_token = _required_string(token, "usage_token")
+        usage_kind = _required_string(token, "usage_kind")
+        section = _required_string(token, "section")
+        claim_type = _required_string(token, "claim_type")
+        _required_string(token, "source_kind")
+        _required_string(token, "source_identity")
+        if usage_token in seen:
+            raise CitationPlanContractError("invalid or duplicate citation usage token")
+        seen.add(usage_token)
+        observed_order.append(usage_token)
+        if (
+            section not in _CITATION_PLAN_V3_COMPATIBILITY
+            or claim_type not in _CITATION_PLAN_V3_COMPATIBILITY[section]
+            or _CLAIM_TYPE_USAGE_KIND.get(claim_type) != usage_kind
+        ):
+            raise CitationPlanContractError(
+                "citation usage token compatibility mismatch"
+            )
+        terms = token["evidence_terms"]
+        if (
+            not isinstance(terms, (list, tuple))
+            or not terms
+            or any(type(term) is not str or not term for term in terms)
+            or len(terms) != len(set(terms))
+        ):
+            raise CitationPlanContractError("citation usage evidence terms are invalid")
+    if observed_order != sorted(observed_order):
+        raise CitationPlanContractError(
+            "citation usage tokens are not in canonical order"
+        )
+    return authority
+
+
+def _exact_usage_term_present(text: str, term: str) -> bool:
+    return re.search(
+        rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])",
+        text,
+        re.IGNORECASE,
+    ) is not None
+
+
+def _match_citation_usage_token(
+    claim_text: str,
+    tokens: object,
+) -> Mapping[str, Any] | None:
+    if not isinstance(tokens, (list, tuple)):
+        raise CitationPlanContractError("citation usage authority tokens are invalid")
+    matches: list[Mapping[str, Any]] = []
+    for token in tokens:
+        if not isinstance(token, Mapping):
+            raise CitationPlanContractError("citation usage token must be an object")
+        if _matches_citation_usage_claim(claim_text, token):
+            matches.append(token)
+    return matches[0] if len(matches) == 1 else None
+
+
+_METHOD_DEFINITION_MODIFIER = (
+    r"(?:anomaly|component|dimensionality|embedding|forest|graph|graph-based|"
+    r"inductive|isolation|learning|linear|localization|machine|neural|network|"
+    r"principal|reduction|representation|statistical|supervised|unsupervised)"
+)
+_METHOD_DEFINITION_PHRASE = (
+    rf"(?:{_METHOD_DEFINITION_MODIFIER}[ \t]+){{0,12}}"
+    r"(?:algorithm|method|model|framework|approach|technique)"
+)
+_EXPERIMENT_DEFINITION_TERM = (
+    r"(?:benchmark|bounded|canonical|circuit|classification|comparison|condition|"
+    r"controlled|data|dataset|detection|deterministic|evaluation|external|"
+    r"family|graph|hardware|input|inputs|learning|localization|mean|method|"
+    r"metric|model|protocol|sample|samples|seed|security|standard|suite|"
+    r"synthetic|trace|traces|training|validation|variant)"
+)
+_EXPERIMENT_DEFINITION_PHRASE = (
+    rf"(?:an?[ \t]+|the[ \t]+)?{_EXPERIMENT_DEFINITION_TERM}"
+    rf"(?:[ \t]+(?:and|for|of|to|{_EXPERIMENT_DEFINITION_TERM}))*"
+)
+
+
+def _matches_citation_usage_claim(
+    claim_text: str,
+    token: Mapping[str, Any],
+) -> bool:
+    """Accept only closed, claim-type-specific definition/source sentences."""
+
+    terms = token.get("evidence_terms")
+    if not isinstance(terms, (list, tuple)) or not terms:
+        raise CitationPlanContractError("citation usage evidence terms are invalid")
+    exact_terms = tuple(
+        str(term) for term in terms
+        if _exact_usage_term_present(claim_text, str(term))
+    )
+    if not exact_terms:
+        return False
+    term_pattern = "(?:" + "|".join(
+        sorted((re.escape(term) for term in exact_terms), key=len, reverse=True)
+    ) + ")"
+    suffix = r"[.!?]?"
+    claim_type = token.get("claim_type")
+    if claim_type in {"method_origin", "algorithm_definition"}:
+        patterns = (
+            rf"(?:The[ \t]+)?{term_pattern}[ \t]+"
+            rf"(?:is|are)[ \t]+(?:an?|the)[ \t]+"
+            rf"{_METHOD_DEFINITION_PHRASE}{suffix}",
+            rf"(?:The[ \t]+)?{term_pattern}[ \t]+"
+            rf"(?:was|were)[ \t]+(?:introduced|proposed|developed|defined)"
+            rf"(?:[ \t]+as[ \t]+(?:an?|the)[ \t]+"
+            rf"{_METHOD_DEFINITION_PHRASE})?{suffix}",
+        )
+    elif claim_type == "dataset_origin":
+        patterns = (
+            rf"(?:The[ \t]+)?{term_pattern}[ \t]+"
+            rf"(?:dataset|corpus|traces?|samples?)[ \t]+"
+            rf"(?:is|are|provides?|contains?|comprises?|consists[ \t]+of|defines?)"
+            rf"[ \t]+{_EXPERIMENT_DEFINITION_PHRASE}{suffix}",
+        )
+    elif claim_type == "benchmark_definition":
+        patterns = (
+            rf"(?:The[ \t]+)?{term_pattern}"
+            rf"(?:[ \t]+(?:benchmark|suite|family|circuits?))?[ \t]+"
+            rf"(?:is|are|defines?|provides?|comprises?|consists[ \t]+of)"
+            rf"[ \t]+{_EXPERIMENT_DEFINITION_PHRASE}{suffix}",
+        )
+    elif claim_type == "evaluation_protocol":
+        patterns = (
+            rf"(?:The[ \t]+)?{term_pattern}"
+            rf"(?:[ \t]+(?:protocol|policy|procedure|evaluation[ \t]+protocol))?"
+            rf"[ \t]+(?:is|are|defines?|specifies?|uses?|aggregates?)"
+            rf"[ \t]+{_EXPERIMENT_DEFINITION_PHRASE}{suffix}",
+        )
+    else:
+        return False
+    return any(re.fullmatch(pattern, claim_text, re.IGNORECASE) for pattern in patterns)
+
+
+def _citation_eligibility_binding(
+    token: Mapping[str, Any],
+    *,
+    usage_authority: Mapping[str, Any],
+    config_source_sha256: object,
+    evidence_excerpt_id: object,
+) -> dict[str, Any]:
+    if (
+        type(config_source_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", config_source_sha256) is None
+    ):
+        raise CitationPlanContractError(
+            "citation eligibility config binding is invalid"
+        )
+    if type(evidence_excerpt_id) is not str or not evidence_excerpt_id:
+        raise CitationPlanContractError(
+            "citation eligibility excerpt binding is invalid"
+        )
+    return {
+        "policy_version": usage_authority["policy_version"],
+        "usage_token": token["usage_token"],
+        "usage_kind": token["usage_kind"],
+        "source_kind": token["source_kind"],
+        "source_identity": token["source_identity"],
+        "canonical_fact_sheet_sha256": usage_authority[
+            "canonical_fact_sheet_sha256"
+        ],
+        "execution_policy_sha256": usage_authority["execution_policy_sha256"],
+        "config_source_sha256": config_source_sha256,
+        "evidence_excerpt_id": evidence_excerpt_id,
+    }
+
+
 def build_citation_plan(
     run_dir: Path, config: RCConfig, *, plan_status: str
 ) -> dict[str, Any]:
+    """Build from a fresh canonical evidence generation."""
+
+    return _build_citation_plan_from_evidence(
+        run_dir,
+        config,
+        plan_status=plan_status,
+        evidence=(
+            load_canonical_experiment_evidence(run_dir)
+            if (run_dir / "stage-10" / "selected_candidate_manifest.json").exists()
+            else None
+        ),
+    )
+
+
+def _build_citation_plan_from_evidence(
+    run_dir: Path,
+    config: RCConfig,
+    *,
+    plan_status: str,
+    evidence: CanonicalExperimentEvidence | None,
+) -> dict[str, Any]:
+    """Private producer helper using one already captured evidence generation."""
+
     if plan_status not in {"preliminary", "final"}:
         raise CitationPlanContractError("invalid citation plan status")
     allowlist_path = run_dir / "stage-06" / "citation_allowlist.json"
@@ -774,6 +1051,11 @@ def build_citation_plan(
         allowlist = validate_citation_allowlist(run_dir, config, allowlist_text)
         policy = load_effective_citation_policy(run_dir, config)
         cards = load_validated_cards(run_dir, config)
+        citation_usage_authority = (
+            build_citation_usage_authority(evidence)
+            if evidence is not None
+            else None
+        )
     except (CitationPolicyContractError, ValueError) as exc:
         raise CitationPlanContractError(f"invalid citation-plan source: {exc}") from exc
 
@@ -786,6 +1068,7 @@ def build_citation_plan(
         effective_policy=policy,
         effective_policy_text=policy_text,
         cards=cards,
+        citation_usage_authority=citation_usage_authority,
     )
 
 
@@ -799,6 +1082,7 @@ def build_citation_plan_from_replayed_inputs(
     effective_policy: Mapping[str, Any],
     effective_policy_text: str,
     cards: tuple[dict[str, Any], ...],
+    citation_usage_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a plan solely from already replayed citation source artifacts."""
     if plan_status not in {"preliminary", "final"}:
@@ -809,6 +1093,9 @@ def build_citation_plan_from_replayed_inputs(
     selected_keys = list(allowlist["eligible_keys"])[:target]
     if len(selected_keys) < int(effective_policy["effective_min_unique_sources"]):
         raise CitationPlanContractError("citation plan cannot meet effective minimum")
+    usage_authority = _validate_citation_usage_authority(
+        citation_usage_authority
+    )
     claims: list[dict[str, Any]] = []
     citation_section = _citation_section_for_config(config)
     for ordinal, cite_key in enumerate(selected_keys, start=1):
@@ -818,38 +1105,82 @@ def build_citation_plan_from_replayed_inputs(
         excerpts = card["evidence_excerpts"]
         if not excerpts:
             raise CitationPlanContractError("eligible key lacks retained excerpt")
-        claim_text = next(
-            (
-                excerpt["excerpt_text"]
-                for excerpt in excerpts
-                if _is_standalone_citation_claim(excerpt["excerpt_text"])
-            ),
-            None,
+        standalone = tuple(
+            excerpt
+            for excerpt in excerpts
+            if _is_standalone_citation_claim(excerpt["excerpt_text"])
         )
-        if claim_text is None:
+        if not standalone:
             raise CitationPlanContractError(
                 "eligible key lacks standalone citation excerpt"
             )
+        selected_excerpt = standalone[0]
+        selected_usage: Mapping[str, Any] | None = None
+        if usage_authority is not None:
+            for excerpt in standalone:
+                matched = _match_citation_usage_token(
+                    excerpt["excerpt_text"], usage_authority["tokens"]
+                )
+                if matched is not None:
+                    selected_excerpt = excerpt
+                    selected_usage = matched
+                    break
+        claim_text = selected_excerpt["excerpt_text"]
+        section = (
+            str(selected_usage["section"])
+            if selected_usage is not None
+            else citation_section
+        )
+        claim_type = (
+            str(selected_usage["claim_type"])
+            if selected_usage is not None
+            else (
+                "prior_work"
+                if usage_authority is not None and section == "Related Work"
+                else "background"
+            )
+        )
+        eligibility_binding = (
+            _citation_eligibility_binding(
+                selected_usage,
+                usage_authority=usage_authority,
+                config_source_sha256=effective_policy.get("config_source_sha256"),
+                evidence_excerpt_id=selected_excerpt["excerpt_id"],
+            )
+            if selected_usage is not None and usage_authority is not None
+            else None
+        )
         claims.append(
             {
                 "claim_id": f"planned-claim-{ordinal:03d}",
-                "section_path": [citation_section],
+                "section_path": [section],
                 "claim_text": claim_text,
-                "claim_type": "background",
+                "claim_type": claim_type,
                 "planned_citations": [
                     {
                         "cite_key": cite_key,
-                        "evidence_excerpt_ids": [
-                            excerpt["excerpt_id"] for excerpt in excerpts
-                        ],
+                        "evidence_excerpt_ids": (
+                            [selected_excerpt["excerpt_id"]]
+                            if usage_authority is not None
+                            else [excerpt["excerpt_id"] for excerpt in excerpts]
+                        ),
                         "support_status": "abstract_sufficient",
                     }
                 ],
+                **(
+                    {"eligibility_binding": eligibility_binding}
+                    if usage_authority is not None
+                    else {}
+                ),
             }
         )
     payload = {
         "schema_version": CITATION_PLAN_SCHEMA_VERSION,
-        "plan_version": CITATION_PLAN_VERSION,
+        "plan_version": (
+            CITATION_PLAN_DOMAIN_VERSION
+            if usage_authority is not None
+            else CITATION_PLAN_VERSION
+        ),
         "plan_status": plan_status,
         "claim_scope": config.experiment.claim_scope,
         "citation_allowlist_path": "stage-06/citation_allowlist.json",
@@ -868,6 +1199,23 @@ def replay_citation_plan_provenance(
     runtime_config: RCConfig | None,
     *,
     project_root: Path,
+) -> ReplayedCitationAuthority:
+    """Public replay derives citation usage authority from canonical disk state."""
+
+    return _replay_citation_plan_provenance(
+        inputs,
+        runtime_config,
+        project_root=project_root,
+        citation_usage_authority=_load_citation_usage_authority(project_root),
+    )
+
+
+def _replay_citation_plan_provenance(
+    inputs: CitationPlanReplayInputs,
+    runtime_config: RCConfig | None,
+    *,
+    project_root: Path,
+    citation_usage_authority: Mapping[str, Any] | None,
 ) -> ReplayedCitationAuthority:
     """Rebuild Stage 4-6 eligibility and Stage 16 policy/plan from captured bytes."""
     try:
@@ -918,6 +1266,7 @@ def replay_citation_plan_provenance(
             effective_policy=stored_policy,
             effective_policy_text=inputs.effective_policy_text,
             cards=cards,
+            citation_usage_authority=citation_usage_authority,
         )
         stored_plan = parse_citation_plan(inputs.citation_plan_text)
     except (CitationPolicyContractError, CitationIdentityError, ValueError) as exc:
@@ -929,6 +1278,29 @@ def replay_citation_plan_provenance(
         effective_policy=stored_policy,
         plan=stored_plan,
         cards=cards,
+    )
+
+
+def _replay_citation_plan_provenance_from_evidence(
+    inputs: CitationPlanReplayInputs,
+    runtime_config: RCConfig | None,
+    *,
+    project_root: Path,
+    evidence: CanonicalExperimentEvidence,
+) -> ReplayedCitationAuthority:
+    """Internal replay bound to an already validated canonical evidence snapshot."""
+
+    if not isinstance(evidence, CanonicalExperimentEvidence):
+        return replay_citation_plan_provenance(
+            inputs,
+            runtime_config,
+            project_root=project_root,
+        )
+    return _replay_citation_plan_provenance(
+        inputs,
+        runtime_config,
+        project_root=project_root,
+        citation_usage_authority=build_citation_usage_authority(evidence),
     )
 
 
@@ -944,21 +1316,54 @@ def capture_replayed_citation_authority(
             return capture_replayed_citation_authority(
                 run_dir, config, release_lock=owned_epoch
             )
+    citation_usage_authority = _load_citation_usage_authority(run_dir)
+    return _capture_replayed_citation_authority(
+        run_dir,
+        config,
+        citation_usage_authority=citation_usage_authority,
+        release_lock=release_lock,
+    )
+
+
+def _capture_replayed_citation_authority(
+    run_dir: Path,
+    config: RCConfig,
+    *,
+    citation_usage_authority: Mapping[str, Any] | None,
+    release_lock: object | None = None,
+) -> CapturedCitationAuthority:
+    """Private capture using one producer-held canonical evidence generation."""
+
+    if release_lock is None:
+        raise CitationPlanContractError(
+            "private citation capture requires an active release epoch"
+        )
     epoch = require_active_release_graph_epoch(run_dir, release_lock)
     with _CitationAuthorityReader(epoch.duplicate_run_fd()) as reader:
         first = _capture_citation_plan_inputs(reader)
-        replayed = replay_citation_plan_provenance(
-            first, config, project_root=run_dir
+        replayed = _replay_citation_plan_provenance(
+            first,
+            config,
+            project_root=run_dir,
+            citation_usage_authority=citation_usage_authority,
         )
         if _capture_citation_plan_inputs(reader) != first:
             raise CitationPlanContractError(
                 "citation authority changed during initial capture replay"
+            )
+        if (
+            _load_citation_usage_authority(run_dir)
+            != citation_usage_authority
+        ):
+            raise CitationPlanContractError(
+                "citation usage authority changed during initial capture replay"
             )
         epoch.assert_canonical()
         return CapturedCitationAuthority(
             inputs=first,
             replayed=replayed,
             run_identity=reader.run_identity,
+            citation_usage_authority=citation_usage_authority,
         )
 
 
@@ -987,6 +1392,13 @@ def verify_captured_citation_authority_unchanged(
         if _capture_citation_plan_inputs(reader) != captured.inputs:
             raise CitationPlanContractError(
                 "citation authority changed after Stage 17 generation"
+            )
+        if (
+            _load_citation_usage_authority(run_dir)
+            != captured.citation_usage_authority
+        ):
+            raise CitationPlanContractError(
+                "citation usage authority changed after Stage 17 generation"
             )
         epoch.assert_canonical()
 
@@ -1061,9 +1473,16 @@ def parse_citation_plan(text: str) -> dict[str, Any]:
         },
         "citation plan",
     )
-    if payload["schema_version"] != CITATION_PLAN_SCHEMA_VERSION:
+    if (
+        type(payload["schema_version"]) is not int
+        or payload["schema_version"] != CITATION_PLAN_SCHEMA_VERSION
+    ):
         raise CitationPlanContractError("unsupported citation plan schema")
-    if payload["plan_version"] != CITATION_PLAN_VERSION:
+    plan_version = payload["plan_version"]
+    if type(plan_version) is not int or plan_version not in {
+        CITATION_PLAN_VERSION,
+        CITATION_PLAN_DOMAIN_VERSION,
+    }:
         raise CitationPlanContractError("unsupported citation plan version")
     if payload["plan_status"] not in {"preliminary", "final"}:
         raise CitationPlanContractError("invalid citation plan status")
@@ -1089,23 +1508,49 @@ def parse_citation_plan(text: str) -> dict[str, Any]:
     for ordinal, claim in enumerate(payload["claims"], start=1):
         if not isinstance(claim, dict):
             raise CitationPlanContractError("planned claim must be an object")
+        claim_keys = {
+            "claim_id",
+            "section_path",
+            "claim_text",
+            "claim_type",
+            "planned_citations",
+        }
+        if plan_version == CITATION_PLAN_DOMAIN_VERSION:
+            claim_keys.add("eligibility_binding")
         _exact_keys(
             claim,
-            {"claim_id", "section_path", "claim_text", "claim_type", "planned_citations"},
+            claim_keys,
             "planned claim",
         )
         claim_id = _required_string(claim, "claim_id")
         if claim_id != f"planned-claim-{ordinal:03d}" or claim_id in claim_ids:
             raise CitationPlanContractError("planned claim ID sequence mismatch")
         claim_ids.add(claim_id)
-        if claim["section_path"] not in (["Introduction"], ["Related Work"]):
-            raise CitationPlanContractError("unsupported v2 section_path")
+        section_path = claim["section_path"]
+        if (
+            not isinstance(section_path, list)
+            or len(section_path) != 1
+            or type(section_path[0]) is not str
+        ):
+            raise CitationPlanContractError("invalid citation plan section_path")
+        section = section_path[0]
         _required_string(claim, "claim_text")
-        if claim["claim_type"] != "background":
-            raise CitationPlanContractError("unsupported v2 claim_type")
+        claim_type = _required_string(claim, "claim_type")
+        if plan_version == CITATION_PLAN_VERSION:
+            if section not in {"Introduction", "Related Work"}:
+                raise CitationPlanContractError("unsupported v2 section_path")
+            if claim_type != "background":
+                raise CitationPlanContractError("unsupported v2 claim_type")
+        elif (
+            section not in _CITATION_PLAN_V3_COMPATIBILITY
+            or claim_type not in _CITATION_PLAN_V3_COMPATIBILITY[section]
+        ):
+            raise CitationPlanContractError(
+                "citation plan v3 section/claim compatibility mismatch"
+            )
         citations = claim["planned_citations"]
         if not isinstance(citations, list) or len(citations) != 1:
-            raise CitationPlanContractError("v2 claim requires one planned citation")
+            raise CitationPlanContractError("claim requires one planned citation")
         citation = citations[0]
         if not isinstance(citation, dict):
             raise CitationPlanContractError("planned citation must be an object")
@@ -1124,8 +1569,82 @@ def parse_citation_plan(text: str) -> dict[str, Any]:
         ) or len(ids) != len(set(ids)):
             raise CitationPlanContractError("invalid evidence_excerpt_ids")
         if citation["support_status"] != "abstract_sufficient":
-            raise CitationPlanContractError("final v2 plan requires abstract_sufficient")
+            raise CitationPlanContractError(
+                "citation plan requires abstract_sufficient"
+            )
+        if plan_version == CITATION_PLAN_DOMAIN_VERSION:
+            _validate_citation_eligibility_binding(
+                claim["eligibility_binding"],
+                section=section,
+                claim_type=claim_type,
+                excerpt_ids=ids,
+            )
     return payload
+
+
+def _validate_citation_eligibility_binding(
+    value: object,
+    *,
+    section: str,
+    claim_type: str,
+    excerpt_ids: list[str],
+) -> None:
+    expected_usage_kind = _CLAIM_TYPE_USAGE_KIND.get(claim_type)
+    if expected_usage_kind is None:
+        if value is not None:
+            raise CitationPlanContractError(
+                "citation plan v3 background claim has eligibility binding"
+            )
+        return
+    if not isinstance(value, dict):
+        raise CitationPlanContractError(
+            "citation plan v3 eligible claim lacks binding"
+        )
+    _exact_keys(
+        value,
+        {
+            "policy_version",
+            "usage_token",
+            "usage_kind",
+            "source_kind",
+            "source_identity",
+            "canonical_fact_sheet_sha256",
+            "execution_policy_sha256",
+            "config_source_sha256",
+            "evidence_excerpt_id",
+        },
+        "citation eligibility binding",
+    )
+    if (
+        type(value["policy_version"]) is not int
+        or value["policy_version"] != _CITATION_USAGE_POLICY_VERSION
+    ):
+        raise CitationPlanContractError(
+            "unsupported citation eligibility policy"
+        )
+    usage_token = _required_string(value, "usage_token")
+    usage_kind = _required_string(value, "usage_kind")
+    _required_string(value, "source_kind")
+    _required_string(value, "source_identity")
+    if usage_kind != expected_usage_kind:
+        raise CitationPlanContractError(
+            "citation plan v3 eligibility compatibility mismatch"
+        )
+    if section not in {"Method", "Experiments"}:
+        raise CitationPlanContractError(
+            "citation eligibility binding is outside an eligible section"
+        )
+    for field in (
+        "canonical_fact_sheet_sha256",
+        "execution_policy_sha256",
+        "config_source_sha256",
+    ):
+        _sha256_field(value, field)
+    excerpt_id = _required_string(value, "evidence_excerpt_id")
+    if excerpt_ids != [excerpt_id]:
+        raise CitationPlanContractError(
+            "citation eligibility excerpt binding mismatch"
+        )
 
 
 def validate_citation_plan(

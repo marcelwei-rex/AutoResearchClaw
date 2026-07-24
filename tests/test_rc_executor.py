@@ -4609,7 +4609,7 @@ class TestDataIntegrityBlock:
         )
         monkeypatch.setattr(
             _paper_writing,
-            "capture_replayed_citation_authority",
+            "_capture_replayed_citation_authority",
             lambda *_args, **_kwargs: captured,
         )
         monkeypatch.setattr(

@@ -22,6 +22,11 @@ from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 from researchclaw.pipeline.canonical_evidence_capabilities import (
     require_canonical_evidence_capabilities,
 )
+from researchclaw.pipeline.canonical_fact_sheet import (
+    CFSIntegrityError,
+    build_canonical_fact_sheet,
+    fact_sheet_numeric_authority_records,
+)
 from researchclaw.pipeline.canonical_experiment_evidence import (
     parse_invocation_result,
 )
@@ -812,12 +817,21 @@ def _numeric_support(
             execution_observations = project_domain_metric_observations(
                 execution_artifact.content
             )
-        except (Stage14DomainEvaluatorError, ValueError) as exc:
+            canonical_fact_sheet = build_canonical_fact_sheet(evidence)
+            if canonical_fact_sheet is None:
+                raise CFSIntegrityError(
+                    "domain evaluator evidence did not produce a fact sheet"
+                )
+            cfs_numeric_records = fact_sheet_numeric_authority_records(
+                canonical_fact_sheet, view="results"
+            )
+        except (CFSIntegrityError, Stage14DomainEvaluatorError, ValueError) as exc:
             raise Stage24PublicationError(
                 f"selected domain observation replay failed: {exc}"
             ) from exc
         execution_ordinal = None
     else:
+        cfs_numeric_records = ()
         try:
             execution_payload = parse_invocation_result(
                 execution_artifact.content.decode("utf-8")
@@ -858,23 +872,60 @@ def _numeric_support(
             child=obligation,
             display_labels=contract.metric_display_labels,
         )
-        candidates: list[tuple[str, str, int, Decimal]] = []
+        candidates: list[
+            tuple[str, str, int | None, Decimal, str, str, str]
+        ] = []
         if label_binding is not None:
             bound_metric, bound_label = label_binding
-            raw_values = evidence.metric_observations.get(bound_metric, ())
             unit = contract.metric_units.get(bound_metric)
             transformed = _transform_value(value, unit_lexeme, unit)
             if transformed is not None:
-                for ordinal, raw_value in enumerate(raw_values):
-                    canonical = _decimal(raw_value)
-                    if canonical == transformed:
+                if domain_evaluator:
+                    for record in cfs_numeric_records:
+                        if record["metric"] != bound_metric:
+                            continue
+                        canonical = _decimal(record["value"])
+                        if canonical == transformed:
+                            candidates.append(
+                                (
+                                    bound_metric,
+                                    bound_label,
+                                    None,
+                                    canonical,
+                                    evidence.manifest_path,
+                                    evidence.manifest_sha256,
+                                    str(record["pointer"]),
+                                )
+                            )
+                else:
+                    raw_values = evidence.metric_observations.get(bound_metric, ())
+                    for ordinal, raw_value in enumerate(raw_values):
+                        canonical = _decimal(raw_value)
+                        if canonical != transformed:
+                            continue
                         candidates.append(
-                            (bound_metric, bound_label, ordinal, canonical)
+                            (
+                                bound_metric,
+                                bound_label,
+                                ordinal,
+                                canonical,
+                                execution_artifact.path,
+                                execution_artifact.sha256,
+                                f"/metric_observations/{bound_metric}/{ordinal}",
+                            )
                         )
         if len(candidates) != 1:
             result[obligation.obligation_id] = {"status": "unsupported"}
             continue
-        metric, display_label, ordinal, canonical = candidates[0]
+        (
+            metric,
+            display_label,
+            ordinal,
+            canonical,
+            authority_path,
+            authority_sha256,
+            semantic_pointer,
+        ) = candidates[0]
         canonical_text = _canonical_decimal_text(canonical)
         result[obligation.obligation_id] = {
             "status": "supported",
@@ -883,13 +934,9 @@ def _numeric_support(
             "invocation_ordinal": execution_ordinal,
             "observation_ordinal": ordinal,
             "canonical_value": canonical_text,
-            "authority_path": execution_artifact.path,
-            "authority_sha256": execution_artifact.sha256,
-            "semantic_pointer": (
-                f"/observations/{ordinal}/metrics/{metric}"
-                if domain_evaluator
-                else f"/metric_observations/{metric}/{ordinal}"
-            ),
+            "authority_path": authority_path,
+            "authority_sha256": authority_sha256,
+            "semantic_pointer": semantic_pointer,
             "semantic_value_sha256": _sha256(canonical_text.encode("utf-8")),
         }
     return result

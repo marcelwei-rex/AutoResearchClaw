@@ -295,6 +295,8 @@ def _domain_numeric_bundle(
         ),
         selected_result_manifest_path="stage-13/refinement_result_set.json",
         selected_result_manifest_sha256="c" * 64,
+        manifest_path="canonical_experiment_evidence.json",
+        manifest_sha256="d" * 64,
         selected_execution_artifact=_bound(
             "stage-12/evidence-v2/observations.json", content
         ),
@@ -746,10 +748,99 @@ def test_stage24_numeric_support_uses_exact_metric_unit_and_label(
     }
 
 
-def test_stage24_numeric_support_replays_domain_observation_pointer(
+def test_stage24_domain_numeric_does_not_use_raw_observation_pointer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bundle = _domain_numeric_bundle(b"## Results\n\nAUPRC was 0.75.\n")
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage24_publication.build_canonical_fact_sheet",
+        lambda evidence: _stage24_cfs(condition_value=Decimal("0.8")),
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage24_publication.validate_contract_dict",
+        lambda *_args: SimpleNamespace(
+            metric_units={"auprc": "ratio"},
+            metric_display_labels={"auprc": ["AUPRC"]},
+        ),
+    )
+
+    support = _numeric_support(
+        bundle, build_claim_obligation_inventory(bundle.paper.content)
+    )
+
+    assert {item["status"] for item in support.values()} == {"unsupported"}
+
+
+def _stage24_cfs(
+    *,
+    condition_value: Decimal = Decimal("0.75"),
+    per_seed_value: Decimal = Decimal("0.625"),
+) -> MappingProxyType:
+    return MappingProxyType(
+        {
+            "schema_version": 1,
+            "metric_keys": ("auprc",),
+            "condition_aggregates": (
+                MappingProxyType(
+                    {
+                        "condition": "trojnet_community_graphsage",
+                        "metrics": MappingProxyType(
+                            {
+                                "auprc": MappingProxyType(
+                                    {
+                                        "mean": condition_value,
+                                        "std": Decimal("0.01"),
+                                        "min": Decimal("0.7"),
+                                        "max": Decimal("0.8"),
+                                    }
+                                )
+                            }
+                        ),
+                    }
+                ),
+            ),
+            "per_seed_aggregates": (
+                MappingProxyType(
+                    {
+                        "condition": "trojnet_community_graphsage",
+                        "seed": 0,
+                        "metrics": MappingProxyType({"auprc": per_seed_value}),
+                    }
+                ),
+            ),
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("paper", "expected_pointer"),
+    (
+        (
+            b"## Results\n\nAUPRC was 0.75.\n",
+            (
+                "/derived/canonical_fact_sheet/v1/condition_aggregates/0/"
+                "metrics/auprc/mean"
+            ),
+        ),
+        (
+            b"## Results\n\nAUPRC was 0.625.\n",
+            (
+                "/derived/canonical_fact_sheet/v1/per_seed_aggregates/0/"
+                "metrics/auprc"
+            ),
+        ),
+    ),
+)
+def test_stage24_domain_numeric_support_uses_cfs_aggregate_pointer(
+    monkeypatch: pytest.MonkeyPatch,
+    paper: bytes,
+    expected_pointer: str,
+) -> None:
+    bundle = _domain_numeric_bundle(paper)
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage24_publication.build_canonical_fact_sheet",
+        lambda evidence: _stage24_cfs(),
+    )
     monkeypatch.setattr(
         "researchclaw.pipeline.stage24_publication.validate_contract_dict",
         lambda *_args: SimpleNamespace(
@@ -763,9 +854,55 @@ def test_stage24_numeric_support_replays_domain_observation_pointer(
     )
     supported = next(item for item in support.values() if item["status"] == "supported")
 
-    assert supported["invocation_ordinal"] is None
-    assert supported["authority_path"] == "stage-12/evidence-v2/observations.json"
-    assert supported["semantic_pointer"] == "/observations/0/metrics/auprc"
+    assert supported["authority_path"] == "canonical_experiment_evidence.json"
+    assert supported["authority_sha256"] == "d" * 64
+    assert supported["semantic_pointer"] == expected_pointer
+
+
+def test_stage24_domain_numeric_support_rejects_raw_only_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _domain_numeric_bundle(b"## Results\n\nAUPRC was 0.5.\n")
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage24_publication.build_canonical_fact_sheet",
+        lambda evidence: _stage24_cfs(),
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage24_publication.validate_contract_dict",
+        lambda *_args: SimpleNamespace(
+            metric_units={"auprc": "ratio"},
+            metric_display_labels={"auprc": ["AUPRC"]},
+        ),
+    )
+
+    support = _numeric_support(
+        bundle, build_claim_obligation_inventory(bundle.paper.content)
+    )
+
+    assert {item["status"] for item in support.values()} == {"unsupported"}
+
+
+def test_stage24_domain_numeric_support_rejects_ambiguous_cfs_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _domain_numeric_bundle(b"## Results\n\nAUPRC was 0.75.\n")
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage24_publication.build_canonical_fact_sheet",
+        lambda evidence: _stage24_cfs(per_seed_value=Decimal("0.75")),
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage24_publication.validate_contract_dict",
+        lambda *_args: SimpleNamespace(
+            metric_units={"auprc": "ratio"},
+            metric_display_labels={"auprc": ["AUPRC"]},
+        ),
+    )
+
+    support = _numeric_support(
+        bundle, build_claim_obligation_inventory(bundle.paper.content)
+    )
+
+    assert {item["status"] for item in support.values()} == {"unsupported"}
 
 
 def test_stage24_numeric_label_requires_lexical_boundary(

@@ -35,11 +35,33 @@ MAX_PROJECTION_ROWS = 162
 MAX_PROJECTION_UTF8_BYTES = 65536
 
 _CFS_SCHEMA_VERSION = 1
+_CITATION_USAGE_AUTHORITY_SCHEMA_VERSION = 1
+_CITATION_USAGE_POLICY_VERSION = 1
 _DECIMAL_REPLAY_TOLERANCE = Decimal("1e-49")
 _VIEWS = frozenset({"introduction", "method", "results", "limitations"})
 _BENCHMARK_TOKEN = re.compile(r"[a-z]{2,}[0-9]+[a-z0-9]*")
 _VERSION_TOKEN = re.compile(r"v[0-9]+")
 _PROMPT_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+:/-]*")
+_METHOD_USAGE_REGISTRY: Mapping[str, tuple[str, tuple[str, ...]]] = {
+    "raw_pca": ("method:principal_component_analysis", ("PCA", "principal component analysis")),
+    "scoap_isolation_forest": (
+        "method:isolation_forest",
+        ("isolation forest",),
+    ),
+    "trojnet_community_graphsage": ("method:graphsage", ("GraphSAGE",)),
+    "trojnet_iscas85_graphsage_localization": (
+        "method:graphsage",
+        ("GraphSAGE",),
+    ),
+}
+_EVALUATION_PROTOCOL_FIELDS = (
+    "primary_observation_set",
+    "primary_aggregation",
+    "execution_backend_policy",
+    "raw_evidence_policy",
+    "observation_policy",
+    "aggregation_policy",
+)
 _COUNT_WORDS = {
     "one": 1,
     "two": 2,
@@ -215,6 +237,119 @@ def canonical_fact_sheet_sha256(cfs: Mapping[str, Any]) -> str:
     except (TypeError, ValueError) as exc:
         raise CFSIntegrityError(f"canonical fact sheet is not serializable: {exc}") from exc
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def build_citation_usage_authority(
+    evidence: CanonicalExperimentEvidence,
+) -> Mapping[str, Any] | None:
+    """Project exact Method/Experiments citation eligibility from canonical evidence."""
+
+    cfs = build_canonical_fact_sheet(evidence)
+    if cfs is None:
+        return None
+    artifact = evidence.execution_policy_artifact
+    if artifact is None:
+        raise CFSIntegrityError("canonical execution policy artifact is missing")
+    policy = parse_domain_execution_policy_bytes(artifact.content)
+
+    tokens: dict[str, dict[str, Any]] = {}
+
+    def add_token(
+        *,
+        usage_token: str,
+        usage_kind: str,
+        section: str,
+        claim_type: str,
+        source_kind: str,
+        source_identity: str,
+        evidence_terms: tuple[str, ...],
+    ) -> None:
+        if usage_token in tokens:
+            return
+        if not evidence_terms or any(not term for term in evidence_terms):
+            raise CFSIntegrityError("citation usage evidence terms are invalid")
+        tokens[usage_token] = {
+            "usage_token": usage_token,
+            "usage_kind": usage_kind,
+            "section": section,
+            "claim_type": claim_type,
+            "source_kind": source_kind,
+            "source_identity": source_identity,
+            "evidence_terms": evidence_terms,
+        }
+
+    condition_ids = tuple(str(item["id"]) for item in cfs["conditions"])
+    evaluator_id = str(cfs["bound_labels"]["evaluator_id"])
+    for source_kind, source_identity in (
+        *(("condition", identity) for identity in condition_ids),
+        ("evaluator", evaluator_id),
+    ):
+        registered = _METHOD_USAGE_REGISTRY.get(source_identity)
+        if registered is None:
+            continue
+        usage_token, terms = registered
+        add_token(
+            usage_token=usage_token,
+            usage_kind="method",
+            section="Method",
+            claim_type="algorithm_definition",
+            source_kind=source_kind,
+            source_identity=source_identity,
+            evidence_terms=terms,
+        )
+
+    dataset = str(cfs["bound_labels"]["dataset"])
+    add_token(
+        usage_token=f"dataset:{_normalize(dataset)}",
+        usage_kind="dataset",
+        section="Experiments",
+        claim_type="dataset_origin",
+        source_kind="dataset",
+        source_identity=dataset,
+        evidence_terms=(dataset,),
+    )
+    for benchmark in cfs["bound_labels"]["benchmark_tokens"]:
+        benchmark_text = str(benchmark)
+        terms = (
+            ("ISCAS-85", "ISCAS85")
+            if benchmark_text == "iscas85"
+            else (benchmark_text,)
+        )
+        add_token(
+            usage_token=f"benchmark:{benchmark_text}",
+            usage_kind="benchmark",
+            section="Experiments",
+            claim_type="benchmark_definition",
+            source_kind="benchmark",
+            source_identity=benchmark_text,
+            evidence_terms=terms,
+        )
+
+    for field in _EVALUATION_PROTOCOL_FIELDS:
+        identity = policy.get(field)
+        if not isinstance(identity, str) or not identity:
+            raise CFSIntegrityError(
+                f"canonical evaluation protocol is missing: {field}"
+            )
+        add_token(
+            usage_token=f"protocol:{identity}",
+            usage_kind="evaluation_protocol",
+            section="Experiments",
+            claim_type="evaluation_protocol",
+            source_kind="execution_policy",
+            source_identity=identity,
+            evidence_terms=(identity,),
+        )
+
+    return _freeze_authority_value(
+        {
+            "schema_version": _CITATION_USAGE_AUTHORITY_SCHEMA_VERSION,
+            "policy_version": _CITATION_USAGE_POLICY_VERSION,
+            "canonical_fact_sheet_sha256": canonical_fact_sheet_sha256(cfs),
+            "execution_policy_sha256": artifact.sha256,
+            "tokens": [tokens[key] for key in sorted(tokens)],
+        }
+    )
 
 
 def render_fact_sheet_text(cfs: Mapping[str, Any], *, view: str) -> str:
@@ -445,18 +580,54 @@ def fact_sheet_numeric_authority(
 ) -> tuple[int | Decimal, ...]:
     """Return only metric values explicitly authoritative for one heading view."""
 
+    return tuple(
+        record["value"]
+        for record in fact_sheet_numeric_authority_records(cfs, view=view)
+    )
+
+
+def fact_sheet_numeric_authority_records(
+    cfs: Mapping[str, Any], *, view: str
+) -> tuple[Mapping[str, Any], ...]:
+    """Return metric values with stable pointers into the derived CFS."""
+
     if view not in _VIEWS:
         raise ValueError(f"unsupported canonical fact sheet view: {view}")
     if view != "results":
         return ()
-    values: list[int | Decimal] = []
-    for condition in cfs["condition_aggregates"]:
+    records: list[Mapping[str, Any]] = []
+    for condition_index, condition in enumerate(cfs["condition_aggregates"]):
         for key in cfs["metric_keys"]:
             summary = condition["metrics"][key]
-            values.extend(summary[name] for name in ("mean", "std", "min", "max"))
-    for row in cfs["per_seed_aggregates"]:
-        values.extend(row["metrics"][key] for key in cfs["metric_keys"])
-    return tuple(_metric_value(value) for value in values)
+            for name in ("mean", "std", "min", "max"):
+                records.append(
+                    _freeze_authority_value(
+                        {
+                            "metric": key,
+                            "pointer": (
+                                "/derived/canonical_fact_sheet/v1/"
+                                f"condition_aggregates/{condition_index}/"
+                                f"metrics/{key}/{name}"
+                            ),
+                            "value": _metric_value(summary[name]),
+                        }
+                    )
+                )
+    for row_index, row in enumerate(cfs["per_seed_aggregates"]):
+        for key in cfs["metric_keys"]:
+            records.append(
+                _freeze_authority_value(
+                    {
+                        "metric": key,
+                        "pointer": (
+                            "/derived/canonical_fact_sheet/v1/"
+                            f"per_seed_aggregates/{row_index}/metrics/{key}"
+                        ),
+                        "value": _metric_value(row["metrics"][key]),
+                    }
+                )
+            )
+    return tuple(records)
 
 
 def render_observation_projection(

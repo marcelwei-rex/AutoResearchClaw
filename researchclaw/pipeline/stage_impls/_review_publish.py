@@ -30,7 +30,7 @@ from researchclaw.literature.citation_policy import (
 )
 from researchclaw.literature.citation_plan import (
     CitationPlanContractError,
-    replay_citation_plan_provenance,
+    _replay_citation_plan_provenance_from_evidence,
     replay_citation_closure,
     validate_paper_citation_minimum,
     validate_paper_citation_minimum_from_authority,
@@ -255,8 +255,11 @@ def _load_bound_stage19_inputs(
         raise OSError(
             "runtime config semantic generation differs from canonical experiment evidence"
         )
-    citation_authority = replay_citation_plan_provenance(
-        bundle.citation_replay_inputs(), canonical_config, project_root=run_dir
+    citation_authority = _replay_citation_plan_provenance_from_evidence(
+        bundle.citation_replay_inputs(),
+        canonical_config,
+        project_root=run_dir,
+        evidence=evidence,
     )
     fact_report = replay_experiment_fact_closure(
         paper_bytes=bundle.paper.content,
@@ -1342,10 +1345,11 @@ def _execute_quality_gate_bound(
                 "runtime config semantic generation differs from canonical experiment evidence"
             )
         stage19_inputs = _load_bound_stage19_inputs(run_dir, config, evidence)
-        citation_authority = replay_citation_plan_provenance(
+        citation_authority = _replay_citation_plan_provenance_from_evidence(
             stage19_inputs.citation_replay_inputs(),
             canonical_config,
             project_root=run_dir,
+            evidence=evidence,
         )
         claim_scope = _snapshot_claim_scope(evidence)
         stage20_inputs = load_stage20_input_bundle(

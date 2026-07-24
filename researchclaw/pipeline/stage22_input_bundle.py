@@ -13,7 +13,7 @@ from researchclaw.literature.citation_plan import (
     CitationPlanContractError,
     ReplayedCitationAuthority,
     replay_citation_closure,
-    replay_citation_plan_provenance,
+    _replay_citation_plan_provenance_from_evidence,
 )
 from researchclaw.literature.citation_policy import parse_config_snapshot_text
 from researchclaw.literature.experiment_fact_closure import (
@@ -84,10 +84,11 @@ def load_stage22_input_bundle(
         claim_scope = validate_contract_dict(contract_value).claim_scope
 
         stage19_inputs = load_stage19_input_bundle(run_dir)
-        citation_authority = replay_citation_plan_provenance(
+        citation_authority = _replay_citation_plan_provenance_from_evidence(
             stage19_inputs.citation_replay_inputs(),
             canonical_config,
             project_root=run_dir,
+            evidence=evidence,
         )
         fact_report = replay_experiment_fact_closure(
             paper_bytes=stage19_inputs.paper.content,

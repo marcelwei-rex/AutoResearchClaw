@@ -35,13 +35,13 @@ from researchclaw.literature.citation_plan import (
     # Stable monkeypatch seam for legacy executor fixtures.
     build_citation_closure_report,
     build_heading_citation_writer_instructions_from_authority,
-    build_citation_plan,
+    _build_citation_plan_from_evidence,
+    _capture_replayed_citation_authority,
     # Stable monkeypatch seam for legacy executor fixtures.
     build_citation_writer_instruction,
     filter_strict_citation_markers,
     # Stable monkeypatch seam for legacy executor fixtures.
     load_final_citation_plan,
-    capture_replayed_citation_authority,
     parse_strict_citation_occurrences,
     project_citation_anchors,
     project_contiguous_citation_anchor_batches,
@@ -99,6 +99,7 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
 from researchclaw.pipeline.canonical_fact_sheet import (
     CFSIntegrityError,
     build_canonical_fact_sheet,
+    build_citation_usage_authority,
     build_heading_grounding_contexts,
     fact_sheet_view_for_heading,
 )
@@ -776,15 +777,23 @@ def _execute_paper_outline(
     else:
         outline = _default_paper_outline(config.research.topic)
     try:
-        preliminary = build_citation_plan(
-            run_dir, config, plan_status="preliminary"
+        preliminary = _build_citation_plan_from_evidence(
+            run_dir,
+            config,
+            plan_status="preliminary",
+            evidence=evidence,
         )
         preliminary_text = canonical_json_text(preliminary)
         preliminary_plan_path.write_text(preliminary_text, encoding="utf-8")
         validate_citation_plan(
             run_dir, config, preliminary_text, plan_status="preliminary"
         )
-        final_plan = build_citation_plan(run_dir, config, plan_status="final")
+        final_plan = _build_citation_plan_from_evidence(
+            run_dir,
+            config,
+            plan_status="final",
+            evidence=evidence,
+        )
         final_plan_text = canonical_json_text(final_plan)
         final_plan_path.write_text(final_plan_text, encoding="utf-8")
         validate_citation_plan(
@@ -3146,8 +3155,11 @@ def _execute_paper_draft_under_release_epoch(
                 decision="retry",
             )
         captured_citation_authority = (
-            capture_replayed_citation_authority(
-                run_dir, config, release_lock=release_lock
+            _capture_replayed_citation_authority(
+                run_dir,
+                config,
+                citation_usage_authority=build_citation_usage_authority(evidence),
+                release_lock=release_lock,
             )
             if canonical_fact_sheet is not None
             else None

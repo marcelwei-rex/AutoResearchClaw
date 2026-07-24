@@ -27,7 +27,7 @@ from researchclaw.literature.experiment_fact_closure import (
 )
 from researchclaw.literature.citation_plan import (
     CitationPlanContractError,
-    replay_citation_plan_provenance,
+    _replay_citation_plan_provenance_from_evidence,
     replay_citation_closure,
 )
 from researchclaw.literature.citation_policy import (
@@ -203,8 +203,11 @@ def audit_sectional_revision(
             project_root=run_dir,
             label="canonical experiment config snapshot",
         )
-        citation_authority = replay_citation_plan_provenance(
-            inputs.citation_replay_inputs(), canonical_config, project_root=run_dir
+        citation_authority = _replay_citation_plan_provenance_from_evidence(
+            inputs.citation_replay_inputs(),
+            canonical_config,
+            project_root=run_dir,
+            evidence=evidence,
         )
         paper = inputs.paper.text()
         reviews = inputs.reviews.text()

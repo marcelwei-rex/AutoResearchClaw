@@ -325,7 +325,11 @@ def _run_quality_gate(
     monkeypatch.setattr(_review_publish, "parse_config_snapshot_text", lambda *_a, **_k: config)
     monkeypatch.setattr(_review_publish, "semantic_config_sha256", lambda _: "same")
     monkeypatch.setattr(_review_publish, "_load_bound_stage19_inputs", lambda *_a: sources)
-    monkeypatch.setattr(_review_publish, "replay_citation_plan_provenance", lambda *_a, **_k: authority)
+    monkeypatch.setattr(
+        _review_publish,
+        "_replay_citation_plan_provenance_from_evidence",
+        lambda *_a, **_k: authority,
+    )
     monkeypatch.setattr(_review_publish, "_snapshot_claim_scope", lambda _: "pipeline_validation")
     monkeypatch.setattr(_review_publish, "load_stage20_input_bundle", lambda *_a, **_k: stage20_inputs)
     monkeypatch.setattr(_review_publish, "verify_stage19_input_bundle_unchanged", lambda *_a: None)

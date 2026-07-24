@@ -60,6 +60,7 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     canonical_authority_json_text,
     canonical_decimal,
 )
+from researchclaw.pipeline import canonical_fact_sheet as cfs_module
 from researchclaw.pipeline.manuscript_sections import parse_manuscript
 from researchclaw.pipeline.canonical_fact_sheet import (  # noqa: F401
     CFSIntegrityError,
@@ -71,6 +72,7 @@ from researchclaw.pipeline.canonical_fact_sheet import (  # noqa: F401
     canonical_fact_sheet_sha256,
     classify_out_of_scope_request,
     compose_grounding_context,
+    fact_sheet_numeric_authority_records,
     is_exclusively_out_of_scope_request,
     render_complete_fact_sheet_text,
     render_fact_sheet_text,
@@ -277,6 +279,66 @@ def _build_cfs(evidence: Any = None) -> Mapping[str, Any]:
     )
     assert cfs is not None, "有效 domain-evaluator 证据必须生成 CFS"
     return cfs
+
+
+def test_citation_usage_authority_is_exact_and_versioned() -> None:
+    authority = cfs_module.build_citation_usage_authority(_make_evidence())
+
+    assert authority is not None
+    assert authority["schema_version"] == 1
+    assert authority["policy_version"] == 1
+    assert authority["canonical_fact_sheet_sha256"] == canonical_fact_sheet_sha256(
+        _build_cfs()
+    )
+    assert authority["execution_policy_sha256"] == hashlib.sha256(
+        _fixture_bytes("execution_policy.json")
+    ).hexdigest()
+    assert {
+        (entry["usage_token"], entry["section"], entry["claim_type"])
+        for entry in authority["tokens"]
+    } >= {
+        ("method:graphsage", "Method", "algorithm_definition"),
+        ("method:isolation_forest", "Method", "algorithm_definition"),
+        ("benchmark:iscas85", "Experiments", "benchmark_definition"),
+        (
+            "protocol:condition_seed_variant_mean_v1",
+            "Experiments",
+            "evaluation_protocol",
+        ),
+    }
+
+
+def test_citation_usage_authority_does_not_infer_louvain() -> None:
+    authority = cfs_module.build_citation_usage_authority(_make_evidence())
+
+    assert authority is not None
+    tokens = {entry["usage_token"] for entry in authority["tokens"]}
+    terms = {
+        term.casefold()
+        for entry in authority["tokens"]
+        for term in entry["evidence_terms"]
+    }
+    assert "method:louvain" not in tokens
+    assert "louvain" not in terms
+
+
+def test_citation_usage_authority_is_recursively_immutable() -> None:
+    authority = cfs_module.build_citation_usage_authority(_make_evidence())
+
+    assert authority is not None
+    with pytest.raises(TypeError):
+        authority["policy_version"] = 2  # type: ignore[index]
+    with pytest.raises(TypeError):
+        authority["tokens"][0]["usage_token"] = "method:forged"  # type: ignore[index]
+
+
+def test_citation_usage_authority_is_absent_for_generic_v1() -> None:
+    evidence = _make_evidence(
+        manifest=_make_manifest(generation_kind="legacy"),
+        execution_policy_artifact=None,
+    )
+
+    assert cfs_module.build_citation_usage_authority(evidence) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1611,3 +1673,39 @@ class TestExperimentFactClosureV3:
                 structured_fact_violations=[forged],
                 canonical_fact_sheet=_build_cfs(_make_evidence()),
             )
+
+
+class TestNumericAuthorityRecords:
+    def test_results_records_bind_condition_and_per_seed_paths(self) -> None:
+        cfs = _build_cfs()
+
+        records = fact_sheet_numeric_authority_records(cfs, view="results")
+
+        condition_pointer = (
+            "/derived/canonical_fact_sheet/v1/condition_aggregates/0/"
+            "metrics/accuracy/mean"
+        )
+        per_seed_pointer = (
+            "/derived/canonical_fact_sheet/v1/per_seed_aggregates/0/"
+            "metrics/accuracy"
+        )
+        condition = next(
+            item for item in records if item["pointer"] == condition_pointer
+        )
+        per_seed = next(
+            item for item in records if item["pointer"] == per_seed_pointer
+        )
+        assert condition == {
+            "metric": "accuracy",
+            "pointer": condition_pointer,
+            "value": cfs["condition_aggregates"][0]["metrics"]["accuracy"]["mean"],
+        }
+        assert per_seed == {
+            "metric": "accuracy",
+            "pointer": per_seed_pointer,
+            "value": cfs["per_seed_aggregates"][0]["metrics"]["accuracy"],
+        }
+
+    @pytest.mark.parametrize("view", ("introduction", "method", "limitations"))
+    def test_non_results_views_have_no_numeric_records(self, view: str) -> None:
+        assert fact_sheet_numeric_authority_records(_build_cfs(), view=view) == ()

@@ -1377,6 +1377,507 @@ def test_stage16_plan_rejects_card_without_standalone_excerpt() -> None:
         )
 
 
+def _citation_usage_authority_fixture() -> dict[str, Any]:
+    authority = {
+        "schema_version": 1,
+        "policy_version": 1,
+        "canonical_fact_sheet_sha256": "a" * 64,
+        "execution_policy_sha256": "b" * 64,
+        "tokens": [
+            {
+                "usage_token": "dataset:synthetic",
+                "usage_kind": "dataset",
+                "section": "Experiments",
+                "claim_type": "dataset_origin",
+                "source_kind": "dataset",
+                "source_identity": "synthetic",
+                "evidence_terms": ["synthetic"],
+            },
+            {
+                "usage_token": "method:graphsage",
+                "usage_kind": "method",
+                "section": "Method",
+                "claim_type": "algorithm_definition",
+                "source_kind": "condition",
+                "source_identity": "trojnet_community_graphsage",
+                "evidence_terms": ["GraphSAGE"],
+            },
+            {
+                "usage_token": "benchmark:iscas85",
+                "usage_kind": "benchmark",
+                "section": "Experiments",
+                "claim_type": "benchmark_definition",
+                "source_kind": "benchmark",
+                "source_identity": "iscas85",
+                "evidence_terms": ["ISCAS-85", "ISCAS85"],
+            },
+            {
+                "usage_token": "protocol:condition_seed_variant_mean_v1",
+                "usage_kind": "evaluation_protocol",
+                "section": "Experiments",
+                "claim_type": "evaluation_protocol",
+                "source_kind": "execution_policy",
+                "source_identity": "condition_seed_variant_mean_v1",
+                "evidence_terms": ["condition_seed_variant_mean_v1"],
+            },
+        ],
+    }
+    authority["tokens"].sort(key=lambda item: item["usage_token"])
+    return authority
+
+
+def _citation_plan_card(
+    cite_key: str, excerpt: str, *, excerpt_id: str
+) -> dict[str, Any]:
+    return {
+        "cite_key": cite_key,
+        "extraction_status": "success",
+        "evidence_excerpts": [
+            {"excerpt_id": excerpt_id, "excerpt_text": excerpt}
+        ],
+    }
+
+
+def _build_v3_plan(cards: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+    keys = [card["cite_key"] for card in cards]
+    return build_citation_plan_from_replayed_inputs(
+        config=_config(),  # type: ignore[arg-type]
+        plan_status="final",
+        allowlist={"eligible_keys": keys},
+        allowlist_text="allowlist",
+        cards_manifest_text="manifest",
+        effective_policy={
+            "effective_target_unique_sources": len(keys),
+            "effective_min_unique_sources": 1,
+            "config_source_sha256": "c" * 64,
+        },
+        effective_policy_text="policy",
+        cards=cards,
+        citation_usage_authority=_citation_usage_authority_fixture(),
+    )
+
+
+def test_citation_plan_v3_allocates_exact_registered_usage_tokens() -> None:
+    cards = (
+        _citation_plan_card(
+            "background2024work",
+            "A bounded background statement.",
+            excerpt_id="ev-background",
+        ),
+        _citation_plan_card(
+            "graphsage2017inductive",
+            "GraphSAGE is an inductive representation learning algorithm.",
+            excerpt_id="ev-graphsage",
+        ),
+        _citation_plan_card(
+            "iscas1985benchmark",
+            "ISCAS-85 defines a benchmark family for circuit evaluation.",
+            excerpt_id="ev-iscas85",
+        ),
+        _citation_plan_card(
+            "synthetic2024dataset",
+            "The synthetic dataset provides bounded evaluation inputs.",
+            excerpt_id="ev-synthetic",
+        ),
+        _citation_plan_card(
+            "protocol2024study",
+            "The condition_seed_variant_mean_v1 protocol is deterministic.",
+            excerpt_id="ev-protocol",
+        ),
+    )
+
+    plan = _build_v3_plan(cards)
+
+    assert plan["plan_version"] == 3
+    by_key = {
+        claim["planned_citations"][0]["cite_key"]: claim
+        for claim in plan["claims"]
+    }
+    assert by_key["background2024work"]["section_path"] == ["Related Work"]
+    assert by_key["background2024work"]["claim_type"] == "prior_work"
+    assert by_key["background2024work"]["eligibility_binding"] is None
+    assert by_key["graphsage2017inductive"]["section_path"] == ["Method"]
+    assert by_key["graphsage2017inductive"]["claim_type"] == "algorithm_definition"
+    assert by_key["graphsage2017inductive"]["eligibility_binding"][
+        "usage_token"
+    ] == "method:graphsage"
+    assert by_key["iscas1985benchmark"]["section_path"] == ["Experiments"]
+    assert by_key["iscas1985benchmark"]["claim_type"] == "benchmark_definition"
+    assert by_key["synthetic2024dataset"]["claim_type"] == "dataset_origin"
+    assert by_key["synthetic2024dataset"]["eligibility_binding"][
+        "usage_token"
+    ] == "dataset:synthetic"
+    assert by_key["protocol2024study"]["claim_type"] == "evaluation_protocol"
+
+
+def test_citation_plan_v3_does_not_infer_unregistered_method() -> None:
+    plan = _build_v3_plan(
+        (
+            _citation_plan_card(
+                "louvain2008communities",
+                "Louvain community optimization identifies graph structure.",
+                excerpt_id="ev-louvain",
+            ),
+        )
+    )
+
+    claim = plan["claims"][0]
+    assert claim["section_path"] == ["Related Work"]
+    assert claim["claim_type"] == "prior_work"
+    assert claim["eligibility_binding"] is None
+
+
+def test_citation_plan_v3_selects_first_exact_eligible_excerpt() -> None:
+    card = {
+        "cite_key": "graphsage2017inductive",
+        "extraction_status": "success",
+        "evidence_excerpts": [
+            {
+                "excerpt_id": "ev-background",
+                "excerpt_text": "A bounded background statement.",
+            },
+            {
+                "excerpt_id": "ev-graphsage",
+                "excerpt_text": (
+                    "GraphSAGE is an inductive representation learning algorithm."
+                ),
+            },
+        ],
+    }
+
+    plan = _build_v3_plan((card,))
+
+    claim = plan["claims"][0]
+    assert claim["section_path"] == ["Method"]
+    assert claim["claim_text"] == card["evidence_excerpts"][1]["excerpt_text"]
+    assert claim["planned_citations"][0]["evidence_excerpt_ids"] == [
+        "ev-graphsage"
+    ]
+    assert claim["eligibility_binding"]["evidence_excerpt_id"] == "ev-graphsage"
+
+
+@pytest.mark.parametrize(
+    ("section", "claim_type"),
+    [
+        ("Introduction", "background"),
+        ("Related Work", "prior_work"),
+        ("Method", "method_origin"),
+        ("Method", "algorithm_definition"),
+        ("Experiments", "dataset_origin"),
+        ("Experiments", "benchmark_definition"),
+        ("Experiments", "evaluation_protocol"),
+    ],
+)
+def test_citation_plan_v3_closed_compatibility_matrix_accepts(
+    section: str, claim_type: str
+) -> None:
+    plan = _build_v3_plan(
+        (
+            _citation_plan_card(
+                "graphsage2017inductive",
+                "GraphSAGE is an inductive representation learning algorithm.",
+                excerpt_id="ev-graphsage",
+            ),
+        )
+    )
+    claim = plan["claims"][0]
+    claim["section_path"] = [section]
+    claim["claim_type"] = claim_type
+    if section in {"Introduction", "Related Work"}:
+        claim["eligibility_binding"] = None
+    else:
+        binding = claim["eligibility_binding"]
+        usage_kind = {
+            "method_origin": "method",
+            "algorithm_definition": "method",
+            "dataset_origin": "dataset",
+            "benchmark_definition": "benchmark",
+            "evaluation_protocol": "evaluation_protocol",
+        }[claim_type]
+        binding["usage_kind"] = usage_kind
+        binding["usage_token"] = f"{usage_kind}:fixture"
+
+    parsed = parse_citation_plan(canonical_json_text(plan))
+
+    assert parsed["claims"][0]["section_path"] == [section]
+    assert parsed["claims"][0]["claim_type"] == claim_type
+
+
+@pytest.mark.parametrize(
+    ("section", "claim_type"),
+    [
+        ("Results", "background"),
+        ("Discussion", "prior_work"),
+        ("Limitations", "benchmark_definition"),
+        ("Conclusion", "method_origin"),
+        ("Method", "background"),
+        ("Experiments", "algorithm_definition"),
+    ],
+)
+def test_citation_plan_v3_closed_compatibility_matrix_rejects(
+    section: str, claim_type: str
+) -> None:
+    plan = _build_v3_plan(
+        (
+            _citation_plan_card(
+                "graphsage2017inductive",
+                "GraphSAGE is an inductive representation learning algorithm.",
+                excerpt_id="ev-graphsage",
+            ),
+        )
+    )
+    plan["claims"][0]["section_path"] = [section]
+    plan["claims"][0]["claim_type"] = claim_type
+
+    with pytest.raises(CitationPlanContractError, match="compatibility"):
+        parse_citation_plan(canonical_json_text(plan))
+
+
+@pytest.mark.parametrize(
+    "claim_text",
+    [
+        "GraphSAGE achieved AUPRC 0.999 in the current run.",
+        "ISCAS-85 produced 162 observations in the current run.",
+    ],
+)
+def test_citation_plan_v3_does_not_authorize_current_run_results(
+    claim_text: str,
+) -> None:
+    plan = _build_v3_plan(
+        (
+            _citation_plan_card(
+                "result2024claim",
+                claim_text,
+                excerpt_id="ev-result",
+            ),
+        )
+    )
+
+    assert plan["claims"][0]["section_path"] == ["Related Work"]
+    assert plan["claims"][0]["eligibility_binding"] is None
+
+
+@pytest.mark.parametrize(
+    "claim_text",
+    [
+        "Our evaluation found that GraphSAGE outperformed the baseline.",
+        "In the current run, GraphSAGE was the best-performing method.",
+        "Our experiment used three seeds with GraphSAGE.",
+        "GraphSAGE is the best performing method.",
+        "GraphSAGE is the current run best method.",
+        "GraphSAGE was introduced as the top performing method.",
+    ],
+)
+def test_citation_plan_v3_only_authorizes_positive_method_definition_grammar(
+    claim_text: str,
+) -> None:
+    plan = _build_v3_plan(
+        (
+            _citation_plan_card(
+                "graphsage2017inductive",
+                claim_text,
+                excerpt_id="ev-graphsage",
+            ),
+        )
+    )
+
+    assert plan["claims"][0]["section_path"] == ["Related Work"]
+    assert plan["claims"][0]["eligibility_binding"] is None
+
+
+def test_citation_plan_v3_rejects_ambiguous_multi_usage_excerpt() -> None:
+    plan = _build_v3_plan(
+        (
+            _citation_plan_card(
+                "graphsage2017inductive",
+                "GraphSAGE is evaluated on the ISCAS-85 benchmark.",
+                excerpt_id="ev-ambiguous",
+            ),
+        )
+    )
+
+    assert plan["claims"][0]["section_path"] == ["Related Work"]
+    assert plan["claims"][0]["eligibility_binding"] is None
+
+
+@pytest.mark.parametrize(
+    "claim_text",
+    [
+        "The synthetic dataset contains 162 observations in the current run.",
+        "ISCAS-85 contains 162 observations in the current run.",
+        (
+            "The condition_seed_variant_mean_v1 protocol uses three seeds "
+            "in the current run."
+        ),
+    ],
+)
+def test_citation_plan_v3_experiment_grammar_rejects_current_run_counts(
+    claim_text: str,
+) -> None:
+    plan = _build_v3_plan(
+        (
+            _citation_plan_card(
+                "experiment2024source",
+                claim_text,
+                excerpt_id="ev-experiment",
+            ),
+        )
+    )
+
+    assert plan["claims"][0]["section_path"] == ["Related Work"]
+    assert plan["claims"][0]["eligibility_binding"] is None
+
+
+def test_citation_plan_v3_rejects_noncanonical_usage_token_order() -> None:
+    authority = _citation_usage_authority_fixture()
+    authority["tokens"] = list(reversed(authority["tokens"]))
+
+    with pytest.raises(CitationPlanContractError, match="canonical order"):
+        build_citation_plan_from_replayed_inputs(
+            config=_config(),  # type: ignore[arg-type]
+            plan_status="final",
+            allowlist={"eligible_keys": ["graphsage2017inductive"]},
+            allowlist_text="allowlist",
+            cards_manifest_text="manifest",
+            effective_policy={
+                "effective_target_unique_sources": 1,
+                "effective_min_unique_sources": 1,
+                "config_source_sha256": "c" * 64,
+            },
+            effective_policy_text="policy",
+            cards=(
+                _citation_plan_card(
+                    "graphsage2017inductive",
+                    "GraphSAGE is an inductive representation learning algorithm.",
+                    excerpt_id="ev-graphsage",
+                ),
+            ),
+            citation_usage_authority=authority,
+        )
+
+
+def test_citation_plan_v2_rejects_v3_eligibility_field() -> None:
+    plan = build_citation_plan_from_replayed_inputs(
+        config=_config(),  # type: ignore[arg-type]
+        plan_status="final",
+        allowlist={"eligible_keys": ["background2024work"]},
+        allowlist_text="allowlist",
+        cards_manifest_text="manifest",
+        effective_policy={
+            "effective_target_unique_sources": 1,
+            "effective_min_unique_sources": 1,
+        },
+        effective_policy_text="policy",
+        cards=(
+            _citation_plan_card(
+                "background2024work",
+                "A bounded background statement.",
+                excerpt_id="ev-background",
+            ),
+        ),
+    )
+    plan["claims"][0]["eligibility_binding"] = None
+
+    with pytest.raises(CitationPlanContractError, match="fields mismatch"):
+        parse_citation_plan(canonical_json_text(plan))
+
+
+@pytest.mark.parametrize("plan_version", [2, 3])
+def test_citation_plan_rejects_bool_schema_version(plan_version: int) -> None:
+    if plan_version == 3:
+        plan = _build_v3_plan(
+            (
+                _citation_plan_card(
+                    "graphsage2017inductive",
+                    "GraphSAGE is an inductive representation learning algorithm.",
+                    excerpt_id="ev-graphsage",
+                ),
+            )
+        )
+    else:
+        plan = build_citation_plan_from_replayed_inputs(
+            config=_config(),  # type: ignore[arg-type]
+            plan_status="final",
+            allowlist={"eligible_keys": ["background2024work"]},
+            allowlist_text="allowlist",
+            cards_manifest_text="manifest",
+            effective_policy={
+                "effective_target_unique_sources": 1,
+                "effective_min_unique_sources": 1,
+            },
+            effective_policy_text="policy",
+            cards=(
+                _citation_plan_card(
+                    "background2024work",
+                    "A bounded background statement.",
+                    excerpt_id="ev-background",
+                ),
+            ),
+        )
+    plan["schema_version"] = True
+
+    with pytest.raises(CitationPlanContractError, match="schema"):
+        parse_citation_plan(canonical_json_text(plan))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "bool_policy", "hash", "excerpt", "usage_kind"],
+)
+def test_citation_plan_v3_rejects_invalid_eligibility_binding(
+    mutation: str,
+) -> None:
+    plan = _build_v3_plan(
+        (
+            _citation_plan_card(
+                "graphsage2017inductive",
+                "GraphSAGE is an inductive representation learning algorithm.",
+                excerpt_id="ev-graphsage",
+            ),
+        )
+    )
+    binding = plan["claims"][0]["eligibility_binding"]
+    if mutation == "missing":
+        plan["claims"][0]["eligibility_binding"] = None
+    elif mutation == "bool_policy":
+        binding["policy_version"] = True
+    elif mutation == "hash":
+        binding["canonical_fact_sheet_sha256"] = "0" * 63
+    elif mutation == "excerpt":
+        binding["evidence_excerpt_id"] = "ev-foreign"
+    else:
+        binding["usage_kind"] = "benchmark"
+
+    with pytest.raises(CitationPlanContractError):
+        parse_citation_plan(canonical_json_text(plan))
+
+
+def test_citation_plan_v3_rejects_binding_on_background_claim() -> None:
+    plan = _build_v3_plan(
+        (
+            _citation_plan_card(
+                "background2024work",
+                "A bounded background statement.",
+                excerpt_id="ev-background",
+            ),
+        )
+    )
+    plan["claims"][0]["eligibility_binding"] = {
+        "policy_version": 1,
+        "usage_token": "method:graphsage",
+        "usage_kind": "method",
+        "source_kind": "condition",
+        "source_identity": "trojnet_community_graphsage",
+        "canonical_fact_sheet_sha256": "a" * 64,
+        "execution_policy_sha256": "b" * 64,
+        "config_source_sha256": "c" * 64,
+        "evidence_excerpt_id": "ev-background",
+    }
+
+    with pytest.raises(CitationPlanContractError, match="background claim"):
+        parse_citation_plan(canonical_json_text(plan))
+
+
 def test_research_release_fails_below_citation_minimum(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     config = _real_config_snapshot(run_dir, claim_scope="research_release")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,22 @@ _SCOPING_LLM_STAGES = frozenset(
 )
 
 
+def _trojnet_papers():
+    papers = _papers(3)
+    papers[0] = replace(
+        papers[0],
+        abstract="GraphSAGE is an inductive representation learning algorithm.",
+    )
+    papers[1] = replace(
+        papers[1],
+        abstract=(
+            "The controlled_synthetic_iscas85_trojan_localization_v1 dataset "
+            "provides bounded evaluation inputs."
+        ),
+    )
+    return papers
+
+
 def test_stage01_through_stage25_trojnet_pipeline_validation_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -58,7 +75,7 @@ def test_stage01_through_stage25_trojnet_pipeline_validation_chain(
     monkeypatch.setattr(LLMClient, "from_rc_config", staticmethod(llm_factory))
     monkeypatch.setattr(
         "researchclaw.literature.search.search_papers_multi_query",
-        lambda *_args, **_kwargs: _papers(3),
+        lambda *_args, **_kwargs: _trojnet_papers(),
     )
     monkeypatch.setattr("researchclaw.data.load_seminal_papers", lambda *_args: [])
     monkeypatch.setattr(
@@ -140,6 +157,43 @@ def test_stage01_through_stage25_trojnet_pipeline_validation_chain(
     )
     assert baseline["schema_version"] == 2
     assert baseline["result_set_type"] == "stage12_domain_evaluator"
+    citation_plan = json.loads(
+        (run_dir / "stage-16/citation_plan.json").read_text(encoding="utf-8")
+    )
+    assert citation_plan["plan_version"] == 3
+    assert all(
+        claim["section_path"][0]
+        in {"Introduction", "Related Work", "Method", "Experiments"}
+        for claim in citation_plan["claims"]
+    )
+    assert all(
+        "eligibility_binding" in claim for claim in citation_plan["claims"]
+    )
+    method_claim = next(
+        claim
+        for claim in citation_plan["claims"]
+        if claim["claim_type"] == "algorithm_definition"
+    )
+    assert method_claim["section_path"] == ["Method"]
+    assert method_claim["claim_text"] == (
+        "GraphSAGE is an inductive representation learning algorithm."
+    )
+    assert method_claim["eligibility_binding"]["usage_token"] == "method:graphsage"
+    assert method_claim["eligibility_binding"]["evidence_excerpt_id"]
+    dataset_claim = next(
+        claim
+        for claim in citation_plan["claims"]
+        if claim["claim_type"] == "dataset_origin"
+    )
+    assert dataset_claim["section_path"] == ["Experiments"]
+    assert dataset_claim["claim_text"] == (
+        "The controlled_synthetic_iscas85_trojan_localization_v1 dataset "
+        "provides bounded evaluation inputs."
+    )
+    assert dataset_claim["eligibility_binding"]["usage_token"] == (
+        "dataset:controlledsyntheticiscas85trojanlocalizationv1"
+    )
+    assert dataset_claim["eligibility_binding"]["evidence_excerpt_id"]
     first_scores = (
         run_dir / "stage-12/evidence-v2/invocation-1/score_evidence.jsonl"
     ).read_bytes()
