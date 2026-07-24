@@ -1147,6 +1147,7 @@ def build_citation_plan_from_replayed_inputs(
         citation_usage_authority
     )
     claims: list[dict[str, Any]] = []
+    occupied_claim_texts: set[str] = set()
     citation_section = _citation_section_for_config(config)
     for ordinal, cite_key in enumerate(selected_keys, start=1):
         card = cards_by_key.get(cite_key)
@@ -1167,15 +1168,39 @@ def build_citation_plan_from_replayed_inputs(
         selected_excerpt = standalone[0]
         selected_usage: Mapping[str, Any] | None = None
         if usage_authority is not None:
+            selected_excerpt = None
+            saw_usage_match = False
             for excerpt in standalone:
                 matched = _match_citation_usage_token(
                     excerpt["excerpt_text"], usage_authority["tokens"]
                 )
                 if matched is not None:
+                    saw_usage_match = True
+                    if excerpt["excerpt_text"] in occupied_claim_texts:
+                        continue
                     selected_excerpt = excerpt
                     selected_usage = matched
                     break
+            if selected_excerpt is None and saw_usage_match:
+                raise CitationPlanContractError(
+                    "eligible key lacks unique usage-bound citation excerpt"
+                )
+            if selected_excerpt is None:
+                selected_excerpt = next(
+                    (
+                        excerpt
+                        for excerpt in standalone
+                        if excerpt["excerpt_text"] not in occupied_claim_texts
+                    ),
+                    None,
+                )
+            if selected_excerpt is None:
+                raise CitationPlanContractError(
+                    "eligible key lacks unique standalone citation excerpt"
+                )
         claim_text = selected_excerpt["excerpt_text"]
+        if usage_authority is not None:
+            occupied_claim_texts.add(claim_text)
         section = (
             str(selected_usage["section"])
             if selected_usage is not None

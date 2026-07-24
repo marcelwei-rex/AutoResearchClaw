@@ -1556,6 +1556,128 @@ def test_citation_plan_v3_selects_first_exact_eligible_excerpt() -> None:
     assert claim["eligibility_binding"]["evidence_excerpt_id"] == "ev-graphsage"
 
 
+def test_citation_plan_v3_selects_first_unoccupied_exact_excerpt() -> None:
+    duplicate = "Shared exact standalone excerpt."
+    cards = (
+        {
+            "cite_key": "first2024work",
+            "extraction_status": "success",
+            "evidence_excerpts": [
+                {"excerpt_id": "ev-first", "excerpt_text": duplicate},
+            ],
+        },
+        {
+            "cite_key": "second2024work",
+            "extraction_status": "success",
+            "evidence_excerpts": [
+                {"excerpt_id": "ev-second-duplicate", "excerpt_text": duplicate},
+                {
+                    "excerpt_id": "ev-second-unique",
+                    "excerpt_text": "Second source has a unique exact excerpt.",
+                },
+            ],
+        },
+    )
+
+    plan = _build_v3_plan(cards)
+
+    assert [claim["claim_id"] for claim in plan["claims"]] == [
+        "planned-claim-001",
+        "planned-claim-002",
+    ]
+    assert [
+        claim["planned_citations"][0]["cite_key"] for claim in plan["claims"]
+    ] == ["first2024work", "second2024work"]
+    assert [claim["claim_text"] for claim in plan["claims"]] == [
+        duplicate,
+        "Second source has a unique exact excerpt.",
+    ]
+    assert plan["claims"][1]["planned_citations"][0]["evidence_excerpt_ids"] == [
+        "ev-second-unique"
+    ]
+    citation_plan_module.project_citation_anchors(plan)
+
+
+def test_citation_plan_v3_rejects_card_without_unoccupied_exact_excerpt() -> None:
+    duplicate = "Shared exact standalone excerpt."
+    cards = (
+        _citation_plan_card(
+            "first2024work",
+            duplicate,
+            excerpt_id="ev-first",
+        ),
+        _citation_plan_card(
+            "second2024work",
+            duplicate,
+            excerpt_id="ev-second",
+        ),
+    )
+
+    with pytest.raises(CitationPlanContractError, match="unique standalone"):
+        _build_v3_plan(cards)
+
+
+def test_citation_plan_v3_does_not_downgrade_occupied_usage_excerpt() -> None:
+    duplicate = "GraphSAGE is an inductive representation learning algorithm."
+    cards = (
+        _citation_plan_card(
+            "first2024graphsage",
+            duplicate,
+            excerpt_id="ev-first",
+        ),
+        {
+            "cite_key": "second2024graphsage",
+            "extraction_status": "success",
+            "evidence_excerpts": [
+                {"excerpt_id": "ev-second-duplicate", "excerpt_text": duplicate},
+                {
+                    "excerpt_id": "ev-second-background",
+                    "excerpt_text": "A unique but unrelated background statement.",
+                },
+            ],
+        },
+    )
+
+    with pytest.raises(CitationPlanContractError, match="unique usage-bound"):
+        _build_v3_plan(cards)
+
+
+def test_citation_plan_v2_preserves_first_excerpt_selection_for_duplicates() -> None:
+    duplicate = "Shared exact standalone excerpt."
+    cards = (
+        _citation_plan_card(
+            "first2024work",
+            duplicate,
+            excerpt_id="ev-first",
+        ),
+        _citation_plan_card(
+            "second2024work",
+            duplicate,
+            excerpt_id="ev-second",
+        ),
+    )
+
+    plan = build_citation_plan_from_replayed_inputs(
+        config=_config(),  # type: ignore[arg-type]
+        plan_status="final",
+        allowlist={"eligible_keys": [card["cite_key"] for card in cards]},
+        allowlist_text="allowlist",
+        cards_manifest_text="manifest",
+        effective_policy={
+            "effective_target_unique_sources": 2,
+            "effective_min_unique_sources": 1,
+        },
+        effective_policy_text="policy",
+        cards=cards,
+    )
+
+    assert plan["plan_version"] == 2
+    assert [claim["claim_text"] for claim in plan["claims"]] == [
+        duplicate,
+        duplicate,
+    ]
+
+
 @pytest.mark.parametrize(
     ("section", "claim_type"),
     [
