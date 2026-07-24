@@ -610,6 +610,154 @@ def test_domain_v2_single_anchor_contract_repair_is_bounded(
     assert anchor.claim_text in repair_prompt
 
 
+def test_domain_v2_zero_authority_section_regenerates_once_without_old_text(
+    tmp_path: Path,
+) -> None:
+    anchor = project_citation_anchors(_anchor_plan())[0]
+    invalid = (
+        "## Method\n\nGraphSAGE (Hamilton et al., 2017) is used.\n\n"
+        "## Experiments\n\nE."
+    )
+    clean = "## Method\n\nM.\n\n## Experiments\n\nE."
+    llm = _SequentialLLM(
+        [
+            _domain_v2_zero_authority_responses()[0],
+            anchor.claim_text,
+            invalid,
+            clean,
+            *_domain_v2_zero_authority_responses()[2:],
+        ]
+    )
+
+    draft = _write_paper_sections(
+        llm=cast(Any, llm),
+        pm=cast(Any, _PromptManagerStub()),
+        preamble="",
+        topic_constraint="",
+        exp_metrics_instruction="",
+        citation_instruction="",
+        outline="",
+        stage_dir=tmp_path,
+        citation_repair_claims=(
+            {
+                "section": anchor.heading,
+                "claim_text": anchor.claim_text,
+                "cite_key": anchor.cite_key,
+            },
+        ),
+        heading_citation_instructions=_domain_v2_heading_instructions(),
+        canonical_fact_sheet=_minimal_cfs(),
+        citation_anchors=(anchor,),
+    )
+
+    assert clean in draft
+    assert invalid not in draft
+    assert len(llm.calls) == 6
+    repair_prompt = "\n".join(
+        message["content"] for message in llm.calls[3]
+    )
+    assert invalid not in repair_prompt
+    assert "BOUNDED DOMAIN-V2 SECTION REGENERATION" in repair_prompt
+    assert llm.config_snapshots[2:4] == [(1, (), ""), (1, (), "")]
+    report = json.loads(
+        (tmp_path / "section_generation_report.json").read_text(encoding="utf-8")
+    )
+    method = next(item for item in report["parts"] if item["part"] == "heading-group-3")
+    assert [attempt["valid"] for attempt in method["attempts"]] == [False, True]
+    assert all("response" not in attempt for attempt in method["attempts"])
+
+
+def test_domain_v2_zero_authority_second_candidate_failure_stops_later_groups(
+    tmp_path: Path,
+) -> None:
+    anchor = project_citation_anchors(_anchor_plan())[0]
+    first_invalid = (
+        "## Method\n\nGraphSAGE (Hamilton et al., 2017) is used.\n\n"
+        "## Experiments\n\nE."
+    )
+    second_invalid = (
+        "## Method\n\nLouvain (Blondel et al., 2008) is used.\n\n"
+        "## Experiments\n\nE."
+    )
+    llm = _SequentialLLM(
+        [
+            _domain_v2_zero_authority_responses()[0],
+            anchor.claim_text,
+            first_invalid,
+            second_invalid,
+            _domain_v2_zero_authority_responses()[2],
+        ]
+    )
+
+    with pytest.raises(PaperSectionContractError, match="citation_anchor"):
+        _write_paper_sections(
+            llm=cast(Any, llm),
+            pm=cast(Any, _PromptManagerStub()),
+            preamble="",
+            topic_constraint="",
+            exp_metrics_instruction="",
+            citation_instruction="",
+            outline="",
+            stage_dir=tmp_path,
+            citation_repair_claims=(
+                {
+                    "section": anchor.heading,
+                    "claim_text": anchor.claim_text,
+                    "cite_key": anchor.cite_key,
+                },
+            ),
+            heading_citation_instructions=_domain_v2_heading_instructions(),
+            canonical_fact_sheet=_minimal_cfs(),
+            citation_anchors=(anchor,),
+        )
+
+    assert len(llm.calls) == 4
+    report = json.loads(
+        (tmp_path / "section_generation_report.json").read_text(encoding="utf-8")
+    )
+    method = next(item for item in report["parts"] if item["part"] == "heading-group-3")
+    assert [attempt["valid"] for attempt in method["attempts"]] == [False, False]
+    assert all("response" not in attempt for attempt in method["attempts"])
+
+
+def test_domain_v2_zero_authority_transport_failure_is_not_repaired(
+    tmp_path: Path,
+) -> None:
+    anchor = project_citation_anchors(_anchor_plan())[0]
+    llm = _SequentialLLM(
+        [
+            _domain_v2_zero_authority_responses()[0],
+            anchor.claim_text,
+            OSError("forced transport failure"),
+            _domain_v2_zero_authority_responses()[1],
+        ]
+    )
+
+    with pytest.raises(PaperSectionContractError, match="transport_error"):
+        _write_paper_sections(
+            llm=cast(Any, llm),
+            pm=cast(Any, _PromptManagerStub()),
+            preamble="",
+            topic_constraint="",
+            exp_metrics_instruction="",
+            citation_instruction="",
+            outline="",
+            stage_dir=tmp_path,
+            citation_repair_claims=(
+                {
+                    "section": anchor.heading,
+                    "claim_text": anchor.claim_text,
+                    "cite_key": anchor.cite_key,
+                },
+            ),
+            heading_citation_instructions=_domain_v2_heading_instructions(),
+            canonical_fact_sheet=_minimal_cfs(),
+            citation_anchors=(anchor,),
+        )
+
+    assert len(llm.calls) == 3
+
+
 def test_domain_v2_constrained_client_disables_retry_and_fallback() -> None:
     class CountingRawLLM(LLMClient):
         def __init__(self) -> None:

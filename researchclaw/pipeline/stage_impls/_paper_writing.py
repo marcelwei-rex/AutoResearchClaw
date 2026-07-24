@@ -1672,7 +1672,9 @@ def _write_batched_domain_v2_paper_sections(
         authority = (
             "DOMAIN-V2 CITATION ANCHOR CONTRACT:\n"
             "- This call has no citation anchors or citation authority.\n"
-            "- Do not output any citation marker, citation key, or foreign anchor."
+            "- Do not output any citation marker, citation key, or foreign anchor.\n"
+            "- Do not name papers or authors, attribute methods to publications, "
+            "or use any author-year citation form."
         )
         user = (
             f"{grounding}\n\n"
@@ -1683,6 +1685,18 @@ def _write_batched_domain_v2_paper_sections(
             "Do not output a References section."
             + _SECTION_OUTPUT_CONTRACT
         )
+        repair_rule = (
+            "\n\nBOUNDED DOMAIN-V2 SECTION REGENERATION:\n"
+            "- The previous response failed the citation-free or section contract.\n"
+            "- Regenerate from the same headings and canonical fact authority only.\n"
+            "- Do not infer, quote, summarize, or discuss the previous response.\n"
+            "- Output no citation candidate, paper/author attribution, citation key, "
+            "or author-year form."
+        )
+        section_system = _citation_safe_system(
+            system,
+            authority + "\n\nCANONICAL FACT AUTHORITY:\n" + grounding,
+        )
         prepared.append(
             {
                 "kind": "section",
@@ -1690,11 +1704,10 @@ def _write_batched_domain_v2_paper_sections(
                 "group": group,
                 "title_slot": title_slot,
                 "grounding": grounding,
-                "system": _citation_safe_system(
-                    system,
-                    authority + "\n\nCANONICAL FACT AUTHORITY:\n" + grounding,
-                ),
+                "system": section_system,
                 "user": user,
+                "repair_system": section_system + repair_rule,
+                "repair_user": user + repair_rule,
             }
         )
 
@@ -1719,43 +1732,104 @@ def _write_batched_domain_v2_paper_sections(
         group = tuple(item["group"])
         part_name = f"heading-group-{index + 1}"
         if item["kind"] == "section":
-            response = _chat_with_prompt(
-                llm,
-                str(item["system"]),
-                str(item["user"]),
-                max_tokens=max_tokens,
-                retries=1,
-            ).content.strip()
+            if citation_llm is None:
+                raise CitationPlanContractError(
+                    "domain-v2 section generation requires a bounded LLM client"
+                )
+            attempt_entries: list[dict[str, Any]] = []
+            prompts = (
+                (str(item["system"]), str(item["user"])),
+                (str(item["repair_system"]), str(item["repair_user"])),
+            )
+            part = ""
+            failure_violations: tuple[str, ...] = ()
+            for semantic_attempt, (call_system, call_user) in enumerate(
+                prompts, start=1
+            ):
+                try:
+                    part = _chat_with_prompt(
+                        citation_llm,
+                        call_system,
+                        call_user,
+                        model=citation_llm.config.primary_model,
+                        max_tokens=max_tokens,
+                        retries=0,
+                    ).content.strip()
+                except Exception as exc:  # noqa: BLE001
+                    failure_violations = (
+                        f"section_part_transport_error:{type(exc).__name__}",
+                    )
+                    attempt_entries.append(
+                        {
+                            "attempt": semantic_attempt,
+                            "response_sha256": hashlib.sha256(b"").hexdigest(),
+                            "valid": False,
+                            "violations": list(failure_violations),
+                            "observed_major_sections": [],
+                        }
+                    )
+                    report_entries.append(
+                        {
+                            "part": part_name,
+                            "title_slot": bool(item["title_slot"]),
+                            "expected_major_sections": list(group),
+                            "attempts": attempt_entries,
+                        }
+                    )
+                    _persist_section_generation_report(stage_dir, report_entries)
+                    raise PaperSectionContractError(
+                        part_name,
+                        failure_violations,
+                        "",
+                    ) from exc
 
-            def validate_candidate(candidate: str) -> None:
+                violations: list[str] = []
                 try:
                     validate_citation_free_anchor_draft(
-                        candidate,
+                        part,
                         anchors=citation_anchors,
                         active_headings=group,
                     )
                 except (CitationPlanContractError, ManuscriptStructureError) as exc:
-                    raise PaperSectionContractError(
-                        part_name,
-                        (f"citation_anchor:{exc}",),
-                        candidate,
-                    ) from exc
-
-            validate_candidate(response)
-            part = _validate_or_regenerate_paper_part(
-                llm=llm,
-                initial_text=response,
-                part_name=part_name,
-                expected_major_sections=group,
-                title_slot=bool(item["title_slot"]),
-                citation_repair_context="None. Do not add citation markers.",
-                allowed_citation_keys=frozenset(),
-                max_tokens=12000,
-                report_entries=report_entries,
-                stage_dir=stage_dir,
-                grounding_context=str(item["grounding"]),
+                    violations.append(f"citation_anchor:{exc}")
+                violations.extend(
+                    _validate_paper_part_sections(
+                        part,
+                        expected_major_sections=group,
+                        title_slot=bool(item["title_slot"]),
+                    )
+                )
+                failure_violations = tuple(dict.fromkeys(violations))
+                attempt_entries.append(
+                    {
+                        "attempt": semantic_attempt,
+                        "response_sha256": hashlib.sha256(
+                            part.encode("utf-8")
+                        ).hexdigest(),
+                        "valid": not failure_violations,
+                        "violations": list(failure_violations),
+                        "observed_major_sections": list(
+                            _observed_major_sections(part)
+                        ),
+                    }
+                )
+                if not failure_violations:
+                    break
+            report_entries.append(
+                {
+                    "part": part_name,
+                    "title_slot": bool(item["title_slot"]),
+                    "expected_major_sections": list(group),
+                    "attempts": attempt_entries,
+                }
             )
-            validate_candidate(part)
+            _persist_section_generation_report(stage_dir, report_entries)
+            if failure_violations:
+                raise PaperSectionContractError(
+                    part_name,
+                    failure_violations,
+                    part,
+                )
             generated.append(part)
             continue
 
