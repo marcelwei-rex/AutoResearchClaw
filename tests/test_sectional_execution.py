@@ -410,6 +410,53 @@ def test_bound_identity_request_reaches_writer(
     assert provider.propose_calls == 1
 
 
+def test_descriptive_table_request_reaches_writer(tmp_path: Path) -> None:
+    run_dir, stage_dir = _prepare_run(tmp_path)
+
+    class _CountingProvider(_FakeProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.propose_calls = 0
+
+        def propose(self, **kwargs):
+            self.propose_calls += 1
+            return super().propose(**kwargs)
+
+    provider = _CountingProvider()
+    reviews = (run_dir / "stage-18" / "reviews.md").read_text(encoding="utf-8")
+    reviews = reviews.replace(
+        "Clarify how the recorded metric is reported.",
+        "Use mean ± std and highlight the best-performing condition.",
+    )
+    (run_dir / "stage-18" / "reviews.md").write_text(reviews, encoding="utf-8")
+    report_path = run_dir / "stage-18" / "review_structure_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["source_reviews_sha256"] = hashlib.sha256(reviews.encode()).hexdigest()
+    report_path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
+    cfs = {
+        "seeds": (0, 1, 2),
+        "conditions": (
+            {"id": "proposed", "role": "primary"},
+            {"id": "baseline", "role": "comparator"},
+        ),
+        "variant_ids": ("c1355_v1",),
+        "metric_keys": ("auprc",),
+    }
+
+    result = _execute_sectional_revision(
+        run_dir=run_dir,
+        stage_dir=stage_dir,
+        config=_config(),
+        claim_scope="pipeline_validation",
+        provider=provider,
+        evidence=_evidence(),
+        canonical_fact_sheet=cfs,
+    )
+
+    assert result.completed is True
+    assert provider.propose_calls == 1
+
+
 def _evidence(claim_scope: str = "pipeline_validation") -> SimpleNamespace:
     dataset_origin = "public" if claim_scope == "research_release" else "synthetic"
     topic = (

@@ -202,7 +202,8 @@ def test_writer_and_critic_receive_only_target_section_cfs_view() -> None:
         calls.append(payload)
         grounding = payload["canonical_grounding_context"]
         assert '"runtime"' in grounding
-        assert '"condition_aggregates"' not in grounding
+        assert '"condition_aggregates":[' not in grounding
+        assert '"globally_available_top_level_fields_withheld"' in grounding
         assert "0.665" not in grounding
         if "grounded_numeric_values" in payload:
             assert payload["grounded_numeric_values"] == []

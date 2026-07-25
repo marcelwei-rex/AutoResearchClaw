@@ -39,6 +39,27 @@ _CITATION_USAGE_AUTHORITY_SCHEMA_VERSION = 1
 _CITATION_USAGE_POLICY_VERSION = 1
 _DECIMAL_REPLAY_TOLERANCE = Decimal("1e-49")
 _VIEWS = frozenset({"introduction", "method", "results", "limitations"})
+_PROMPT_AUTHORITY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "claim_scope",
+        "dataset_origin",
+        "bound_labels",
+        "conditions",
+        "seeds",
+        "circuit_families",
+        "variants_per_family",
+        "variant_ids",
+        "counts",
+        "metric_keys",
+        "primary_metric",
+        "condition_aggregates",
+        "per_seed_aggregates",
+        "scale",
+        "runtime",
+        "derived_facts",
+    }
+)
 _BENCHMARK_TOKEN = re.compile(r"[a-z]{2,}[0-9]+[a-z0-9]*")
 _VERSION_TOKEN = re.compile(r"v[0-9]+")
 _PROMPT_IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+:/-]*")
@@ -358,6 +379,14 @@ def render_fact_sheet_text(cfs: Mapping[str, Any], *, view: str) -> str:
     payload = fact_sheet_view_payload(cfs, view=view)
     body = canonical_authority_json_text(_thaw_authority_value(payload)).rstrip("\n")
     text = f"canonical_fact_sheet view={view}\n```json\n{body}\n```"
+    text += (
+        "\nSCOPED VIEW SEMANTICS: top-level fields listed under "
+        "globally_available_top_level_fields_withheld exist in canonical "
+        "evidence but are not rendered as dedicated top-level entries in this "
+        "view. Their top-level omission must never be described as absent, "
+        "missing, unavailable, or unreported. Use only values actually rendered "
+        "in this scoped prompt."
+    )
     if view == "results":
         projection = render_observation_projection(
             cfs["observation_rows"],
@@ -415,7 +444,18 @@ def classify_out_of_scope_request(
         if kind == "variant" and _VARIANT_NAME_REQUEST.search(match.group(0)):
             continue
         count = _requested_count(match.group(0), kind)
-        if count is None or count != allowed_counts[kind]:
+        explicit_change_without_count = bool(
+            re.search(
+                r"\b(?:more|additional|several|increase|decrease|expand|"
+                r"reduce|raise|change)\b",
+                match.group(0),
+                re.IGNORECASE,
+            )
+        )
+        if (
+            count is not None
+            and count != allowed_counts[kind]
+        ) or (count is None and explicit_change_without_count):
             codes.add(f"{kind}_count_out_of_scope")
     if _NEW_EXPERIMENT_REQUEST.search(text) or _NEW_RESULTS_REQUEST.search(text):
         codes.add("new_experiment_request")
@@ -445,6 +485,7 @@ def is_exclusively_out_of_scope_request(
 
     if not isinstance(text, str) or not text.strip():
         return False
+    text = re.sub(r"^\s*\d+[.)]\s+", "", text, count=1)
     clauses = [
         clause.strip()
         for clause in _SUBSTANTIVE_CLAUSE_SPLIT.split(text)
@@ -572,6 +613,20 @@ def fact_sheet_view_payload(
             "scale": cfs["scale"],
             "derived_facts": cfs["derived_facts"],
         }
+    included = frozenset(payload)
+    unknown_fields = included - _PROMPT_AUTHORITY_FIELDS
+    if unknown_fields:
+        raise CFSIntegrityError(
+            "canonical fact sheet view contains unknown authority fields"
+        )
+    payload["authority_availability"] = {
+        "top_level_omission_semantics": "withheld_not_absent",
+        "included_top_level_fields": sorted(included),
+        "globally_available_top_level_fields_withheld": sorted(
+            _PROMPT_AUTHORITY_FIELDS - included
+        ),
+        "absent_top_level_fields": [],
+    }
     return _freeze_authority_value(payload)
 
 

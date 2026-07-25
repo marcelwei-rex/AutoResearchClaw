@@ -31,7 +31,10 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidence,
     canonical_decimal,
 )
-from researchclaw.pipeline.canonical_fact_sheet import classify_out_of_scope_request
+from researchclaw.pipeline.canonical_fact_sheet import (
+    classify_out_of_scope_request,
+    is_exclusively_out_of_scope_request,
+)
 from researchclaw.pipeline.sectional_revision import (
     ReviewComment,
     ReviewLedger,
@@ -223,7 +226,14 @@ def execute_sectional_revision(
                     comments_by_id[assignment.comment_id].exact_text,
                     canonical_fact_sheet,
                 )
-                if assignment.disposition == "assigned" and codes:
+                if (
+                    assignment.disposition == "assigned"
+                    and codes
+                    and is_exclusively_out_of_scope_request(
+                        comments_by_id[assignment.comment_id].exact_text,
+                        canonical_fact_sheet,
+                    )
+                ):
                     assignment = replace(
                         assignment,
                         target_section_ids=(),

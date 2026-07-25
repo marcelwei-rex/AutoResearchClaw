@@ -1031,6 +1031,12 @@ class TestSectionScopedViews:
     def test_in_scope_request_classifier_is_empty(self, request_text: str) -> None:
         assert classify_out_of_scope_request(request_text, _build_cfs()) == ()
 
+    def test_descriptive_table_request_is_not_a_count_change(self) -> None:
+        request = "Use mean ± std and highlight the best-performing condition."
+
+        assert classify_out_of_scope_request(request, _build_cfs()) == ()
+        assert not is_exclusively_out_of_scope_request(request, _build_cfs())
+
     def test_word_count_must_be_bound_to_count_occurrence(self) -> None:
         cfs = _build_cfs()
         assert is_exclusively_out_of_scope_request("Re-run with ten seeds.", cfs)
@@ -1061,6 +1067,27 @@ class TestSectionScopedViews:
         assert "162" in text
         assert "invocation" in text.casefold()
         assert repr(_real_primary_metric()["value"])[:6] not in text
+
+    @pytest.mark.parametrize("view", ("introduction", "method", "limitations"))
+    def test_narrow_views_distinguish_withheld_from_absent(
+        self, view: str
+    ) -> None:
+        cfs = _build_cfs()
+        text = render_fact_sheet_text(cfs, view=view)
+
+        assert '"top_level_omission_semantics":"withheld_not_absent"' in text
+        assert '"condition_aggregates"' in text
+        assert '"per_seed_aggregates"' in text
+        assert '"globally_available_top_level_fields_withheld"' in text
+        assert canonical_decimal(cfs["condition_aggregates"][0]["metrics"]["auprc"]["mean"]) not in text
+
+    def test_results_availability_is_explicitly_top_level_only(self) -> None:
+        text = render_fact_sheet_text(_build_cfs(), view="results")
+
+        assert '"globally_available_top_level_fields_withheld"' in text
+        assert '"top_level_omission_semantics":"withheld_not_absent"' in text
+        assert "values are not authorized" not in text
+        assert "Use only values actually rendered" in text
 
     def test_results_view_aggregates_and_projection(self) -> None:
         cfs = _build_cfs()
