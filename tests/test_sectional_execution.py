@@ -6,22 +6,35 @@ from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import yaml
 
 from researchclaw.config import PaperRevisionConfig
-from researchclaw.experiment_runtime.contract import dump_contract, validate_contract_dict
+from researchclaw.experiment_runtime.contract import (
+    dump_contract,
+    load_contract,
+    validate_contract_dict,
+)
 from researchclaw.experiment_runtime.metric_authority import (
     publish_metric_authority_snapshots,
     select_metric_authority,
 )
+from researchclaw.pipeline import sectional_execution as sectional_execution_module
+from researchclaw.pipeline import sectional_release_audit as sectional_audit_module
+from researchclaw.pipeline.canonical_fact_sheet import CFSIntegrityError
 from researchclaw.pipeline.sectional_execution import (
     ResolutionAssessment,
     SectionProposal,
+    SectionalExecutionError,
     build_validation_context,
     clean_sectional_outputs,
     execute_sectional_revision,
+)
+from researchclaw.pipeline.sectional_release_audit import (
+    SectionalAuditError,
+    audit_sectional_revision,
 )
 
 
@@ -226,18 +239,35 @@ def _execute_sectional_revision(
     bibliography = (run_dir / "stage-04" / "references.bib").read_text(
         encoding="utf-8"
     )
-    return execute_sectional_revision(
-        run_dir=run_dir,
-        stage_dir=stage_dir,
-        paper_text=(run_dir / "stage-17" / "paper_draft.md").read_text(encoding="utf-8"),
-        reviews_text=(run_dir / "stage-18" / "reviews.md").read_text(encoding="utf-8"),
-        review_structure_report_text=(
+    call = {
+        "run_dir": run_dir,
+        "stage_dir": stage_dir,
+        "paper_text": (run_dir / "stage-17" / "paper_draft.md").read_text(
+            encoding="utf-8"
+        ),
+        "reviews_text": (run_dir / "stage-18" / "reviews.md").read_text(
+            encoding="utf-8"
+        ),
+        "review_structure_report_text": (
             run_dir / "stage-18" / "review_structure_report.json"
         ).read_text(encoding="utf-8"),
-        bibliography_text=bibliography,
-        bibliography_sha256=hashlib.sha256(bibliography.encode("utf-8")).hexdigest(),
+        "bibliography_text": bibliography,
+        "bibliography_sha256": hashlib.sha256(
+            bibliography.encode("utf-8")
+        ).hexdigest(),
         **kwargs,
-    )
+    }
+    fact_sheet = call.get("canonical_fact_sheet")
+    replayed_fact_sheet = call.pop("_replayed_fact_sheet", fact_sheet)
+    # These narrow fixtures do not rebuild the full Stage 04-14 graph.
+    # Production still independently rebuilds and compares the fact sheet
+    # before any provider call.
+    with patch.object(
+        sectional_execution_module,
+        "build_canonical_fact_sheet",
+        return_value=replayed_fact_sheet,
+    ):
+        return execute_sectional_revision(**call)
 
 
 def _config() -> PaperRevisionConfig:
@@ -296,6 +326,82 @@ def test_not_actionable_plan_does_not_invoke_writer(tmp_path: Path) -> None:
     assert [item["final_status"] for item in unresolved["comments"]] == [
         "not_actionable_with_reason"
     ]
+
+
+def test_caller_fact_sheet_cannot_replace_replayed_authority(tmp_path: Path) -> None:
+    run_dir, stage_dir = _prepare_run(tmp_path)
+
+    class _NoPlanner(_FakeProvider):
+        def build_plan(self, **kwargs):
+            _ = kwargs
+            raise AssertionError("planner must not run before fact-sheet replay")
+
+    trusted = {
+        "seeds": (0, 1, 2),
+        "condition_aggregates": ({"condition": "proposed"},),
+    }
+    forged = {
+        **trusted,
+        "seeds": (0, 1, 9),
+    }
+
+    with pytest.raises(
+        SectionalExecutionError,
+        match="caller fact sheet does not match canonical evidence",
+    ):
+        _execute_sectional_revision(
+            run_dir=run_dir,
+            stage_dir=stage_dir,
+            config=_config(),
+            claim_scope="pipeline_validation",
+            provider=_NoPlanner(),
+            evidence=_evidence(),
+            canonical_fact_sheet=forged,
+            _replayed_fact_sheet=trusted,
+        )
+
+
+def test_release_audit_rebuilds_cfs_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, stage_dir = _prepare_run(tmp_path)
+    evidence = _evidence()
+    result = _execute_sectional_revision(
+        run_dir=run_dir,
+        stage_dir=stage_dir,
+        config=_config(),
+        claim_scope="pipeline_validation",
+        provider=_FakeProvider(),
+        evidence=evidence,
+    )
+    assert result.completed is True
+
+    monkeypatch.setattr(
+        sectional_audit_module,
+        "load_canonical_experiment_evidence",
+        lambda _run_dir: evidence,
+    )
+
+    def reject_cfs(_evidence: object) -> None:
+        raise CFSIntegrityError("forced independent CFS replay failure")
+
+    monkeypatch.setattr(
+        sectional_audit_module,
+        "build_canonical_fact_sheet",
+        reject_cfs,
+    )
+    contract_path = run_dir / "stage-09" / "experiment_contract.yaml"
+
+    with pytest.raises(SectionalAuditError) as caught:
+        audit_sectional_revision(
+            run_dir,
+            run_manifest={},
+            contract_path=contract_path,
+            contract=load_contract(contract_path),
+        )
+
+    assert caught.value.code == "sectional_canonical_evidence_invalid"
+    assert "forced independent CFS replay failure" in caught.value.message
 
 
 @pytest.mark.parametrize(

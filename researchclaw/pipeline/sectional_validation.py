@@ -767,6 +767,8 @@ class SectionRevisionManifest:
 def validate_section_candidate(
     context: SectionValidationContext,
     candidate_body: str,
+    *,
+    canonical_fact_sheet: Mapping[str, Any] | None = None,
 ) -> SectionValidationResult:
     """Run all B1 hard checks against one proposed section body."""
 
@@ -957,6 +959,8 @@ def validate_section_candidate(
 def merge_validated_sections(
     document: ManuscriptDocument,
     replacements: Mapping[str, ValidatedSectionReplacement],
+    *,
+    canonical_fact_sheet: Mapping[str, Any] | None = None,
 ) -> MergeResult:
     """Merge only bodies whose validation result is accepted and hash-bound."""
 
@@ -985,7 +989,11 @@ def merge_validated_sections(
             _fail("validation_original_hash_mismatch", f"original hash mismatches {section_id}")
         if result.candidate_sha256 != _sha256(replacement.body):
             _fail("validation_candidate_hash_mismatch", f"candidate hash mismatches {section_id}")
-        recomputed = validate_section_candidate(replacement.context, replacement.body)
+        recomputed = validate_section_candidate(
+            replacement.context,
+            replacement.body,
+            canonical_fact_sheet=canonical_fact_sheet,
+        )
         if recomputed != result:
             _fail(
                 "validation_recompute_mismatch",
@@ -1045,6 +1053,7 @@ def build_section_revision_manifest(
     unresolved_comments_text: str,
     completed: bool,
     validation_context_text: str | None = None,
+    canonical_fact_sheet: Mapping[str, Any] | None = None,
 ) -> SectionRevisionManifest:
     """Derive a manifest from authoritative inputs; never accept free-form counts."""
 
@@ -1068,6 +1077,7 @@ def build_section_revision_manifest(
         unresolved_comments_text=unresolved_comments_text,
         completed=completed,
         validation_context_text=validation_context_text,
+        canonical_fact_sheet=canonical_fact_sheet,
     )
     return SectionRevisionManifest.from_dict(manifest.to_dict())
 
@@ -1113,6 +1123,7 @@ def validate_section_revision_manifest(
     unresolved_comments_text: str,
     completed: bool,
     validation_context_text: str | None = None,
+    canonical_fact_sheet: Mapping[str, Any] | None = None,
 ) -> SectionRevisionManifest:
     """Recompute the complete manifest and reject any stale or edited field."""
 
@@ -1141,6 +1152,7 @@ def validate_section_revision_manifest(
         unresolved_comments_text=unresolved_comments_text,
         completed=completed,
         validation_context_text=validation_context_text,
+        canonical_fact_sheet=canonical_fact_sheet,
     )
     if parsed != expected:
         _fail(
@@ -1171,6 +1183,7 @@ def _construct_manifest(
     unresolved_comments_text: str,
     completed: bool,
     validation_context_text: str | None,
+    canonical_fact_sheet: Mapping[str, Any] | None,
 ) -> SectionRevisionManifest:
     if claim_scope not in _CLAIM_SCOPES:
         _fail("claim_scope_invalid", f"invalid claim scope {claim_scope!r}")
@@ -1353,6 +1366,7 @@ def _construct_manifest(
             document,
             metadata,
             required_comments,
+            canonical_fact_sheet,
         )
         entries.append(
             SectionManifestEntry(
@@ -1647,6 +1661,7 @@ def _validate_section_manifest_state(
     document: ManuscriptDocument,
     metadata: SectionManifestMetadata,
     required_comment_ids: set[str],
+    canonical_fact_sheet: Mapping[str, Any] | None,
 ) -> str | None:
     validation = metadata.validation_result
     context = metadata.validation_context
@@ -1674,7 +1689,11 @@ def _validate_section_manifest_state(
                 "manifest_validation_comment_mismatch",
                 f"validation required comments mismatch {merge_section.section_id}",
             )
-        recomputed = validate_section_candidate(context, final_body)
+        recomputed = validate_section_candidate(
+            context,
+            final_body,
+            canonical_fact_sheet=canonical_fact_sheet,
+        )
         if recomputed != validation:
             _fail(
                 "manifest_validation_recompute_mismatch",

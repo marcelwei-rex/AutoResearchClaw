@@ -32,6 +32,9 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     canonical_decimal,
 )
 from researchclaw.pipeline.canonical_fact_sheet import (
+    CFSIntegrityError,
+    build_canonical_fact_sheet,
+    canonical_fact_sheet_sha256,
     classify_out_of_scope_request,
     is_exclusively_out_of_scope_request,
 )
@@ -198,6 +201,26 @@ def execute_sectional_revision(
         raise SectionalExecutionError(
             "Stage 19 claim scope does not match the canonical Stage 9 contract"
         )
+    try:
+        replayed_fact_sheet = build_canonical_fact_sheet(evidence)
+        if (canonical_fact_sheet is None) != (replayed_fact_sheet is None):
+            raise CFSIntegrityError(
+                "caller fact-sheet presence does not match canonical evidence"
+            )
+        if (
+            canonical_fact_sheet is not None
+            and replayed_fact_sheet is not None
+            and canonical_fact_sheet_sha256(canonical_fact_sheet)
+            != canonical_fact_sheet_sha256(replayed_fact_sheet)
+        ):
+            raise CFSIntegrityError(
+                "caller fact sheet does not match canonical evidence"
+            )
+        canonical_fact_sheet = replayed_fact_sheet
+    except CFSIntegrityError as exc:
+        raise SectionalExecutionError(
+            f"canonical fact sheet replay failed: {exc}"
+        ) from exc
     contract_rel = evidence.experiment_contract_path
     contract_sha = evidence.experiment_contract_sha256
 
@@ -340,7 +363,11 @@ def execute_sectional_revision(
             )
             candidate_path = sections_dir / f"{section_id}.attempt-{attempt}.md"
             _write_text_atomic(candidate_path, proposal.revised_body)
-            validation = validate_section_candidate(context, proposal.revised_body)
+            validation = validate_section_candidate(
+                context,
+                proposal.revised_body,
+                canonical_fact_sheet=canonical_fact_sheet,
+            )
             validation_rel = (
                 f"stage-19/section_validation/{section_id}.attempt-{attempt}.json"
             )
@@ -472,7 +499,11 @@ def execute_sectional_revision(
         accepted_comment_sections=accepted_comment_sections,
     )
     validate_review_ledger(final_ledger, reviews=reviews_text, require_final=True)
-    merge_result = merge_validated_sections(document, replacements)
+    merge_result = merge_validated_sections(
+        document,
+        replacements,
+        canonical_fact_sheet=canonical_fact_sheet,
+    )
     assessments_text = _jsonl_text(assessments)
     attempts_text = _jsonl_text(attempts)
     parse_section_attempts_jsonl(attempts_text)
@@ -507,6 +538,7 @@ def execute_sectional_revision(
             unresolved_comments_text=unresolved_text,
             completed=True,
             validation_context_text=context_bundle.text,
+            canonical_fact_sheet=canonical_fact_sheet,
         )
     except SectionalRevisionContractError as exc:
         if claim_scope == "pipeline_validation":
@@ -532,6 +564,7 @@ def execute_sectional_revision(
             unresolved_comments_text=unresolved_text,
             completed=False,
             validation_context_text=context_bundle.text,
+            canonical_fact_sheet=canonical_fact_sheet,
         )
         error = str(exc)
     else:
@@ -557,6 +590,7 @@ def execute_sectional_revision(
         unresolved_comments_text=unresolved_text,
         completed=completed,
         validation_context_text=context_bundle.text,
+        canonical_fact_sheet=canonical_fact_sheet,
     )
     artifacts = (
         "review_comment_ledger.json",
@@ -595,6 +629,7 @@ def execute_sectional_revision(
             assessments_text=assessments_text,
             unresolved_comments_text=unresolved_text,
             validation_context_text=context_bundle.text,
+            canonical_fact_sheet=canonical_fact_sheet,
         )
     except Exception:
         clean_sectional_outputs(stage_dir)
@@ -1067,6 +1102,7 @@ def _replay_published_sectional_bundle(
     assessments_text: str,
     unresolved_comments_text: str,
     validation_context_text: str,
+    canonical_fact_sheet: Mapping[str, Any] | None,
 ) -> None:
     """Reopen every published Stage 19 authority artifact before success."""
     expected_texts = {
@@ -1135,6 +1171,7 @@ def _replay_published_sectional_bundle(
         unresolved_comments_text=stored["unresolved_comments.json"],
         completed=True,
         validation_context_text=stored["validation_context.json"],
+        canonical_fact_sheet=canonical_fact_sheet,
     )
 
 

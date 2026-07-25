@@ -21,6 +21,10 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidenceError,
     load_canonical_experiment_evidence,
 )
+from researchclaw.pipeline.canonical_fact_sheet import (
+    CFSIntegrityError,
+    build_canonical_fact_sheet,
+)
 from researchclaw.literature.experiment_fact_closure import (
     ExperimentFactClosureError,
     replay_experiment_fact_closure,
@@ -149,7 +153,13 @@ def audit_sectional_revision(
 
     try:
         evidence = load_canonical_experiment_evidence(run_dir)
-    except (CanonicalExperimentEvidenceError, OSError, RuntimeError) as exc:
+        canonical_fact_sheet = build_canonical_fact_sheet(evidence)
+    except (
+        CanonicalExperimentEvidenceError,
+        CFSIntegrityError,
+        OSError,
+        RuntimeError,
+    ) as exc:
         _raise(
             "sectional_canonical_evidence_invalid",
             f"canonical experiment evidence cannot be independently replayed: {exc}",
@@ -615,7 +625,11 @@ def audit_sectional_revision(
                 min_length_ratio=float(context_payload["min_length_ratio"]),
                 max_length_ratio=float(context_payload["max_length_ratio"]),
             )
-            recomputed = validate_section_candidate(context, candidate)
+            recomputed = validate_section_candidate(
+                context,
+                candidate,
+                canonical_fact_sheet=canonical_fact_sheet,
+            )
             failed_codes = tuple(
                 check.code for check in recomputed.checks if check.status == "failed"
             )
@@ -680,7 +694,11 @@ def audit_sectional_revision(
                     f"resolved comment lacks accepted section evidence: {comment.comment_id}",
                 )
 
-    merge_result = merge_validated_sections(document, replacements)
+    merge_result = merge_validated_sections(
+        document,
+        replacements,
+        canonical_fact_sheet=canonical_fact_sheet,
+    )
     revised_text = _read_text(
         stage19 / "paper_revised.md", "sectional_merge_body_mismatch"
     )
@@ -703,6 +721,7 @@ def audit_sectional_revision(
         "plan": plan,
         "reviews": reviews,
         "claim_scope": contract.claim_scope,
+        "canonical_fact_sheet": canonical_fact_sheet,
         "experiment_contract_path": contract_rel,
         "experiment_contract_sha256": contract_sha,
         "canonical_experiment_evidence_path": evidence.manifest_path,
