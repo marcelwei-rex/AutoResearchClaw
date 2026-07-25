@@ -3857,6 +3857,7 @@ Generated: {_utcnow_iso()}
                         "structured_fact_violations", []
                     ),
                     canonical_fact_sheet=canonical_fact_sheet,
+                    evidence=evidence if canonical_fact_sheet is not None else None,
                 )
             except Exception as exc:  # noqa: BLE001
                 raise ExperimentFactClosureError(

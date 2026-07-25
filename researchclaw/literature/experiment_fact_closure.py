@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-from researchclaw.experiment_runtime.contract import validate_contract_dict
+from researchclaw.experiment_runtime.contract import (
+    parse_contract_bytes,
+    validate_contract_dict,
+)
 from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidence,
     CanonicalExperimentEvidenceError,
@@ -22,7 +24,7 @@ from researchclaw.pipeline.canonical_fact_sheet import (
     CFSIntegrityError,
     build_canonical_fact_sheet,
     canonical_fact_sheet_sha256,
-    fact_sheet_numeric_authority,
+    fact_sheet_numeric_authority_records,
     fact_sheet_view_for_heading,
 )
 from researchclaw.pipeline.manuscript_sections import (
@@ -53,13 +55,16 @@ _INTEGER_UNIT_RE = re.compile(
 )
 _COUNT_CLAIM_RE = re.compile(
     r"(?<![\w.])(?P<number>\d+)\s+"
-    r"(?P<prefix>(?:[A-Za-z][A-Za-z-]*\s+){0,2})"
+    r"(?P<prefix>(?:[A-Za-z][A-Za-z0-9-]*\s+){0,2})"
     r"(?P<unit>runs?|seeds?|circuits?|families?|observations?|conditions?|"
     r"variants?|baselines?|comparators?|invocations?|trials?|iterations?|"
-    r"epochs?|samples?)\b",
+    r"epochs?|samples?|netlists?)\b",
     re.I,
 )
-_VERSION_RE = re.compile(r"\b(?:PyTorch|torch|Python)\s+v?(?P<version>\d+(?:\.\d+)+)\b", re.I)
+_LEGACY_VERSION_RE = re.compile(
+    r"\b(?:PyTorch|torch|Python)\s+v?(?P<version>\d+(?:\.\d+)+)\b",
+    re.I,
+)
 _RUNTIME_DURATION_RE = re.compile(r"\b\d+(?:\.\d+)?\s+(?:seconds?|minutes?|hours?)\b", re.I)
 _COMPARATOR_ABSENCE_RE = re.compile(
     r"\b(?:comparators?|baselines?|comparison results?)\b[^.!?\n]{0,80}"
@@ -116,6 +121,58 @@ _SCALE_RANGE_RE = re.compile(
     r"(?P<maximum>\d[\d,]*)\b",
     re.I,
 )
+_SCALE_SUFFIX_RANGE_RE = re.compile(
+    r"(?<![\w.])(?P<minimum>\d[\d,]*)\s*(?:to|through|-|–|—)\s*"
+    r"(?P<maximum>\d[\d,]*)\s+(?:gates?|nodes?)\b",
+    re.I,
+)
+_SCALE_VERBOSE_RANGE_RE = re.compile(
+    r"(?<![\w.])(?P<minimum>\d[\d,]*)\s+(?:gates?|nodes?)"
+    r"[^.!?\n]{0,40}?\bto\s+"
+    r"(?P<maximum>\d[\d,]*)\s+(?:gates?|nodes?)\b",
+    re.I,
+)
+_SEED_LIST_RE = re.compile(
+    r"\bseeds?\s*\((?P<values>\d+(?:\s*,\s*\d+)*)\)",
+    re.I,
+)
+_SINGLE_SEED_RE = re.compile(r"\bseed\s+(?P<seed>\d+)\b", re.I)
+_TORCH_THREAD_RE = re.compile(
+    r"\btorch\.set_num_threads\((?P<count>\d+)\)",
+    re.I,
+)
+_NUMERIC_CORE_RE = re.compile(
+    r"[-+]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)"
+    r"(?:[eE][-+]?\d+)?"
+)
+_NUMERIC_RUN_CHARS = frozenset("0123456789,+.eE-")
+_ASCII_WORD_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+)
+_IDENTIFIER_NUMBER_PATTERNS = (
+    re.compile(r"(?i)\b(?:figure|fig\.|equation|eq\.|table|section|sec\.)\s+\d+\b"),
+    re.compile(r"(?i)\b[A-Za-z][A-Za-z0-9_-]*@\d+\b"),
+    re.compile(r"(?m)^[ \t]*\d+[.)][ \t]+"),
+    re.compile(r"(?i)\b(?:doi:|https?://doi\.org/)10\.\d{4,9}/\S+"),
+    re.compile(r"(?i)\barxiv:\s*\d{4}\.\d{4,5}(?:v\d+)?\b"),
+    re.compile(r"\b(?:2D|3D|3PIP)\b"),
+    re.compile(
+        r"(?i)\b(?:in|since|from|during|published\s+in|appeared\s+in)"
+        r"\s+(?:19|20)\d{2}\b"
+    ),
+)
+_UNBOUND_NUMERIC_UNIT_RE = re.compile(
+    r"(?i)(?<![\w-])(?:ms|milliseconds?|seconds?|cycles?|fps|percent)(?![\w-])"
+)
+_UNBOUND_COMPARISON_RE = re.compile(
+    r"(?i)\b(?:lower|higher|less|greater|more|worse|better|"
+    r"outperform(?:s|ed|ing)?|underperform(?:s|ed|ing)?|than)\b"
+)
+_UNBOUND_AGGREGATION_RE = re.compile(
+    r"(?i)\b(?:median|mode|variance|quartile|percentile)\b"
+)
+_CONDITION_LIKE_RE = re.compile(r"(?<![\w-])[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+(?![\w-])")
+_MAX_NUMERIC_EXPONENT = 100
 _OWN_SOURCE_USAGE_RE = re.compile(
     r"\b(?:our method|our evaluation|our experiment|our study|our model|this work|we)"
     r"\b[^.!?\n]{0,40}\b(?:used|using)\s+(?:the\s+)?"
@@ -167,18 +224,13 @@ def build_experiment_fact_closure_report(
 ) -> dict[str, Any]:
     try:
         evidence = evidence or load_canonical_experiment_evidence(run_dir)
-        contract_text = evidence.experiment_contract_bytes.decode("utf-8")
-        contract_data = yaml.safe_load(contract_text)
-        if not isinstance(contract_data, dict):
-            raise ValueError("contract root must be an object")
-        contract = validate_contract_dict(contract_data)
+        contract = _contract_from_evidence(evidence)
     except (
         CanonicalExperimentEvidenceError,
         CFSIntegrityError,
         OSError,
         UnicodeDecodeError,
         ValueError,
-        yaml.YAMLError,
     ) as exc:
         raise ExperimentFactClosureError(f"cannot load experiment contract: {exc}") from exc
 
@@ -192,6 +244,12 @@ def build_experiment_fact_closure_report(
         raise ExperimentFactClosureError(
             f"canonical fact sheet is invalid: {exc}"
         ) from exc
+
+
+def _contract_from_evidence(evidence: CanonicalExperimentEvidence) -> Any:
+    return validate_contract_dict(
+        parse_contract_bytes(evidence.experiment_contract_bytes)
+    )
 
 
 def build_experiment_fact_closure_from_text(
@@ -224,7 +282,7 @@ def build_experiment_fact_closure_from_text(
         unknown_values = _unknown_metric_values(manuscript_literals, grounded)
     else:
         manuscript_literals, unknown_values = _extract_view_scoped_metric_literals(
-            paper_text, cfs
+            paper_text, cfs, contract
         )
     citation_bound_numeric_claims = (
         _citation_bound_numeric_claims(paper_text) if cfs is not None else []
@@ -234,7 +292,9 @@ def build_experiment_fact_closure_from_text(
         find_dataset_claim_violations(paper_text, contract.dataset_origin)
     )
     structured_violations = (
-        _structured_fact_violations(paper_text, cfs) if cfs is not None else []
+        _structured_fact_violations(paper_text, cfs, contract)
+        if cfs is not None
+        else []
     )
     payload = {
         "schema_version": (
@@ -279,11 +339,7 @@ def replay_experiment_fact_closure(
     try:
         paper_text = paper_bytes.decode("utf-8")
         stored_text = stored_report_bytes.decode("utf-8")
-        contract_text = evidence.experiment_contract_bytes.decode("utf-8")
-        contract_data = yaml.safe_load(contract_text)
-        if not isinstance(contract_data, dict):
-            raise ValueError("contract root must be an object")
-        contract = validate_contract_dict(contract_data)
+        contract = _contract_from_evidence(evidence)
         stored = parse_experiment_fact_closure_report(stored_text)
         expected = build_experiment_fact_closure_from_text(
             paper_text=paper_text,
@@ -293,7 +349,6 @@ def replay_experiment_fact_closure(
     except (
         UnicodeDecodeError,
         ValueError,
-        yaml.YAMLError,
         CanonicalExperimentEvidenceError,
         CFSIntegrityError,
     ) as exc:
@@ -559,7 +614,7 @@ def _extract_experiment_metric_literals(
             body = _mask_spans(
                 body,
                 [match.span() for match in _COUNT_CLAIM_RE.finditer(body)]
-                + [match.span() for match in _VERSION_RE.finditer(body)]
+                + [match.span() for match in _LEGACY_VERSION_RE.finditer(body)]
                 + citation_spans,
             )
         section_texts.append(body)
@@ -579,8 +634,442 @@ def _unknown_metric_values(
     ]
 
 
+@dataclass(frozen=True)
+class _NumericToken:
+    start: int
+    end: int
+    value: Decimal | None
+    is_percent: bool
+    malformed: bool
+
+
+@dataclass(frozen=True)
+class _DomainNumericAnalysis:
+    literals: tuple[tuple[Decimal, bool], ...]
+    unknown_tokens: tuple[_NumericToken, ...]
+    grammar_violations: tuple[dict[str, Any], ...]
+
+
+def _runtime_version_matches(
+    body: str, cfs: Mapping[str, Any]
+) -> tuple[tuple[re.Match[str], str, str], ...]:
+    runtime = cfs["runtime"]
+    aliases: dict[str, tuple[str, str]] = {
+        "python": ("python", str(runtime["python"])),
+    }
+    for package, version in runtime["packages"].items():
+        package_name = str(package)
+        aliases[package_name.casefold()] = (package_name, str(version))
+        if package_name.casefold() == "torch":
+            aliases["pytorch"] = (package_name, str(version))
+    matches: list[tuple[re.Match[str], str, str]] = []
+    occupied: list[tuple[int, int]] = []
+    for alias in sorted(aliases, key=lambda value: (-len(value), value)):
+        package_name, expected = aliases[alias]
+        pattern = re.compile(
+            rf"(?<![\w-]){re.escape(alias)}[ \t]+v?"
+            rf"(?P<version>\d+(?:\.\d+)+)"
+            rf"(?=$|[\s,;:)\]]|\.(?:\s|$))",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(body):
+            if any(start < match.end() and match.start() < end for start, end in occupied):
+                continue
+            matches.append((match, package_name, expected))
+            occupied.append(match.span())
+    return tuple(sorted(matches, key=lambda item: item[0].start()))
+
+
+def _scale_range_matches(body: str) -> tuple[re.Match[str], ...]:
+    return tuple(
+        sorted(
+            (
+                *_SCALE_RANGE_RE.finditer(body),
+                *_SCALE_SUFFIX_RANGE_RE.finditer(body),
+                *_SCALE_VERBOSE_RANGE_RE.finditer(body),
+            ),
+            key=lambda match: (match.start(), match.end()),
+        )
+    )
+
+
+def _citation_marker_spans(body: str) -> tuple[tuple[int, int], ...]:
+    from researchclaw.literature.citation_plan import parse_strict_citation_occurrences
+
+    return tuple(
+        (occurrence.char_start, occurrence.char_end)
+        for occurrence in parse_strict_citation_occurrences(body)
+    )
+
+
+def _domain_numeric_protected_spans(
+    body: str, cfs: Mapping[str, Any]
+) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = [
+        match.span() for match in _COUNT_CLAIM_RE.finditer(body)
+    ]
+    spans.extend(match.span() for match in _scale_range_matches(body))
+    spans.extend(
+        match.span() for match, _package, _expected in _runtime_version_matches(body, cfs)
+    )
+    spans.extend(match.span() for match in _SEED_LIST_RE.finditer(body))
+    spans.extend(match.span() for match in _SINGLE_SEED_RE.finditer(body))
+    spans.extend(match.span() for match in _TORCH_THREAD_RE.finditer(body))
+    spans.extend(_citation_marker_spans(body))
+    for pattern in _IDENTIFIER_NUMBER_PATTERNS:
+        spans.extend(match.span() for match in pattern.finditer(body))
+    return tuple(sorted(set(spans)))
+
+
+def _numeric_candidate_start(text: str, index: int) -> bool:
+    if index > 0 and text[index - 1] in _ASCII_WORD_CHARS:
+        return False
+    value = text[index]
+    if value.isdigit():
+        return True
+    if value in "+-":
+        return index + 1 < len(text) and (
+            text[index + 1].isdigit()
+            or (
+                text[index + 1] == "."
+                and index + 2 < len(text)
+                and text[index + 2].isdigit()
+            )
+        )
+    return value == "." and index + 1 < len(text) and text[index + 1].isdigit()
+
+
+def _scan_numeric_tokens(text: str) -> tuple[_NumericToken, ...]:
+    tokens: list[_NumericToken] = []
+    index = 0
+    while index < len(text):
+        if not _numeric_candidate_start(text, index):
+            index += 1
+            continue
+        start = index
+        cursor = index
+        while cursor < len(text) and text[cursor] in _NUMERIC_RUN_CHARS:
+            cursor += 1
+        run_end = cursor
+        core_end = run_end
+        if (
+            core_end > start
+            and text[core_end - 1] in ",."
+            and (core_end == len(text) or text[core_end].isspace())
+            and _NUMERIC_CORE_RE.fullmatch(text[start : core_end - 1]) is not None
+        ):
+            core_end -= 1
+        core = text[start:core_end]
+        cursor = core_end
+        is_percent = cursor < len(text) and text[cursor] == "%"
+        if is_percent:
+            cursor += 1
+        invalid_boundary = (
+            cursor < len(text) and text[cursor] in _ASCII_WORD_CHARS
+        )
+        malformed = _NUMERIC_CORE_RE.fullmatch(core) is None or invalid_boundary
+        exponent_match = re.search(r"[eE](?P<exponent>[-+]?\d+)$", core)
+        if exponent_match is not None and (
+            abs(int(exponent_match.group("exponent"))) > _MAX_NUMERIC_EXPONENT
+        ):
+            malformed = True
+        value: Decimal | None = None
+        if not malformed:
+            value = _decimal_token(core.replace(",", ""))
+            if is_percent:
+                value /= Decimal(100)
+        tokens.append(
+            _NumericToken(
+                start=start,
+                end=run_end if malformed else cursor,
+                value=value,
+                is_percent=is_percent,
+                malformed=malformed,
+            )
+        )
+        index = max(cursor, run_end, start + 1)
+    return tuple(tokens)
+
+
+def _sentence_for_numeric_token(body: str, token: _NumericToken) -> tuple[int, int]:
+    start, end, _block_type = _safe_fact_block_span(body, token.start)
+    return start, end
+
+
+def _metric_label_binding(
+    sentence: str,
+    *,
+    number_start: int,
+    number_end: int,
+    display_labels: Mapping[str, list[str]],
+) -> tuple[str, str] | None:
+    candidates: set[tuple[str, str]] = set()
+    for metric, labels in display_labels.items():
+        for label in labels:
+            if not isinstance(label, str) or not label:
+                raise ExperimentFactClosureError("metric display label is invalid")
+            left = r"(?<![\w-])" if (label[0].isalnum() or label[0] == "_") else ""
+            right = r"(?![\w-])" if (label[-1].isalnum() or label[-1] == "_") else ""
+            pattern = re.compile(left + re.escape(label) + right, re.IGNORECASE)
+            for match in pattern.finditer(sentence):
+                if match.end() <= number_start and re.fullmatch(
+                    r"\s*(?:(?:was|is|reached|averaged|achieved|measured)\s+|"
+                    r"[:=]\s*)?",
+                    sentence[match.end():number_start],
+                    re.IGNORECASE,
+                ):
+                    candidates.add((str(metric), label))
+                elif number_end <= match.start() and re.fullmatch(
+                    r"\s+", sentence[number_end:match.start()]
+                ):
+                    candidates.add((str(metric), label))
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def _metric_record_identity(
+    record: Mapping[str, Any], cfs: Mapping[str, Any]
+) -> tuple[str, str, int | None]:
+    pointer = str(record["pointer"])
+    condition_match = re.fullmatch(
+        r"/derived/canonical_fact_sheet/v1/condition_aggregates/"
+        r"(?P<index>\d+)/metrics/[^/]+/(?P<aggregation>mean|std|min|max)",
+        pointer,
+    )
+    if condition_match is not None:
+        index = int(condition_match.group("index"))
+        rows = cfs["condition_aggregates"]
+        if index >= len(rows):
+            raise ExperimentFactClosureError("metric authority pointer is invalid")
+        return (
+            str(rows[index]["condition"]),
+            condition_match.group("aggregation"),
+            None,
+        )
+    seed_match = re.fullmatch(
+        r"/derived/canonical_fact_sheet/v1/per_seed_aggregates/"
+        r"(?P<index>\d+)/metrics/[^/]+",
+        pointer,
+    )
+    if seed_match is not None:
+        index = int(seed_match.group("index"))
+        rows = cfs["per_seed_aggregates"]
+        if index >= len(rows):
+            raise ExperimentFactClosureError("metric authority pointer is invalid")
+        return str(rows[index]["condition"]), "per_seed", int(rows[index]["seed"])
+    raise ExperimentFactClosureError("metric authority pointer is invalid")
+
+
+def _condition_mentions(
+    sentence: str, cfs: Mapping[str, Any]
+) -> frozenset[str]:
+    mentions: set[str] = set()
+    for entry in cfs["conditions"]:
+        condition = str(entry["id"])
+        if re.search(
+            rf"(?<![\w-]){re.escape(condition)}(?![\w-])",
+            sentence,
+            re.IGNORECASE,
+        ):
+            mentions.add(condition)
+    return frozenset(mentions)
+
+
+def _metric_sentence_modifiers_are_bound(sentence: str) -> bool:
+    if _UNBOUND_NUMERIC_UNIT_RE.search(sentence) is not None:
+        return False
+    if _UNBOUND_COMPARISON_RE.search(sentence) is not None:
+        return False
+    return _UNBOUND_AGGREGATION_RE.search(sentence) is None
+
+
+def _metric_identity_binding(
+    sentence: str,
+    *,
+    number_start: int,
+    number_end: int,
+    metric: str,
+    label: str,
+    cfs: Mapping[str, Any],
+) -> tuple[str, str, int | None] | str | None:
+    condition_ids = tuple(str(item["id"]) for item in cfs["conditions"])
+    prefix = sentence[:number_start]
+    suffix = sentence[number_end:]
+    if re.fullmatch(r"\s*\.\s*", suffix) is None:
+        return None
+    label_pattern = rf"(?i:{re.escape(label)})"
+    relation = r"(?i:was|is|reached|averaged|achieved|measured)|[:=]"
+    explicit: list[tuple[str, str, int | None]] = []
+    for condition in condition_ids:
+        aggregate_match = re.fullmatch(
+            rf"\s*{re.escape(condition)}[ \t]+"
+            rf"(?P<aggregation>mean|std|min|max)[ \t]+"
+            rf"{label_pattern}[ \t]+(?:{relation})[ \t]*",
+            prefix,
+        )
+        if aggregate_match is not None:
+            explicit.append(
+                (condition, aggregate_match.group("aggregation"), None)
+            )
+        seed_match = re.fullmatch(
+            rf"\s*{re.escape(condition)}[ \t]+seed[ \t]+"
+            rf"(?P<seed>\d+)[ \t]+per-seed[ \t]+"
+            rf"{label_pattern}[ \t]+(?:{relation})[ \t]*",
+            prefix,
+        )
+        if seed_match is not None:
+            explicit.append(
+                (condition, "per_seed", int(seed_match.group("seed")))
+            )
+    if explicit:
+        if len(explicit) != 1:
+            return None
+        return explicit[0]
+    primary = cfs["primary_metric"]
+    if metric != primary["key"]:
+        return None
+    primary_patterns = (
+        rf"\s*(?:{label_pattern}|(?i:the)[ \t]+"
+        rf"(?:(?i:primary)[ \t]+)?{label_pattern})"
+        rf"[ \t]+(?:{relation})[ \t]*",
+        rf"\s*(?i:across)[ \t]+{len(cfs['seeds'])}[ \t]+(?i:seeds),"
+        rf"[ \t]+(?i:the)[ \t]+{label_pattern}[ \t]+(?:{relation})[ \t]*",
+    )
+    if not any(re.fullmatch(pattern, prefix) is not None for pattern in primary_patterns):
+        return None
+    return "primary"
+
+
+def _invalid_metric_scalar_violations(
+    section: Any,
+    contract: Any,
+) -> tuple[dict[str, Any], ...]:
+    body = section.body
+    violations: list[dict[str, Any]] = []
+    scalar_pattern = re.compile(
+        r"(?i)(?<![\w-])(?:nan|inf(?:inity)?|not-a-number|"
+        r"true|false|null)(?![\w-])"
+    )
+    for labels in contract.metric_display_labels.values():
+        for label in labels:
+            if not isinstance(label, str) or not label:
+                raise ExperimentFactClosureError("metric display label is invalid")
+            left = r"(?<![\w-])" if (label[0].isalnum() or label[0] == "_") else ""
+            right = r"(?![\w-])" if (label[-1].isalnum() or label[-1] == "_") else ""
+            label_pattern = re.compile(
+                left + re.escape(label) + right,
+                re.IGNORECASE,
+            )
+            for label_match in label_pattern.finditer(body):
+                sentence_start, sentence_end, _block_type = _safe_fact_block_span(
+                    body, label_match.start()
+                )
+                sentence = body[sentence_start:sentence_end]
+                for scalar_match in scalar_pattern.finditer(sentence):
+                    scalar_start = sentence_start + scalar_match.start()
+                    scalar_end = sentence_start + scalar_match.end()
+                    violations.append(
+                        _violation(
+                            "numeric_grammar_violation",
+                            section.title,
+                            section.section_id,
+                            body,
+                            scalar_start,
+                            scalar_end,
+                        )
+                    )
+    return tuple(violations)
+
+
+def _domain_numeric_analysis_for_section(
+    *,
+    section: Any,
+    cfs: Mapping[str, Any],
+    contract: Any,
+) -> _DomainNumericAnalysis:
+    body = section.body
+    masked = _mask_spans(body, _domain_numeric_protected_spans(body, cfs))
+    tokens = _scan_numeric_tokens(masked)
+    literals: list[tuple[Decimal, bool]] = []
+    unknown: list[_NumericToken] = []
+    grammar: list[dict[str, Any]] = []
+    view = fact_sheet_view_for_heading(section.path[0])
+    records = fact_sheet_numeric_authority_records(cfs, view=view)
+    for token in tokens:
+        if token.malformed or token.value is None:
+            grammar.append(
+                _violation(
+                    "numeric_grammar_violation",
+                    section.title,
+                    section.section_id,
+                    body,
+                    token.start,
+                    token.end,
+                )
+            )
+            continue
+        literals.append((token.value, token.is_percent))
+        if view != "results":
+            unknown.append(token)
+            continue
+        sentence_start, sentence_end = _sentence_for_numeric_token(body, token)
+        sentence = body[sentence_start:sentence_end]
+        binding = _metric_label_binding(
+            sentence,
+            number_start=token.start - sentence_start,
+            number_end=token.end - sentence_start,
+            display_labels=contract.metric_display_labels,
+        )
+        candidates: list[Mapping[str, Any]] = []
+        if binding is not None and _metric_sentence_modifiers_are_bound(sentence):
+            metric, label = binding
+            unit = contract.metric_units.get(metric)
+            transformed = token.value
+            if token.is_percent:
+                transformed = (
+                    token.value if unit == "ratio" else token.value * Decimal(100)
+                )
+            if unit in {"ratio", "percent", "count", "unitless"}:
+                identity = _metric_identity_binding(
+                    sentence,
+                    number_start=token.start - sentence_start,
+                    number_end=token.end - sentence_start,
+                    metric=metric,
+                    label=label,
+                    cfs=cfs,
+                )
+                if identity == "primary":
+                    primary = cfs["primary_metric"]
+                    candidates = [
+                        primary
+                        for _ in (0,)
+                        if Decimal(primary["value"]) == transformed
+                    ]
+                elif isinstance(identity, tuple):
+                    condition, aggregation, seed = identity
+                    candidates = [
+                        record
+                        for record in records
+                        if record["metric"] == metric
+                        and Decimal(record["value"]) == transformed
+                        if _metric_record_identity(record, cfs)[1] == aggregation
+                        and _metric_record_identity(record, cfs)[0] == condition
+                        and (
+                            seed is None
+                            or _metric_record_identity(record, cfs)[2] == seed
+                        )
+                    ]
+        if len(candidates) != 1:
+            unknown.append(token)
+    grammar.extend(_invalid_metric_scalar_violations(section, contract))
+    return _DomainNumericAnalysis(
+        literals=tuple(literals),
+        unknown_tokens=tuple(unknown),
+        grammar_violations=tuple(grammar),
+    )
+
+
 def _extract_view_scoped_metric_literals(
-    paper_text: str, cfs: Mapping[str, Any]
+    paper_text: str, cfs: Mapping[str, Any], contract: Any
 ) -> tuple[list[tuple[Decimal, bool]], list[Decimal]]:
     try:
         document = parse_manuscript(paper_text, strict=True)
@@ -591,20 +1080,17 @@ def _extract_view_scoped_metric_literals(
     literals: list[tuple[Decimal, bool]] = []
     unknown: list[Decimal] = []
     for section in document.sections:
-        body = _mask_spans(
-            section.body,
-            [match.span() for match in _COUNT_CLAIM_RE.finditer(section.body)]
-            + [match.span() for match in _VERSION_RE.finditer(section.body)],
+        analysis = _domain_numeric_analysis_for_section(
+            section=section,
+            cfs=cfs,
+            contract=contract,
         )
-        section_literals = _extract_metric_literals(body)
-        allowed = [
-            Decimal(value)
-            for value in fact_sheet_numeric_authority(
-                cfs, view=fact_sheet_view_for_heading(section.path[0])
-            )
-        ]
-        literals.extend(section_literals)
-        unknown.extend(_unknown_metric_values(section_literals, allowed))
+        literals.extend(analysis.literals)
+        unknown.extend(
+            token.value
+            for token in analysis.unknown_tokens
+            if token.value is not None
+        )
     return literals, unknown
 
 
@@ -661,7 +1147,7 @@ def _mask_spans(text: str, spans: list[tuple[int, int]]) -> str:
 
 
 def _structured_fact_violations(
-    paper_text: str, cfs: Mapping[str, Any]
+    paper_text: str, cfs: Mapping[str, Any], contract: Any
 ) -> list[dict[str, Any]]:
     try:
         document = parse_manuscript(paper_text, strict=True)
@@ -690,7 +1176,14 @@ def _structured_fact_violations(
         violations.extend(
             _condition_violations(section.title, section.section_id, section.body, cfs)
         )
-        for match in _SCALE_RANGE_RE.finditer(section.body):
+        violations.extend(
+            _domain_numeric_analysis_for_section(
+                section=section,
+                cfs=cfs,
+                contract=contract,
+            ).grammar_violations
+        )
+        for match in _scale_range_matches(section.body):
             observed = (
                 int(match.group("minimum").replace(",", "")),
                 int(match.group("maximum").replace(",", "")),
@@ -701,6 +1194,45 @@ def _structured_fact_violations(
                     _violation(
                         "scale_violation", section.title, section.section_id, section.body,
                         match.start(), match.end(),
+                    )
+                )
+        for match in _SEED_LIST_RE.finditer(section.body):
+            observed = tuple(
+                int(value.strip()) for value in match.group("values").split(",")
+            )
+            if observed != tuple(cfs["seeds"]):
+                violations.append(
+                    _violation(
+                        "seed_identity_violation",
+                        section.title,
+                        section.section_id,
+                        section.body,
+                        match.start(),
+                        match.end(),
+                    )
+                )
+        for match in _SINGLE_SEED_RE.finditer(section.body):
+            if int(match.group("seed")) not in cfs["seeds"]:
+                violations.append(
+                    _violation(
+                        "seed_identity_violation",
+                        section.title,
+                        section.section_id,
+                        section.body,
+                        match.start(),
+                        match.end(),
+                    )
+                )
+        for match in _TORCH_THREAD_RE.finditer(section.body):
+            if int(match.group("count")) != cfs["runtime"]["torch_num_threads"]:
+                violations.append(
+                    _violation(
+                        "runtime_violation",
+                        section.title,
+                        section.section_id,
+                        section.body,
+                        match.start(),
+                        match.end(),
                     )
                 )
         for match in _COMPARATOR_ABSENCE_RE.finditer(section.body):
@@ -758,6 +1290,8 @@ def _count_violation_kind(
     number = int(match.group("number"))
     raw_unit = match.group("unit").casefold()
     unit = "family" if raw_unit in {"family", "families"} else raw_unit.rstrip("s")
+    if unit == "netlist":
+        unit = "variant"
     qualifiers = tuple(match.group("prefix").casefold().split())
     suffix = body[match.end():]
     clause_suffix = re.split(r"[.;!?\n]", suffix, maxsplit=1)[0].strip().casefold()
@@ -769,6 +1303,32 @@ def _count_violation_kind(
     )
     if predicate is not None:
         return "unsupported_derived_count"
+    if raw_unit in {"netlist", "netlists"}:
+        allowed_netlist_qualifiers = {
+            (),
+            ("distinct",),
+            ("ht-injected",),
+            ("distinct", "ht-injected"),
+            ("trojan-injected",),
+            ("distinct", "trojan-injected"),
+        }
+        if qualifiers not in allowed_netlist_qualifiers:
+            return "unsupported_derived_count"
+        return None if number == len(cfs["variant_ids"]) else "count_mismatch"
+    if unit == "family" and len(qualifiers) == 1:
+        normalized_qualifier = _normalize_source_name(qualifiers[0])
+        benchmark_tokens = {
+            _normalize_source_name(str(value))
+            for value in cfs["bound_labels"]["benchmark_tokens"]
+        }
+        if normalized_qualifier in benchmark_tokens and (
+            not clause_suffix or clause_suffix.startswith(":")
+        ):
+            return (
+                None
+                if number == len(cfs["circuit_families"])
+                else "count_mismatch"
+            )
     if clause_suffix.startswith(","):
         metric_names = "|".join(re.escape(str(key)) for key in cfs["metric_keys"])
         if clause_suffix == ", the evaluation was repeated":
@@ -851,12 +1411,9 @@ def _runtime_violations(
     section: str, section_id: str, body: str, cfs: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
     runtime = cfs["runtime"]
-    packages = runtime["packages"]
     violations: list[dict[str, Any]] = []
-    for match in _VERSION_RE.finditer(body):
-        product = match.group(0).split()[0].casefold()
+    for match, _package, expected in _runtime_version_matches(body, cfs):
         actual = match.group("version")
-        expected = runtime["python"] if product == "python" else packages.get("torch")
         if expected != actual:
             violations.append(
                 _violation(
@@ -897,6 +1454,11 @@ def _provenance_violations(
         _normalize_source_name(labels[key])
         for key in ("dataset", "evaluator_schema", "evaluator_id")
     )
+    allowed.update(
+        _normalize_source_name(str(package))
+        for package in cfs["runtime"]["packages"]
+    )
+    allowed.update({"pytorch", "python"})
     metric_aliases = {
         _normalize_source_name(str(key)) for key in cfs["metric_keys"]
     }
@@ -969,6 +1531,8 @@ def remove_unsupported_experiment_fact_blocks(
     dataset_origin: str,
     structured_fact_violations: list[dict[str, Any]] | None = None,
     canonical_fact_sheet: Mapping[str, Any] | None = None,
+    evidence: CanonicalExperimentEvidence | None = None,
+    experiment_contract: Any | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Remove the smallest deterministic blocks containing unsupported facts.
 
@@ -992,6 +1556,37 @@ def remove_unsupported_experiment_fact_blocks(
     replacements: dict[str, str] = {}
     operations: list[dict[str, Any]] = []
     structured_fact_violations = structured_fact_violations or []
+    if canonical_fact_sheet is not None and evidence is None:
+        raise ExperimentFactClosureError(
+            "captured evidence is required for domain fact repair"
+        )
+    if evidence is not None:
+        fresh_fact_sheet = build_canonical_fact_sheet(evidence)
+        fresh_contract = _contract_from_evidence(evidence)
+        if fresh_fact_sheet is None:
+            raise ExperimentFactClosureError(
+                "canonical evidence did not produce a fact sheet"
+            )
+        if (
+            canonical_fact_sheet is not None
+            and canonical_fact_sheet != fresh_fact_sheet
+        ):
+            raise ExperimentFactClosureError(
+                "canonical fact sheet differs from captured evidence"
+            )
+        if (
+            experiment_contract is not None
+            and experiment_contract != fresh_contract
+        ):
+            raise ExperimentFactClosureError(
+                "experiment contract differs from captured evidence"
+            )
+        canonical_fact_sheet = fresh_fact_sheet
+        experiment_contract = fresh_contract
+    if canonical_fact_sheet is not None and experiment_contract is None:
+        raise ExperimentFactClosureError(
+            "experiment contract is required for domain fact repair"
+        )
     if structured_fact_violations:
         sections_by_id = {section.section_id: section for section in document.sections}
         for violation in structured_fact_violations:
@@ -1018,7 +1613,11 @@ def remove_unsupported_experiment_fact_blocks(
             raise ExperimentFactClosureError(
                 "canonical fact sheet is required for structured repair"
             )
-        fresh = _structured_fact_violations(paper_text, canonical_fact_sheet)
+        fresh = _structured_fact_violations(
+            paper_text,
+            canonical_fact_sheet,
+            experiment_contract,
+        )
         if structured_fact_violations != fresh:
             raise ExperimentFactClosureError(
                 "structured repair violations do not match fresh replay"
@@ -1026,7 +1625,17 @@ def remove_unsupported_experiment_fact_blocks(
     for section in document.sections:
         body = section.body
         targets: list[tuple[int, str, Decimal | None]] = []
-        if _is_experiment_fact_section(section.title):
+        if canonical_fact_sheet is not None:
+            analysis = _domain_numeric_analysis_for_section(
+                section=section,
+                cfs=canonical_fact_sheet,
+                contract=experiment_contract,
+            )
+            targets.extend(
+                (token.start, "unsupported_numeric", token.value)
+                for token in analysis.unknown_tokens
+            )
+        elif _is_experiment_fact_section(section.title):
             for start, _end, value, is_percent in _metric_literal_spans(body):
                 if not any(
                     _numeric_equivalent(value, expected, is_percent=is_percent)

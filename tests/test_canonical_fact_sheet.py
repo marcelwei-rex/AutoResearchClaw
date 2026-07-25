@@ -1231,9 +1231,13 @@ def _fact_closure(paper_text: str, evidence: CanonicalExperimentEvidence | None 
     return build_experiment_fact_closure_from_text(
         paper_text=paper_text,
         evidence=selected,
-        contract=validate_contract_dict(
-            parse_contract_bytes(selected.experiment_contract_bytes)
-        ),
+        contract=_contract_for(selected),
+    )
+
+
+def _contract_for(evidence: CanonicalExperimentEvidence):
+    return validate_contract_dict(
+        parse_contract_bytes(evidence.experiment_contract_bytes)
     )
 
 
@@ -1360,6 +1364,354 @@ class TestExperimentFactClosureV3:
             item["kind"] == "runtime_violation"
             for item in report["structured_fact_violations"]
         )
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "The undocumented hidden dimension is 999.",
+            "The encoder uses 64 hidden units.",
+            "The forest uses n_estimators=100.",
+            "The encoder is 2-layer.",
+            "The embedding is 10-dimensional.",
+        ],
+    )
+    def test_unbound_plain_integer_method_claims_fail_closed(
+        self, claim: str
+    ) -> None:
+        report = _fact_closure(_paper(claim, heading="Method"))
+
+        assert report["valid"] is False
+        assert report["unknown_numeric_values"] or any(
+            item["kind"] == "numeric_grammar_violation"
+            for item in report["structured_fact_violations"]
+        )
+
+    def test_exact_metric_value_cannot_authorize_an_unbound_parameter(self) -> None:
+        evidence = _make_evidence()
+        cfs = _build_cfs(evidence)
+        exact_primary = canonical_decimal(cfs["primary_metric"]["value"])
+
+        report = _fact_closure(
+            _paper(
+                f"The undocumented dropout hyperparameter was {exact_primary}.",
+                heading="Results",
+            ),
+            evidence,
+        )
+
+        assert report["valid"] is False
+        assert report["unknown_numeric_values"] == [Decimal(exact_primary)]
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "The unsupported latency was 10ms.",
+            "The result was 1e999.",
+        ],
+    )
+    def test_numeric_first_tokens_are_not_generic_identifiers(
+        self, claim: str
+    ) -> None:
+        report = _fact_closure(_paper(claim, heading="Method"))
+
+        assert report["valid"] is False
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "AUPRC was NaN.",
+            "AUPRC was Infinity.",
+            "AUPRC was true.",
+            "AUPRC was false.",
+            "AUPRC was null.",
+        ],
+    )
+    def test_metric_scalar_lexemes_fail_closed(self, claim: str) -> None:
+        report = _fact_closure(_paper(claim))
+
+        assert report["valid"] is False
+        assert "numeric_grammar_violation" in {
+            item["kind"] for item in report["structured_fact_violations"]
+        }
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "AUPRC remained NaN.",
+            "The NaN AUPRC result was discarded.",
+            "The AUPRC value became Infinity.",
+            "AUPRC equals false.",
+        ],
+    )
+    def test_metric_scalar_lexemes_reject_alternate_sentence_positions(
+        self, claim: str
+    ) -> None:
+        report = _fact_closure(_paper(claim))
+
+        assert report["valid"] is False
+        assert "numeric_grammar_violation" in {
+            item["kind"] for item in report["structured_fact_violations"]
+        }
+
+    def test_metric_value_cannot_bind_to_the_wrong_condition(self) -> None:
+        evidence = _make_evidence()
+        cfs = _build_cfs(evidence)
+        source_condition = next(
+            item
+            for item in cfs["condition_aggregates"]
+            if item["condition"] == "scoap_isolation_forest"
+        )
+        value = canonical_decimal(source_condition["metrics"]["auprc"]["mean"])
+
+        report = _fact_closure(
+            _paper(
+                f"trojnet_community_graphsage mean AUPRC was {value}.",
+            ),
+            evidence,
+        )
+
+        assert report["valid"] is False
+        assert report["unknown_numeric_values"] == [Decimal(value)]
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "evil_model mean AUPRC was {value}.",
+            "raw_cc1 and scoap_isolation_forest mean AUPRC was {value}.",
+            "scoap_isolation_forest median AUPRC was {value}.",
+            "scoap_isolation_forest seed zero per-seed AUPRC was {value}.",
+            "The higher scoap_isolation_forest mean AUPRC was {value}.",
+            "The ms scoap_isolation_forest mean AUPRC was {value}.",
+        ],
+    )
+    def test_metric_identity_grammar_is_default_deny(
+        self, template: str
+    ) -> None:
+        evidence = _make_evidence()
+        cfs = _build_cfs(evidence)
+        row = next(
+            item
+            for item in cfs["condition_aggregates"]
+            if item["condition"] == "scoap_isolation_forest"
+        )
+        value = canonical_decimal(row["metrics"]["auprc"]["mean"])
+
+        report = _fact_closure(_paper(template.format(value=value)), evidence)
+
+        assert report["valid"] is False
+
+    def test_metric_value_binds_condition_and_aggregation_pointer(self) -> None:
+        evidence = _make_evidence()
+        cfs = _build_cfs(evidence)
+        source_condition = next(
+            item
+            for item in cfs["condition_aggregates"]
+            if item["condition"] == "scoap_isolation_forest"
+        )
+        value = canonical_decimal(source_condition["metrics"]["auprc"]["mean"])
+
+        valid = _fact_closure(
+            _paper(f"scoap_isolation_forest mean AUPRC was {value}."),
+            evidence,
+        )
+        wrong_aggregation = _fact_closure(
+            _paper(f"scoap_isolation_forest maximum AUPRC was {value}."),
+            evidence,
+        )
+
+        assert valid["valid"] is True
+        assert wrong_aggregation["valid"] is False
+
+    def test_metric_value_binds_per_seed_identity(self) -> None:
+        evidence = _make_evidence()
+        cfs = _build_cfs(evidence)
+        row = next(
+            item
+            for item in cfs["per_seed_aggregates"]
+            if item["condition"] == "scoap_isolation_forest"
+            and item["seed"] == 0
+        )
+        value = canonical_decimal(row["metrics"]["auprc"])
+
+        valid = _fact_closure(
+            _paper(
+                f"scoap_isolation_forest seed 0 per-seed AUPRC was {value}."
+            ),
+            evidence,
+        )
+        wrong_seed = _fact_closure(
+            _paper(
+                f"scoap_isolation_forest seed 1 per-seed AUPRC was {value}."
+            ),
+            evidence,
+        )
+
+        assert valid["valid"] is True
+        assert wrong_seed["valid"] is False
+
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            " ms",
+            " lower than raw_cc1",
+        ],
+    )
+    def test_metric_value_rejects_unbound_unit_or_comparison(
+        self, suffix: str
+    ) -> None:
+        evidence = _make_evidence()
+        cfs = _build_cfs(evidence)
+        exact_primary = canonical_decimal(cfs["primary_metric"]["value"])
+
+        report = _fact_closure(
+            _paper(f"AUPRC was {exact_primary}{suffix}."),
+            evidence,
+        )
+
+        assert report["valid"] is False
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "evil model AUPRC was {value}.",
+            "raw CC1 AUPRC was {value}.",
+            "The baseline AUPRC was {value}.",
+            "The improved AUPRC was {value}.",
+            "AUPRC was {value} kg.",
+            "AUPRC was {value} nanoseconds.",
+            "AUPRC was {value} on the fabricated baseline.",
+        ],
+    )
+    def test_primary_metric_shorthand_has_closed_full_sentence_grammar(
+        self, template: str
+    ) -> None:
+        evidence = _make_evidence()
+        cfs = _build_cfs(evidence)
+        value = canonical_decimal(cfs["primary_metric"]["value"])
+
+        report = _fact_closure(_paper(template.format(value=value)), evidence)
+
+        assert report["valid"] is False
+
+    def test_primary_metric_shorthand_allows_only_frozen_templates(self) -> None:
+        evidence = _make_evidence()
+        cfs = _build_cfs(evidence)
+        value = canonical_decimal(cfs["primary_metric"]["value"])
+
+        for claim in (
+            f"AUPRC was {value}.",
+            f"The primary AUPRC was {value}.",
+            f"Across 3 seeds, the AUPRC reached {value}.",
+        ):
+            assert _fact_closure(_paper(claim), evidence)["valid"] is True
+
+    def test_domain_repair_requires_captured_evidence(self) -> None:
+        evidence = _make_evidence()
+        cfs = _build_cfs(evidence)
+
+        with pytest.raises(ValueError, match="captured evidence is required"):
+            remove_unsupported_experiment_fact_blocks(
+                _paper("The unsupported hidden dimension is 999.", heading="Method"),
+                grounded_numeric_values=[],
+                dataset_origin="synthetic",
+                canonical_fact_sheet=cfs,
+                experiment_contract=_contract_for(evidence),
+            )
+
+    @pytest.mark.parametrize(
+        ("heading", "claim"),
+        [
+            ("Introduction", "In 2024, the field advanced."),
+            ("Related Work", "Prior work appeared in 2024 [smith2024deep]."),
+        ],
+    )
+    def test_bibliographic_year_metadata_is_not_metric_authority(
+        self, heading: str, claim: str
+    ) -> None:
+        report = _fact_closure(_paper(claim, heading=heading))
+
+        assert report["valid"] is True
+        assert report["unknown_numeric_values"] == []
+
+    def test_all_bound_runtime_package_versions_are_allowed(self) -> None:
+        report = _fact_closure(
+            _paper(
+                "Execution used Python 3.11, PyTorch 2.12.1, NetworkX 3.6.1, "
+                "and scikit-learn 1.9.0 on CPU.",
+                heading="Method",
+            )
+        )
+
+        assert report["valid"] is True
+        assert report["unknown_numeric_values"] == []
+        assert report["structured_fact_violations"] == []
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "Execution used NetworkX 3.6.2.",
+            "Execution used scikit-learn 1.9.1.",
+            "Execution used PyTorch 2.12.2.",
+        ],
+    )
+    def test_tampered_runtime_package_versions_fail_closed(
+        self, claim: str
+    ) -> None:
+        report = _fact_closure(_paper(claim, heading="Method"))
+
+        assert report["valid"] is False
+        assert "runtime_violation" in {
+            item["kind"] for item in report["structured_fact_violations"]
+        }
+
+    def test_domain_repair_uses_heading_scoped_numeric_authority(self) -> None:
+        evidence = _make_evidence()
+        cfs = _build_cfs(evidence)
+        raw_observation = canonical_decimal(
+            evidence.metric_observations["auprc"][0]
+        )
+        source = _paper(
+            "Execution used NetworkX 3.6.1. "
+            "The undocumented hidden dimension is 999.",
+            heading="Method",
+        ).replace(
+            "## Experiments\n\nThe fixed design is used.",
+            (
+                "## Experiments\n\n"
+                "The controlled fixture contains 18 distinct HT-injected netlists "
+                "from 6 ISCAS85 families. Graph sizes range from 196 nodes (c432) "
+                "to 2,480 nodes (c6288). The seeds (0, 1, 2) are fixed and "
+                "torch.set_num_threads(1) is replayed."
+            ),
+        ).replace(
+            "## Results\n\nThe evidence is summarized.",
+            (
+                "## Results\n\n"
+                f"AUPRC was {raw_observation} for one raw observation."
+            ),
+        )
+        initial = _fact_closure(source, evidence)
+
+        repaired, _log = remove_unsupported_experiment_fact_blocks(
+            source,
+            grounded_numeric_values=initial["grounded_numeric_values"],
+            dataset_origin=initial["dataset_origin"],
+            structured_fact_violations=initial["structured_fact_violations"],
+            canonical_fact_sheet=cfs,
+            evidence=evidence,
+            experiment_contract=_contract_for(evidence),
+        )
+        after = _fact_closure(repaired, evidence)
+
+        assert "NetworkX 3.6.1" in repaired
+        assert "18 distinct HT-injected netlists" in repaired
+        assert "6 ISCAS85 families" in repaired
+        assert "196 nodes (c432) to 2,480 nodes" in repaired
+        assert "seeds (0, 1, 2)" in repaired
+        assert "torch.set_num_threads(1)" in repaired
+        assert "hidden dimension is 999" not in repaired
+        assert f"AUPRC was {raw_observation}" not in repaired
+        assert after["valid"] is True
 
     def test_negated_foreign_devices_do_not_trigger_runtime_violation(self) -> None:
         report = _fact_closure(
@@ -1565,6 +1917,7 @@ class TestExperimentFactClosureV3:
         assert "canonical_fact_sheet_sha256" not in report
 
     def test_structured_violation_repair_removes_only_bound_sentence(self) -> None:
+        evidence = _make_evidence()
         source = _paper(
             "The evidence remains canonical. We completed 20 experimental runs. "
             "The primary aggregate is retained."
@@ -1575,7 +1928,9 @@ class TestExperimentFactClosureV3:
             grounded_numeric_values=initial["grounded_numeric_values"],
             dataset_origin=initial["dataset_origin"],
             structured_fact_violations=initial["structured_fact_violations"],
-            canonical_fact_sheet=_build_cfs(_make_evidence()),
+            canonical_fact_sheet=_build_cfs(evidence),
+            evidence=evidence,
+            experiment_contract=_contract_for(evidence),
         )
         after = _fact_closure(repaired)
 
@@ -1586,6 +1941,7 @@ class TestExperimentFactClosureV3:
         assert log["operations"][0]["block_type"] == "sentence"
 
     def test_duplicate_structured_claims_bind_distinct_occurrences(self) -> None:
+        evidence = _make_evidence()
         source = _paper(
             "We completed 20 experimental runs. The evidence remains canonical. "
             "We completed 20 experimental runs."
@@ -1603,12 +1959,15 @@ class TestExperimentFactClosureV3:
             grounded_numeric_values=initial["grounded_numeric_values"],
             dataset_origin=initial["dataset_origin"],
             structured_fact_violations=violations,
-            canonical_fact_sheet=_build_cfs(_make_evidence()),
+            canonical_fact_sheet=_build_cfs(evidence),
+            evidence=evidence,
+            experiment_contract=_contract_for(evidence),
         )
         assert "20 experimental runs" not in repaired
         assert "The evidence remains canonical." in repaired
 
     def test_structured_repair_rejects_oversize_char_end(self) -> None:
+        evidence = _make_evidence()
         source = _paper("We completed 20 experimental runs.")
         initial = _fact_closure(source)
         violation = dict(initial["structured_fact_violations"][0])
@@ -1627,13 +1986,16 @@ class TestExperimentFactClosureV3:
                 grounded_numeric_values=initial["grounded_numeric_values"],
                 dataset_origin=initial["dataset_origin"],
                 structured_fact_violations=[violation],
-                canonical_fact_sheet=_build_cfs(_make_evidence()),
+                canonical_fact_sheet=_build_cfs(evidence),
+                evidence=evidence,
+                experiment_contract=_contract_for(evidence),
             )
 
     @pytest.mark.parametrize("bad_span", [True, 1.0])
     def test_structured_repair_rejects_non_true_int_span(
         self, bad_span: object
     ) -> None:
+        evidence = _make_evidence()
         source = _paper("We completed 20 experimental runs.")
         initial = _fact_closure(source)
         violation = dict(initial["structured_fact_violations"][0])
@@ -1645,10 +2007,13 @@ class TestExperimentFactClosureV3:
                 grounded_numeric_values=initial["grounded_numeric_values"],
                 dataset_origin=initial["dataset_origin"],
                 structured_fact_violations=[violation],
-                canonical_fact_sheet=_build_cfs(_make_evidence()),
+                canonical_fact_sheet=_build_cfs(evidence),
+                evidence=evidence,
+                experiment_contract=_contract_for(evidence),
             )
 
     def test_structured_repair_rejects_synchronized_innocent_sentence_binding(self) -> None:
+        evidence = _make_evidence()
         source = _paper(
             "The innocent sentence remains. We completed 20 experimental runs."
         )
@@ -1671,7 +2036,9 @@ class TestExperimentFactClosureV3:
                 grounded_numeric_values=initial["grounded_numeric_values"],
                 dataset_origin=initial["dataset_origin"],
                 structured_fact_violations=[forged],
-                canonical_fact_sheet=_build_cfs(_make_evidence()),
+                canonical_fact_sheet=_build_cfs(evidence),
+                evidence=evidence,
+                experiment_contract=_contract_for(evidence),
             )
 
 
