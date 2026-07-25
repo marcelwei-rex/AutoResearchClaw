@@ -240,6 +240,137 @@ def _domain_v2_zero_authority_responses() -> list[str]:
     ]
 
 
+def _domain_v2_transition_response(
+    *, before: str = "", after: str = ""
+) -> str:
+    return json.dumps(
+        {"before": before, "after": after},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def test_domain_v2_immutable_scaffold_owns_claim004_anchor_line(
+    tmp_path: Path,
+) -> None:
+    anchor = citation_plan_module.CitationAnchor(
+        claim_id="planned-claim-004",
+        heading="Related Work",
+        claim_text=(
+            "Thus, malicious logic (Hardware Trojans, HT) being surreptitiously "
+            "injected by untrusted vendors into 3PIP cores used in IC design is "
+            "an ever present threat."
+        ),
+        cite_key="muralidhar2022contrastive",
+    )
+    responses = _domain_v2_zero_authority_responses()
+    responses[1:1] = [_domain_v2_transition_response()]
+    llm = _SequentialLLM(responses)
+
+    draft = _write_paper_sections(
+        llm=cast(Any, llm),
+        pm=cast(Any, _PromptManagerStub()),
+        preamble="",
+        topic_constraint="",
+        exp_metrics_instruction="",
+        citation_instruction="",
+        outline="",
+        stage_dir=tmp_path,
+        citation_repair_claims=(
+            {
+                "section": anchor.heading,
+                "claim_text": anchor.claim_text,
+                "cite_key": anchor.cite_key,
+            },
+        ),
+        heading_citation_instructions=_domain_v2_heading_instructions(),
+        canonical_fact_sheet=_minimal_cfs(),
+        citation_anchors=(anchor,),
+    )
+
+    assert f"\n{anchor.claim_text}\n" in draft
+    prompt = "\n".join(message["content"] for message in llm.calls[1])
+    assert anchor.claim_text not in prompt
+    assert anchor.claim_id not in prompt
+    assert anchor.cite_key not in prompt
+
+
+def test_domain_v2_immutable_scaffold_rejects_provider_anchor_replay(
+    tmp_path: Path,
+) -> None:
+    anchor = project_citation_anchors(_anchor_plan())[0]
+    responses = _domain_v2_zero_authority_responses()
+    responses[1:1] = [anchor.claim_text, anchor.claim_text]
+    llm = _SequentialLLM(responses)
+
+    with pytest.raises(PaperSectionContractError, match="citation_anchor"):
+        _write_paper_sections(
+            llm=cast(Any, llm),
+            pm=cast(Any, _PromptManagerStub()),
+            preamble="",
+            topic_constraint="",
+            exp_metrics_instruction="",
+            citation_instruction="",
+            outline="",
+            stage_dir=tmp_path,
+            citation_repair_claims=(
+                {
+                    "section": anchor.heading,
+                    "claim_text": anchor.claim_text,
+                    "cite_key": anchor.cite_key,
+                },
+            ),
+            heading_citation_instructions=_domain_v2_heading_instructions(),
+            canonical_fact_sheet=_minimal_cfs(),
+            citation_anchors=(anchor,),
+        )
+
+    assert len(llm.calls) == 3
+
+
+@pytest.mark.parametrize(
+    "transition",
+    (
+        "Prior work [smith2024deep].",
+        "Smith et al. (2024) reported this.",
+        "The Trust-HUB dataset contains 10 examples.",
+        "AUPRC reached 0.999.",
+        "Exact bounded claim.",
+    ),
+)
+def test_domain_v2_immutable_scaffold_rejects_unauthorized_transition(
+    tmp_path: Path,
+    transition: str,
+) -> None:
+    anchor = project_citation_anchors(_anchor_plan())[0]
+    invalid = _domain_v2_transition_response(after=transition)
+    responses = _domain_v2_zero_authority_responses()
+    responses[1:1] = [invalid, invalid]
+    llm = _SequentialLLM(responses)
+
+    with pytest.raises(PaperSectionContractError, match="citation_anchor"):
+        _write_paper_sections(
+            llm=cast(Any, llm),
+            pm=cast(Any, _PromptManagerStub()),
+            preamble="",
+            topic_constraint="",
+            exp_metrics_instruction="",
+            citation_instruction="",
+            outline="",
+            stage_dir=tmp_path,
+            citation_repair_claims=(
+                {
+                    "section": anchor.heading,
+                    "claim_text": anchor.claim_text,
+                    "cite_key": anchor.cite_key,
+                },
+            ),
+            heading_citation_instructions=_domain_v2_heading_instructions(),
+            canonical_fact_sheet=_minimal_cfs(),
+            citation_anchors=(anchor,),
+        )
+
+
 def test_domain_v2_anchor_batches_are_contiguous_and_bounded() -> None:
     anchors = project_citation_anchors(_many_anchor_plan(11))
 
@@ -510,7 +641,9 @@ def test_domain_v2_related_work_uses_isolated_contiguous_batches(
 ) -> None:
     anchors = project_citation_anchors(_many_anchor_plan(6))
     responses = _domain_v2_zero_authority_responses()
-    responses[1:1] = [anchor.claim_text for anchor in anchors]
+    responses[1:1] = [
+        _domain_v2_transition_response() for _anchor in anchors
+    ]
     llm = _SequentialLLM(responses)
 
     draft = _write_paper_sections(
@@ -544,13 +677,13 @@ def test_domain_v2_related_work_uses_isolated_contiguous_batches(
         for index in range(1, 7)
     ]
     for ordinal, prompt in enumerate(batch_prompts):
-        assert anchors[ordinal].claim_text in prompt
+        assert "code-owned citation scaffold" in prompt
+        assert anchors[ordinal].claim_text not in prompt
         assert anchors[ordinal].claim_id not in prompt
         assert anchors[ordinal].cite_key not in prompt
         assert all(
             anchor.claim_text not in prompt
-            for index, anchor in enumerate(anchors)
-            if index != ordinal
+            for anchor in anchors
         )
     report = json.loads(
         (tmp_path / "section_generation_report.json").read_text(encoding="utf-8")
@@ -573,7 +706,10 @@ def test_domain_v2_single_anchor_contract_repair_is_bounded(
 ) -> None:
     anchor = project_citation_anchors(_anchor_plan())[0]
     responses = _domain_v2_zero_authority_responses()
-    responses[1:1] = ["Paraphrased claim.", anchor.claim_text]
+    responses[1:1] = [
+        "not valid scaffold JSON",
+        _domain_v2_transition_response(),
+    ]
     llm = _SequentialLLM(responses)
 
     draft = _write_paper_sections(
@@ -608,8 +744,8 @@ def test_domain_v2_single_anchor_contract_repair_is_bounded(
     repair_prompt = "\n".join(
         message["content"] for message in llm.calls[2]
     )
-    assert "Paraphrased claim." not in repair_prompt
-    assert anchor.claim_text in repair_prompt
+    assert "not valid scaffold JSON" not in repair_prompt
+    assert anchor.claim_text not in repair_prompt
     assert anchor.claim_id not in repair_prompt
     assert anchor.cite_key not in repair_prompt
 
@@ -628,7 +764,8 @@ def test_domain_v2_provider_prompt_hides_citation_identity() -> None:
     authority = _paper_writing._render_domain_v2_anchor_authority((anchor,))
 
     assert "heading: Related Work" in authority
-    assert anchor.claim_text in authority
+    assert "code-owned and hidden" in authority
+    assert anchor.claim_text not in authority
     assert anchor.claim_id not in authority
     assert anchor.cite_key not in authority
     assert "Sarihi" not in authority
@@ -647,7 +784,7 @@ def test_domain_v2_zero_authority_section_regenerates_once_without_old_text(
     llm = _SequentialLLM(
         [
             _domain_v2_zero_authority_responses()[0],
-            anchor.claim_text,
+            _domain_v2_transition_response(),
             invalid,
             clean,
             *_domain_v2_zero_authority_responses()[2:],
@@ -707,7 +844,7 @@ def test_domain_v2_zero_authority_second_candidate_failure_stops_later_groups(
     llm = _SequentialLLM(
         [
             _domain_v2_zero_authority_responses()[0],
-            anchor.claim_text,
+            _domain_v2_transition_response(),
             first_invalid,
             second_invalid,
             _domain_v2_zero_authority_responses()[2],
@@ -752,7 +889,7 @@ def test_domain_v2_zero_authority_transport_failure_is_not_repaired(
     llm = _SequentialLLM(
         [
             _domain_v2_zero_authority_responses()[0],
-            anchor.claim_text,
+            _domain_v2_transition_response(),
             OSError("forced transport failure"),
             _domain_v2_zero_authority_responses()[1],
         ]
@@ -913,10 +1050,18 @@ def test_domain_v2_full_replay_rejects_cross_batch_missing_and_duplicate(
     anchors = project_citation_anchors(_many_anchor_plan(6))
     responses = _domain_v2_zero_authority_responses()
     responses[1:1] = [
-        *(anchor.claim_text for anchor in anchors[:5]),
-        anchors[4].claim_text,
+        _domain_v2_transition_response() for _anchor in anchors
     ]
     llm = _SequentialLLM(responses)
+    assembled = iter(
+        [anchor.claim_text for anchor in anchors[:5]]
+        + [anchors[4].claim_text]
+    )
+    monkeypatch.setattr(
+        _paper_writing,
+        "_assemble_domain_v2_anchor_fragment",
+        lambda *_args, **_kwargs: next(assembled),
+    )
     monkeypatch.setattr(
         _paper_writing,
         "validate_citation_free_anchor_fragment",
@@ -1005,7 +1150,7 @@ def test_domain_v2_realistic_25_anchor_plan_forms_five_batches(
 ) -> None:
     anchors = project_citation_anchors(_many_anchor_plan(25))
     responses = [_domain_v2_zero_authority_responses()[0]]
-    responses.extend(anchor.claim_text for anchor in anchors)
+    responses.extend(_domain_v2_transition_response() for _anchor in anchors)
     responses.extend(_domain_v2_zero_authority_responses()[1:])
     llm = _SequentialLLM(responses)
 
@@ -1143,7 +1288,7 @@ def test_domain_v2_zero_authority_section_accepts_bounded_numeric_interval(
 ) -> None:
     anchor = project_citation_anchors(_anchor_plan())[0]
     responses = _domain_v2_zero_authority_responses()
-    responses.insert(1, anchor.claim_text)
+    responses.insert(1, _domain_v2_transition_response())
     responses[2] = (
         "## Method\n\nFeatures are normalized to \\([0,1]\\).\n\n"
         "## Experiments\n\nThe bounded fixture is evaluated deterministically."

@@ -30,6 +30,7 @@ from researchclaw.literature.citation_plan import (
     CitationAnchor,
     CitationPlanContractError,
     DOMAIN_V2_CITATION_BATCH_MAX_PROMPT_UTF8_BYTES,
+    DOMAIN_V2_CITATION_FRAGMENT_MAX_UTF8_BYTES,
     attribute_citation_keys_to_top_level_headings,
     build_citation_closure_from_texts,
     # Stable monkeypatch seam for legacy executor fixtures.
@@ -1525,24 +1526,65 @@ def _heading_writer_groups(
 def _render_domain_v2_anchor_authority(
     anchors: tuple[CitationAnchor, ...],
 ) -> str:
-    lines = [
-        "DOMAIN-V2 CITATION ANCHOR CONTRACT:",
-        "- Output a headingless prose fragment. Do not output any Markdown heading.",
-        "- Do not output any Markdown, LaTeX, escaped, malformed, or unknown citation marker.",
-        "- Copy every EXACT ANCHOR below as its own physical line, byte for byte.",
-        "- Do not paraphrase, extend, merge, punctuate, or reorder an anchor.",
-        "- Deterministic code will insert citation markers after validation.",
-    ]
-    for anchor in anchors:
-        lines.extend(
-            (
-                f"- heading: {anchor.heading}",
-                "  EXACT ANCHOR START",
-                anchor.claim_text,
-                "  EXACT ANCHOR END",
-            )
+    if len(anchors) != 1:
+        raise CitationPlanContractError(
+            "domain-v2 immutable scaffold requires one anchor"
         )
-    return "\n".join(lines)
+    return "\n".join(
+        (
+            "DOMAIN-V2 IMMUTABLE CITATION ANCHOR SCAFFOLD:",
+            f"- heading: {anchors[0].heading}",
+            "- The exact citation anchor is code-owned and hidden from this call.",
+            "- Do not output or infer an anchor, citation, source, number, or prose.",
+            '- Return exactly this JSON object: {"after":"","before":""}',
+            "- No Markdown fence, explanation, or additional field is allowed.",
+        )
+    )
+
+
+def _parse_domain_v2_scaffold_response(response: str) -> tuple[str, str]:
+    """Parse one provider acknowledgement without granting prose authority."""
+
+    if len(response.encode("utf-8")) > DOMAIN_V2_CITATION_FRAGMENT_MAX_UTF8_BYTES:
+        raise CitationPlanContractError(
+            "domain-v2 citation scaffold response exceeds byte budget"
+        )
+    try:
+        payload = _strict_json_object(response, "citation scaffold response")
+    except ValueError as exc:
+        raise CitationPlanContractError(
+            f"domain-v2 citation scaffold response is invalid: {exc}"
+        ) from exc
+    if set(payload) != {"before", "after"}:
+        raise CitationPlanContractError(
+            "domain-v2 citation scaffold fields mismatch"
+        )
+    before = payload["before"]
+    after = payload["after"]
+    if type(before) is not str or type(after) is not str:
+        raise CitationPlanContractError(
+            "domain-v2 citation scaffold slots must be strings"
+        )
+    if before or after:
+        raise CitationPlanContractError(
+            "domain-v2 citation scaffold does not authorize transition prose"
+        )
+    return before, after
+
+
+def _assemble_domain_v2_anchor_fragment(
+    anchor: CitationAnchor,
+    *,
+    before: str,
+    after: str,
+) -> str:
+    """Insert the exact plan-owned anchor as its own physical line."""
+
+    if before or after:
+        raise CitationPlanContractError(
+            "domain-v2 citation scaffold received unauthorized prose"
+        )
+    return anchor.claim_text
 
 
 def _domain_v2_fragment_system(
@@ -1652,10 +1694,8 @@ def _write_batched_domain_v2_paper_sections(
                     grounding=batch_grounding,
                 )
                 batch_user = (
-                    f"{batch_grounding}\n\n"
-                    f"Write one headingless prose fragment for {batch_group[0]}.\n"
-                    "Use only the batch authority below. Do not output a heading, "
-                    "citation marker, code fence, preamble, or explanation.\n\n"
+                    f"Confirm the code-owned citation scaffold for {batch_group[0]}.\n"
+                    "Do not reconstruct or infer the hidden anchor.\n\n"
                     f"{authority}"
                 )
                 return batch_system, batch_user
@@ -1883,8 +1923,14 @@ def _write_batched_domain_v2_paper_sections(
                     )
                     break
                 try:
+                    before, after = _parse_domain_v2_scaffold_response(response)
+                    fragment = _assemble_domain_v2_anchor_fragment(
+                        batch.anchors[0],
+                        before=before,
+                        after=after,
+                    )
                     validate_citation_free_anchor_fragment(
-                        response,
+                        fragment,
                         anchors=batch.anchors,
                         all_anchors=citation_anchors,
                     )
@@ -1921,7 +1967,7 @@ def _write_batched_domain_v2_paper_sections(
                             "violation": "",
                         }
                     )
-                    response = response.strip()
+                    response = fragment
                 break
             if violation:
                 batch_entries.append(

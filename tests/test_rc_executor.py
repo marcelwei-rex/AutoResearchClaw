@@ -28,6 +28,8 @@ from researchclaw.experiment_runtime.contract import (
     sha256_file,
 )
 from researchclaw.hitl.intervention import HumanAction, HumanInput
+from researchclaw.literature.citation_plan import CitationAnchor
+from researchclaw.llm.client import LLMClient, LLMConfig, LLMResponse
 from researchclaw.pipeline import executor as rc_executor
 from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 from researchclaw.pipeline.stage_impls import _release_audit as release_audit
@@ -4660,6 +4662,121 @@ class TestDataIntegrityBlock:
         assert "authority changed" in (result.error or "").lower()
         assert verify_calls == 1
         assert (stage_dir / "paper_draft_invalid.md").exists()
+        for name in (
+            "paper_draft.md",
+            "experiment_fact_closure_report.json",
+            "citation_closure_report.json",
+        ):
+            assert not (stage_dir / name).exists()
+
+    def test_domain_v2_invalid_scaffold_exhaustion_clears_success_authority(
+        self,
+        run_dir: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _write_prior_artifact(run_dir, 16, "outline.md", "# Outline\n## Abstract\n")
+        runs_dir = run_dir / "stage-12" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        (runs_dir / "results.json").write_text(
+            json.dumps(
+                {
+                    "claim_scope": "pipeline_validation",
+                    "dataset_origin": "synthetic",
+                    "evaluator_owner": "scaffold",
+                    "metrics": {"detection_f1": 0.4753327669},
+                }
+            ),
+            encoding="utf-8",
+        )
+        stage_dir = run_dir / "stage-17"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "paper_draft.md",
+            "experiment_fact_closure_report.json",
+            "citation_closure_report.json",
+        ):
+            (stage_dir / name).write_text("stale authority", encoding="utf-8")
+
+        anchor = CitationAnchor(
+            claim_id="planned-claim-001",
+            heading="Related Work",
+            claim_text="Exact bounded claim.",
+            cite_key="smith2024deep",
+        )
+
+        class InvalidScaffoldLLM(LLMClient):
+            def __init__(self) -> None:
+                super().__init__(
+                    LLMConfig(
+                        base_url="https://primary.invalid/v1",
+                        api_key="test-key",
+                        primary_model="primary-model",
+                    )
+                )
+                self.responses = iter(
+                    (
+                        '{"after":"","before":"unauthorized prose"}',
+                        "not-json",
+                    )
+                )
+                self.calls: list[str] = []
+
+            def chat(
+                self,
+                messages: list[dict[str, str]],
+                **kwargs: object,
+            ) -> LLMResponse:
+                del messages, kwargs
+                self.calls.append("citation")
+                return LLMResponse(
+                    content=next(self.responses),
+                    model=self.config.primary_model,
+                )
+
+        llm = InvalidScaffoldLLM()
+
+        def write_invalid_scaffold(
+            *_args: object,
+            **kwargs: object,
+        ) -> str:
+            return _paper_writing._write_batched_domain_v2_paper_sections(
+                llm=cast(LLMClient, kwargs["llm"]),
+                system="system",
+                groups=(("Related Work",),),
+                grounding_contexts={"Related Work": "CFS_BOUND"},
+                citation_anchors=(anchor,),
+                model_name="primary-model",
+                stage_dir=cast(Path, kwargs["stage_dir"]),
+            )
+
+        monkeypatch.setattr(
+            _paper_writing,
+            "_write_paper_sections",
+            write_invalid_scaffold,
+        )
+
+        result = rc_executor._execute_paper_draft(
+            stage_dir,
+            run_dir,
+            rc_config,
+            adapters,
+            llm=llm,
+        )
+
+        assert result.status == StageStatus.FAILED
+        assert "citation scaffold response is invalid" in (result.error or "")
+        assert llm.calls == ["citation", "citation"]
+        assert (stage_dir / "paper_draft_invalid.md").exists()
+        generation = json.loads(
+            (stage_dir / "section_generation_report.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        related = generation["parts"][0]
+        assert related["batches"][0]["attempt_count"] == 2
+        assert related["citation_outbound_count"] == 2
         for name in (
             "paper_draft.md",
             "experiment_fact_closure_report.json",
