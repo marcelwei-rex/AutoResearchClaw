@@ -56,6 +56,32 @@ _OBJECT_KINDS = frozenset({"decimal", "string", "identifier", "boolean"})
 _SECTION_IDS = frozenset(
     {"abstract", "results", "discussion", "limitations", "conclusion"}
 )
+_COMPLETE_CFS_FIELDS = frozenset(
+    {
+        "schema_version",
+        "dataset_origin",
+        "claim_scope",
+        "bound_labels",
+        "conditions",
+        "seeds",
+        "circuit_families",
+        "variants_per_family",
+        "variant_ids",
+        "counts",
+        "metric_keys",
+        "primary_metric",
+        "condition_aggregates",
+        "per_seed_aggregates",
+        "scale",
+        "runtime",
+        "derived_facts",
+        "provenance",
+        "observation_rows",
+    }
+)
+_PRIMARY_METRIC_FIELDS = frozenset(
+    {"condition", "key", "aggregation", "observation_set", "value"}
+)
 
 _EVIDENCE_FACT_FIELDS = frozenset(
     {
@@ -177,6 +203,27 @@ _EVIDENCE_FACT_REGISTRY = (
 )
 _RENDERER_TEMPLATE_REGISTRY = (
     _RendererTemplateSpec(
+        template_id="abstract.primary_metric.v1",
+        claim_kind="primary_metric_summary",
+        section_id="abstract",
+        mandatory=True,
+        slot_fact_kinds=(
+            "primary_metric_key",
+            "primary_metric_value",
+            "primary_condition",
+            "primary_aggregation",
+            "primary_observation_set",
+        ),
+        literal_parts=(
+            "The governed evaluation reported ",
+            " of ",
+            " for primary condition ",
+            " under ",
+            " over ",
+            ".",
+        ),
+    ),
+    _RendererTemplateSpec(
         template_id="result.primary_metric.v1",
         claim_kind="primary_metric_result",
         section_id="results",
@@ -188,6 +235,82 @@ _RENDERER_TEMPLATE_REGISTRY = (
             " under ",
             " over ",
             " was ",
+            ".",
+        ),
+    ),
+    _RendererTemplateSpec(
+        template_id="result.primary_metric_scope.v1",
+        claim_kind="primary_metric_scope",
+        section_id="results",
+        mandatory=False,
+        slot_fact_kinds=(
+            "primary_aggregation",
+            "primary_observation_set",
+            "primary_condition",
+        ),
+        literal_parts=(
+            "The primary result uses ",
+            " over ",
+            " for condition ",
+            ".",
+        ),
+    ),
+    _RendererTemplateSpec(
+        template_id="discussion.primary_metric_scope.v1",
+        claim_kind="primary_metric_scope_interpretation",
+        section_id="discussion",
+        mandatory=True,
+        slot_fact_kinds=(
+            "primary_metric_key",
+            "primary_condition",
+            "primary_aggregation",
+            "primary_observation_set",
+        ),
+        literal_parts=(
+            "Interpretation of the primary ",
+            " result for ",
+            " is scoped to ",
+            " over ",
+            ".",
+        ),
+    ),
+    _RendererTemplateSpec(
+        template_id="limitation.primary_metric_scope.v1",
+        claim_kind="primary_metric_scope_limitation",
+        section_id="limitations",
+        mandatory=True,
+        slot_fact_kinds=(
+            "primary_metric_key",
+            "primary_condition",
+            "primary_aggregation",
+            "primary_observation_set",
+        ),
+        literal_parts=(
+            "The reported primary ",
+            " result pertains to ",
+            " under ",
+            " over ",
+            ".",
+        ),
+    ),
+    _RendererTemplateSpec(
+        template_id="conclusion.primary_metric.v1",
+        claim_kind="primary_metric_conclusion",
+        section_id="conclusion",
+        mandatory=True,
+        slot_fact_kinds=(
+            "primary_metric_key",
+            "primary_metric_value",
+            "primary_condition",
+            "primary_aggregation",
+            "primary_observation_set",
+        ),
+        literal_parts=(
+            "The governed evidence records ",
+            " of ",
+            " for ",
+            " under ",
+            " over ",
             ".",
         ),
     ),
@@ -380,9 +503,7 @@ def build_scientific_claim_generation_binding(
         raise ScientificClaimAuthorityError(
             "scientific claim binding requires exact domain-evaluator v2 CFS"
         )
-    if not isinstance(cfs, Mapping):
-        raise ScientificClaimAuthorityError("rebuilt CFS must be an object")
-    _true_int_one(cfs.get("schema_version"), "CFS schema_version")
+    cfs = _require_complete_cfs(cfs)
 
     evidence_path = _safe_path(
         evidence.manifest_path, "canonical experiment evidence path"
@@ -655,18 +776,8 @@ def build_scientific_claim_registry(
         raise ScientificClaimAuthorityError(
             f"cannot rebuild scientific claim CFS: {exc}"
         ) from exc
-    if not isinstance(cfs, Mapping):
-        raise ScientificClaimAuthorityError("rebuilt CFS must be an object")
-    _true_int_one(cfs.get("schema_version"), "CFS schema_version")
+    cfs = _require_complete_cfs(cfs)
     primary_metric = cfs.get("primary_metric")
-    expected_primary_fields = {spec.cfs_key for spec in _EVIDENCE_FACT_REGISTRY}
-    if (
-        not isinstance(primary_metric, Mapping)
-        or set(primary_metric) != expected_primary_fields
-    ):
-        raise ScientificClaimAuthorityError(
-            "rebuilt CFS primary_metric schema mismatch"
-        )
 
     source = bind_scientific_claim_source(
         binding, binding.canonical_experiment_evidence_path
@@ -1012,6 +1123,23 @@ def _validate_code_owned_registries() -> None:
             raise ScientificClaimAuthorityError(
                 f"code-owned template registry is invalid: {template.template_id}"
             )
+
+
+def _require_complete_cfs(cfs: object) -> Mapping[str, Any]:
+    if not isinstance(cfs, Mapping) or set(cfs) != _COMPLETE_CFS_FIELDS:
+        raise ScientificClaimAuthorityError(
+            "rebuilt complete CFS schema mismatch"
+        )
+    _true_int_one(cfs.get("schema_version"), "CFS schema_version")
+    primary_metric = cfs.get("primary_metric")
+    if (
+        not isinstance(primary_metric, Mapping)
+        or set(primary_metric) != _PRIMARY_METRIC_FIELDS
+    ):
+        raise ScientificClaimAuthorityError(
+            "rebuilt complete CFS primary_metric schema mismatch"
+        )
+    return cfs
 
 
 def _fact_object_value(spec: _EvidenceFactSpec, value: object) -> str:

@@ -57,6 +57,36 @@ FACT_A = "1" * 64
 FACT_B = "2" * 64
 
 
+def _complete_cfs(*, primary_value: Decimal = Decimal("1.25")) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "dataset_origin": "Trust-HUB",
+        "claim_scope": "fixture scope",
+        "bound_labels": {},
+        "conditions": (),
+        "seeds": (),
+        "circuit_families": (),
+        "variants_per_family": {},
+        "variant_ids": (),
+        "counts": {},
+        "metric_keys": ("auprc",),
+        "primary_metric": {
+            "condition": "trojnet_community_graphsage",
+            "key": "auprc",
+            "aggregation": "mean_variants_then_mean_seeds_v1",
+            "observation_set": "exact_18_variants_per_seed",
+            "value": primary_value,
+        },
+        "condition_aggregates": (),
+        "per_seed_aggregates": (),
+        "scale": {},
+        "runtime": {},
+        "derived_facts": {},
+        "provenance": {},
+        "observation_rows": (),
+    }
+
+
 def _evidence(**overrides: Any) -> CanonicalExperimentEvidence:
     summary_content = overrides.pop("_summary_content", SOURCE_CONTENT)
     contract = parse_contract_bytes(CONTRACT_BYTES)
@@ -259,7 +289,7 @@ def _evidence(**overrides: Any) -> CanonicalExperimentEvidence:
 def binding(monkeypatch: pytest.MonkeyPatch):
     from researchclaw.pipeline import scientific_claim_authority as authority
 
-    cfs = {"schema_version": 1, "value": Decimal("1.25")}
+    cfs = _complete_cfs()
     monkeypatch.setattr(authority, "build_canonical_fact_sheet", lambda _evidence: cfs)
     built = build_scientific_claim_generation_binding(_evidence())
     expected_payload = {
@@ -626,7 +656,7 @@ def test_generation_binding_rebuild_has_no_caller_hash_shortcut(
 ) -> None:
     from researchclaw.pipeline import scientific_claim_authority as authority
 
-    cfs = {"schema_version": 1, "value": Decimal("2.00")}
+    cfs = _complete_cfs(primary_value=Decimal("2.00"))
     monkeypatch.setattr(authority, "build_canonical_fact_sheet", lambda _evidence: cfs)
     first = build_scientific_claim_generation_binding(_evidence())
     second = build_scientific_claim_generation_binding(
@@ -677,7 +707,7 @@ def test_generation_binding_rejects_stored_manifest_hash_fallback(
     monkeypatch.setattr(
         authority,
         "build_canonical_fact_sheet",
-        lambda _evidence: {"schema_version": 1},
+        lambda _evidence: _complete_cfs(),
     )
     with pytest.raises(ScientificClaimAuthorityError, match="evidence bytes/hash"):
         build_scientific_claim_generation_binding(
@@ -823,7 +853,7 @@ def test_exact_non_nfc_source_string_is_preserved(
     monkeypatch.setattr(
         authority,
         "build_canonical_fact_sheet",
-        lambda _evidence: {"schema_version": 1},
+        lambda _evidence: _complete_cfs(),
     )
     binding = build_scientific_claim_generation_binding(
         _evidence(_summary_content=content)

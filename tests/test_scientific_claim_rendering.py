@@ -40,7 +40,24 @@ PRIMARY_METRIC = {
 def _cfs(**primary_overrides: Any) -> dict[str, Any]:
     return {
         "schema_version": 1,
+        "dataset_origin": "Trust-HUB",
+        "claim_scope": "fixture scope",
+        "bound_labels": {},
+        "conditions": (),
+        "seeds": (),
+        "circuit_families": (),
+        "variants_per_family": {},
+        "variant_ids": (),
+        "counts": {},
+        "metric_keys": ("auprc",),
         "primary_metric": {**PRIMARY_METRIC, **primary_overrides},
+        "condition_aggregates": (),
+        "per_seed_aggregates": (),
+        "scale": {},
+        "runtime": {},
+        "derived_facts": {},
+        "provenance": {},
+        "observation_rows": (),
     }
 
 
@@ -80,6 +97,14 @@ def _rehash_claim(claim, **changes: Any):
     payload = changed.to_dict()
     payload["claim_id"] = authority.scientific_claim_id(payload)
     return replace(changed, claim_id=payload["claim_id"])
+
+
+def _claim_for(registry, template_id: str):
+    return next(
+        claim
+        for claim in registry.claims
+        if claim.renderer_template_id == template_id
+    )
 
 
 def test_repeated_construction_is_byte_and_identity_deterministic(binding) -> None:
@@ -196,8 +221,8 @@ def test_fact_registry_rejects_duplicate_and_reordered_records(binding) -> None:
 
 def test_claim_registry_is_closed_before_selection(binding) -> None:
     registry = authority.build_scientific_claim_registry(binding)
-    assert len(registry.claims) == 1
-    claim = registry.claims[0]
+    assert len(registry.claims) == 6
+    claim = _claim_for(registry, "result.primary_metric.v1")
     assert claim.claim_kind == "primary_metric_result"
     assert claim.section_id == "results"
     assert claim.renderer_template_id == "result.primary_metric.v1"
@@ -214,17 +239,24 @@ def test_claim_registry_rejects_unknown_fact_and_mixed_generation(
     binding, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry = authority.build_scientific_claim_registry(binding)
+    claim = _claim_for(registry, "result.primary_metric.v1")
     unknown_claim = _rehash_claim(
-        registry.claims[0],
-        evidence_fact_ids=tuple(sorted((*registry.claims[0].evidence_fact_ids[:-1], SHA_UNKNOWN))),
+        claim,
+        evidence_fact_ids=tuple(
+            sorted((*claim.evidence_fact_ids[:-1], SHA_UNKNOWN))
+        ),
         renderer_slot_fact_ids=(
-            *registry.claims[0].renderer_slot_fact_ids[:-1],
+            *claim.renderer_slot_fact_ids[:-1],
             SHA_UNKNOWN,
         ),
     )
+    claims = tuple(
+        unknown_claim if item.claim_id == claim.claim_id else item
+        for item in registry.claims
+    )
     with pytest.raises(authority.ScientificClaimAuthorityError):
         authority.validate_scientific_claim_registry(
-            replace(registry, claims=(unknown_claim,)),
+            replace(registry, claims=claims),
             binding=binding,
         )
 
@@ -269,9 +301,10 @@ def test_renderer_rejects_unknown_template_and_wrong_slots(
 
 def test_renderer_uses_canonical_values_without_float_conversion(binding) -> None:
     registry = authority.build_scientific_claim_registry(binding)
+    claim = _claim_for(registry, "result.primary_metric.v1")
     rendered = authority.render_scientific_claim(
-        registry.claims[0].renderer_template_id,
-        registry.claims[0].renderer_slot_fact_ids,
+        claim.renderer_template_id,
+        claim.renderer_slot_fact_ids,
         registry=registry,
         binding=binding,
     )
@@ -303,14 +336,19 @@ def test_claim_rerender_rejects_sentence_hash_and_id_synchronized_tamper(
     binding, sentence: str
 ) -> None:
     registry = authority.build_scientific_claim_registry(binding)
+    claim = _claim_for(registry, "result.primary_metric.v1")
     forged = _rehash_claim(
-        registry.claims[0],
+        claim,
         rendered_sentence=sentence,
         rendered_sentence_sha256=hashlib.sha256(sentence.encode("utf-8")).hexdigest(),
     )
+    claims = tuple(
+        forged if item.claim_id == claim.claim_id else item
+        for item in registry.claims
+    )
     with pytest.raises(authority.ScientificClaimAuthorityError, match="rerender"):
         authority.validate_scientific_claim_registry(
-            replace(registry, claims=(forged,)),
+            replace(registry, claims=claims),
             binding=binding,
         )
 
@@ -337,7 +375,7 @@ def test_selection_semantics_reject_unknown_other_section_and_mandatory_omission
     binding,
 ) -> None:
     registry = authority.build_scientific_claim_registry(binding)
-    claim_id = registry.claims[0].claim_id
+    claim_id = _claim_for(registry, "result.primary_metric.v1").claim_id
     with pytest.raises(authority.ScientificClaimAuthorityError, match="unknown"):
         authority.validate_scientific_claim_selection(
             _selection([SHA_UNKNOWN]),
@@ -360,7 +398,7 @@ def test_selection_semantics_reject_unknown_other_section_and_mandatory_omission
 
 def test_selection_preserves_exact_permutation_and_none_connector_policy(binding) -> None:
     registry = authority.build_scientific_claim_registry(binding)
-    claim_id = registry.claims[0].claim_id
+    claim_id = _claim_for(registry, "result.primary_metric.v1").claim_id
     selection = authority.validate_scientific_claim_selection(
         _selection([claim_id]),
         target_section="results",
@@ -399,13 +437,14 @@ def test_none_connector_emits_zero_bytes_and_join_adds_one_ascii_space() -> None
 
 def test_selection_rendering_uses_only_code_built_registry(binding) -> None:
     registry = authority.build_scientific_claim_registry(binding)
-    claim_id = registry.claims[0].claim_id
+    claim = _claim_for(registry, "result.primary_metric.v1")
+    claim_id = claim.claim_id
     rendered = authority.render_scientific_claim_selection(
         _selection([claim_id]),
         target_section="results",
         binding=binding,
     )
-    assert rendered == registry.claims[0].rendered_sentence.encode("utf-8")
+    assert rendered == claim.rendered_sentence.encode("utf-8")
     with pytest.raises(TypeError):
         authority.render_scientific_claim_selection(
             _selection([claim_id]),
@@ -429,7 +468,7 @@ def test_source_inventory_late_mutation_is_rejected(
 def test_b2_apis_do_not_write_artifacts(binding, tmp_path) -> None:
     before = tuple(tmp_path.iterdir())
     registry = authority.build_scientific_claim_registry(binding)
-    claim_id = registry.claims[0].claim_id
+    claim_id = _claim_for(registry, "result.primary_metric.v1").claim_id
     authority.render_scientific_claim_selection(
         _selection([claim_id]),
         target_section="results",
