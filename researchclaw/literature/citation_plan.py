@@ -7,7 +7,6 @@ import json
 import os
 import re
 import stat
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -65,8 +64,6 @@ CITATION_PLAN_SCHEMA_VERSION = 1
 CITATION_PLAN_VERSION = 2
 CITATION_PLAN_DOMAIN_VERSION = 3
 _CITATION_USAGE_POLICY_VERSION = 1
-DOMAIN_V2_CITATION_BATCH_MAX_ANCHORS = 1
-DOMAIN_V2_CITATION_BATCH_MAX_PROMPT_UTF8_BYTES = 16_384
 DOMAIN_V2_CITATION_FRAGMENT_MAX_UTF8_BYTES = 8_192
 _STRICT_CITE_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\d{4}[A-Za-z0-9_-]*")
 _MARKDOWN_CITATION_CANDIDATE_RE = re.compile(r"\[([^\[\]\n]+)\]")
@@ -166,17 +163,6 @@ class CitationAnchor:
     boundary_kind: str = "standalone_line"
 
 
-@dataclass(frozen=True)
-class CitationAnchorBatch:
-    """One precomputed provider-visible prompt for contiguous plan anchors."""
-
-    ordinal: int
-    anchors: tuple[CitationAnchor, ...]
-    system_prompt: str
-    user_prompt: str
-    prompt_utf8_bytes: int
-
-
 def _is_standalone_citation_claim(text: object) -> bool:
     return (
         type(text) is str
@@ -213,88 +199,6 @@ def project_citation_anchors(plan: Mapping[str, Any]) -> tuple[CitationAnchor, .
             )
         )
     return tuple(anchors)
-
-
-def project_contiguous_citation_anchor_batches(
-    anchors: tuple[CitationAnchor, ...],
-    *,
-    render_prompt: Callable[[tuple[CitationAnchor, ...]], tuple[str, str]],
-    max_anchors: int = DOMAIN_V2_CITATION_BATCH_MAX_ANCHORS,
-    max_prompt_utf8_bytes: int = DOMAIN_V2_CITATION_BATCH_MAX_PROMPT_UTF8_BYTES,
-) -> tuple[CitationAnchorBatch, ...]:
-    """Freeze single-anchor calls using final provider-visible bytes."""
-
-    if type(max_anchors) is not int or max_anchors <= 0:
-        raise CitationPlanContractError("citation batch anchor budget is invalid")
-    if max_anchors != 1:
-        raise CitationPlanContractError(
-            "domain-v2 citation projection requires single-anchor batches"
-        )
-    if type(max_prompt_utf8_bytes) is not int or max_prompt_utf8_bytes <= 0:
-        raise CitationPlanContractError("citation batch prompt budget is invalid")
-    if not anchors:
-        return ()
-    heading = anchors[0].heading
-    if any(anchor.heading != heading for anchor in anchors):
-        raise CitationPlanContractError(
-            "citation anchor batch cannot span multiple headings"
-        )
-
-    frozen: list[CitationAnchorBatch] = []
-    pending: tuple[CitationAnchor, ...] = ()
-    pending_prompts: tuple[str, str] | None = None
-    pending_bytes = 0
-
-    def render(candidate: tuple[CitationAnchor, ...]) -> tuple[str, str, int]:
-        prompts = render_prompt(candidate)
-        if (
-            not isinstance(prompts, tuple)
-            or len(prompts) != 2
-            or any(type(prompt) is not str for prompt in prompts)
-        ):
-            raise CitationPlanContractError(
-                "citation batch prompt renderer returned invalid prompts"
-            )
-        size = sum(len(prompt.encode("utf-8")) for prompt in prompts)
-        return prompts[0], prompts[1], size
-
-    def append_pending() -> None:
-        nonlocal pending, pending_prompts, pending_bytes
-        if not pending or pending_prompts is None:
-            return
-        frozen.append(
-            CitationAnchorBatch(
-                ordinal=len(frozen) + 1,
-                anchors=pending,
-                system_prompt=pending_prompts[0],
-                user_prompt=pending_prompts[1],
-                prompt_utf8_bytes=pending_bytes,
-            )
-        )
-        pending = ()
-        pending_prompts = None
-        pending_bytes = 0
-
-    for anchor in anchors:
-        candidate = pending + (anchor,)
-        if len(candidate) > max_anchors:
-            append_pending()
-            candidate = (anchor,)
-        system_prompt, user_prompt, size = render(candidate)
-        if size > max_prompt_utf8_bytes:
-            if pending:
-                append_pending()
-                candidate = (anchor,)
-                system_prompt, user_prompt, size = render(candidate)
-            if size > max_prompt_utf8_bytes:
-                raise CitationPlanContractError(
-                    "single citation anchor exceeds prompt budget"
-                )
-        pending = candidate
-        pending_prompts = (system_prompt, user_prompt)
-        pending_bytes = size
-    append_pending()
-    return tuple(frozen)
 
 
 def validate_citation_free_anchor_fragment(

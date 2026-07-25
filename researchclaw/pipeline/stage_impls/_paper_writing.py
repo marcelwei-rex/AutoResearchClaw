@@ -12,7 +12,6 @@ from collections.abc import Mapping
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
-from time import perf_counter
 from typing import Any
 
 import yaml
@@ -29,8 +28,6 @@ from researchclaw.literature.citation_policy import (
 from researchclaw.literature.citation_plan import (
     CitationAnchor,
     CitationPlanContractError,
-    DOMAIN_V2_CITATION_BATCH_MAX_PROMPT_UTF8_BYTES,
-    DOMAIN_V2_CITATION_FRAGMENT_MAX_UTF8_BYTES,
     attribute_citation_keys_to_top_level_headings,
     build_citation_closure_from_texts,
     # Stable monkeypatch seam for legacy executor fixtures.
@@ -45,7 +42,6 @@ from researchclaw.literature.citation_plan import (
     load_final_citation_plan,
     parse_strict_citation_occurrences,
     project_citation_anchors,
-    project_contiguous_citation_anchor_batches,
     require_citation_candidate_free,
     strict_citation_keys,
     strict_sentence_spans,
@@ -116,8 +112,6 @@ from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
 
-_DOMAIN_V2_CITATION_MAX_TOKENS = 2_048
-_DOMAIN_V2_CITATION_MAX_ATTEMPTS = 2
 
 _SECTION_OUTPUT_CONTRACT = """
 
@@ -1523,96 +1517,8 @@ def _heading_writer_groups(
     return tuple(result)
 
 
-def _render_domain_v2_anchor_authority(
-    anchors: tuple[CitationAnchor, ...],
-) -> str:
-    if len(anchors) != 1:
-        raise CitationPlanContractError(
-            "domain-v2 immutable scaffold requires one anchor"
-        )
-    return "\n".join(
-        (
-            "DOMAIN-V2 IMMUTABLE CITATION ANCHOR SCAFFOLD:",
-            f"- heading: {anchors[0].heading}",
-            "- The exact citation anchor is code-owned and hidden from this call.",
-            "- Do not output or infer an anchor, citation, source, number, or prose.",
-            '- Return exactly this JSON object: {"after":"","before":""}',
-            "- No Markdown fence, explanation, or additional field is allowed.",
-        )
-    )
-
-
-def _parse_domain_v2_scaffold_response(response: str) -> tuple[str, str]:
-    """Parse one provider acknowledgement without granting prose authority."""
-
-    if len(response.encode("utf-8")) > DOMAIN_V2_CITATION_FRAGMENT_MAX_UTF8_BYTES:
-        raise CitationPlanContractError(
-            "domain-v2 citation scaffold response exceeds byte budget"
-        )
-    try:
-        payload = _strict_json_object(response, "citation scaffold response")
-    except ValueError as exc:
-        raise CitationPlanContractError(
-            f"domain-v2 citation scaffold response is invalid: {exc}"
-        ) from exc
-    if set(payload) != {"before", "after"}:
-        raise CitationPlanContractError(
-            "domain-v2 citation scaffold fields mismatch"
-        )
-    before = payload["before"]
-    after = payload["after"]
-    if type(before) is not str or type(after) is not str:
-        raise CitationPlanContractError(
-            "domain-v2 citation scaffold slots must be strings"
-        )
-    if before or after:
-        raise CitationPlanContractError(
-            "domain-v2 citation scaffold does not authorize transition prose"
-        )
-    return before, after
-
-
-def _assemble_domain_v2_anchor_fragment(
-    anchor: CitationAnchor,
-    *,
-    before: str,
-    after: str,
-) -> str:
-    """Insert the exact plan-owned anchor as its own physical line."""
-
-    if before or after:
-        raise CitationPlanContractError(
-            "domain-v2 citation scaffold received unauthorized prose"
-        )
-    return anchor.claim_text
-
-
-def _domain_v2_fragment_system(
-    system: str,
-    *,
-    authority: str,
-    grounding: str,
-) -> str:
-    retained = [
-        line for line in system.splitlines()
-        if "cite" not in line.casefold() and "citation" not in line.casefold()
-    ]
-    return (
-        "\n".join(retained).rstrip()
-        + "\n\nSECTION-SCOPED CITATION OVERRIDE:\n"
-        + authority
-        + "\nThese batch-scoped rules override every earlier citation and section-format "
-        "instruction. Output no heading, preamble, explanation, or code fence."
-        + (
-            "\n\nCANONICAL FACT AUTHORITY:\n" + grounding
-            if grounding
-            else ""
-        )
-    )
-
-
 def _constrain_stage17_citation_llm(llm: object) -> LLMClient:
-    """Resolve one client whose citation chat performs one provider request."""
+    """Resolve one client for bounded zero-authority prose generation."""
 
     resolver = getattr(llm, "resolve_for_legacy", None)
     resolved = resolver() if callable(resolver) else llm
@@ -1632,28 +1538,6 @@ def _constrain_stage17_citation_llm(llm: object) -> LLMClient:
     return constrained
 
 
-def _domain_v2_repair_prompt(
-    *,
-    batch: Any,
-) -> tuple[str, str]:
-    """Render one bounded repair without exposing the invalid response."""
-
-    repair_rule = (
-        "\n\nBOUNDED REPAIR ATTEMPT:\n"
-        "- The previous response failed citation_fragment_contract_error.\n"
-        "- Regenerate from the same anchor authority only.\n"
-        "- Do not infer, quote, or discuss the previous response."
-    )
-    system = batch.system_prompt + repair_rule
-    user = batch.user_prompt + repair_rule
-    size = len(system.encode("utf-8")) + len(user.encode("utf-8"))
-    if size > DOMAIN_V2_CITATION_BATCH_MAX_PROMPT_UTF8_BYTES:
-        raise CitationPlanContractError(
-            "single citation anchor repair exceeds prompt budget"
-        )
-    return system, user
-
-
 def _write_batched_domain_v2_paper_sections(
     *,
     llm: LLMClient,
@@ -1664,7 +1548,7 @@ def _write_batched_domain_v2_paper_sections(
     model_name: str,
     stage_dir: Path | None,
 ) -> str:
-    """Precompute every prompt, then generate and replay contiguous anchor batches."""
+    """Generate zero-authority prose and assemble exact code-owned anchors."""
 
     prepared: list[dict[str, Any]] = []
     for index, group in enumerate(groups):
@@ -1680,36 +1564,18 @@ def _write_batched_domain_v2_paper_sections(
                 raise CitationPlanContractError(
                     "citation-bearing domain-v2 group must own exactly one heading"
                 )
-
-            def render_prompt(
-                batch: tuple[CitationAnchor, ...],
-                *,
-                batch_group: tuple[str, ...] = group,
-                batch_grounding: str = grounding,
-            ) -> tuple[str, str]:
-                authority = _render_domain_v2_anchor_authority(batch)
-                batch_system = _domain_v2_fragment_system(
-                    system,
-                    authority=authority,
-                    grounding=batch_grounding,
+            for anchor in active_anchors:
+                validate_citation_free_anchor_fragment(
+                    anchor.claim_text,
+                    anchors=(anchor,),
+                    all_anchors=citation_anchors,
                 )
-                batch_user = (
-                    f"Confirm the code-owned citation scaffold for {batch_group[0]}.\n"
-                    "Do not reconstruct or infer the hidden anchor.\n\n"
-                    f"{authority}"
-                )
-                return batch_system, batch_user
-
-            batches = project_contiguous_citation_anchor_batches(
-                active_anchors,
-                render_prompt=render_prompt,
-            )
             prepared.append(
                 {
                     "kind": "citation",
                     "index": index,
                     "group": group,
-                    "batches": batches,
+                    "anchors": active_anchors,
                 }
             )
             continue
@@ -1758,19 +1624,9 @@ def _write_batched_domain_v2_paper_sections(
             }
         )
 
-    repair_prompts = {
-        batch.ordinal: _domain_v2_repair_prompt(batch=batch)
-        for item in prepared
-        if item["kind"] == "citation"
-        for batch in item["batches"]
-    }
     citation_llm = (
         _constrain_stage17_citation_llm(llm) if citation_anchors else None
     )
-    citation_outbound_limit = (
-        _DOMAIN_V2_CITATION_MAX_ATTEMPTS * len(citation_anchors)
-    )
-    citation_outbound_count = 0
     report_entries: list[dict[str, Any]] = []
     generated: list[str] = []
     max_tokens = 24000 if model_name.startswith(("gpt-5", "o3", "o4")) else 12000
@@ -1882,108 +1738,24 @@ def _write_batched_domain_v2_paper_sections(
 
         fragments: list[str] = []
         batch_entries: list[dict[str, Any]] = []
-        for batch in item["batches"]:
-            response = ""
-            failure_exc: Exception | None = None
-            attempt_entries: list[dict[str, Any]] = []
-            violation = ""
-            prompts = (
-                (batch.system_prompt, batch.user_prompt),
-                repair_prompts[batch.ordinal],
-            )
-            for attempt, (call_system, call_user) in enumerate(prompts, start=1):
-                if citation_outbound_count >= citation_outbound_limit:
-                    raise CitationPlanContractError(
-                        "domain-v2 citation outbound request budget exceeded"
-                    )
-                citation_outbound_count += 1
-                started = perf_counter()
-                try:
-                    response = _chat_with_prompt(
-                        citation_llm,
-                        call_system,
-                        call_user,
-                        model=citation_llm.config.primary_model,
-                        max_tokens=_DOMAIN_V2_CITATION_MAX_TOKENS,
-                        retries=0,
-                    ).content
-                except Exception as exc:  # noqa: BLE001
-                    violation = "citation_batch_transport_error"
-                    failure_exc = exc
-                    attempt_entries.append(
-                        {
-                            "attempt": attempt,
-                            "call_role": "initial" if attempt == 1 else "repair",
-                            "validated_response_sha256": hashlib.sha256(b"").hexdigest(),
-                            "response_utf8_bytes": 0,
-                            "wall_time_ms": int((perf_counter() - started) * 1000),
-                            "valid": False,
-                            "violation": violation,
-                        }
-                    )
-                    break
-                try:
-                    before, after = _parse_domain_v2_scaffold_response(response)
-                    fragment = _assemble_domain_v2_anchor_fragment(
-                        batch.anchors[0],
-                        before=before,
-                        after=after,
-                    )
-                    validate_citation_free_anchor_fragment(
-                        fragment,
-                        anchors=batch.anchors,
-                        all_anchors=citation_anchors,
-                    )
-                except (CitationPlanContractError, ManuscriptStructureError) as exc:
-                    violation = "citation_batch_contract_error"
-                    failure_exc = exc
-                    attempt_entries.append(
-                        {
-                            "attempt": attempt,
-                            "call_role": "initial" if attempt == 1 else "repair",
-                            "validated_response_sha256": hashlib.sha256(
-                                response.encode("utf-8")
-                            ).hexdigest(),
-                            "response_utf8_bytes": len(response.encode("utf-8")),
-                            "wall_time_ms": int((perf_counter() - started) * 1000),
-                            "valid": False,
-                            "violation": violation,
-                        }
-                    )
-                    if attempt < _DOMAIN_V2_CITATION_MAX_ATTEMPTS:
-                        continue
-                else:
-                    violation = ""
-                    attempt_entries.append(
-                        {
-                            "attempt": attempt,
-                            "call_role": "initial" if attempt == 1 else "repair",
-                            "validated_response_sha256": hashlib.sha256(
-                                response.encode("utf-8")
-                            ).hexdigest(),
-                            "response_utf8_bytes": len(response.encode("utf-8")),
-                            "wall_time_ms": int((perf_counter() - started) * 1000),
-                            "valid": True,
-                            "violation": "",
-                        }
-                    )
-                    response = fragment
-                break
-            if violation:
+        for ordinal, anchor in enumerate(item["anchors"], start=1):
+            fragment = anchor.claim_text
+            try:
+                validate_citation_free_anchor_fragment(
+                    fragment,
+                    anchors=(anchor,),
+                    all_anchors=citation_anchors,
+                )
+            except (CitationPlanContractError, ManuscriptStructureError) as exc:
                 batch_entries.append(
                     {
-                        "batch_ordinal": batch.ordinal,
-                        "first_claim_id": batch.anchors[0].claim_id,
-                        "last_claim_id": batch.anchors[-1].claim_id,
-                        "anchor_count": len(batch.anchors),
-                        "prompt_utf8_bytes": batch.prompt_utf8_bytes,
-                        "validated_response_sha256": hashlib.sha256(
-                            response.encode("utf-8")
-                        ).hexdigest(),
-                        "attempt_count": len(attempt_entries),
-                        "attempts": attempt_entries,
+                        "batch_ordinal": ordinal,
+                        "first_claim_id": anchor.claim_id,
+                        "last_claim_id": anchor.claim_id,
+                        "anchor_count": 1,
+                        "assembly_kind": "code_owned",
                         "valid": False,
-                        "violations": [violation],
+                        "violations": ["citation_batch_contract_error"],
                     }
                 )
                 report_entries.append(
@@ -1991,34 +1763,28 @@ def _write_batched_domain_v2_paper_sections(
                         "part": part_name,
                         "title_slot": False,
                         "expected_major_sections": list(group),
+                        "assembly_kind": "code_owned",
                         "batches": batch_entries,
-                        "citation_outbound_count": citation_outbound_count,
-                        "citation_outbound_limit": citation_outbound_limit,
                     }
                 )
                 _persist_section_generation_report(stage_dir, report_entries)
                 raise PaperSectionContractError(
                     part_name,
-                    (f"citation_anchor:{failure_exc}",),
-                    response,
-                ) from failure_exc
+                    (f"citation_anchor:{exc}",),
+                    fragment,
+                ) from exc
             batch_entries.append(
                 {
-                    "batch_ordinal": batch.ordinal,
-                    "first_claim_id": batch.anchors[0].claim_id,
-                    "last_claim_id": batch.anchors[-1].claim_id,
-                    "anchor_count": len(batch.anchors),
-                    "prompt_utf8_bytes": batch.prompt_utf8_bytes,
-                    "validated_response_sha256": hashlib.sha256(
-                        response.encode("utf-8")
-                    ).hexdigest(),
-                    "attempt_count": len(attempt_entries),
-                    "attempts": attempt_entries,
+                    "batch_ordinal": ordinal,
+                    "first_claim_id": anchor.claim_id,
+                    "last_claim_id": anchor.claim_id,
+                    "anchor_count": 1,
+                    "assembly_kind": "code_owned",
                     "valid": True,
                     "violations": [],
                 }
             )
-            fragments.append(response)
+            fragments.append(fragment)
 
         part = f"## {group[0]}\n\n" + "\n\n".join(fragments)
         try:
@@ -2042,10 +1808,9 @@ def _write_batched_domain_v2_paper_sections(
                     "part": part_name,
                     "title_slot": False,
                     "expected_major_sections": list(group),
+                    "assembly_kind": "code_owned",
                     "batches": batch_entries,
                     "full_replay_valid": False,
-                    "citation_outbound_count": citation_outbound_count,
-                    "citation_outbound_limit": citation_outbound_limit,
                 }
             )
             _persist_section_generation_report(stage_dir, report_entries)
@@ -2059,10 +1824,9 @@ def _write_batched_domain_v2_paper_sections(
                 "part": part_name,
                 "title_slot": False,
                 "expected_major_sections": list(group),
+                "assembly_kind": "code_owned",
                 "batches": batch_entries,
                 "full_replay_valid": True,
-                "citation_outbound_count": citation_outbound_count,
-                "citation_outbound_limit": citation_outbound_limit,
             }
         )
         _persist_section_generation_report(stage_dir, report_entries)

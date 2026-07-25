@@ -28,7 +28,10 @@ from researchclaw.experiment_runtime.contract import (
     sha256_file,
 )
 from researchclaw.hitl.intervention import HumanAction, HumanInput
-from researchclaw.literature.citation_plan import CitationAnchor
+from researchclaw.literature.citation_plan import (
+    CitationAnchor,
+    CitationPlanContractError,
+)
 from researchclaw.llm.client import LLMClient, LLMConfig, LLMResponse
 from researchclaw.pipeline import executor as rc_executor
 from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
@@ -4669,7 +4672,7 @@ class TestDataIntegrityBlock:
         ):
             assert not (stage_dir / name).exists()
 
-    def test_domain_v2_invalid_scaffold_exhaustion_clears_success_authority(
+    def test_domain_v2_code_owned_anchor_failure_clears_success_authority(
         self,
         run_dir: Path,
         rc_config: RCConfig,
@@ -4706,19 +4709,13 @@ class TestDataIntegrityBlock:
             cite_key="smith2024deep",
         )
 
-        class InvalidScaffoldLLM(LLMClient):
+        class NoCitationCallLLM(LLMClient):
             def __init__(self) -> None:
                 super().__init__(
                     LLMConfig(
                         base_url="https://primary.invalid/v1",
                         api_key="test-key",
                         primary_model="primary-model",
-                    )
-                )
-                self.responses = iter(
-                    (
-                        '{"after":"","before":"unauthorized prose"}',
-                        "not-json",
                     )
                 )
                 self.calls: list[str] = []
@@ -4730,12 +4727,9 @@ class TestDataIntegrityBlock:
             ) -> LLMResponse:
                 del messages, kwargs
                 self.calls.append("citation")
-                return LLMResponse(
-                    content=next(self.responses),
-                    model=self.config.primary_model,
-                )
+                raise AssertionError("code-owned citation anchor called the provider")
 
-        llm = InvalidScaffoldLLM()
+        llm = NoCitationCallLLM()
 
         def write_invalid_scaffold(
             *_args: object,
@@ -4756,6 +4750,13 @@ class TestDataIntegrityBlock:
             "_write_paper_sections",
             write_invalid_scaffold,
         )
+        monkeypatch.setattr(
+            _paper_writing,
+            "validate_citation_free_anchor_fragment",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                CitationPlanContractError("forced code-owned anchor failure")
+            ),
+        )
 
         result = rc_executor._execute_paper_draft(
             stage_dir,
@@ -4766,17 +4767,9 @@ class TestDataIntegrityBlock:
         )
 
         assert result.status == StageStatus.FAILED
-        assert "citation scaffold response is invalid" in (result.error or "")
-        assert llm.calls == ["citation", "citation"]
-        assert (stage_dir / "paper_draft_invalid.md").exists()
-        generation = json.loads(
-            (stage_dir / "section_generation_report.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        related = generation["parts"][0]
-        assert related["batches"][0]["attempt_count"] == 2
-        assert related["citation_outbound_count"] == 2
+        assert "forced code-owned anchor failure" in (result.error or "")
+        assert llm.calls == []
+        assert not (stage_dir / "paper_draft_invalid.md").exists()
         for name in (
             "paper_draft.md",
             "experiment_fact_closure_report.json",
