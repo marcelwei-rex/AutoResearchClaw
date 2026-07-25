@@ -1,9 +1,9 @@
-"""Strict B1 contracts and identities for structured scientific claims.
+"""Strict contracts and deterministic construction for scientific claims.
 
-This module deliberately does not activate any pipeline stage, build a claim
-registry, or implement deterministic rendering.  It validates canonical bytes,
-closed record shapes, trusted source/CFS/generation bindings, self-excluding
-record identities, and the structural selection response.
+This B1-B2 module deliberately does not activate any pipeline stage.  It
+validates canonical bytes, closed record shapes, trusted source/CFS/generation
+bindings, self-excluding identities, code-owned construction and rendering,
+and section-aware semantic selection.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import PurePosixPath
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from researchclaw.experiment_runtime.contract import (
     ContractValidationError,
@@ -101,6 +101,98 @@ _SELECTION_FIELDS = frozenset(
         "connector_template_ids",
     }
 )
+_RENDERED_CITATION_RE = re.compile(
+    r"\[[^\]]+\]|\([^()]*\b(?:19|20)[0-9]{2}[a-z]?\b[^()]*\)"
+)
+_RENDERED_TERMINATOR_RE = re.compile(r"[.!?](?=$|\s)")
+
+
+@dataclass(frozen=True)
+class _EvidenceFactSpec:
+    fact_kind: str
+    subject_id: str
+    predicate_id: str
+    object_kind: str
+    unit_id: str
+    cfs_key: str
+    source_json_pointer: str
+
+
+@dataclass(frozen=True)
+class _RendererTemplateSpec:
+    template_id: str
+    claim_kind: str
+    section_id: str
+    mandatory: bool
+    slot_fact_kinds: tuple[str, ...]
+    literal_parts: tuple[str, ...]
+
+
+_EVIDENCE_FACT_REGISTRY = (
+    _EvidenceFactSpec(
+        "primary_condition",
+        "primary_metric",
+        "condition",
+        "string",
+        "NONE",
+        "condition",
+        "/primary_metric/condition",
+    ),
+    _EvidenceFactSpec(
+        "primary_metric_key",
+        "primary_metric",
+        "metric_key",
+        "string",
+        "NONE",
+        "key",
+        "/primary_metric/key",
+    ),
+    _EvidenceFactSpec(
+        "primary_aggregation",
+        "primary_metric",
+        "aggregation_policy",
+        "string",
+        "NONE",
+        "aggregation",
+        "/primary_metric/aggregation",
+    ),
+    _EvidenceFactSpec(
+        "primary_observation_set",
+        "primary_metric",
+        "observation_set",
+        "string",
+        "NONE",
+        "observation_set",
+        "/primary_metric/observation_set",
+    ),
+    _EvidenceFactSpec(
+        "primary_metric_value",
+        "primary_metric",
+        "value",
+        "decimal",
+        "NONE",
+        "value",
+        "/primary_metric/value",
+    ),
+)
+_RENDERER_TEMPLATE_REGISTRY = (
+    _RendererTemplateSpec(
+        template_id="result.primary_metric.v1",
+        claim_kind="primary_metric_result",
+        section_id="results",
+        mandatory=True,
+        slot_fact_kinds=tuple(spec.fact_kind for spec in _EVIDENCE_FACT_REGISTRY),
+        literal_parts=(
+            "For primary condition ",
+            ", ",
+            " under ",
+            " over ",
+            " was ",
+            ".",
+        ),
+    ),
+)
+_METRIC_DISPLAY_LABELS = (("auprc", "AUPRC"),)
 
 
 class ScientificClaimAuthorityError(ValueError):
@@ -227,6 +319,37 @@ class ScientificClaimSelection:
 
     def canonical_bytes(self) -> bytes:
         return _canonical_bytes(self.to_dict())
+
+
+@dataclass(frozen=True)
+class RenderedScientificClaim:
+    """Exact sentence bytes and digest produced by a code-owned template."""
+
+    sentence: str
+    content: bytes
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ScientificClaimAuthorityRegistry:
+    """Immutable B2 fact and claim registries for one generation."""
+
+    facts: tuple[EvidenceFact, ...]
+    claims: tuple[ScientificClaimRecord, ...]
+
+    def facts_bytes(self) -> bytes:
+        return _canonical_bytes([fact.to_dict() for fact in self.facts])
+
+    def claims_bytes(self) -> bytes:
+        return _canonical_bytes([claim.to_dict() for claim in self.claims])
+
+    @property
+    def facts_sha256(self) -> str:
+        return hashlib.sha256(self.facts_bytes()).hexdigest()
+
+    @property
+    def claims_sha256(self) -> str:
+        return hashlib.sha256(self.claims_bytes()).hexdigest()
 
 
 def bind_scientific_claim_source(
@@ -517,6 +640,543 @@ def parse_scientific_claim_selection(content: bytes) -> ScientificClaimSelection
             "connector policy v1 accepts only NONE IDs"
         )
     return ScientificClaimSelection(selected, ordered, tuple(connectors))
+
+
+def build_scientific_claim_registry(
+    binding: ScientificClaimGenerationBinding,
+) -> ScientificClaimAuthorityRegistry:
+    """Build the closed B2 fact and claim registries from captured authority."""
+
+    _validate_code_owned_registries()
+    binding = _rebuild_generation_binding(binding)
+    try:
+        cfs = build_canonical_fact_sheet(binding.evidence)
+    except (CFSIntegrityError, CanonicalExperimentEvidenceError) as exc:
+        raise ScientificClaimAuthorityError(
+            f"cannot rebuild scientific claim CFS: {exc}"
+        ) from exc
+    if not isinstance(cfs, Mapping):
+        raise ScientificClaimAuthorityError("rebuilt CFS must be an object")
+    _true_int_one(cfs.get("schema_version"), "CFS schema_version")
+    primary_metric = cfs.get("primary_metric")
+    expected_primary_fields = {spec.cfs_key for spec in _EVIDENCE_FACT_REGISTRY}
+    if (
+        not isinstance(primary_metric, Mapping)
+        or set(primary_metric) != expected_primary_fields
+    ):
+        raise ScientificClaimAuthorityError(
+            "rebuilt CFS primary_metric schema mismatch"
+        )
+
+    source = bind_scientific_claim_source(
+        binding, binding.canonical_experiment_evidence_path
+    )
+    facts: list[EvidenceFact] = []
+    for spec in _EVIDENCE_FACT_REGISTRY:
+        source_value = _resolve_canonical_json_pointer(
+            source.content, spec.source_json_pointer
+        )
+        source_object_value = _fact_object_value(spec, source_value)
+        cfs_object_value = _fact_object_value(
+            spec, primary_metric[spec.cfs_key]
+        )
+        if source_object_value != cfs_object_value:
+            raise ScientificClaimAuthorityError(
+                f"CFS/source exact mismatch for {spec.fact_kind}"
+            )
+        payload: dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
+            "fact_id": "0" * 64,
+            "fact_kind": spec.fact_kind,
+            "subject_id": spec.subject_id,
+            "predicate_id": spec.predicate_id,
+            "object_kind": spec.object_kind,
+            "object_value": source_object_value,
+            "unit_id": spec.unit_id,
+            "source_path": source.path,
+            "source_sha256": source.sha256,
+            "source_json_pointer": spec.source_json_pointer,
+            "cfs_schema_version": binding.cfs_schema_version,
+            "cfs_sha256": binding.cfs_sha256,
+            "generation_binding_sha256": binding.generation_binding_sha256,
+        }
+        payload["fact_id"] = evidence_fact_id(payload)
+        facts.append(
+            parse_evidence_fact(
+                _canonical_bytes(payload),
+                binding=binding,
+                source=source,
+            )
+        )
+
+    fact_tuple = tuple(facts)
+    claims: list[ScientificClaimRecord] = []
+    for template in _RENDERER_TEMPLATE_REGISTRY:
+        slot_facts = _slot_facts_for_template(template, fact_tuple)
+        rendered = _render_template(template, slot_facts)
+        evidence_fact_ids = tuple(sorted(fact.fact_id for fact in slot_facts))
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "claim_id": "0" * 64,
+            "claim_kind": template.claim_kind,
+            "section_id": template.section_id,
+            "evidence_fact_ids": list(evidence_fact_ids),
+            "renderer_template_id": template.template_id,
+            "renderer_slot_fact_ids": [
+                fact.fact_id for fact in slot_facts
+            ],
+            "rendered_sentence": rendered.sentence,
+            "rendered_sentence_sha256": rendered.sha256,
+            "mandatory": template.mandatory,
+            "source_path": source.path,
+            "source_sha256": source.sha256,
+            "cfs_schema_version": binding.cfs_schema_version,
+            "cfs_sha256": binding.cfs_sha256,
+            "generation_binding_sha256": binding.generation_binding_sha256,
+        }
+        payload["claim_id"] = scientific_claim_id(payload)
+        claims.append(
+            parse_scientific_claim_record(
+                _canonical_bytes(payload),
+                binding=binding,
+                source=source,
+            )
+        )
+    return ScientificClaimAuthorityRegistry(fact_tuple, tuple(claims))
+
+
+def validate_scientific_claim_registry(
+    registry: ScientificClaimAuthorityRegistry,
+    *,
+    binding: ScientificClaimGenerationBinding,
+) -> ScientificClaimAuthorityRegistry:
+    """Independently rebuild and semantically replay one in-memory registry."""
+
+    if not isinstance(registry, ScientificClaimAuthorityRegistry):
+        raise ScientificClaimAuthorityError(
+            "scientific claim registry must be code-built"
+        )
+    expected = build_scientific_claim_registry(binding)
+    source = bind_scientific_claim_source(
+        binding, binding.canonical_experiment_evidence_path
+    )
+    if len(registry.facts) != len(_EVIDENCE_FACT_REGISTRY):
+        raise ScientificClaimAuthorityError("fact registry cardinality mismatch")
+    for index, (fact, spec) in enumerate(
+        zip(registry.facts, _EVIDENCE_FACT_REGISTRY, strict=True)
+    ):
+        if not isinstance(fact, EvidenceFact):
+            raise ScientificClaimAuthorityError(
+                f"fact registry record {index} has the wrong type"
+            )
+        if not _fact_matches_spec(fact, spec):
+            raise ScientificClaimAuthorityError(
+                f"fact registry semantic mismatch at index {index}"
+            )
+        parse_evidence_fact(
+            fact.canonical_bytes(),
+            binding=binding,
+            source=source,
+        )
+    if registry.facts != expected.facts:
+        raise ScientificClaimAuthorityError(
+            "fact registry differs from code-owned construction"
+        )
+
+    if len(registry.claims) != len(_RENDERER_TEMPLATE_REGISTRY):
+        raise ScientificClaimAuthorityError("claim registry cardinality mismatch")
+    fact_by_id = {fact.fact_id: fact for fact in registry.facts}
+    for index, (claim, template) in enumerate(
+        zip(registry.claims, _RENDERER_TEMPLATE_REGISTRY, strict=True)
+    ):
+        if not isinstance(claim, ScientificClaimRecord):
+            raise ScientificClaimAuthorityError(
+                f"claim registry record {index} has the wrong type"
+            )
+        if (
+            claim.claim_kind != template.claim_kind
+            or claim.section_id != template.section_id
+            or claim.renderer_template_id != template.template_id
+            or claim.mandatory is not template.mandatory
+        ):
+            raise ScientificClaimAuthorityError(
+                f"claim registry semantic mismatch at index {index}"
+            )
+        try:
+            slot_facts = tuple(
+                fact_by_id[fact_id]
+                for fact_id in claim.renderer_slot_fact_ids
+            )
+        except KeyError as exc:
+            raise ScientificClaimAuthorityError(
+                "claim registry references an unknown fact"
+            ) from exc
+        rendered = _render_template(template, slot_facts)
+        if (
+            rendered.content != claim.rendered_sentence.encode("utf-8")
+            or rendered.sha256 != claim.rendered_sentence_sha256
+        ):
+            raise ScientificClaimAuthorityError(
+                "claim rerender does not match stored sentence bytes"
+            )
+        parse_scientific_claim_record(
+            claim.canonical_bytes(),
+            binding=binding,
+            source=source,
+        )
+    if registry.claims != expected.claims:
+        raise ScientificClaimAuthorityError(
+            "claim registry differs from code-owned construction"
+        )
+    if len({fact.fact_id for fact in registry.facts}) != len(registry.facts):
+        raise ScientificClaimAuthorityError("fact registry contains duplicate IDs")
+    if len({claim.claim_id for claim in registry.claims}) != len(registry.claims):
+        raise ScientificClaimAuthorityError("claim registry contains duplicate IDs")
+    return registry
+
+
+def render_scientific_claim(
+    template_id: str,
+    renderer_slot_fact_ids: Sequence[str],
+    *,
+    registry: ScientificClaimAuthorityRegistry,
+    binding: ScientificClaimGenerationBinding,
+) -> RenderedScientificClaim:
+    """Render one code-owned template from an independently replayed registry."""
+
+    validate_scientific_claim_registry(registry, binding=binding)
+    template = _template_for_id(template_id)
+    if isinstance(renderer_slot_fact_ids, (str, bytes)) or not isinstance(
+        renderer_slot_fact_ids, Sequence
+    ):
+        raise ScientificClaimAuthorityError(
+            "renderer slot fact IDs must be an ordered sequence"
+        )
+    fact_by_id = {fact.fact_id: fact for fact in registry.facts}
+    try:
+        slot_facts = tuple(
+            fact_by_id[_sha256(fact_id, "renderer slot fact ID")]
+            for fact_id in renderer_slot_fact_ids
+        )
+    except KeyError as exc:
+        raise ScientificClaimAuthorityError(
+            "renderer references an unknown fact"
+        ) from exc
+    return _render_template(template, slot_facts)
+
+
+def validate_scientific_claim_selection(
+    content: bytes,
+    *,
+    target_section: str,
+    binding: ScientificClaimGenerationBinding,
+) -> ScientificClaimSelection:
+    """Apply registry membership, section, and mandatory selection semantics."""
+
+    if type(target_section) is not str or target_section not in _SECTION_IDS:
+        raise ScientificClaimAuthorityError("target section is unsupported")
+    selection = parse_scientific_claim_selection(content)
+    registry = build_scientific_claim_registry(binding)
+    claim_by_id = {claim.claim_id: claim for claim in registry.claims}
+    unknown = [
+        claim_id
+        for claim_id in selection.selected_claim_ids
+        if claim_id not in claim_by_id
+    ]
+    if unknown:
+        raise ScientificClaimAuthorityError(
+            "selection contains an unknown claim ID"
+        )
+    if any(
+        claim_by_id[claim_id].section_id != target_section
+        for claim_id in selection.selected_claim_ids
+    ):
+        raise ScientificClaimAuthorityError(
+            "selection contains a claim from another section"
+        )
+    mandatory = {
+        claim.claim_id
+        for claim in registry.claims
+        if claim.section_id == target_section and claim.mandatory
+    }
+    if not mandatory.issubset(selection.selected_claim_ids):
+        raise ScientificClaimAuthorityError(
+            "selection omits a mandatory claim"
+        )
+    return selection
+
+
+def render_scientific_claim_selection(
+    content: bytes,
+    *,
+    target_section: str,
+    binding: ScientificClaimGenerationBinding,
+) -> bytes:
+    """Render one validated section selection without paths, files, or LLMs."""
+
+    selection = validate_scientific_claim_selection(
+        content,
+        target_section=target_section,
+        binding=binding,
+    )
+    registry = build_scientific_claim_registry(binding)
+    claim_by_id = {claim.claim_id: claim for claim in registry.claims}
+    sentences = tuple(
+        claim_by_id[claim_id].rendered_sentence.encode("utf-8")
+        for claim_id in selection.ordered_claim_ids
+    )
+    return _join_rendered_sentences(
+        sentences, selection.connector_template_ids
+    )
+
+
+def render_connector(template_id: object) -> bytes:
+    """Render connector policy v1; ``NONE`` itself emits no bytes."""
+
+    if type(template_id) is not str or template_id != "NONE":
+        raise ScientificClaimAuthorityError(
+            "connector policy v1 accepts only NONE without parameters"
+        )
+    return b""
+
+
+def _join_rendered_sentences(
+    sentences: Sequence[bytes], connector_template_ids: Sequence[str]
+) -> bytes:
+    if isinstance(sentences, (str, bytes)) or not isinstance(sentences, Sequence):
+        raise ScientificClaimAuthorityError("rendered sentences must be byte records")
+    if isinstance(connector_template_ids, (str, bytes)) or not isinstance(
+        connector_template_ids, Sequence
+    ):
+        raise ScientificClaimAuthorityError("connector IDs must be a sequence")
+    if len(connector_template_ids) != max(len(sentences) - 1, 0):
+        raise ScientificClaimAuthorityError("connector template count is invalid")
+    validated: list[bytes] = []
+    for sentence in sentences:
+        if type(sentence) is not bytes:
+            raise ScientificClaimAuthorityError(
+                "rendered sentence content must be exact bytes"
+            )
+        try:
+            text = sentence.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ScientificClaimAuthorityError(
+                "rendered sentence bytes are not UTF-8"
+            ) from exc
+        _validate_rendered_sentence(text)
+        if text.encode("utf-8") != sentence:
+            raise ScientificClaimAuthorityError(
+                "rendered sentence byte replay mismatch"
+            )
+        validated.append(sentence)
+    for connector in connector_template_ids:
+        if render_connector(connector) != b"":
+            raise ScientificClaimAuthorityError(
+                "NONE connector emitted unexpected bytes"
+            )
+    return b" ".join(validated)
+
+
+def _validate_code_owned_registries() -> None:
+    fact_kinds = tuple(spec.fact_kind for spec in _EVIDENCE_FACT_REGISTRY)
+    if len(fact_kinds) != len(set(fact_kinds)):
+        raise ScientificClaimAuthorityError(
+            "code-owned fact registry contains duplicates"
+        )
+    template_ids = tuple(
+        template.template_id for template in _RENDERER_TEMPLATE_REGISTRY
+    )
+    if len(template_ids) != len(set(template_ids)):
+        raise ScientificClaimAuthorityError(
+            "code-owned template registry contains duplicates"
+        )
+    claim_keys = tuple(
+        (template.claim_kind, template.section_id)
+        for template in _RENDERER_TEMPLATE_REGISTRY
+    )
+    if len(claim_keys) != len(set(claim_keys)):
+        raise ScientificClaimAuthorityError(
+            "code-owned claim registry contains duplicates"
+        )
+    known_fact_kinds = set(fact_kinds)
+    for template in _RENDERER_TEMPLATE_REGISTRY:
+        if (
+            len(template.literal_parts) != len(template.slot_fact_kinds) + 1
+            or len(template.slot_fact_kinds)
+            != len(set(template.slot_fact_kinds))
+            or any(
+                fact_kind not in known_fact_kinds
+                for fact_kind in template.slot_fact_kinds
+            )
+        ):
+            raise ScientificClaimAuthorityError(
+                f"code-owned template registry is invalid: {template.template_id}"
+            )
+
+
+def _fact_object_value(spec: _EvidenceFactSpec, value: object) -> str:
+    if spec.object_kind == "decimal":
+        if isinstance(value, bool) or not isinstance(value, (int, Decimal)):
+            raise ScientificClaimAuthorityError(
+                f"{spec.fact_kind} must resolve to a finite decimal"
+            )
+        try:
+            return canonical_decimal(value)
+        except CanonicalExperimentEvidenceError as exc:
+            raise ScientificClaimAuthorityError(
+                f"{spec.fact_kind} decimal is invalid: {exc}"
+            ) from exc
+    if spec.object_kind == "string":
+        if (
+            type(value) is not str
+            or len(value) > 128
+            or _REGISTRY_ID_RE.fullmatch(value) is None
+        ):
+            raise ScientificClaimAuthorityError(
+                f"{spec.fact_kind} is not an admitted data string"
+            )
+        return value
+    raise ScientificClaimAuthorityError(
+        f"unsupported code-owned fact object kind: {spec.object_kind}"
+    )
+
+
+def _fact_matches_spec(fact: EvidenceFact, spec: _EvidenceFactSpec) -> bool:
+    return (
+        fact.fact_kind == spec.fact_kind
+        and fact.subject_id == spec.subject_id
+        and fact.predicate_id == spec.predicate_id
+        and fact.object_kind == spec.object_kind
+        and fact.unit_id == spec.unit_id
+        and fact.source_json_pointer == spec.source_json_pointer
+    )
+
+
+def _template_for_id(template_id: object) -> _RendererTemplateSpec:
+    if type(template_id) is not str:
+        raise ScientificClaimAuthorityError(
+            "renderer template ID must be a string"
+        )
+    _validate_code_owned_registries()
+    for template in _RENDERER_TEMPLATE_REGISTRY:
+        if template.template_id == template_id:
+            return template
+    raise ScientificClaimAuthorityError("renderer template ID is unknown")
+
+
+def _slot_facts_for_template(
+    template: _RendererTemplateSpec, facts: Sequence[EvidenceFact]
+) -> tuple[EvidenceFact, ...]:
+    by_kind = {fact.fact_kind: fact for fact in facts}
+    if len(by_kind) != len(facts):
+        raise ScientificClaimAuthorityError(
+            "fact registry contains duplicate semantic kinds"
+        )
+    try:
+        return tuple(by_kind[kind] for kind in template.slot_fact_kinds)
+    except KeyError as exc:
+        raise ScientificClaimAuthorityError(
+            "template requires an unavailable fact kind"
+        ) from exc
+
+
+def _render_template(
+    template: _RendererTemplateSpec,
+    slot_facts: Sequence[EvidenceFact],
+) -> RenderedScientificClaim:
+    if len(slot_facts) != len(template.slot_fact_kinds):
+        raise ScientificClaimAuthorityError("renderer template arity mismatch")
+    values: list[str] = []
+    spec_by_kind = {
+        spec.fact_kind: spec for spec in _EVIDENCE_FACT_REGISTRY
+    }
+    for index, (fact, expected_kind) in enumerate(
+        zip(slot_facts, template.slot_fact_kinds, strict=True)
+    ):
+        spec = spec_by_kind[expected_kind]
+        if not isinstance(fact, EvidenceFact) or not _fact_matches_spec(fact, spec):
+            raise ScientificClaimAuthorityError(
+                f"renderer slot semantic mismatch at index {index}"
+            )
+        value = _fact_object_value(spec, _fact_typed_value(fact))
+        if fact.fact_kind == "primary_metric_key":
+            labels = dict(_METRIC_DISPLAY_LABELS)
+            if value not in labels:
+                raise ScientificClaimAuthorityError(
+                    "primary metric has no code-owned display label"
+                )
+            value = labels[value]
+        values.append(value)
+
+    pieces: list[str] = [template.literal_parts[0]]
+    for value, literal in zip(
+        values, template.literal_parts[1:], strict=True
+    ):
+        pieces.extend((value, literal))
+    sentence = "".join(pieces)
+    _validate_rendered_sentence(sentence)
+    content = sentence.encode("utf-8")
+    return RenderedScientificClaim(
+        sentence=sentence,
+        content=content,
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+
+
+def _fact_typed_value(fact: EvidenceFact) -> object:
+    if fact.object_kind == "decimal":
+        try:
+            return Decimal(fact.object_value)
+        except Exception as exc:
+            raise ScientificClaimAuthorityError(
+                "renderer decimal fact is invalid"
+            ) from exc
+    if fact.object_kind == "string":
+        return fact.object_value
+    raise ScientificClaimAuthorityError(
+        "renderer fact object kind is unsupported"
+    )
+
+
+def _validate_rendered_sentence(sentence: object) -> str:
+    sentence = _canonical_string(
+        sentence, "rendered sentence", allow_empty=False
+    )
+    if any(
+        ord(character) < 0x20 or ord(character) == 0x7F
+        for character in sentence
+    ):
+        raise ScientificClaimAuthorityError(
+            "rendered sentence contains a control character"
+        )
+    if sentence.lstrip().startswith("#") or _RENDERED_CITATION_RE.search(sentence):
+        raise ScientificClaimAuthorityError(
+            "rendered sentence contains forbidden markup or citation syntax"
+        )
+    if sentence[-1] not in ".!?":
+        raise ScientificClaimAuthorityError(
+            "rendered sentence lacks terminal punctuation"
+        )
+    for index, character in enumerate(sentence[:-1]):
+        if character not in ".!?":
+            continue
+        if (
+            character == "."
+            and index > 0
+            and sentence[index - 1].isascii()
+            and sentence[index - 1].isdigit()
+            and sentence[index + 1].isascii()
+            and sentence[index + 1].isdigit()
+        ):
+            continue
+        raise ScientificClaimAuthorityError(
+            "renderer must emit exactly one terminally punctuated sentence"
+        )
+    if len(_RENDERED_TERMINATOR_RE.findall(sentence)) != 1:
+        raise ScientificClaimAuthorityError(
+            "renderer must emit exactly one terminally punctuated sentence"
+        )
+    return sentence
 
 
 def _parse_canonical_object(
