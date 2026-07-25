@@ -2026,6 +2026,8 @@ def replay_citation_closure(
     citation_allowlist_bytes: bytes,
     citation_authority: ReplayedCitationAuthority,
     evidence: CanonicalExperimentEvidence,
+    citation_inputs: CitationPlanReplayInputs | None = None,
+    project_root: Path | None = None,
 ) -> dict[str, Any]:
     """Replay captured Stage 17 closure bytes without reopening run inputs."""
 
@@ -2048,6 +2050,49 @@ def replay_citation_closure(
             raise CitationPlanContractError(
                 "citation closure allowlist is not provenance-replayed"
             )
+        if citation_authority.plan["plan_version"] == CITATION_PLAN_DOMAIN_VERSION:
+            if citation_inputs is None or project_root is None:
+                raise CitationPlanContractError(
+                    "domain citation closure lacks typed replay inputs"
+                )
+            from researchclaw.pipeline.stage17_typed_citation_authority import (
+                CitationTypedAuthorityError,
+                project_typed_citation_authority,
+            )
+
+            try:
+                typed = project_typed_citation_authority(
+                    inputs=citation_inputs,
+                    citation_authority=citation_authority,
+                    evidence=evidence,
+                    project_root=project_root,
+                )
+            except CitationTypedAuthorityError as exc:
+                raise CitationPlanContractError(
+                    f"typed citation closure replay failed: {exc}"
+                ) from exc
+            expected_claims = tuple(
+                (
+                    claim["claim_id"],
+                    claim["section_path"][0],
+                    claim["planned_citations"][0]["cite_key"],
+                    claim["claim_text"].encode("utf-8"),
+                )
+                for claim in citation_authority.plan["claims"]
+            )
+            actual_claims = tuple(
+                (
+                    claim.claim_id,
+                    claim.heading,
+                    claim.cite_key,
+                    claim.claim_text_bytes,
+                )
+                for claim in typed.manuscript_claims
+            )
+            if actual_claims != expected_claims:
+                raise CitationPlanContractError(
+                    "typed manuscript claim projection mismatch"
+                )
         expected = build_citation_closure_from_texts(
             paper_text=paper_text,
             structure_report_text=structure_text,

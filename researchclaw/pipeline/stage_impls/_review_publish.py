@@ -275,6 +275,8 @@ def _load_bound_stage19_inputs(
         citation_allowlist_bytes=bundle.citation_allowlist.content,
         citation_authority=citation_authority,
         evidence=evidence,
+        citation_inputs=bundle.citation_replay_inputs(),
+        project_root=run_dir,
     )
     if (
         fact_report["paper_sha256"] != bundle.paper.sha256

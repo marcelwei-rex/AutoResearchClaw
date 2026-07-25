@@ -4587,6 +4587,7 @@ class TestDataIntegrityBlock:
         stage_dir = run_dir / "stage-17"
         stage_dir.mkdir(parents=True, exist_ok=True)
         captured = SimpleNamespace(
+            inputs=None,
             replayed=SimpleNamespace(
                 effective_policy={
                     "effective_min_unique_sources": 1,
@@ -4627,8 +4628,12 @@ class TestDataIntegrityBlock:
         )
         monkeypatch.setattr(
             _paper_writing,
-            "project_citation_anchors",
-            lambda _plan: (),
+            "project_typed_citation_authority",
+            lambda **_kwargs: _paper_writing.TypedCitationAuthority(
+                claim_scope="pipeline_validation",
+                evidence_anchors=(),
+                manuscript_claims=(),
+            ),
         )
 
         def write_draft(*_args: object, **kwargs: object) -> str:

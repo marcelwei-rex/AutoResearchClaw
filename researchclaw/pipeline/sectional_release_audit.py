@@ -225,6 +225,8 @@ def audit_sectional_revision(
             citation_allowlist_bytes=inputs.citation_allowlist.content,
             citation_authority=citation_authority,
             evidence=evidence,
+            citation_inputs=inputs.citation_replay_inputs(),
+            project_root=run_dir,
         )
     except (
         Stage19InputBundleError,

@@ -41,7 +41,6 @@ from researchclaw.literature.citation_plan import (
     # Stable monkeypatch seam for legacy executor fixtures.
     load_final_citation_plan,
     parse_strict_citation_occurrences,
-    project_citation_anchors,
     require_citation_candidate_free,
     strict_citation_keys,
     strict_sentence_spans,
@@ -99,6 +98,11 @@ from researchclaw.pipeline.canonical_fact_sheet import (
     build_citation_usage_authority,
     build_heading_grounding_contexts,
     fact_sheet_view_for_heading,
+)
+from researchclaw.pipeline.stage17_typed_citation_authority import (
+    CitationTypedAuthorityError,
+    TypedCitationAuthority,
+    project_typed_citation_authority,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.pipeline.stage15_decision_projection import (
@@ -2914,6 +2918,20 @@ def _execute_paper_draft(
         return result
 
 
+def _citation_anchors_from_typed_authority(
+    authority: TypedCitationAuthority,
+) -> tuple[CitationAnchor, ...]:
+    return tuple(
+        CitationAnchor(
+            claim_id=claim.claim_id,
+            heading=claim.heading,
+            claim_text=claim.claim_text_bytes.decode("utf-8"),
+            cite_key=claim.cite_key,
+        )
+        for claim in authority.manuscript_claims
+    )
+
+
 def _execute_paper_draft_under_release_epoch(
     stage_dir: Path,
     run_dir: Path,
@@ -2942,6 +2960,7 @@ def _execute_paper_draft_under_release_epoch(
         "references_preverified.bib",
     ):
         (stage_dir / owned_name).unlink(missing_ok=True)
+    typed_citation_authority: TypedCitationAuthority | None = None
     try:
         evidence = load_canonical_experiment_evidence(run_dir)
         canonical_fact_sheet = build_canonical_fact_sheet(evidence)
@@ -2972,6 +2991,13 @@ def _execute_paper_draft_under_release_epoch(
             if canonical_fact_sheet is not None
             else None
         )
+        if captured_citation_authority is not None:
+            typed_citation_authority = project_typed_citation_authority(
+                inputs=captured_citation_authority.inputs,
+                citation_authority=captured_citation_authority.replayed,
+                evidence=evidence,
+                project_root=run_dir,
+            )
         effective_citation_policy = (
             captured_citation_authority.replayed.effective_policy
             if captured_citation_authority is not None
@@ -2980,6 +3006,7 @@ def _execute_paper_draft_under_release_epoch(
     except (
         CanonicalExperimentEvidenceError,
         CFSIntegrityError,
+        CitationTypedAuthorityError,
         CitationPolicyContractError,
         OSError,
         UnicodeDecodeError,
@@ -3353,11 +3380,11 @@ def _execute_paper_draft_under_release_epoch(
             )
         )
         citation_anchors = (
-            project_citation_anchors(final_citation_plan)
-            if canonical_fact_sheet is not None
+            _citation_anchors_from_typed_authority(typed_citation_authority)
+            if typed_citation_authority is not None
             else ()
         )
-    except CitationPlanContractError as exc:
+    except (CitationPlanContractError, CitationTypedAuthorityError) as exc:
         return StageResult(
             stage=Stage.PAPER_DRAFT,
             status=StageStatus.FAILED,
@@ -3610,7 +3637,16 @@ def _execute_paper_draft_under_release_epoch(
                     captured_citation_authority,
                     release_lock=release_lock,
                 )
-            except CitationPlanContractError as exc:
+                if project_typed_citation_authority(
+                    inputs=captured_citation_authority.inputs,
+                    citation_authority=captured_citation_authority.replayed,
+                    evidence=evidence,
+                    project_root=run_dir,
+                ) != typed_citation_authority:
+                    raise CitationTypedAuthorityError(
+                        "typed citation authority changed after generation"
+                    )
+            except (CitationPlanContractError, CitationTypedAuthorityError) as exc:
                 (stage_dir / "paper_draft_invalid.md").write_text(
                     draft, encoding="utf-8"
                 )
@@ -3870,6 +3906,15 @@ Generated: {_utcnow_iso()}
                 captured_citation_authority,
                 release_lock=release_lock,
             )
+            if project_typed_citation_authority(
+                inputs=captured_citation_authority.inputs,
+                citation_authority=captured_citation_authority.replayed,
+                evidence=evidence,
+                project_root=run_dir,
+            ) != typed_citation_authority:
+                raise CitationTypedAuthorityError(
+                    "typed citation authority changed before closure"
+                )
             citation_report = build_citation_closure_from_texts(
                 paper_text=final_draft,
                 structure_report_text=(
@@ -3908,8 +3953,18 @@ Generated: {_utcnow_iso()}
                 captured_citation_authority,
                 release_lock=release_lock,
             )
+            if project_typed_citation_authority(
+                inputs=captured_citation_authority.inputs,
+                citation_authority=captured_citation_authority.replayed,
+                evidence=evidence,
+                project_root=run_dir,
+            ) != typed_citation_authority:
+                raise CitationTypedAuthorityError(
+                    "typed citation authority changed after publication replay"
+                )
     except (
         CitationPlanContractError,
+        CitationTypedAuthorityError,
         ExperimentFactClosureError,
         OSError,
         UnicodeDecodeError,

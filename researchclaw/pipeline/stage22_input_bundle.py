@@ -104,6 +104,8 @@ def load_stage22_input_bundle(
             citation_allowlist_bytes=stage19_inputs.citation_allowlist.content,
             citation_authority=citation_authority,
             evidence=evidence,
+            citation_inputs=stage19_inputs.citation_replay_inputs(),
+            project_root=run_dir,
         )
         if (
             fact_report["paper_sha256"] != stage19_inputs.paper.sha256
