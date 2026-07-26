@@ -16,7 +16,7 @@ REQUIRED_STRUCTURED_CAPABILITIES = (
 )
 
 STRUCTURED_SCIENTIFIC_CLAIM_CAPABILITIES: dict[str, int] = {
-    "stage17_publication": 0,
+    "stage17_publication": 1,
     "stage19_revision": 0,
     "stage20_replay": 0,
     "stage24_and_release_integration": 0,

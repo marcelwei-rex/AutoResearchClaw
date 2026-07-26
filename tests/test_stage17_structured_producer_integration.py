@@ -40,9 +40,9 @@ from researchclaw.pipeline.stage17_structured_publication import (
 from tests.test_scientific_claim_authority import _complete_cfs, _evidence
 
 
-def test_b3b_declaration_remains_exactly_inactive() -> None:
+def test_b3_declaration_is_exactly_1000_and_structured_path_remains_inactive() -> None:
     assert capability.STRUCTURED_SCIENTIFIC_CLAIM_CAPABILITIES == {
-        "stage17_publication": 0,
+        "stage17_publication": 1,
         "stage19_revision": 0,
         "stage20_replay": 0,
         "stage24_and_release_integration": 0,
