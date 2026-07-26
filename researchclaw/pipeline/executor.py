@@ -1459,8 +1459,50 @@ def _execute_stage_under_release_scope_impl(
         )
 
     invalidate_domain_authority = False
+    structured_stage17_attempt = False
     if result.status == StageStatus.DONE:
         output_files = _select_output_files(contract, config)
+        if stage is Stage.PAPER_DRAFT:
+            from researchclaw.pipeline.stage17_structured_publication import (
+                has_structured_stage17_published_context,
+                invalidate_structured_stage17_authority,
+                validate_structured_stage17_executor_postcondition,
+            )
+
+            structured_stage17_attempt = bool(
+                result.decision == "structured-scientific-claim-v1"
+                or has_structured_stage17_published_context(release_lock)
+            )
+            if structured_stage17_attempt:
+                output_files = ()
+                try:
+                    if release_lock is None:
+                        raise RuntimeError(
+                            "structured Stage 17 postcondition requires writer epoch"
+                        )
+                    validate_structured_stage17_executor_postcondition(
+                        release_lock,
+                        artifacts=result.artifacts,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    result = StageResult(
+                        stage=stage,
+                        status=StageStatus.FAILED,
+                        artifacts=result.artifacts,
+                        error=f"Structured Stage 17 postcondition failed: {exc}",
+                        decision="retry",
+                        evidence_refs=result.evidence_refs,
+                    )
+                    try:
+                        if release_lock is None:
+                            raise RuntimeError(
+                                "structured Stage 17 cleanup requires writer epoch"
+                            )
+                        invalidate_structured_stage17_authority(release_lock)
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        result = _append_authority_cleanup_error(
+                            result, cleanup_exc
+                        )
         try:
             domain_outputs = _domain_evaluator_output_contract(
                 stage, run_dir, config
@@ -1722,7 +1764,8 @@ def _execute_stage_under_release_scope_impl(
     # fixed evaluator is likewise manifest-only, while the legacy v1 branch
     # retains its historical diagnostics namespace.
     exact_authority_namespace = (
-        stage in _EXACT_AUTHORITY_NAMESPACE_STAGES
+        structured_stage17_attempt
+        or stage in _EXACT_AUTHORITY_NAMESPACE_STAGES
         or (
             stage is Stage.EXPERIMENT_DESIGN
             and fixed_stage9_authority
@@ -1784,5 +1827,51 @@ def _execute_stage_under_release_scope_impl(
         result = _finalize_fixed_stage9_authority(
             result, run_dir, config, release_lock, stage9_namespace
         )
+
+    if structured_stage17_attempt:
+        from researchclaw.pipeline.stage17_structured_publication import (
+            clear_structured_stage17_published_context,
+            invalidate_structured_stage17_authority,
+            validate_structured_stage17_executor_postcondition,
+        )
+
+        try:
+            if release_lock is None:
+                raise RuntimeError(
+                    "structured Stage 17 terminal guard requires writer epoch"
+                )
+            if result.status is StageStatus.DONE:
+                validate_structured_stage17_executor_postcondition(
+                    release_lock,
+                    artifacts=result.artifacts,
+                )
+                clear_structured_stage17_published_context(release_lock)
+            else:
+                invalidate_structured_stage17_authority(release_lock)
+        except Exception as postcondition_exc:  # noqa: BLE001
+            if result.status is StageStatus.DONE:
+                result = StageResult(
+                    stage=stage,
+                    status=StageStatus.FAILED,
+                    artifacts=result.artifacts,
+                    error=(
+                        "Structured Stage 17 terminal postcondition failed: "
+                        f"{postcondition_exc}"
+                    ),
+                    decision="retry",
+                    evidence_refs=result.evidence_refs,
+                )
+            else:
+                result = _append_authority_cleanup_error(
+                    result, postcondition_exc
+                )
+            try:
+                if release_lock is None:
+                    raise RuntimeError(
+                        "structured Stage 17 terminal cleanup requires writer epoch"
+                    )
+                invalidate_structured_stage17_authority(release_lock)
+            except Exception as cleanup_exc:  # noqa: BLE001
+                result = _append_authority_cleanup_error(result, cleanup_exc)
 
     return result

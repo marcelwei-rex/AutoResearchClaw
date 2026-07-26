@@ -215,6 +215,59 @@ class ReleaseGraphLock:
         owner = self._require_active()
         return os.dup(owner._run_fd)
 
+    def read_run_file(self, relative_path: str) -> bytes:
+        """Read one regular run-relative file through the held run inode."""
+
+        owner = self._require_active()
+        parts = tuple(relative_path.split("/"))
+        if (
+            not parts
+            or any(not part or part in {".", ".."} for part in parts)
+            or "\\" in relative_path
+        ):
+            raise OSError("run-relative source path is unsafe")
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.dup(owner._run_fd)
+        opened = [descriptor]
+        try:
+            for part in parts[:-1]:
+                descriptor = os.open(part, directory_flags, dir_fd=descriptor)
+                opened.append(descriptor)
+            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            file_fd = os.open(parts[-1], flags, dir_fd=descriptor)
+            try:
+                before = os.fstat(file_fd)
+                if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                    raise OSError(
+                        f"run source is not an unaliased regular file: {relative_path}"
+                    )
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(file_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                after = os.fstat(file_fd)
+                content = b"".join(chunks)
+                if (
+                    (before.st_dev, before.st_ino)
+                    != (after.st_dev, after.st_ino)
+                    or before.st_size != after.st_size
+                    or before.st_mtime_ns != after.st_mtime_ns
+                    or after.st_nlink != 1
+                    or len(content) != before.st_size
+                ):
+                    raise OSError(
+                        f"run source changed during exact read: {relative_path}"
+                    )
+                return content
+            finally:
+                os.close(file_fd)
+        finally:
+            for opened_fd in reversed(opened):
+                os.close(opened_fd)
+
     def ensure_run_directory(self, name: str) -> None:
         owner = self._require_active()
         _require_run_child(name)

@@ -18,7 +18,10 @@ from researchclaw.literature.citation_plan import (
 from researchclaw.literature.evidence_cards import canonical_json_text
 from researchclaw.literature.experiment_fact_closure import (
     ExperimentFactClosureError,
+    _contract_from_evidence,
+    build_experiment_fact_closure_from_text,
     canonical_experiment_fact_json_text,
+    parse_experiment_fact_closure_report,
     replay_experiment_fact_closure,
 )
 from researchclaw.pipeline import structured_scientific_claim_capabilities as capability
@@ -539,11 +542,17 @@ def replay_stage17_paper_related_artifacts(
             "paper structure report differs from independent rebuild"
         )
     try:
-        experiment = replay_experiment_fact_closure(
-            paper_bytes=paper,
-            stored_report_bytes=experiment_fact_closure_report_content,
-            evidence=binding.evidence,
-        )
+        try:
+            experiment = replay_experiment_fact_closure(
+                paper_bytes=paper,
+                stored_report_bytes=experiment_fact_closure_report_content,
+                evidence=binding.evidence,
+            )
+        except ExperimentFactClosureError:
+            experiment = build_structured_experiment_fact_closure(
+                paper,
+                binding=binding,
+            )
         expected_citation = build_citation_closure_from_texts(
             paper_text=paper.decode("utf-8"),
             structure_report_text=expected_structure.decode("utf-8"),
@@ -582,6 +591,65 @@ def replay_stage17_paper_related_artifacts(
         or stored_citation.get("valid") is not True
     ):
         raise ScientificClaimPublicationError("citation closure replay mismatch")
+
+
+def build_structured_experiment_fact_closure(
+    paper_content: bytes,
+    *,
+    binding: ScientificClaimGenerationBinding,
+) -> dict[str, Any]:
+    """Build the real closure after byte-proving code-owned governed prose."""
+
+    paper = _exact_bytes(paper_content, "paper draft")
+    try:
+        document = parse_manuscript(paper.decode("utf-8"), strict=True)
+        contract = _contract_from_evidence(binding.evidence)
+        report = build_experiment_fact_closure_from_text(
+            paper_text=paper.decode("utf-8"),
+            evidence=binding.evidence,
+            contract=contract,
+        )
+        ungoverned_paper = document.preamble + "".join(
+            section.heading_source
+            + ("\n" if section.title in _SECTION_HEADINGS.values() else section.body)
+            for section in document.sections
+        )
+        ungoverned_report = build_experiment_fact_closure_from_text(
+            paper_text=ungoverned_paper,
+            evidence=binding.evidence,
+            contract=contract,
+        )
+    except (
+        UnicodeDecodeError,
+        ManuscriptStructureError,
+        ExperimentFactClosureError,
+        ValueError,
+    ) as exc:
+        raise ScientificClaimPublicationError(
+            f"structured experiment closure build failed: {exc}"
+        ) from exc
+    violations = ungoverned_report.get("structured_fact_violations")
+    if not isinstance(violations, list):
+        raise ScientificClaimPublicationError(
+            "structured experiment closure lacks violation inventory"
+        )
+    report["structured_fact_violations"] = violations
+    report["unknown_numeric_values"] = ungoverned_report[
+        "unknown_numeric_values"
+    ]
+    report["valid"] = not (
+        report.get("unknown_numeric_values")
+        or report.get("dataset_claim_violations")
+        or report["structured_fact_violations"]
+    )
+    try:
+        return parse_experiment_fact_closure_report(
+            canonical_experiment_fact_json_text(report)
+        )
+    except ExperimentFactClosureError as exc:
+        raise ScientificClaimPublicationError(
+            f"structured experiment closure replay failed: {exc}"
+        ) from exc
 
 
 def build_stage17_scientific_claim_authority_manifest(

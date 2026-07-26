@@ -86,11 +86,22 @@ from researchclaw.pipeline.manuscript_sections import (
     parse_manuscript,
 )
 from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
+from researchclaw.pipeline import (
+    structured_scientific_claim_capabilities as structured_claim_capability,
+)
 from researchclaw.pipeline.canonical_experiment_evidence import (
     CanonicalExperimentEvidence,
     CanonicalExperimentEvidenceError,
     canonical_decimal,
     load_canonical_experiment_evidence,
+)
+from researchclaw.pipeline.canonical_fact_sheet import _is_domain_evaluator_v2
+from researchclaw.pipeline.stage17_structured_publication import (
+    STRUCTURED_STAGE17_MANIFEST,
+    STRUCTURED_STAGE17_OUTPUTS,
+    capture_structured_stage17_sources,
+    invalidate_structured_stage17_authority,
+    publish_structured_stage17_from_capture,
 )
 from researchclaw.pipeline.canonical_fact_sheet import (
     CFSIntegrityError,
@@ -115,6 +126,24 @@ from researchclaw.pipeline.stage15_decision_projection import (
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
+
+_LEGACY_STAGE17_OWNED_NAMES = (
+    "paper_draft.md",
+    "paper_draft_invalid.md",
+    "paper_structure_report.json",
+    "section_generation_report.json",
+    "citation_closure_report.json",
+    "experiment_fact_closure_report.json",
+    "experiment_fact_closure_invalid.json",
+    "experiment_fact_closure_initial.json",
+    "experiment_fact_closure_after.json",
+    "experiment_fact_repair_log.json",
+    "citation_heading_repair_log.json",
+    "draft_quality.json",
+    "paper_meta.json",
+    "quality_warnings.json",
+    "references_preverified.bib",
+)
 
 
 _SECTION_OUTPUT_CONTRACT = """
@@ -2902,9 +2931,85 @@ def _execute_paper_draft(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    structured_eligible = structured_claim_capability.structured_publication_is_eligible()
+    if structured_eligible:
+        structured_claim_capability.require_complete_structured_capability(
+            "stage17_paper_draft_dispatch"
+        )
     with ReleaseGraphLock.acquire(
         run_dir, "stage17_paper_draft", mode="write"
     ) as release_lock:
+        if not structured_eligible:
+            _invalidate_legacy_stage17_outputs(stage_dir)
+        try:
+            evidence = load_canonical_experiment_evidence(run_dir)
+        except Exception as exc:  # noqa: BLE001
+            cleanup = _structured_dispatch_failure_cleanup(
+                release_lock, enabled=structured_eligible
+            )
+            return StageResult(
+                stage=Stage.PAPER_DRAFT,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=(
+                    f"Canonical Stage 17 input replay failed: {exc}"
+                    + cleanup
+                ),
+                decision="retry",
+            )
+        manifest = evidence.manifest
+        has_domain_discriminator = bool(
+            manifest.get("generation_kind") == "domain_evaluator"
+            or (
+                type(manifest.get("schema_version")) is int
+                and manifest["schema_version"] == 2
+            )
+        )
+        exact_domain = _is_domain_evaluator_v2(evidence)
+        if has_domain_discriminator and not exact_domain:
+            cleanup = _structured_dispatch_failure_cleanup(
+                release_lock, enabled=structured_eligible
+            )
+            return StageResult(
+                stage=Stage.PAPER_DRAFT,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=(
+                    "Canonical Stage 17 domain-v2 discriminator is inconsistent"
+                    + cleanup
+                ),
+                decision="retry",
+            )
+        if structured_eligible and exact_domain:
+            try:
+                capture = capture_structured_stage17_sources(
+                    release_lock, evidence
+                )
+                publish_structured_stage17_from_capture(
+                    release_lock,
+                    stage_dir=stage_dir,
+                    capture=capture,
+                    llm=llm,
+                )
+            except Exception as exc:  # noqa: BLE001
+                cleanup = _structured_dispatch_failure_cleanup(
+                    release_lock, enabled=True
+                )
+                return StageResult(
+                    stage=Stage.PAPER_DRAFT,
+                    status=StageStatus.FAILED,
+                    artifacts=(),
+                    error=f"Structured Stage 17 publication failed: {exc}{cleanup}",
+                    decision="retry",
+                )
+            artifacts = (*STRUCTURED_STAGE17_OUTPUTS, STRUCTURED_STAGE17_MANIFEST)
+            return StageResult(
+                stage=Stage.PAPER_DRAFT,
+                status=StageStatus.DONE,
+                artifacts=artifacts,
+                decision="structured-scientific-claim-v1",
+                evidence_refs=tuple(f"stage-17/{name}" for name in artifacts),
+            )
         result = _execute_paper_draft_under_release_epoch(
             stage_dir,
             run_dir,
@@ -2913,9 +3018,31 @@ def _execute_paper_draft(
             llm=llm,
             prompts=prompts,
             release_lock=release_lock,
+            captured_evidence=evidence,
         )
         release_lock.assert_canonical()
         return result
+
+
+def _invalidate_legacy_stage17_outputs(stage_dir: Path) -> None:
+    for owned_name in _LEGACY_STAGE17_OWNED_NAMES:
+        (stage_dir / owned_name).unlink(missing_ok=True)
+
+
+def _structured_dispatch_failure_cleanup(
+    release_lock: ReleaseGraphLock,
+    *,
+    enabled: bool,
+) -> str:
+    if not enabled:
+        return ""
+    try:
+        unsafe = invalidate_structured_stage17_authority(release_lock)
+    except Exception as cleanup_exc:  # noqa: BLE001
+        return f"; structured authority cleanup also failed: {cleanup_exc}"
+    if unsafe:
+        return f"; structured authority cleanup rejected: {'; '.join(unsafe)}"
+    return ""
 
 
 def _citation_anchors_from_typed_authority(
@@ -2941,28 +3068,16 @@ def _execute_paper_draft_under_release_epoch(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
     release_lock: object,
+    captured_evidence: CanonicalExperimentEvidence | None = None,
 ) -> StageResult:
-    for owned_name in (
-        "paper_draft.md",
-        "paper_draft_invalid.md",
-        "paper_structure_report.json",
-        "section_generation_report.json",
-        "citation_closure_report.json",
-        "experiment_fact_closure_report.json",
-        "experiment_fact_closure_invalid.json",
-        "experiment_fact_closure_initial.json",
-        "experiment_fact_closure_after.json",
-        "experiment_fact_repair_log.json",
-        "citation_heading_repair_log.json",
-        "draft_quality.json",
-        "paper_meta.json",
-        "quality_warnings.json",
-        "references_preverified.bib",
-    ):
-        (stage_dir / owned_name).unlink(missing_ok=True)
+    _invalidate_legacy_stage17_outputs(stage_dir)
     typed_citation_authority: TypedCitationAuthority | None = None
     try:
-        evidence = load_canonical_experiment_evidence(run_dir)
+        evidence = (
+            captured_evidence
+            if captured_evidence is not None
+            else load_canonical_experiment_evidence(run_dir)
+        )
         canonical_fact_sheet = build_canonical_fact_sheet(evidence)
         outline = _load_bound_stage16_outline(run_dir, evidence)
         guidance_file = stage_dir / "hitl_guidance.md"

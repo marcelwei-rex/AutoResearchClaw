@@ -10,6 +10,14 @@ from pathlib import Path
 from typing import Mapping
 
 
+@dataclass(frozen=True)
+class BoundRegularFile:
+    content: bytes
+    identity: tuple[int, int]
+    size: int
+    mtime_ns: int
+
+
 @dataclass
 class BoundOutputNamespace:
     """Hold a canonical stage directory open across its publication lifecycle."""
@@ -164,7 +172,10 @@ class BoundOutputNamespace:
         """Require both live paths to still name the held directories."""
 
         run_info = os.stat(self.run_dir, follow_symlinks=False)
-        if not stat.S_ISDIR(run_info.st_mode) or _identity(run_info) != self._run_identity:
+        if (
+            not stat.S_ISDIR(run_info.st_mode)
+            or _identity(run_info) != self._run_identity
+        ):
             raise OSError("run directory changed during output publication")
         stage_info = os.stat(
             self.stage_name, dir_fd=self._run_fd, follow_symlinks=False
@@ -559,6 +570,31 @@ class BoundOutputNamespace:
         else:
             os.close(tree_fd)
 
+    def stage_flat_files_new(self, name: str, files: Mapping[str, bytes]) -> None:
+        """Create a new exact flat staging directory and reject collisions."""
+
+        _require_child_name(name)
+        if not files:
+            raise OSError("staged file set is empty")
+        for child, content in files.items():
+            _require_child_name(child)
+            if not isinstance(content, bytes):
+                raise OSError(f"staged output content is not bytes: {child}")
+        os.mkdir(name, 0o700, dir_fd=self._stage_fd)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        tree_fd = os.open(name, flags, dir_fd=self._stage_fd)
+        try:
+            for child, content in sorted(files.items()):
+                _write_new_file(tree_fd, child, content)
+            os.fsync(tree_fd)
+        except Exception:
+            os.close(tree_fd)
+            self._remove_flat_entry(name)
+            raise
+        else:
+            os.close(tree_fd)
+
     def read_flat_tree(
         self, name: str
     ) -> tuple[dict[str, bytes], dict[str, dict[str, bytes]]]:
@@ -623,6 +659,56 @@ class BoundOutputNamespace:
         os.rmdir(name, dir_fd=self._stage_fd)
         self.assert_canonical()
 
+    def publish_staged_files_exclusive(
+        self, name: str, *, direct_names: tuple[str, ...]
+    ) -> None:
+        """Link exact staged files into absent live names, never replacing."""
+
+        _require_child_name(name)
+        if not direct_names or len(set(direct_names)) != len(direct_names):
+            raise OSError("exclusive staged publication names are invalid")
+        if os.link not in os.supports_dir_fd:
+            raise OSError("exclusive staged publication is unsupported")
+        direct, directories = self.read_flat_tree(name)
+        if set(direct) != set(direct_names) or directories:
+            raise OSError("exclusive staged publication namespace mismatch")
+        for child in direct_names:
+            try:
+                os.stat(child, dir_fd=self._stage_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise FileExistsError(f"late output collision: {child}")
+
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        tree_fd = os.open(name, flags, dir_fd=self._stage_fd)
+        linked: list[str] = []
+        try:
+            for child in direct_names:
+                _read_regular_file_snapshot(tree_fd, child)
+                os.link(
+                    child,
+                    child,
+                    src_dir_fd=tree_fd,
+                    dst_dir_fd=self._stage_fd,
+                    follow_symlinks=False,
+                )
+                linked.append(child)
+            for child in direct_names:
+                os.unlink(child, dir_fd=tree_fd)
+            os.fsync(self._stage_fd)
+        except Exception:
+            for child in linked:
+                try:
+                    os.unlink(child, dir_fd=self._stage_fd)
+                except FileNotFoundError:
+                    pass
+            raise
+        finally:
+            os.close(tree_fd)
+        os.rmdir(name, dir_fd=self._stage_fd)
+        self.assert_canonical()
+
     def reset_flat_namespace(self) -> None:
         """Remove prior direct files and flat directories from this owned stage."""
 
@@ -674,6 +760,24 @@ class BoundOutputNamespace:
         finally:
             os.close(descriptor)
 
+    def read_regular_snapshot(self, name: str) -> BoundRegularFile:
+        """Read one stable regular file and reject any hardlink alias."""
+
+        _require_child_name(name)
+        return _read_regular_file_snapshot(self._stage_fd, name)
+
+    def canonical_identity(
+        self,
+    ) -> tuple[tuple[int, int], tuple[int, int], tuple[str, ...]]:
+        """Capture held directory identities and the exact direct namespace."""
+
+        self.assert_canonical()
+        return (
+            _identity(os.fstat(self._run_fd)),
+            _identity(os.fstat(self._stage_fd)),
+            tuple(sorted(os.listdir(self._stage_fd))),
+        )
+
     def read_run_file(self, relative_path: str) -> bytes:
         """Read one regular run-relative file through the held run fd."""
 
@@ -686,7 +790,7 @@ class BoundOutputNamespace:
             for part in parts[:-1]:
                 descriptor = os.open(part, flags, dir_fd=descriptor)
                 opened.append(descriptor)
-            return _read_regular_file(descriptor, parts[-1])
+            return _read_regular_file_snapshot(descriptor, parts[-1]).content
         finally:
             for opened_fd in reversed(opened):
                 os.close(opened_fd)
@@ -880,6 +984,45 @@ def _read_regular_file(directory_fd: int, name: str) -> bytes:
             if not chunk:
                 return b"".join(chunks)
             chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+
+
+def _read_regular_file_snapshot(
+    directory_fd: int, name: str
+) -> BoundRegularFile:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError(f"output is not a regular file: {name}")
+        if before.st_nlink != 1:
+            raise OSError(f"output has a hardlink alias: {name}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            _identity(before) != _identity(after)
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or after.st_nlink != 1
+        ):
+            raise OSError(f"output changed during exact read: {name}")
+        content = b"".join(chunks)
+        if len(content) != before.st_size:
+            raise OSError(f"output size changed during exact read: {name}")
+        return BoundRegularFile(
+            content=content,
+            identity=_identity(before),
+            size=before.st_size,
+            mtime_ns=before.st_mtime_ns,
+        )
     finally:
         os.close(descriptor)
 
