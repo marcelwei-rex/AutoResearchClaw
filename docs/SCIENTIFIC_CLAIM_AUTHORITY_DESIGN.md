@@ -1,15 +1,16 @@
 # Structured Scientific Claim Authority Design
 
-Status: `B3-D0 / FROZEN SCHEMAS / NOT ACTIVATED`
+Status: `B4-D0 / STAGE 19-20 SCHEMAS FROZEN / NOT ACTIVATED`
 
-Scope: Batch B3-D0 docs-only authority for the future Stage 17 publication of
-the `structured-scientific-claim-v1` capability.
+Scope: Batch B4-D0 docs-only authority for future structured Stage 19 revision
+and Stage 20 replay of the `structured-scientific-claim-v1` capability.
 
-The B1-B2 record, construction, and rendering primitives exist, but B3-D0 does
-not implement Stage 17 publication, change a runtime capability, or activate
-the structured path. In particular, the current manuscript pipeline must not
-claim scientific-prose safety from regex blacklists, negation windows,
-false-absence word lists, or an LLM's prose.
+B3 Stage 17 implementation and its separate declaration are complete. The
+code-owned structured capability is now exactly `1000`: Stage 17 publication
+is declared, while Stage 19 revision, Stage 20 replay, and Stage 24/release
+integration remain undeclared. B4-D0 freezes schemas and lifecycle only. It
+does not implement Stage 19 or Stage 20, change the capability map, or activate
+the structured production path.
 
 ## 1. Normative boundary
 
@@ -33,22 +34,22 @@ The words MUST, MUST NOT, SHOULD, and MAY are normative.
    unchanged.
 10. A fresh F0 remains forbidden until separately authorized.
 
-The current non-sectional Stage 19 prose path and the current conditional
-Stage 20 CFS build are known B3-B4 blockers. This design does not describe them
-as already closed.
+The current non-sectional and sectional Stage 19 prose paths remain
+`generic-v1`. The current conditional Stage 20 replay is also not structured
+authority. This design does not describe either blocker as already closed.
 
 ## 2. Structured capability admission and mixed generations
 
 The existing `CANONICAL_EVIDENCE_CAPABILITIES` map is frozen independently.
-B3 MUST NOT add, remove, or rename a key in that map and MUST NOT route a
+B4 MUST NOT add, remove, or rename a key in that map and MUST NOT route a
 partial structured migration through its guard.
 
 Structured admission has code-owned schema version `1` and this separate exact
-four-key map. At B3-D0 and before B3 implementation it is exactly:
+four-key map. At B4-D0 and throughout B4 implementation it is exactly:
 
 ```json
 {
-  "stage17_publication": 0,
+  "stage17_publication": 1,
   "stage19_revision": 0,
   "stage20_replay": 0,
   "stage24_and_release_integration": 0
@@ -81,14 +82,16 @@ structured production path.
 
 ### 2.1 Admission matrix
 
-| Strict canonical input result | Code-owned structured map | Ordinary dispatch | Direct structured entry or replay |
-|---|---|---|---|
-| Strict replay succeeds and confirms a recognized, legal non-domain-v2 generation | any complete, partial, or invalid structured map | unchanged `generic-v1` | not eligible; reject |
-| Strict replay succeeds and confirms exact domain-v2, CFS-v1, and one generation | exact map, all four true integer `1` | structured path | continue |
-| Strict replay succeeds and confirms exact domain-v2, CFS-v1, and one generation | any true integer `0`, or missing, unknown, or wrong-typed map value | unchanged `generic-v1`; structured remains inactive | reject before direct-entry I/O |
-| A domain-v2 discriminator is present, but its evidence, CFS schema, generation binding, or required replay is invalid | any map state | `FAILED`; never generic fallback | `FAILED` |
-| Canonical evidence cannot be strictly captured and replayed | any map state | `FAILED`; never generic fallback | `FAILED` |
-| Persisted snapshot, artifact presence, caller, config, environment, or LLM claims activation | code-owned map does not independently authorize it | declaration is ignored and cannot select a path | reject it as authority |
+| Case | Strict canonical input result | Code-owned structured map | Ordinary dispatch | Public/direct structured entry |
+|---|---|---|---|---|
+| 1 | recognized legal non-domain-v2 generation | any valid, partial, or malformed map | unchanged `generic-v1`; no structured probe or cleanup | reject before structured output I/O |
+| 2 | exact domain-v2, CFS-v1, one generation | exact `1000` | unchanged `generic-v1` | incomplete capability; reject before lock, provider, or output I/O |
+| 3 | domain-v2 discriminator present but Stage 17 authority manifest, CFS, generation, or replay is invalid | any map | `FAILED`; never generic fallback | `FAILED`; never generic fallback |
+| 4 | strict canonical replay succeeds | malformed map: missing/unknown key, wrong root type, or wrong-typed value | unchanged `generic-v1`; malformed map is ineligible | capability-invalid before direct-entry I/O |
+| 5 | exact domain-v2, CFS-v1, one generation | any other partial state, including exact `1000` | unchanged `generic-v1` | incomplete capability before direct-entry I/O |
+| 6 | exact domain-v2, CFS-v1, one generation | internal B4 pre-activation test with repository still `1000` | ordinary dispatcher remains `generic-v1` | public/direct entry remains blocked; only the private verified-context helper in this section is eligible |
+| 7 | exact domain-v2, CFS-v1, one generation | future declared `1110` | unchanged `generic-v1` | incomplete capability before direct-entry I/O |
+| 8 | exact domain-v2, CFS-v1, one generation | future complete `1111` | structured path | continue under held-fd structured admission |
 
 `Legal non-domain-v2` means strict replay succeeded and the code-owned
 discriminator is either absent where the canonical schema permits absence or
@@ -96,10 +99,10 @@ names a recognized non-domain-v2 generation. An unknown, malformed, or
 inconsistent discriminator is invalid; it is not evidence for generic
 fallback.
 
-The ordinary Stage 17 dispatcher first inspects only the code-owned map, then
-reuses the same canonical input capture and strict replay that Stage 17 already
-requires. The captured result is passed to the selected implementation; it is
-not reopened through a new live path. This common capture is the sole
+The ordinary Stage 17/19/20 dispatcher first inspects only the code-owned map,
+then reuses the canonical input capture and strict replay already required by
+that stage. The captured result is passed to the selected implementation; it
+is not reopened through a new live path. This common capture is the sole
 discriminator authority:
 
 1. replay failure returns `FAILED`;
@@ -125,13 +128,28 @@ probe as an oracle. Selecting generic adds no structured file probe, cleanup,
 provider call, schema change, or failure rule beyond failures already produced
 by the mandatory canonical capture/replay.
 
-A direct structured entry MUST call a no-caller-map complete-capability guard
-before acquiring a lock or performing any filesystem, provider, or output
-I/O. Evidence domain, CFS schema, and generation prerequisites are then
-derived through held-fd source capture and replay; they MUST fail before any
-provider call or creation or publication of a new output. Once structured
-entry begins, any error returns `FAILED`; it MUST NOT fall back to
-`generic-v1`.
+A public or direct structured entry MUST call a no-caller-map
+complete-capability guard before acquiring a lock or performing any
+filesystem, provider, or output I/O. Evidence domain, CFS schema, and
+generation prerequisites are then derived through held-fd source capture and
+replay; they MUST fail before any provider call or creation or publication of
+a new output. Once structured entry begins, any error returns `FAILED`; it
+MUST NOT fall back to `generic-v1`.
+
+B4 implementation is tested while the repository map remains exact `1000`.
+There is no caller, config, environment, persisted-snapshot, or test-flag
+bypass. The only end-to-end pre-activation seam is one private
+under-lock helper accepting a `StructuredStage19VerifiedContext`. Its
+constructor is private. Code may issue it only after validating a live writer
+lease and completing Snapshot A plus full Stage 17 and Stage 18 replay. An
+issuance registry binds the context to the same writer-owner object, run and
+stage device/inode identities, canonical run path, generation binding,
+Stage 17 manifest digest, and complete Snapshot A identity tuple. The helper
+rechecks the registry and every binding. A copied, caller-constructed, expired,
+cross-run, cross-epoch, or cross-generation context is rejected before
+provider or publication I/O. This seam bypasses only the complete-map
+admission check for tests; it bypasses no source, schema, lifecycle, or
+postcondition check and creates no production activation authority.
 
 A structured registry, selection, paper, closure report, or manifest from a
 different evidence/CFS generation MUST fail closed. There is no conversion,
@@ -146,15 +164,14 @@ canonical serialization still sorts object keys under Section 3:
 
 | Repository state | Exact code-owned map | Allowed change |
 |---|---|---|
-| B3-D0 and immediately before B3 implementation | `{"stage17_publication":0,"stage19_revision":0,"stage20_replay":0,"stage24_and_release_integration":0}` | docs-only freeze; no activation |
-| Every B3 implementation commit | `{"stage17_publication":0,"stage19_revision":0,"stage20_replay":0,"stage24_and_release_integration":0}` | implementation only; map change forbidden |
-| Separately approved B3 declaration commit | `{"stage17_publication":1,"stage19_revision":0,"stage20_replay":0,"stage24_and_release_integration":0}` | only `stage17_publication: 0 -> 1` |
+| Completed B3 implementation and declaration; B4-D0 | `{"stage17_publication":1,"stage19_revision":0,"stage20_replay":0,"stage24_and_release_integration":0}` | current `1000`; B4-D0 docs only |
 | Every B4 implementation commit | `{"stage17_publication":1,"stage19_revision":0,"stage20_replay":0,"stage24_and_release_integration":0}` | implementation only; map change forbidden |
 | Separately approved B4 declaration commit | `{"stage17_publication":1,"stage19_revision":1,"stage20_replay":1,"stage24_and_release_integration":0}` | only B4-owned `stage19_revision` and `stage20_replay: 0 -> 1` |
 | Every B5 implementation and pre-activation approval commit | `{"stage17_publication":1,"stage19_revision":1,"stage20_replay":1,"stage24_and_release_integration":0}` | implementation/evidence only; final component remains `0` |
 | Separately named and reviewed global activation commit | `{"stage17_publication":1,"stage19_revision":1,"stage20_replay":1,"stage24_and_release_integration":1}` | only `stage24_and_release_integration: 0 -> 1`; activates the full structured path |
 
-The last transition MUST be a commit explicitly named as the global activation
+Neither `1000` nor `1110` activates a public or direct structured production
+entry. The last transition MUST be a commit explicitly named as the global activation
 of `structured-scientific-claim-v1`. It MUST contain no implementation change.
 It requires separate review of the completed B3, B4, B5 evidence and generic-v1
 byte regressions. No implementation, refactor, test, or schema commit may
@@ -613,12 +630,12 @@ path or mutate runtime authority.
 
 For a Stage 17 origin, `source_authority_manifest` MUST be present and its only
 legal value is JSON null. Missing, empty object, empty string, or a `FileRef`
-is rejected. A future Stage 19 manifest uses the same envelope: it sets
-`publication_stage_id` to `stage19` and requires
-`source_authority_manifest` to be an exact `FileRef` to the Stage 17 manifest;
-null or missing is then rejected. This present-null versus exact-`FileRef`
-union prevents a missing/null fork while preserving a compatible origin
-chain.
+is rejected. Stage 19 does not reuse this envelope: Section 11 freezes a
+distinct schema-version-2 manifest because Stage 17 schema version 1 cannot
+unambiguously represent the Stage 18 review binding, source selection, source
+paper, or Stage 19 closure. In that Stage 19 schema,
+`source_authority_manifest` is an exact `FileRef` to this Stage 17 manifest;
+null or missing is rejected.
 
 The manifest contains no field for its own path, SHA-256, or identity. Its
 consumer captures and hashes the manifest's exact bytes externally; a later
@@ -734,200 +751,664 @@ paper/selection and diagnostics may be retained only under explicitly
 non-authoritative, non-manifest names. A failure must not leave a consumable
 manifest.
 
-## 11. Stage 19 revision lifecycle
+## 11. Stage 19 source authority: Snapshot A
 
-Stage 19 captures the complete Stage 17 publication and independently replays
-its evidence, CFS, facts, registry, selections, sentences, and manifest.
+Structured Stage 19 captures all sources once through held descriptors before
+any provider call. `Snapshot A` is the following ordered tuple. Every file
+entry contains its safe run-relative path, exact bytes, SHA-256, byte size,
+device/inode identity, mode, and link count:
 
-For governed sections, the provider may return only the strict selection JSON.
-The new selection may keep, delete, and reorder existing claim IDs subject to
-mandatory-claim rules. It may not:
+1. the complete Stage 17 authority, in exact executor artifact order:
+   `stage-17/scientific_evidence_facts.json`,
+   `stage-17/scientific_claim_registry.json`,
+   `stage-17/scientific_claim_selection.json`,
+   `stage-17/paper_draft.md`,
+   `stage-17/paper_structure_report.json`,
+   `stage-17/experiment_fact_closure_report.json`,
+   `stage-17/citation_closure_report.json`, and
+   `stage-17/scientific_claim_authority_manifest.json`;
+2. the complete Stage 17 source-file closure, sorted by run-relative path:
+   canonical evidence manifest, candidate manifest, selected-result manifest,
+   every recursively referenced safe run-relative `FileRef`, every evidence
+   artifact and project artifact, selected execution artifact, execution
+   policy artifact, experiment contract, and bound run config;
+3. `stage-16/citation_plan.json`;
+4. `stage-06/citation_allowlist.json`;
+5. `stage-18/reviews.md`;
+6. `stage-18/review_structure_report.json`.
 
-- edit `rendered_sentence`;
-- change renderer/template/slot data;
-- mint a fact or claim;
-- add connector parameters;
-- return prose;
-- combine records from another generation.
+Duplicate paths across items 1-4 are captured once and MUST have the same exact
+bytes and digest at every binding site. The Stage 17 manifest entry includes
+its exact path, bytes, SHA-256, size, and identity even though the Stage 17
+manifest does not self-reference. The source closure MUST explicitly prove
+that the canonical evidence, experiment contract, and run config match the
+Stage 17 manifest. Code independently rebuilds canonical CFS bytes, requires
+true integer CFS schema version `1`, recomputes the CFS SHA-256, and rebuilds
+the generation binding from these captured bytes.
 
-Stage 19 rerenders from the unchanged registry, publishes a newly bound
-selection and deterministic paper, and writes its manifest last. The manifest
-must explicitly bind the CFS hash, generation binding, Stage 17 registry hash,
-Stage 19 selection hash, and rendered paper hash.
+Stage 17 full replay is mandatory. It rebuilds the five facts and six claims,
+requires exact facts and registry bytes, strictly replays the five-section
+Stage 17 selection, rerenders the governed sentences, requires exact
+`paper_draft.md`, and rebuilds all three Stage 17 closure reports. Matching
+stored hashes is not sufficient.
 
-The current CFS rebuild, caller presence/hash comparison, parameter threading,
-publication replay, and release-audit rebuild are reusable plumbing. In
-B3-D0 they are not a scientific-safety proof.
+Stage 18 has no manifest and has no absence branch. Both Stage 18 files are
+mandatory regular single-link files. The schema-version-2
+`review_structure_report.json` has exactly these keys:
+`schema_version`, `valid`, `source_reviews_path`, `source_reviews_sha256`,
+`source_paper_path`, `source_paper_sha256`,
+`paper_structure_report_path`, `paper_structure_report_sha256`,
+`experiment_fact_closure_report_path`,
+`experiment_fact_closure_report_sha256`,
+`citation_closure_report_path`, `citation_closure_report_sha256`,
+`canonical_experiment_evidence_path`,
+`canonical_experiment_evidence_sha256`, `comment_count`, and `issues`.
+`schema_version` and `comment_count` are true integers; schema is exactly `2`;
+`valid` MUST be true; `issues` MUST be empty. Every path/hash pair MUST bind
+the captured Stage 17 or Stage 18 bytes, and strict `ReviewLedger` replay from
+`reviews.md` MUST reproduce `comment_count`.
 
-On failure, Stage 19 runs its owned-output cleanup and leaves no revised paper
-or canonical manifest. Diagnostics remain non-authoritative.
+Because current Stage 18 has no independently anchored provenance manifest,
+the two-file binding proves internal consistency and the Snapshot A/B
+fixpoint; it does not prove the historical origin of a synchronized,
+strictly-valid replacement made before Snapshot A. Any Stage 18 byte change
+after Snapshot A is rejected. A pre-Snapshot replacement of both files that
+correctly rebuilds the schema-version-2 report is mechanically
+indistinguishable at this boundary, but remains confined to advisory input and
+the selection constraints in Section 13. B4-D0 does not invent an
+unimplemented Stage 18 provenance oracle.
 
-## 12. Stage 20 independent replay
+The Stage 18 review bytes are provider-advisory authority only. They may
+influence which pre-existing claim IDs the provider suggests keeping,
+deleting, or reordering. They never become fact, claim, sentence, renderer,
+template, slot, connector, or prose authority. Scientific authority remains
+the independently rebuilt evidence, facts, claim registry, validated
+selection, deterministic rendering, and closure reports.
 
-Stage 20 MUST perform the following before any quality-model call and even when
-`llm is None`:
+The citation plan and allowlist are used only for deterministic citation
+closure replay. Citation policy, raw evidence prose, configuration prose,
+live files, sectional plans, prior provider responses, and any other input are
+forbidden from the Stage 19 provider prompt. There is no vague category such
+as "related inputs" or "complete publication".
 
-1. capture the sole Stage 19 publication;
-2. independently reload canonical evidence;
-3. rebuild the CFS and generation binding;
-4. rebuild the facts and claim registry from code;
-5. compare their canonical bytes/hashes with the Stage 17/19 manifests;
-6. strictly parse and validate the Stage 19 selection;
-7. rerender every sentence and the paper;
-8. require byte equality with the Stage 19 paper;
-9. reject namespace or generation changes during replay.
+## 12. Exact Stage 19 authority namespace
 
-The quality model may assess a replayed paper, but its report cannot authorize
-facts, claims, sentences, connectors, or publication. Stage 20's manifest binds
-the CFS, registry, selection, generation, and paper hashes and is written last.
+Structured Stage 19 owns this exact success authority set in the held
+`stage-19` namespace:
 
-## 13. Stage 24 reuse boundary
+1. `scientific_claim_selection.json`;
+2. `scientific_claim_paper_revised.md`;
+3. `scientific_claim_paper_structure_report.json`;
+4. `scientific_claim_experiment_fact_closure_report.json`;
+5. `scientific_claim_citation_closure_report.json`;
+6. `scientific_claim_authority_manifest.json`.
 
-The structured path may reuse Stage 24's:
+The exact staging entry is
+`.stage19-structured-publication.staging`. The success `StageResult.artifacts`
+tuple is the six names above in that order; `evidence_refs` is the same order
+with `stage-19/` prefixes. The manifest is always last.
 
-- safe relative-path rules;
-- source byte capture and SHA-256;
-- byte offsets and exact substring replay;
-- identity payloads that exclude their own IDs;
-- canonical JSON and Decimal discipline;
-- staged namespace, manifest-last publication, final fixpoint, and cleanup.
+The final held `stage-19` structured namespace has exactly those six regular,
+single-link files and no staging entry. Structured Stage 19 persists no raw
+provider response, invalid selection, repair output, or diagnostics file.
+Transport diagnostics exist only as bounded in-memory/log records, are not
+authority, and are never referenced by a manifest. Any extra direct entry,
+including an old generic-v1 artifact, diagnostic, invalid output, symlink,
+directory, FIFO, device, socket, hardlink, or staging collision, fails the
+structured exact-namespace check; structured cleanup MUST NOT delete a name it
+does not own.
 
-It MUST NOT use comparative or negation regex, lexical obligation extraction,
-or open-English grammar as an oracle for structured scientific claim meaning.
-Those mechanisms may remain only where required for unchanged `generic-v1`
-compatibility.
+The distinct `scientific_claim_*` paper and closure names intentionally do not
+reuse generic-v1 Stage 19 names. Stage 17 facts, registry, source selection,
+source paper, closures, and manifest are referenced from their Stage 17 paths;
+they are not copied into Stage 19. Stage 19 republishes only its new selection,
+revised paper, three rebuilt closure artifacts, and manifest.
 
-## 14. `generic-v1` compatibility
+Every failure invalidates these commit points: the manifest first, then each of
+the five non-manifest outputs independently, then staging. A malformed current
+artifact or collision at one name cannot prevent attempted invalidation of the
+other owned commit points. Failure returns empty `artifacts` and
+`evidence_refs` and MUST leave neither a revised-paper success artifact nor a
+consumable manifest.
 
-When the structured capability is inactive:
+## 13. Stage 19 selection schema
 
-- `build_canonical_fact_sheet` keeps its existing `None` behavior;
-- no structured claim artifacts are required or emitted;
-- no new validation check code appears;
-- existing manifest schemas and canonical bytes remain unchanged;
-- Stage 17/19/20/24 dispatch and failure behavior remain unchanged;
-- release reconstruction accepts the same historical artifacts as before.
-- stale structured files do not activate, block, alter, or get consumed by the
-  generic path;
-- the generic path does not enumerate, parse, require, publish, or clean the
-  structured names.
+`stage-19/scientific_claim_selection.json` uses selection schema version `1`
+and has this exact root and nested key set:
 
-Tests MUST compare exact dictionaries/bytes/hashes where practical, not merely
-semantic success. They MUST also prove that partial and malformed structured
-maps cause no structured function call, structured file open, cleanup,
-provider call, or output change on the generic path. The existing
-canonical-evidence map and every existing caller remain byte-for-byte and
-behaviorally unchanged.
+```json
+{
+  "schema_version": 1,
+  "claim_policy_id": "structured-scientific-claim-v1",
+  "generation_binding_sha256": "<sha256>",
+  "claim_registry_sha256": "<sha256>",
+  "sections": [
+    {
+      "section_id": "abstract",
+      "selected_claim_ids": ["<abstract-claim-id>"],
+      "ordered_claim_ids": ["<abstract-claim-id>"],
+      "connector_template_ids": []
+    },
+    {
+      "section_id": "results",
+      "selected_claim_ids": ["<results-claim-id>"],
+      "ordered_claim_ids": ["<results-claim-id>"],
+      "connector_template_ids": []
+    },
+    {
+      "section_id": "discussion",
+      "selected_claim_ids": ["<discussion-claim-id>"],
+      "ordered_claim_ids": ["<discussion-claim-id>"],
+      "connector_template_ids": []
+    },
+    {
+      "section_id": "limitations",
+      "selected_claim_ids": ["<limitations-claim-id>"],
+      "ordered_claim_ids": ["<limitations-claim-id>"],
+      "connector_template_ids": []
+    },
+    {
+      "section_id": "conclusion",
+      "selected_claim_ids": ["<conclusion-claim-id>"],
+      "ordered_claim_ids": ["<conclusion-claim-id>"],
+      "connector_template_ids": []
+    }
+  ]
+}
+```
 
-## 15. B1-B5 commit split
+`schema_version` is the true integer `1`. The root exact key set is
+`schema_version`, `claim_policy_id`, `generation_binding_sha256`,
+`claim_registry_sha256`, and `sections`. `sections` is an array of exactly five
+objects in the fixed order `abstract`, `results`, `discussion`, `limitations`,
+`conclusion`. Each section exact key set is `section_id`,
+`selected_claim_ids`, `ordered_claim_ids`, and `connector_template_ids`.
+Duplicate keys and unknown, missing, duplicated, or reordered sections fail.
 
-Each commit is narrow and independently reviewable.
+For each section, the provider returns exactly:
 
-### B1 — contracts and identity
+```json
+{
+  "selected_claim_ids": ["<claim-id>"],
+  "ordered_claim_ids": ["<claim-id>"],
+  "connector_template_ids": []
+}
+```
 
-- strict `EvidenceFact` and `ScientificClaimRecord` parsers;
-- canonical Decimal/JSON enforcement;
-- self-hash-excluding ID computation;
-- generation/CFS/source binding;
-- registry and selection schema parsers;
-- no stage activation.
+Code injects `section_id` and every root field. A provider response containing
+section, schema, policy, hash, generation, fact, sentence, rendered prose,
+template, slot, explanation, or any other free string/field is rejected.
 
-### B2 — deterministic construction and rendering
+The Stage 19 selection is a constrained descendant of both the Stage 17
+registry and Stage 17 selection:
 
-- code-built fact and claim registries;
-- deterministic renderer and sentence hashes;
-- strict selection validation;
-- `NONE` connector only;
-- adversarial unit tests;
-- no Stage 17 publication switch.
+- a Stage 19 `selected_claim_ids` array is a duplicate-free subset of the
+  corresponding Stage 17 selected IDs;
+- it may keep or delete only those IDs and may not reintroduce an optional ID
+  present in the registry but absent from the Stage 17 selection;
+- every registry-mandatory ID for that section MUST remain selected;
+- every ID MUST belong to that section and the same generation;
+- `ordered_claim_ids` is an exact duplicate-free permutation of the Stage 19
+  selected set; it may reorder but may not add, omit, or duplicate;
+- `connector_template_ids` has exactly
+  `max(len(ordered_claim_ids) - 1, 0)` entries and every entry is exact `NONE`.
 
-### B3 — Stage 17 authority publication
+Unknown, missing, duplicate, cross-section, or minted IDs; mandatory deletion;
+connector injection; wrong connector count; and selection/ordering membership
+forks are rejected. Provider bytes and response hashes are not authority.
 
-- governed-section selection-only calls;
-- deterministic paper assembly;
-- manifest-last publication and cleanup;
-- Stage 17 replay tests;
-- explicit capability gate.
+## 14. Deterministic revised paper and closure
 
-### B4 — Stage 19 and Stage 20 closure
+The captured Stage 17 paper is the sole document template. Code parses it
+strictly and replaces only the bodies of Abstract, Results, Discussion,
+Limitations, and Conclusion. The preamble, governed headings, every
+non-governed heading and body, ordering, whitespace, line endings, citation
+markers, and all other bytes are copied exactly from Snapshot A.
 
-- close all Stage 19 governed-section prose paths;
-- ID-only revision and exact registry binding;
-- Stage 20 unconditional independent rebuild/replay;
-- CFS/registry/selection/paper manifest binding;
-- mixed-generation and no-LLM tests.
+Each governed body is rerendered from the unchanged, independently rebuilt
+facts and registry plus the validated Stage 19 selection. No stored
+`rendered_sentence`, sentence hash, fact ID, or claim ID is trusted: all are
+recomputed from canonical inputs. The complete
+`scientific_claim_paper_revised.md` MUST be byte-for-byte equal to an
+independent rerender and splice.
 
-### B5 — Stage 24 and release integration
+Stage 19 recomputes, canonically serializes, and publishes:
 
-- structured-claim Stage 24 mechanical replay path;
-- no comparative lexical oracle on the structured path;
-- release-audit/reconstruction integration;
-- complete generic-v1 byte regression;
-- fresh F0 remains a separately authorized acceptance step.
+- `stage-19/scientific_claim_paper_structure_report.json`;
+- `stage-19/scientific_claim_experiment_fact_closure_report.json`;
+- `stage-19/scientific_claim_citation_closure_report.json`.
 
-## 16. Adversarial test matrix
+All three reports bind the revised-paper digest and are independently rebuilt
+from Snapshot A, not copied from Stage 17. Citation closure uses only the
+captured citation plan and allowlist. Decimal and JSON handling follows
+Section 3. Synchronously editing stored sentences, hashes, IDs, reports, and
+their downstream digests is not proof; code-owned rebuild and exact byte
+comparison are the oracle.
+
+## 15. Exact Stage 19 manifest schema
+
+Stage 19 uses manifest schema version `2`. A `FileRef` still has exactly two
+keys, `path` and `sha256`; Snapshot A/B, rather than persisted `FileRef`, owns
+size and identity checks. The exact manifest shape is:
+
+```json
+{
+  "schema_version": 2,
+  "publication_stage_id": "stage19",
+  "claim_policy_id": "structured-scientific-claim-v1",
+  "structured_capability_schema_version": 1,
+  "structured_capability_snapshot": {
+    "stage17_publication": 1,
+    "stage19_revision": 1,
+    "stage20_replay": 1,
+    "stage24_and_release_integration": 1
+  },
+  "generation_binding_sha256": "<sha256>",
+  "canonical_experiment_evidence": {
+    "path": "canonical_experiment_evidence.json",
+    "sha256": "<sha256>"
+  },
+  "experiment_contract": {
+    "path": "stage-09/experiment_contract.yaml",
+    "sha256": "<sha256>"
+  },
+  "run_config": {
+    "path": "<bound-config-path>",
+    "sha256": "<sha256>"
+  },
+  "cfs": {
+    "schema_version": 1,
+    "sha256": "<sha256>"
+  },
+  "facts": {
+    "file": {
+      "path": "stage-17/scientific_evidence_facts.json",
+      "sha256": "<sha256>"
+    },
+    "record_count": 5
+  },
+  "claim_registry": {
+    "file": {
+      "path": "stage-17/scientific_claim_registry.json",
+      "sha256": "<sha256>"
+    },
+    "record_count": 6
+  },
+  "source_claim_selection": {
+    "file": {
+      "path": "stage-17/scientific_claim_selection.json",
+      "sha256": "<sha256>"
+    },
+    "section_count": 5
+  },
+  "claim_selection": {
+    "file": {
+      "path": "stage-19/scientific_claim_selection.json",
+      "sha256": "<sha256>"
+    },
+    "section_count": 5
+  },
+  "source_paper_draft": {
+    "path": "stage-17/paper_draft.md",
+    "sha256": "<sha256>"
+  },
+  "paper_revised": {
+    "path": "stage-19/scientific_claim_paper_revised.md",
+    "sha256": "<sha256>"
+  },
+  "paper_structure_report": {
+    "path": "stage-19/scientific_claim_paper_structure_report.json",
+    "sha256": "<sha256>"
+  },
+  "experiment_fact_closure_report": {
+    "path": "stage-19/scientific_claim_experiment_fact_closure_report.json",
+    "sha256": "<sha256>"
+  },
+  "citation_closure_report": {
+    "path": "stage-19/scientific_claim_citation_closure_report.json",
+    "sha256": "<sha256>"
+  },
+  "stage18_review": {
+    "reviews": {
+      "path": "stage-18/reviews.md",
+      "sha256": "<sha256>"
+    },
+    "structure_report": {
+      "path": "stage-18/review_structure_report.json",
+      "sha256": "<sha256>"
+    },
+    "structure_schema_version": 2,
+    "comment_count": 1
+  },
+  "source_authority_manifest": {
+    "path": "stage-17/scientific_claim_authority_manifest.json",
+    "sha256": "<sha256>"
+  }
+}
+```
+
+The exact root key set is: `schema_version`, `publication_stage_id`,
+`claim_policy_id`, `structured_capability_schema_version`,
+`structured_capability_snapshot`, `generation_binding_sha256`,
+`canonical_experiment_evidence`, `experiment_contract`, `run_config`, `cfs`,
+`facts`, `claim_registry`, `source_claim_selection`, `claim_selection`,
+`source_paper_draft`, `paper_revised`, `paper_structure_report`,
+`experiment_fact_closure_report`, `citation_closure_report`, `stage18_review`,
+and `source_authority_manifest`.
+
+`schema_version` is true integer `2`;
+`publication_stage_id` is exact `stage19`. `cfs` has exactly
+`schema_version` and `sha256`. The facts and registry objects have exactly
+`file` and `record_count`; counts are true integers `5` and `6`. Both selection
+objects have exactly `file` and `section_count`; counts are true integer `5`.
+`stage18_review` has exactly `reviews`, `structure_report`,
+`structure_schema_version`, and `comment_count`; the version is true integer
+`2`, and the count equals the independently replayed ledger.
+
+Stage 17 `FileRef`s are used for canonical evidence, contract, config, facts,
+registry, source selection, source paper, and source authority manifest. The
+Stage 18 structure report separately binds its Stage 17 source paper and
+reports through the exact flat path/hash fields frozen in Section 11. Stage 19
+`FileRef`s are used only for the new selection, revised paper, and three new
+closure reports. Every path is a safe run-relative regular single-link file
+and every digest covers exact bytes.
+
+`source_authority_manifest` MUST be the exact Stage 17 manifest `FileRef`.
+Unlike the Stage 17 origin schema, null is forbidden. Missing, null, empty
+object, wrong path, or another Stage 17 generation is rejected. Both Stage 18
+files are mandatory `FileRef`s; there is no null/absence branch.
+
+The capability snapshot is copied only from the validated code-owned map. A
+public production publication requires exact `1111`. The private B4
+pre-activation helper may test the same schema while the repository remains
+`1000`; such a manifest records exact `1000`, is accepted only inside its
+live verified context, and is never public/direct or Stage 20 production
+authority. `1110`, malformed, caller-supplied, or persisted snapshots cannot
+authorize publication.
+
+The manifest contains no path, hash, size, or identity for itself. Its exact
+bytes are captured and hashed externally by the consumer and by a later source
+manifest, so there is no self-hash cycle.
+
+Replay independently rebuilds all expected fields and bytes. Mutual consistency
+among stored files, hashes, IDs, and manifests is never an oracle.
+
+## 16. Provider prompt, no-op behavior, and call bounds
+
+All five non-no-op prompts are precomputed from the same immutable Snapshot A
+before the first call. Each prompt is canonical UTF-8 JSON with exactly these
+root fields:
+
+```json
+{
+  "schema_version": 1,
+  "claim_policy_id": "structured-scientific-claim-v1",
+  "target_section": "abstract",
+  "source_selection": {
+    "selected_claim_ids": ["<claim-id>"],
+    "ordered_claim_ids": ["<claim-id>"],
+    "connector_template_ids": []
+  },
+  "allowed_claims": [
+    {
+      "claim_id": "<claim-id>",
+      "mandatory": true,
+      "rendered_sentence": "<code-rendered-sentence>"
+    }
+  ],
+  "review_advice": [
+    {
+      "comment_id": "<comment-id>",
+      "reviewer": "Reviewer A",
+      "category": "actionable_revision",
+      "exact_text": "<captured-review-comment>"
+    }
+  ]
+}
+```
+
+The root exact key set is `schema_version`, `claim_policy_id`,
+`target_section`, `source_selection`, `allowed_claims`, and `review_advice`.
+`source_selection` has exactly the provider's three selection keys.
+`allowed_claims` contains only code-owned `claim_id`, `mandatory`, and
+`rendered_sentence` for exactly the claims selected for that target section by
+Stage 17; registry-only unselected claims are not shown. `review_advice`
+contains every strictly replayed ledger comment, in ledger order, with only
+the fields shown. Review text is untrusted data, not instructions or prose
+authority. Citation plan, policy, evidence prose, config, CFS, hashes,
+generation identifiers, previous call output, and live state are not prompt
+fields.
+
+The no-op definition is exact: strict replay of both Stage 18 files produces a
+`ReviewLedger.comments` tuple of length zero. Raw whitespace, keywords, caller
+or config flags, and model judgment cannot define no-op.
+
+- If comments are empty, Stage 19 makes zero provider calls, inherits the exact
+  Stage 17 selection, independently rerenders, rebuilds closures, and completes
+  the full Stage 19 lifecycle.
+- If comments are nonempty and `llm is None`, Stage 19 first completes Snapshot
+  A, full Stage 17 replay, and Stage 18 dual-FileRef replay, then fails before
+  staging or success publication. It invalidates old Stage 19 success
+  authority, preserves Stage 17/18 sources, and never falls back to
+  `generic-v1`.
+- If comments are nonempty and an LLM exists, Stage 19 performs exactly five
+  semantic selection calls, one per governed section in fixed section order.
+
+The maximum semantic call count is `5`. Each semantic call permits at most two
+actual outbound requests, so the total outbound maximum is `10`. The second
+request is allowed only after a pure transport failure: connection failure,
+timeout, or explicitly retryable HTTP `429`/`5xx`, and only when no response
+content exists that can undergo schema or semantic validation.
+
+The second request uses identical model, endpoint, exact prompt bytes, JSON
+mode, temperature, max tokens, and request fingerprint. The request uses JSON
+mode, temperature `0`, and a code-owned max-token limit. Model fallback,
+endpoint fallback, a third request, free-form repair, and semantic repair are
+forbidden. Empty, truncated, malformed, duplicate-key, extra-field,
+missing-field, invalid-ID, schema-invalid, or semantic-invalid response content
+is an immediate `FAILED`, not a retry condition.
+
+B4 implementation MUST NOT call a generic chat helper with hidden retry,
+fallback, or repair behavior unless a mechanical test proves that its complete
+outbound behavior satisfies this exact contract.
+
+Each outbound attempt emits a non-authoritative diagnostic record with exact
+fields `semantic_call_ordinal`, `section_id`, `outbound_attempt_ordinal`,
+`request_fingerprint`, `outcome`, and `transport_class`. Ordinals are
+one-based; the second outbound attempt retains the same fingerprint. Records
+contain no raw response content and are kept only in bounded memory/logging.
+A previous call's response never changes a later prompt or authority.
+
+## 17. Held-fd Stage 19 lifecycle
+
+The structured transaction order is normative:
+
+1. **Capability/admission.** Public/direct entry checks the exact code-owned
+   map before its first I/O, lock, or provider action. The private B4 test seam
+   validates its unforgeable verified context.
+2. **Release-graph writer epoch.** Acquire one writer epoch for the complete
+   attempt; no nested live-path publication authority is created.
+3. **Held run/stage namespace.** Bind the run and canonical `stage-19`
+   directories by descriptor and record their device/inode identities.
+4. **Manifest-first invalidation.** Attempt to remove
+   `scientific_claim_authority_manifest.json` first.
+5. **Aggregate cleanup.** Independently attempt each other owned success name
+   and `.stage19-structured-publication.staging`; one malformed artifact,
+   collision, or cleanup error cannot suppress attempts at the remaining
+   commit points.
+6. **Snapshot A capture.** Capture the exact ordered source closure from
+   Section 11 through held descriptors.
+7. **Stage 17 full replay.** Independently rebuild CFS, generation, facts,
+   registry, selection, paper, reports, and Stage 17 manifest.
+8. **Provider selection.** Strictly replay Stage 18, apply Section 16 no-op/LLM
+   rules, and obtain only validated three-field selections.
+9. **Deterministic rerender.** Build the Stage 19 selection, splice the five
+   code-rendered bodies, and rebuild all three closure reports.
+10. **Staged exact replay.** Create the exact staging tree with the five
+    non-manifest files, reopen it, require exact names, and independently
+    replay every byte.
+11. **Source fixpoint.** Recapture all Snapshot A sources and require unchanged
+    bytes, hashes, sizes, modes, link counts, and file identities.
+12. **Non-manifest publication.** Exclusively publish the five staged files to
+    their exact direct names; no overwrite or late collision is permitted.
+13. **Staging absence.** Require the staging entry to be consumed and absent.
+14. **Manifest-last.** Independently build schema-v2 manifest bytes and publish
+    the manifest with collision-safe atomic creation.
+15. **Final semantic replay.** Capture the exact six-name final namespace and
+    independently replay source manifest, Stage 18 binding, selection, paper,
+    closures, and manifest.
+16. **Snapshot B.** Recapture the complete source tuple and final namespace,
+    including file and directory identities.
+17. **A/B equality.** Require Snapshot A source bytes, hashes, sizes, modes,
+    link counts, and identities to equal the source portion of Snapshot B;
+    require a second final-namespace capture to equal the first and require
+    held run/stage identities to remain exact.
+18. **Executor postconditions.** Immediately after the stage result and again
+    after HITL/terminal hooks, validate the live writer context, exact artifact
+    and evidence-ref tuples, exact namespace snapshot, manifest replay, staging
+    absence, and run/stage identities.
+19. **Success return.** Only after both postconditions can Stage 19 return
+    `DONE` with the exact tuple from Section 12.
+
+All canonical reads, writes, staging, publication, and cleanup are
+descriptor-relative. Symlink, FIFO, socket, device, special file, directory
+collision, hardlink (`st_nlink != 1`), late name collision, unsafe path, or
+identity change fails closed.
+
+If the live run or stage parent is replaced, the transaction performs zero
+reads, writes, or deletes against the replacement target. Cleanup may operate
+only on the already-held detached original inode. It invalidates every
+reachable commit point there so detached authority cannot revive if the
+original parent is restored. Replacement-target behavior is
+external-zero-write and external-zero-delete.
+
+Cleanup failure is appended to the original error and never changes failure to
+success. A malformed current manifest, paper, staging tree, or other artifact
+cannot block independent invalidation of other owned names. Any provider,
+replay, publication, final-capture, or executor-postcondition failure runs
+manifest-first aggregate cleanup and returns `FAILED` with empty artifact
+tuples.
+
+## 18. Stage 20 handoff
+
+Structured Stage 20 has exactly one source authority:
+`stage-19/scientific_claim_authority_manifest.json` plus the exact six-name
+Stage 19 namespace from Section 12. Stage 20 captures that manifest and
+namespace through held descriptors, hashes the manifest exact bytes
+externally, and treats the schema-v2 manifest as its
+`source_authority_manifest`.
+
+Before any quality-model call, and also when `llm is None`, Stage 20 MUST:
+
+1. replay Stage 19 schema version `2` and the exact namespace;
+2. follow the Stage 17 source manifest and independently rebuild evidence,
+   CFS, generation, five facts, and six claims;
+3. replay the Stage 18 dual-FileRef binding without granting review prose
+   scientific authority;
+4. validate the Stage 19 descendant selection;
+5. independently rerender and splice the paper;
+6. rebuild all Stage 19 closure reports and require exact bytes;
+7. require source and namespace fixpoints.
+
+Structured Stage 20 MUST NOT fall back to Stage 17 selection or paper,
+`stage-19/paper_revised.md`, `revision_evidence_binding.json`, a sectional
+manifest, live prose, or any generic-v1 alternative. Missing or invalid
+Stage 19 authority is `FAILED`. B4-B may implement this frozen handoff but may
+not invent another Stage 19 output schema.
+
+The quality model may assess only the fully replayed paper. It cannot authorize
+facts, claims, sentences, connectors, selections, or publication.
+
+## 19. Generic and release boundary
+
+`generic-v1` Stage 18, Stage 19, and Stage 20 schemas, bytes, artifact names,
+provider behavior, cleanup, and failure behavior remain unchanged. At map
+`1000`, malformed/partial states, and future `1110`, ordinary dispatch remains
+generic after its mandatory common canonical replay.
+
+Generic code does not enumerate, parse, require, publish, consume, block on, or
+clean any structured-only `scientific_claim_*` Stage 19 name or structured
+staging entry. Stale structured artifacts cannot activate the structured path
+and cannot affect generic bytes or results. Artifact presence, caller, config,
+environment, or persisted snapshot is never a discriminator.
+
+Once a valid `1111` domain-v2 dispatch enters the structured path, every later
+error is `FAILED`; generic fallback is forbidden.
+
+Stage 24, Stages 21-25, E9, `release_check`, release gates, and fresh F0 are
+outside B4-D0 and B4-A. B4-D0 changes no release authority. Fresh F0 requires
+separate explicit authorization.
+
+## 20. B1-B5 milestone split
+
+B1 and B2 supplied strict records, identities, deterministic construction,
+rendering, and selection. B3 supplied structured Stage 17 publication and the
+separate `1000` declaration.
+
+B4-D0 freezes this Stage 19/20 design only. Every B4 implementation commit
+keeps map `1000`. A separately reviewed B4 declaration may change it to
+`1110`, which still does not activate public/direct structured production.
+B4-A implements Stage 19 against this frozen schema; B4-B implements the Stage
+20 handoff and may not revise Stage 19 schema.
+
+B5 owns Stage 24 and release integration. Only a separately named, reviewed
+`1111` declaration activates the full structured path.
+
+## 21. Adversarial test matrix
 
 | Area | Mutation | Required result |
 |---|---|---|
-| Strict JSON | extra selection key or prose wrapper | reject |
-| Strict JSON | duplicate JSON key | reject |
-| Connector | value other than `NONE` | reject |
-| Connector | argument object/string channel | reject |
+| Generation | mix Stage 17 facts/registry/manifest with a Stage 19 generation | reject before provider or publication |
+| Stage 18 | after Snapshot A, mutate either review file or synchronously mutate both | source fixpoint rejects and cleanup runs |
+| Stage 18 | before Snapshot A, replace both files and correctly rebuild a strict valid report | no false provenance claim: accept only as bounded advisory; subset/mandatory/ID-only replay still prevents scientific-authority escalation |
+| Provider | return prose, explanation, section, schema, generation, or hash | reject response; no retry or repair |
+| Selection | unknown, missing, duplicate, cross-section, or minted ID; or `ordered_claim_ids` is not an exact permutation of selected IDs | reject |
+| Selection | section objects are reordered, missing, or duplicated | reject |
+| Selection | `ordered_claim_ids` is a legal exact permutation of selected IDs | accept and deterministically render that exact order |
+| Selection | reintroduce registry ID absent from Stage 17 selection | reject |
+| Mandatory | delete a mandatory claim | reject |
+| Connector | inject connector argument or value other than `NONE` | reject |
 | Connector | wrong connector count | reject |
-| Registry | selected unknown ID | reject |
-| Registry | selected valid ID from another section | reject |
-| Registry | duplicate selected ID | reject |
-| Mandatory | omit mandatory ID | reject |
-| Ordering | missing, duplicate, or extra ordered ID | reject |
-| Ordering | same set but wrong allowed order | accept and render that exact order |
-| Fact ID | include `fact_id` in identity payload | reject/recompute mismatch |
-| Claim ID | include or edit `claim_id` payload | reject/recompute mismatch |
-| Decimal builder | typed, finite non-normalized `Decimal` | canonicalize before publication |
-| Decimal parser | float, NaN, infinity, `-0`, exponent/trailing-zero alias | reject |
-| Source | traversal, absolute path, symlink, wrong hash | reject |
-| CFS | caller CFS differs from rebuilt CFS | reject before provider call |
-| CFS | schema/hash changed after selection | reject |
-| Generation | mix Stage 17 registry and Stage 19 evidence | reject |
-| Renderer | unknown template or wrong slot arity | reject |
-| Renderer | altered punctuation/space/Unicode bytes | sentence hash/replay failure |
-| Renderer | persisted sentence edited with same facts | byte replay failure |
-| Stage 17 | provider returns governed prose | reject, no canonical manifest |
-| Stage 17 | failure after paper write, before manifest | cleanup canonical outputs |
-| Stage 19 | provider mints claim or edits sentence | reject |
-| Stage 19 | late namespace mutation | replay failure and cleanup |
-| Stage 20 | `llm=None` | full independent rebuild/replay still required |
-| Stage 20 | forged green quality report | cannot bypass replay |
-| Stage 24 | comparative wording outside registry | no structured authority inferred |
-| Manifest | manifest written before an output | fail manifest-last test |
-| Manifest | CFS/registry/selection hash tamper | independent audit rejects |
-| Manifest | facts/registry/selection/manifest synchronously recomputed | code-owned rebuild byte mismatch rejects |
-| Manifest | missing Stage 17 source manifest field | reject; present JSON null is required |
-| Capability | snapshot/config/caller self-reports all components active | no authority; reject direct entry |
-| Capability | partial or wrong-typed map | generic unchanged; direct entry rejects before I/O |
-| Dispatch | strict replay confirms legal non-domain-v2 | unchanged `generic-v1` |
-| Dispatch | domain-v2 discriminator exists but CFS/schema/generation/replay is invalid | `FAILED`; never generic fallback |
-| Dispatch | canonical evidence strict replay fails | `FAILED`; never generic fallback |
-| Activation | implementation commit changes a capability component | reject commit scope |
-| Activation | final component changes outside named global activation commit | reject commit scope |
-| Capability | gate occurs after lock or cleanup | fail external-zero-write test |
-| Namespace | collision or parent replacement | fail closed; no external write |
-| Namespace | source or final output changes after replay | fail fixpoint and cleanup |
-| Stale output | structured artifact exists while inactive | generic path does not read or consume it |
-| generic-v1 | capability inactive | exact legacy schema/bytes/hash behavior |
+| Forgery | synchronously edit sentence, sentence hash, fact ID, and claim ID | code-owned rebuild/byte replay rejects |
+| Manifest union | Stage 17 source manifest is missing or non-null | Stage 17 reject |
+| Manifest union | Stage 19 source manifest is null, missing, or wrong path | Stage 19 reject |
+| Manifest | bind the wrong Stage 17 authority manifest | reject |
+| Manifest | add a self path/hash/size field | exact-key rejection; no self-hash cycle |
+| Source | mutate a Snapshot A source after provider calls | source fixpoint rejects and cleanup runs |
+| Final namespace | mutate an output after final replay/read | Snapshot B or executor postcondition rejects |
+| File type | canonical name is a hardlink, symlink, FIFO, device, socket, or directory | reject without following or overwriting |
+| Collision | staging or final name already exists | fail closed; aggregate cleanup owned names |
+| Staging | staging remains after publication | reject and cleanup |
+| Parent | replace run or stage parent during attempt | external-zero-write/zero-delete; clean detached original |
+| Revival | restore detached original run after failure | no manifest or revised-paper authority can revive |
+| Executor | return `DONE` with wrong tuple, refs, context, or disk bytes | immediate/terminal postcondition converts to `FAILED` and cleans |
+| No LLM | empty strict ReviewLedger | zero calls; inherit selection; full rerender/replay/publication |
+| No LLM | nonempty strict ReviewLedger | `FAILED` before staging/success publication; no generic fallback |
+| Transport | connection/timeout/retryable 429/5xx before response content | at most one identical second outbound attempt |
+| Transport | third request or changed retry fingerprint | reject/fail call-bound test |
+| Semantic | empty, truncated, malformed, duplicate/extra/missing fields, or invalid IDs | immediate `FAILED`; no retry/repair |
+| Capability | malformed or partial map | ordinary generic unchanged; direct rejects before I/O |
+| Capability | exact `1000` or future `1110` | public/direct structured remains blocked |
+| Test seam | forged, copied, expired, cross-run, or cross-epoch verified context | reject before provider/publication |
+| Discriminator | domain-v2 marker exists but Stage 17/CFS/generation/replay is invalid | `FAILED`; never generic fallback |
+| Generic | stale structured files exist while inactive | generic does not read, block on, consume, or clean them |
+| Generic | legal generic-v1 input | exact existing schemas, bytes, artifacts, and failure behavior |
 
-## 17. B3-D0 acceptance and non-claims
+## 22. B4-D0 acceptance and non-claims
 
-B3-D0 is ready for a narrow docs-only commit only when:
+B4-D0 is ready for a narrow docs-only commit only when:
 
-- this design is independently reviewed;
-- every JSON example parses with a strict duplicate-key parser;
+- the original schema and lifecycle reviewers complete a read-only fixpoint;
+- no P0 or P1 remains and any new material disagreement returns `STOP`;
+- every JSON fence parses with a duplicate-safe strict parser;
 - Markdown fences are paired;
-- the tracked diff contains only this document;
+- paths, names, versions, counts, capability states, call bounds, lifecycle
+  steps, and Stage 20 handoff are internally consistent;
+- the Stage 19 manifest has no self-hash cycle;
+- tracked diff contains only this document and production/tests have zero diff;
 - `git diff --check` passes;
-- an original reviewer completes a read-only fixpoint with no open P0/P1.
+- the original nine untracked groups remain untouched.
 
-B3-D0 does not claim that Stage 17 structured publication exists, that any
-structured capability component is active, that Stage 19 is already ID-only,
-that Stage 20 already replays without an LLM, or that a release run is
-accepted. Implementation, commit, push, and fresh F0 authorization remain
-separate decisions.
+B4-D0 does not implement Stage 19 or Stage 20, activate a structured
+production path, change the capability map, authorize B4-A/B4-B, accept a
+release, authorize commit/push, or authorize API, resume, or fresh F0 work.
