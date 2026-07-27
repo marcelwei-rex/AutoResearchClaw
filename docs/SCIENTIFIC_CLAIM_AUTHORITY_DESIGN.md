@@ -1,16 +1,17 @@
 # Structured Scientific Claim Authority Design
 
-Status: `B4-D0 / STAGE 19-20 SCHEMAS FROZEN / NOT ACTIVATED`
+Status: `B4-D1 / STAGE 19-20 SUCCESS AUTHORITY FROZEN / NOT ACTIVATED`
 
-Scope: Batch B4-D0 docs-only authority for future structured Stage 19 revision
-and Stage 20 replay of the `structured-scientific-claim-v1` capability.
+Scope: Batch B4-D0/D1 docs-only authority for structured Stage 19 revision and
+future Stage 20 replay of the `structured-scientific-claim-v1` capability.
 
 B3 Stage 17 implementation and its separate declaration are complete. The
 code-owned structured capability is now exactly `1000`: Stage 17 publication
 is declared, while Stage 19 revision, Stage 20 replay, and Stage 24/release
-integration remain undeclared. B4-D0 freezes schemas and lifecycle only. It
-does not implement Stage 19 or Stage 20, change the capability map, or activate
-the structured production path.
+integration remain undeclared. B4-A has implemented but not declared Stage 19.
+B4-D0/D1 freeze schemas and lifecycle only. They do not implement Stage 20,
+change the capability map, declare B4, or activate the structured production
+path.
 
 ## 1. Normative boundary
 
@@ -1289,35 +1290,617 @@ replay, publication, final-capture, or executor-postcondition failure runs
 manifest-first aggregate cleanup and returns `FAILED` with empty artifact
 tuples.
 
-## 18. Stage 20 handoff
+## 18. Structured Stage 20 success authority
+
+### 18.1 Sole source binding
 
 Structured Stage 20 has exactly one source authority:
 `stage-19/scientific_claim_authority_manifest.json` plus the exact six-name
-Stage 19 namespace from Section 12. Stage 20 captures that manifest and
-namespace through held descriptors, hashes the manifest exact bytes
-externally, and treats the schema-v2 manifest as its
-`source_authority_manifest`.
+Stage 19 namespace from Section 12. Stage 20 captures every source through
+held descriptors. It hashes exact held bytes and never rediscovers source
+authority from a stored Stage 20 output.
 
-Before any quality-model call, and also when `llm is None`, Stage 20 MUST:
+The following five values are exact and appear in both structured
+`quality_report.json` and structured `fabrication_flags.json`:
 
-1. replay Stage 19 schema version `2` and the exact namespace;
-2. follow the Stage 17 source manifest and independently rebuild evidence,
-   CFS, generation, five facts, and six claims;
-3. replay the Stage 18 dual-FileRef binding without granting review prose
+```text
+source_paper_path =
+  "stage-19/scientific_claim_paper_revised.md"
+
+source_paper_sha256 =
+  SHA256(Snapshot A held-fd exact source-paper bytes)
+
+stage19_publication_mode =
+  "structured-scientific-claim-v1"
+
+stage19_publication_binding_path =
+  "stage-19/scientific_claim_authority_manifest.json"
+
+stage19_publication_binding_sha256 =
+  SHA256(Snapshot A held-fd exact Stage 19 manifest bytes)
+```
+
+The manifest and degradation signal express the same binding as exact
+`FileRef`s named `source_paper` and `stage19_authority_manifest`, plus the same
+exact `stage19_publication_mode` string. Path spelling, bytes, and digests MUST
+equal the five values above.
+
+All five values are independently derived from Snapshot A. A caller, stored
+report, stored flags, stored manifest, config, environment variable, or model
+response MUST NOT provide, select, or override them. No sixth caller-provided
+Stage 19 schema field exists. Instead, mode-dispatched replay MUST require that
+the bound Stage 19 manifest has true-integer `schema_version == 2`,
+`publication_stage_id == "stage19"`,
+`claim_policy_id == "structured-scientific-claim-v1"`, the exact Section 15
+shape, and exact independently rebuilt bytes. A boolean version is rejected.
+
+Before any quality-model call, including the `llm is None` branch, Stage 20
+MUST:
+
+1. capture held root-parent, run, and `stage-20` writer identities;
+2. capture held Snapshot A for the complete Stage 19 six-file namespace and
+   all recursively referenced sources;
+3. replay Stage 19 schema version `2` and its exact namespace;
+4. follow the Stage 17 source manifest and independently rebuild canonical
+   evidence, CFS, generation, five facts, and six claims;
+5. replay the Stage 18 dual-FileRef binding without granting review prose
    scientific authority;
-4. validate the Stage 19 descendant selection;
-5. independently rerender and splice the paper;
-6. rebuild all Stage 19 closure reports and require exact bytes;
-7. require source and namespace fixpoints.
+6. validate the Stage 19 descendant selection;
+7. independently rerender and splice the structured paper;
+8. rebuild all Stage 19 closure reports and require exact bytes; and
+9. recapture the complete source tuple and require the Snapshot A fixpoint.
 
 Structured Stage 20 MUST NOT fall back to Stage 17 selection or paper,
-`stage-19/paper_revised.md`, `revision_evidence_binding.json`, a sectional
-manifest, live prose, or any generic-v1 alternative. Missing or invalid
-Stage 19 authority is `FAILED`. B4-B may implement this frozen handoff but may
-not invent another Stage 19 output schema.
+`stage-19/paper_revised.md`, `revision_evidence_binding.json`,
+`section_revision_manifest.json`, live prose, or any generic-v1 alternative.
+Missing or invalid Stage 19 authority is `FAILED`, uses zero model calls, and
+runs structured cleanup. The quality model may assess only the fully replayed
+paper. It cannot authorize facts, claims, sentences, connectors, selections,
+CFS, generation, publication bindings, fabrication state, or publication.
 
-The quality model may assess only the fully replayed paper. It cannot authorize
-facts, claims, sentences, connectors, selections, or publication.
+### 18.2 `quality_report.json` schema v1
+
+Structured `stage-20/quality_report.json` uses true-integer schema version `1`
+and exactly this root and nested shape:
+
+```json
+{
+  "schema_version": 1,
+  "canonical_experiment_evidence": {
+    "path": "canonical_experiment_evidence.json",
+    "sha256": "<sha256>"
+  },
+  "cfs": {
+    "schema_version": 1,
+    "sha256": "<sha256>"
+  },
+  "generation_binding_sha256": "<sha256>",
+  "source_paper_path": "stage-19/scientific_claim_paper_revised.md",
+  "source_paper_sha256": "<sha256>",
+  "stage19_publication_mode": "structured-scientific-claim-v1",
+  "stage19_publication_binding_path": "stage-19/scientific_claim_authority_manifest.json",
+  "stage19_publication_binding_sha256": "<sha256>",
+  "score_1_to_10": 8.0,
+  "verdict": "proceed",
+  "strengths": ["<nonempty diagnostic string>"],
+  "weaknesses": ["<nonempty diagnostic string>"],
+  "required_actions": ["<nonempty diagnostic string>"],
+  "generated": "2026-07-27T00:00:00+00:00"
+}
+```
+
+The exact root key set is `schema_version`,
+`canonical_experiment_evidence`, `cfs`, `generation_binding_sha256`,
+`source_paper_path`, `source_paper_sha256`,
+`stage19_publication_mode`, `stage19_publication_binding_path`,
+`stage19_publication_binding_sha256`, `score_1_to_10`, `verdict`,
+`strengths`, `weaknesses`, `required_actions`, and `generated`.
+`canonical_experiment_evidence` is an exact `FileRef`. `cfs` has exactly
+`schema_version` and `sha256`, and its version is true integer `1`.
+`generation_binding_sha256` and every source binding MUST equal the
+independent Stage 19 replay.
+
+`score_1_to_10` is a finite JSON integer or number in `[0, 10]`; a boolean,
+string, null, non-finite token, or out-of-range value is rejected. `verdict`
+is exactly `proceed`, `revise`, or `reject`. The three diagnostic arrays are
+arrays of nonempty strings and preserve provider order; duplicate array
+elements retain the existing qualitative semantics and are not scientific
+authority. `generated` is a code-owned nonempty UTC timestamp and is not an
+outcome or scientific-authority oracle. The generic optional `criteria`
+object is forbidden in this structured v1 schema.
+
+The quality-model response has exactly five keys: `score_1_to_10`, `verdict`,
+`strengths`, `weaknesses`, and `required_actions`. Only score and verdict can
+affect the deterministic quality outcome. The other three values are bounded
+diagnostic prose; weaknesses may be copied into the non-authoritative
+degradation signal. Code injects every schema, evidence, CFS, generation,
+source, publication, and timestamp field after strict response parsing. A
+provider-supplied authority field is an extra field and is rejected.
+
+Duplicate, extra, or missing root or nested keys; a wrong or boolean version;
+an unsafe path; a noncanonical digest; and a binding mismatch all fail before
+publication. Report bytes are authority only when the v2 manifest binds them
+and the complete expected rebuild succeeds. They never become
+scientific-claim authority.
+
+### 18.3 `fabrication_flags.json` schema v3
+
+Structured `stage-20/fabrication_flags.json` uses true-integer schema version
+`3` and exactly this root and nested shape:
+
+```json
+{
+  "schema_version": 3,
+  "canonical_experiment_evidence": {
+    "path": "canonical_experiment_evidence.json",
+    "sha256": "<sha256>"
+  },
+  "cfs": {
+    "schema_version": 1,
+    "sha256": "<sha256>"
+  },
+  "generation_binding_sha256": "<sha256>",
+  "source_paper_path": "stage-19/scientific_claim_paper_revised.md",
+  "source_paper_sha256": "<sha256>",
+  "stage19_publication_mode": "structured-scientific-claim-v1",
+  "stage19_publication_binding_path": "stage-19/scientific_claim_authority_manifest.json",
+  "stage19_publication_binding_sha256": "<sha256>",
+  "experiment_failed": false,
+  "quality_score": 8.0,
+  "real_metric_values": ["0.875"],
+  "verified_values_count": 1,
+  "verified_conditions": ["proposed"],
+  "has_real_data": true,
+  "fabrication_suspected": false
+}
+```
+
+The exact root key set is `schema_version`,
+`canonical_experiment_evidence`, `cfs`, `generation_binding_sha256`, the
+five flat source/publication fields from Section 18.1, `experiment_failed`,
+`quality_score`, `real_metric_values`, `verified_values_count`,
+`verified_conditions`, `has_real_data`, and `fabrication_suspected`.
+Evidence, CFS, generation, and all five source values have the same exact
+meaning as the report and MUST replay independently.
+
+`quality_score` is the exact finite `[0, 10]` report score. It is the only
+model-derived value in this file. `experiment_failed`, `has_real_data`, and
+`fabrication_suspected` are true JSON booleans. `verified_values_count` is a
+true nonnegative integer. `real_metric_values` is the sorted, duplicate-free
+array of canonical decimal strings independently rebuilt from canonical
+evidence. `verified_conditions` is the sorted, duplicate-free array of
+nonempty canonical condition IDs.
+
+The deterministic relations are exact:
+
+```text
+has_real_data == (verified_values_count > 0)
+experiment_failed == (not has_real_data)
+fabrication_suspected == experiment_failed
+```
+
+Structured scientific-claim replay establishes what the paper is allowed to
+say; fabrication reconstruction independently establishes whether canonical
+real-data and numeric support exist. Neither substitutes for the other. The
+quality response cannot change any deterministic fabrication field. A stored
+flags file, even if synchronously rehashed into a forged report and manifest,
+is never a Stage 19 replay oracle. Code independently reconstructs state from
+held canonical evidence and requires exact bytes.
+
+Duplicate, extra, or missing fields; a wrong or boolean version; unordered or
+duplicate canonical arrays; noncanonical decimals; inconsistent booleans or
+counts; or any binding mismatch fails closed.
+
+### 18.4 `quality_gate_manifest.json` schema v2
+
+Structured `stage-20/quality_gate_manifest.json` uses true-integer schema
+version `2`. A passed manifest has exactly this shape:
+
+```json
+{
+  "schema_version": 2,
+  "publication_stage_id": "stage20",
+  "stage19_publication_mode": "structured-scientific-claim-v1",
+  "canonical_experiment_evidence": {
+    "path": "canonical_experiment_evidence.json",
+    "sha256": "<sha256>"
+  },
+  "cfs": {
+    "schema_version": 1,
+    "sha256": "<sha256>"
+  },
+  "generation_binding_sha256": "<sha256>",
+  "source_paper": {
+    "path": "stage-19/scientific_claim_paper_revised.md",
+    "sha256": "<sha256>"
+  },
+  "stage19_authority_manifest": {
+    "path": "stage-19/scientific_claim_authority_manifest.json",
+    "sha256": "<sha256>"
+  },
+  "quality_report": {
+    "path": "stage-20/quality_report.json",
+    "sha256": "<sha256>"
+  },
+  "fabrication_flags": {
+    "path": "stage-20/fabrication_flags.json",
+    "sha256": "<sha256>"
+  },
+  "outcome": "passed",
+  "quality_verdict": "proceed",
+  "quality_score": "8",
+  "quality_threshold": "6",
+  "graceful_degradation": true,
+  "degradation_signal": null,
+  "generated": "2026-07-27T00:00:00+00:00"
+}
+```
+
+The exact root key set is `schema_version`, `publication_stage_id`,
+`stage19_publication_mode`, `canonical_experiment_evidence`, `cfs`,
+`generation_binding_sha256`, `source_paper`,
+`stage19_authority_manifest`, `quality_report`, `fabrication_flags`,
+`outcome`, `quality_verdict`, `quality_score`, `quality_threshold`,
+`graceful_degradation`, `degradation_signal`, and `generated`. Every object
+named as a file is an exact two-key `FileRef`. `cfs` has exactly
+`schema_version` and `sha256`.
+
+`publication_stage_id` is exact `stage20`; the publication mode is exact
+`structured-scientific-claim-v1`. The evidence, CFS, generation, paper, and
+Stage 19 manifest values are independently derived from Snapshot A and must
+equal the bindings in the report and flags. The Stage 19 authority manifest
+is independently rebuilt and replayed; mutual hash consistency among stored
+Stage 20 files is not an oracle.
+
+`quality_report` and `fabrication_flags` bind the exact already-published
+bytes. `quality_score` and `quality_threshold` are canonical decimal strings,
+while the report score remains the exact finite JSON number from which
+`quality_score` is canonically derived. `quality_verdict` equals the report
+verdict. `graceful_degradation` is the exact canonical-config boolean.
+`generated` is code-owned and non-authoritative. Every generated timestamp is
+issued exactly once into the live verified transaction context before its
+object is serialized. Expected rebuild receives that held context value; it
+MUST NOT rediscover a timestamp from a stored report, flags, signal, or
+manifest.
+
+`outcome` is exactly `passed` or `degraded` and is independently derived:
+
+```text
+passed =
+  has_real_data
+  and not fabrication_suspected
+  and quality_verdict == "proceed"
+  and quality_score >= quality_threshold
+
+degraded =
+  has_real_data
+  and not fabrication_suspected
+  and quality_verdict == "revise"
+  and quality_score < quality_threshold
+  and graceful_degradation is true
+```
+
+Every other combination has no publishable outcome. In particular, `reject`
+never publishes at any score; `proceed` below threshold and `revise` at or
+above threshold are contradictions; and no-real-data or suspected
+fabrication always blocks.
+
+For `passed`, `degradation_signal` is JSON null and both root
+`degradation_signal.json` and `degradation_signal.json.tmp` MUST be absent.
+For `degraded`, `degradation_signal` is an exact `FileRef` whose path is
+`degradation_signal.json`; that root file MUST exist as a regular,
+single-link file with the exact bound bytes. Missing, extra, stale, wrong-path,
+wrong-hash, null/FileRef branch mismatch, or a signal for `passed` fails
+closed.
+
+The manifest contains no path, digest, size, or identity for itself. Snapshot
+A/B and the executor hold those external facts. This avoids a self-hash
+cycle. The manifest is the last Stage 20 commit point and is accepted only by
+an independent expected rebuild of every field and every referenced byte.
+
+### 18.5 Exact structured degradation signal
+
+The degraded-only root `degradation_signal.json` is operational evidence that
+the run is degraded. It is not scientific authority and is never included in
+the Stage 20 artifact or evidence-ref tuple. It uses true-integer schema
+version `1` and exactly this shape:
+
+```json
+{
+  "schema_version": 1,
+  "publication_stage_id": "stage20",
+  "outcome": "degraded",
+  "stage19_publication_mode": "structured-scientific-claim-v1",
+  "canonical_experiment_evidence": {
+    "path": "canonical_experiment_evidence.json",
+    "sha256": "<sha256>"
+  },
+  "cfs": {
+    "schema_version": 1,
+    "sha256": "<sha256>"
+  },
+  "generation_binding_sha256": "<sha256>",
+  "source_paper": {
+    "path": "stage-19/scientific_claim_paper_revised.md",
+    "sha256": "<sha256>"
+  },
+  "stage19_authority_manifest": {
+    "path": "stage-19/scientific_claim_authority_manifest.json",
+    "sha256": "<sha256>"
+  },
+  "quality_report": {
+    "path": "stage-20/quality_report.json",
+    "sha256": "<sha256>"
+  },
+  "fabrication_flags": {
+    "path": "stage-20/fabrication_flags.json",
+    "sha256": "<sha256>"
+  },
+  "quality_verdict": "revise",
+  "quality_score": "4",
+  "quality_threshold": "6",
+  "weaknesses": ["<nonempty diagnostic string>"],
+  "generated": "2026-07-27T00:00:00+00:00"
+}
+```
+
+The exact root key set is `schema_version`, `publication_stage_id`, `outcome`,
+`stage19_publication_mode`, `canonical_experiment_evidence`, `cfs`,
+`generation_binding_sha256`, `source_paper`,
+`stage19_authority_manifest`, `quality_report`, `fabrication_flags`,
+`quality_verdict`, `quality_score`, `quality_threshold`, `weaknesses`, and
+`generated`. FileRef, CFS, digest, decimal-string, diagnostic-array, and
+generated-field rules are identical to the corresponding manifest and report
+rules. `outcome` is exact `degraded`; `quality_verdict` is exact `revise`.
+The signal is published before the manifest, then captured, hashed, bound by
+the manifest, and included in final replay and fixpoint checks.
+
+### 18.6 Exact namespace and publication lifecycle
+
+The three canonical Stage 20 success names are exactly:
+
+```text
+quality_report.json
+fabrication_flags.json
+quality_gate_manifest.json
+```
+
+The structured staging and temporary names are exactly:
+
+```text
+.stage20-structured-publication.staging
+.stage20-structured-publication.staging/quality_report.json
+.stage20-structured-publication.staging/fabrication_flags.json
+.stage20-structured-publication.staging/quality_report.json.tmp
+.stage20-structured-publication.staging/fabrication_flags.json.tmp
+quality_gate_manifest.json.tmp
+degradation_signal.json.tmp
+```
+
+The only persisted Stage 20 diagnostic sidecar names are:
+
+```text
+quality_gate_llm_diagnostics.json
+quality_gate_llm_diagnostics.json.tmp
+```
+
+Diagnostics are accumulated in memory during an attempt. A bounded
+`quality_gate_llm_diagnostics.json` may be published only after a structured
+failure and its aggregate success-authority cleanup; it is non-authoritative
+and excluded from every manifest and StageResult tuple. Its temporary name
+MUST be absent after diagnostic publication. Admission independently
+invalidates both diagnostic names so stale failure diagnostics cannot affect a
+later attempt. Structured success requires both diagnostic names absent; the
+exact successful direct namespace therefore contains only the three authority
+files. No raw provider response, prompt, invalid report, repair response, or
+free-form diagnostic name may persist. The root
+`degradation_signal.json` belongs to the Stage 20 writer epoch even though it
+is outside `stage-20`; it is present only for a committed degraded outcome.
+
+Structured Stage 20 permits at most two semantic quality calls: one initial
+call and, only after a syntactically received but empty, truncated, malformed,
+duplicate-key, wrong-field, wrong-type, or otherwise invalid response, one
+repair call. A valid first response uses one semantic call. A transport failure
+does not consume the semantic repair branch. Each semantic call permits at
+most one identical retry after a connection error, timeout, retryable 429, or
+retryable 5xx before response content, for a total maximum of four outbound
+attempts. The retry endpoint, model, prompt bytes, JSON mode, token limit, and
+request fingerprint are identical. Once any response content is received,
+transport retry is forbidden. A valid parsed response completes that semantic
+call; an invalid first response may enter the one repair call. A
+non-retryable error, second transport failure, second invalid response, third
+semantic call, or fifth outbound attempt fails immediately. No hidden model,
+endpoint, credential, or prompt fallback is allowed.
+
+Structured publication follows this exact order:
+
+1. reject public/direct structured admission before I/O, lock, or model access
+   unless the complete code-owned capability is exact `1111`;
+2. for the B4-B private seam, require a live under-lock non-forgeable verified
+   context before any structured source or output I/O;
+3. hold root-parent, run, stage, source, and output descriptors and reject
+   unsafe identities or file types;
+4. invalidate the current manifest first, then independently invalidate the
+   other two success names, staging, their temporary entries, the root signal
+   and temporary signal, and both diagnostic names;
+5. aggregate every cleanup collision or error; a collision cannot hide
+   another owned name;
+6. capture Snapshot A and complete all source replay and fixpoint checks;
+7. only after replay succeeds, call the quality model within the exact
+   two-semantic/four-outbound bound and strictly parse its five-field response;
+8. issue each code-owned timestamp once into the live verified transaction
+   context, then deterministically construct report v1, flags v3, the outcome,
+   and all expected manifest fields in memory;
+9. write report and flags only into the held staging directory;
+10. replay the staged report and flags from held bytes against independent
+    evidence, CFS, generation, source, and fabrication state;
+11. recapture the full Snapshot A source tuple and require an exact fixpoint;
+12. exclusively publish report first and flags second into the held final
+    namespace, without overwriting a collision;
+13. for `passed`, require root signal and temp absence; for `degraded`,
+    atomically publish the exact root signal and replay its held bytes;
+14. write `quality_gate_manifest.json` atomically and exclusively last;
+15. replay manifest v2 from held bytes against an independently rebuilt
+    expected object, then replay report, flags, and the null/FileRef signal
+    branch;
+16. require staging and every temporary name absent;
+17. capture Snapshot B over the complete source tuple, final Stage 20
+    namespace, root signal state, and root-parent/run/stage identities;
+18. capture the same final state a second time and require exact equality;
+19. require Snapshot A source bytes, digests, sizes, modes, link counts, and
+    identities to equal the source portion of Snapshot B; and
+20. require both diagnostic names absent, publish the live private executor
+    context, and return success only after the immediate postcondition
+    succeeds.
+
+All reads, writes, renames, captures, invalidations, and cleanup are
+descriptor-relative. Direct-path rediscovery is not authority. Symlink, FIFO,
+socket, device, directory collision, hardlink (`st_nlink != 1`), unsafe path,
+late name collision, missing or extra direct entry, identity change, or
+parent replacement fails closed.
+
+Manifest-first cleanup invalidates all three success names and the root signal
+on every structured failure. Cleanup operates only on the held original
+writer epoch and may clean an already-held detached inode. It performs zero
+reads, writes, or deletes against a replacement root-parent, run, stage, or
+root-signal target. Cleanup errors are aggregated and appended to the original
+failure; they never change failure into success. Restoring a detached original
+cannot revive Stage 20 authority because its manifest and root signal commit
+points were invalidated first.
+
+### 18.7 Exact terminal outcome matrix
+
+The only structured success tuple is:
+
+```text
+artifacts = (
+  "quality_report.json",
+  "fabrication_flags.json",
+  "quality_gate_manifest.json",
+)
+
+evidence_refs = (
+  "stage-20/quality_report.json",
+  "stage-20/fabrication_flags.json",
+  "stage-20/quality_gate_manifest.json",
+)
+```
+
+The three manifest-bound files are quality-gate authority. They are not
+scientific-claim authority. The degradation signal is operational
+non-authority and is excluded from both tuples. Every structured failure has
+`status=FAILED`, `decision="retry"`, `artifacts=()`, and
+`evidence_refs=()`. `decision=None` is forbidden, and the publication-mode
+string `structured-scientific-claim-v1` is never a quality outcome.
+
+| Case | Status / decision | Report | Flags | Manifest | Root signal | Authority and downstream |
+|---|---|---|---|---|---|---|
+| `proceed` and score at or above threshold | `DONE` / `proceed` | required | required | required v2 `passed` | forbidden; manifest field null | exact success tuples; not consumable by current Stage 21 |
+| `revise`, low score, graceful degradation true | `DONE` / `degraded` | required | required | required v2 `degraded` | required exact bound file | exact success tuples; degraded operational state; not consumable by current Stage 21 |
+| `reject` at any score | `FAILED` / `retry` | forbidden after cleanup | forbidden after cleanup | forbidden | forbidden | diagnostics only; empty tuples; no downstream |
+| verdict/score contradiction | `FAILED` / `retry` | forbidden after cleanup | forbidden after cleanup | forbidden | forbidden | diagnostics only; empty tuples; no downstream |
+| fabrication suspected or no real data | `FAILED` / `retry` | forbidden after cleanup | forbidden after cleanup | forbidden | forbidden | deterministic block; empty tuples; no downstream |
+| Stage 19 replay or source fixpoint failure | `FAILED` / `retry` | forbidden | forbidden | forbidden | forbidden | zero model calls; empty tuples; no downstream |
+| quality transport or strict parser failure | `FAILED` / `retry` | forbidden | forbidden | forbidden | forbidden | bounded diagnostic sidecar may remain; empty tuples; no downstream |
+| `llm is None` | `FAILED` / `retry` | forbidden | forbidden | forbidden | forbidden | replay still required, zero calls, no default report or fallback |
+| post-publication replay, Snapshot B, or final-capture failure | `FAILED` / `retry` | removed | removed | removed first | removed | diagnostic only; empty tuples; no downstream |
+| immediate or terminal executor postcondition failure | `FAILED` / `retry` | removed | removed | removed first | removed | Stage 20 generation marked withdrawn in the live revocation interface; B5 owns later downstream recognition and invalidation; empty tuples; no downstream |
+
+Report, flags, or manifest bytes found after a failure are stale or cleanup
+failure evidence, never authority. A diagnostic sidecar may describe the
+failure but cannot use a success name or enter a tuple.
+
+### 18.8 Admission and B4-B pre-activation
+
+At exact `1000`, future `1110`, malformed maps, and partial maps, ordinary
+production dispatch remains generic-v1. Public or direct structured Stage 20
+entrypoints call the code-owned complete-capability guard as their first
+operation and reject before I/O, lock acquisition, model access, cleanup, or
+artifact enumeration.
+
+B4-B may exercise structured Stage 20 only through a private, under-lock,
+non-forgeable verified context. The context binds the exact Stage 19 v2
+manifest and six-file namespace, root-parent/run/stage inode identities,
+writer owner and epoch, generation binding, CFS, canonical evidence, Snapshot
+A source closure, and structured output namespace. It is live only in the
+issuing writer epoch and cannot be serialized, copied, caller-constructed, or
+reused.
+
+A fake, copied, reader-mode, inactive, expired, wrong-run, wrong-stage,
+wrong-generation, wrong-source, wrong-namespace, or wrong-owner context is
+rejected before model or publication. The private seam never makes a B4-B
+artifact public production authority. Only exact `1111` plus the exact
+domain-v2 discriminator formally enters structured production. Once that
+entry begins, every later error is structured `FAILED`; generic fallback is
+forbidden.
+
+### 18.9 Executor immediate and terminal postconditions
+
+The executor recognizes a structured Stage 20 attempt only from exact
+domain-v2 dispatch or the live private published context, never from artifact
+presence, `decision`, config, or stored mode strings.
+
+Immediately after the producer returns and before ordinary output checks,
+PRM, HITL, or gate hooks, the executor MUST:
+
+1. if the producer is non-`DONE`, run manifest-first cleanup in the same writer
+   epoch and force empty tuples;
+2. for `DONE`, require the live private context in published phase;
+3. require the exact success artifact and evidence-ref tuples;
+4. require the exact three-file report-v1, flags-v3, and manifest-v2 namespace
+   with no diagnostic, missing, empty, extra, staged, or temporary entry;
+5. replay the Stage 19 source closure and Snapshot A fixpoint;
+6. independently rebuild and replay report, flags, outcome, manifest, and the
+   passed-null/degraded-FileRef signal branch;
+7. require exact Snapshot B bytes, digests, sizes, modes, link counts, inode
+   identities, and two-capture equality;
+8. require the original root-parent, run, stage, root-signal, namespace, and
+   writer epoch identities; and
+9. reject any producer `DONE` with missing, empty, reordered, duplicated, or
+   mismatched tuples or disk bytes.
+
+After PRM, HITL, gate, checkpoint, and other terminal hooks, the executor runs
+the same validator again against the same live context and original writer
+epoch. If a hook converts `DONE` to any non-`DONE` status, or if any source,
+paper, report, flags, signal, manifest, namespace, tuple, identity, or parent
+changes after the immediate check, terminal handling converts the result to
+`FAILED`, sets `decision="retry"`, runs aggregate cleanup, and returns empty
+tuples.
+
+Late mutation of source, output, or manifest after a final read is caught by
+the second final capture or a postcondition. B4-B cleanup invalidates only the
+Stage 20 manifest, report, flags, signal, staging, and temporary commit points
+in the current Stage 20 generation. It records that generation as withdrawn in
+the live revocation interface but does not enumerate, open, mutate, or delete
+any Stage 21+ output. B5 consumers must later recognize the withdrawn
+generation and own actual invalidation or cleanup of their commit points.
+Replacement cleanup uses only held detached original inodes and never touches
+replacement targets.
+
+### 18.10 B5 downstream deferral
+
+B4-B owns only private structured Stage 20 source replay, quality evaluation,
+publication, self-replay, postconditions, and invalidation. It MUST NOT modify
+Stage 21, Stage 22, Stage 24, independent release reconstruction,
+`release_check`, or any release gate.
+
+Current Stage 21 accepts only the generic versionless report, flags v2, and
+manifest v1. Current Stage 22 accepts only Stage 19 publication modes
+`legacy` and `sectional`. Stage 24 and independent reconstruction inherit that
+generic chain, while direct `release_check` score/flag reads are not a
+structured schema oracle. Therefore no current Stage 21/22/24 or release
+consumer may consume structured Stage 20 output, and existing fields are not
+sufficient for safe structured recognition.
+
+B5 owns Stage 21/22 dual-schema dispatch, structured publication-mode
+propagation, Stage 24 binding, independent reconstruction, release-check and
+gate integration, recognition of a withdrawn Stage 20 generation, and actual
+invalidation of downstream commit points. Generic-v1 Stage 20, Stage 21, and
+Stage 22 schemas, paths, bytes, and behavior remain unchanged. Stale structured
+Stage 19 or Stage 20 files cannot discriminate generic dispatch. B4
+implementation and a later `1110` declaration remain inactive; only completed
+B5 integration followed by a separately reviewed exact `1111` declaration can
+activate the full structured path.
 
 ## 19. Generic and release boundary
 
@@ -1335,9 +1918,9 @@ environment, or persisted snapshot is never a discriminator.
 Once a valid `1111` domain-v2 dispatch enters the structured path, every later
 error is `FAILED`; generic fallback is forbidden.
 
-Stage 24, Stages 21-25, E9, `release_check`, release gates, and fresh F0 are
-outside B4-D0 and B4-A. B4-D0 changes no release authority. Fresh F0 requires
-separate explicit authorization.
+Structured dispatch and parsing for Stages 21-25, E9, `release_check`, release
+gates, and fresh F0 are outside B4-D0, B4-D1, B4-A, and B4-B. B4-D0/D1 change
+no release authority. Fresh F0 requires separate explicit authorization.
 
 ## 20. B1-B5 milestone split
 
@@ -1345,14 +1928,17 @@ B1 and B2 supplied strict records, identities, deterministic construction,
 rendering, and selection. B3 supplied structured Stage 17 publication and the
 separate `1000` declaration.
 
-B4-D0 freezes this Stage 19/20 design only. Every B4 implementation commit
-keeps map `1000`. A separately reviewed B4 declaration may change it to
-`1110`, which still does not activate public/direct structured production.
-B4-A implements Stage 19 against this frozen schema; B4-B implements the Stage
-20 handoff and may not revise Stage 19 schema.
+B4-D0 freezes the Stage 19 design and B4-D1 freezes the Stage 20 success
+authority. Every B4 implementation commit keeps map `1000`. A separately
+reviewed B4 declaration may change it to `1110`, which still does not activate
+public/direct structured production. B4-A implements Stage 19 against this
+frozen schema; B4-B implements only the private Stage 20 handoff and may not
+revise Stage 19 or any downstream schema.
 
-B5 owns Stage 24 and release integration. Only a separately named, reviewed
-`1111` declaration activates the full structured path.
+B5 owns structured Stage 21/22 parsing and dispatch, Stage 24, independent
+reconstruction, `release_check`, release gates, and full release integration.
+Only a separately named, reviewed `1111` declaration after B5 activates the
+full structured path.
 
 ## 21. Adversarial test matrix
 
@@ -1374,6 +1960,28 @@ B5 owns Stage 24 and release integration. Only a separately named, reviewed
 | Manifest union | Stage 19 source manifest is null, missing, or wrong path | Stage 19 reject |
 | Manifest | bind the wrong Stage 17 authority manifest | reject |
 | Manifest | add a self path/hash/size field | exact-key rejection; no self-hash cycle |
+| Stage 20 binding | forge `stage19_publication_mode` | reject before quality publication |
+| Stage 20 binding | source paper points to generic `stage-19/paper_revised.md` | reject before model; zero calls |
+| Stage 20 binding | publication binding points to legacy or sectional file | reject before model; zero calls |
+| Stage 20 binding | synchronously recompute a forged Stage 19 manifest and its digest | independent Stage 19 expected rebuild rejects |
+| Stage 20 schema | report v1, flags v3, and manifest v2 are synchronously forged | independent source, CFS, generation, fabrication, and outcome rebuild rejects |
+| Stage 20 schema | wrong or boolean schema version | exact-type/version rejection |
+| Stage 20 schema | duplicate, extra, or missing report/flags/manifest field | duplicate-safe exact-key rejection |
+| Stage 20 outcome | `proceed` below threshold or `revise` at/above threshold | `FAILED`; cleanup all success names and root signal |
+| Stage 20 outcome | `reject` with a high score | `FAILED`; no manifest or root signal |
+| Stage 20 outcome | fabrication suspected or no real data despite high score | `FAILED`; deterministic fabrication block wins |
+| Stage 20 forgery | source replay fails, then a green report is forged | zero model calls; forged report cannot authorize; cleanup |
+| Stage 20 publication | report is published but flags or manifest publication fails | manifest-first aggregate cleanup leaves empty tuples |
+| Stage 20 publication | manifest is written, then source or source paper mutates | final replay/Snapshot B rejects and cleanup runs |
+| Stage 20 publication | output mutates after final read | second capture or executor postcondition rejects |
+| Degradation | passed outcome has any root signal or non-null manifest field | reject and cleanup |
+| Degradation | degraded outcome has null, missing, extra, wrong-path, or wrong-hash signal | reject and cleanup |
+| Degradation | root signal or temp is a symlink, directory, hardlink, or other collision | fail closed with external-zero-write/delete |
+| Stage 20 parent | replace root parent, run, stage, or root-signal parent | external-zero-write/delete; clean held detached original only |
+| Stage 20 executor | producer returns `DONE` with tuple mismatch | immediate postcondition converts to `FAILED` and cleans |
+| Stage 20 executor | HITL/PRM/gate converts `DONE` to non-`DONE` | terminal cleanup; empty tuples |
+| Stage 20 executor | mutate source, report, flags, signal, or manifest after immediate validation | terminal postcondition rejects and cleans |
+| Stage 20 no LLM | `llm is None` with otherwise valid source | full source replay, zero calls, then `FAILED`; no default report |
 | Source | mutate a Snapshot A source after provider calls | source fixpoint rejects and cleanup runs |
 | Final namespace | mutate an output after final replay/read | Snapshot B or executor postcondition rejects |
 | File type | canonical name is a hardlink, symlink, FIFO, device, socket, or directory | reject without following or overwriting |
@@ -1382,21 +1990,28 @@ B5 owns Stage 24 and release integration. Only a separately named, reviewed
 | Parent | replace run or stage parent during attempt | external-zero-write/zero-delete; clean detached original |
 | Revival | restore detached original run after failure | no manifest or revised-paper authority can revive |
 | Executor | return `DONE` with wrong tuple, refs, context, or disk bytes | immediate/terminal postcondition converts to `FAILED` and cleans |
-| No LLM | empty strict ReviewLedger | zero calls; inherit selection; full rerender/replay/publication |
-| No LLM | nonempty strict ReviewLedger | `FAILED` before staging/success publication; no generic fallback |
-| Transport | connection/timeout/retryable 429/5xx before response content | at most one identical second outbound attempt |
-| Transport | third request or changed retry fingerprint | reject/fail call-bound test |
-| Semantic | empty, truncated, malformed, duplicate/extra/missing fields, or invalid IDs | immediate `FAILED`; no retry/repair |
+| Stage 19 no LLM | empty strict ReviewLedger | zero calls; inherit selection; full rerender/replay/publication |
+| Stage 19 no LLM | nonempty strict ReviewLedger | `FAILED` before staging/success publication; no generic fallback |
+| Stage 19 transport | connection/timeout/retryable 429/5xx before response content | at most one identical second outbound attempt |
+| Stage 19 transport | third request or changed retry fingerprint | reject/fail call-bound test |
+| Stage 19 semantic | empty, truncated, malformed, duplicate/extra/missing fields, or invalid IDs | immediate `FAILED`; no retry/repair |
+| Stage 20 transport | first connection/timeout/retryable 429/5xx before content | at most one identical retry for that semantic call |
+| Stage 20 transport | changed retry fingerprint, fifth outbound attempt, or hidden fallback | `FAILED`; diagnostics only; cleanup |
+| Stage 20 semantic | first empty/truncated/malformed/duplicate/extra/missing/wrong-type response | permit exactly one repair semantic call |
+| Stage 20 semantic | second invalid response or third semantic call | `FAILED`; diagnostics only; cleanup |
 | Capability | malformed or partial map | ordinary generic unchanged; direct rejects before I/O |
 | Capability | exact `1000` or future `1110` | public/direct structured remains blocked |
 | Test seam | forged, copied, expired, cross-run, or cross-epoch verified context | reject before provider/publication |
 | Discriminator | domain-v2 marker exists but Stage 17/CFS/generation/replay is invalid | `FAILED`; never generic fallback |
-| Generic | stale structured files exist while inactive | generic does not read, block on, consume, or clean them |
+| Downstream | current Stage 21 or Stage 22 is asked to consume structured Stage 20 | reject; B5 parser/dispatch is not implemented |
+| Downstream | synchronously forge Stage 21/22 hashes around structured Stage 20 | independent reconstruction rejects; no B4 release authority |
+| Generic | stale structured-only Stage 19 names or `.stage20-structured-publication.staging` exist while inactive | generic does not use them as dispatch authority or consume them |
+| Generic | overlapping Stage 20 `quality_report.json`, `fabrication_flags.json`, or `quality_gate_manifest.json` is stale | unchanged generic entry cleanup may invalidate it; the name never discriminates structured dispatch |
 | Generic | legal generic-v1 input | exact existing schemas, bytes, artifacts, and failure behavior |
 
-## 22. B4-D0 acceptance and non-claims
+## 22. B4-D1 acceptance and non-claims
 
-B4-D0 is ready for a narrow docs-only commit only when:
+B4-D1 is ready for a narrow docs-only commit only when:
 
 - the original schema and lifecycle reviewers complete a read-only fixpoint;
 - no P0 or P1 remains and any new material disagreement returns `STOP`;
@@ -1404,11 +2019,12 @@ B4-D0 is ready for a narrow docs-only commit only when:
 - Markdown fences are paired;
 - paths, names, versions, counts, capability states, call bounds, lifecycle
   steps, and Stage 20 handoff are internally consistent;
-- the Stage 19 manifest has no self-hash cycle;
+- neither the Stage 19 nor Stage 20 manifest has a self-hash cycle;
 - tracked diff contains only this document and production/tests have zero diff;
 - `git diff --check` passes;
 - the original nine untracked groups remain untouched.
 
-B4-D0 does not implement Stage 19 or Stage 20, activate a structured
-production path, change the capability map, authorize B4-A/B4-B, accept a
-release, authorize commit/push, or authorize API, resume, or fresh F0 work.
+B4-D1 does not implement Stage 20, modify downstream consumers, activate a
+structured production path, change the capability map, authorize B4-B or a B4
+declaration, accept a release, authorize commit/push, or authorize API, resume,
+or fresh F0 work.
