@@ -1,17 +1,18 @@
 # Structured Scientific Claim Authority Design
 
-Status: `B4-D1 / STAGE 19-20 SUCCESS AUTHORITY FROZEN / NOT ACTIVATED`
+Status: `B4-D3 / STAGE 19-20 SUCCESS AUTHORITY FROZEN / NOT ACTIVATED`
 
-Scope: Batch B4-D0/D1 docs-only authority for structured Stage 19 revision and
-future Stage 20 replay of the `structured-scientific-claim-v1` capability.
+Scope: Batch B4-D0/D1/D2/D3 docs-only authority for structured Stage 19
+revision and future Stage 20 replay of the
+`structured-scientific-claim-v1` capability.
 
 B3 Stage 17 implementation and its separate declaration are complete. The
 code-owned structured capability is now exactly `1000`: Stage 17 publication
 is declared, while Stage 19 revision, Stage 20 replay, and Stage 24/release
 integration remain undeclared. B4-A has implemented but not declared Stage 19.
-B4-D0/D1 freeze schemas and lifecycle only. They do not implement Stage 20,
-change the capability map, declare B4, or activate the structured production
-path.
+B4-D0/D1/D2/D3 freeze schemas, lifecycle, and the Stage 20 threat boundary
+only. They do not implement Stage 20, change the capability map, declare B4,
+or activate the structured production path.
 
 ## 1. Normative boundary
 
@@ -1595,8 +1596,9 @@ closed.
 
 The manifest contains no path, digest, size, or identity for itself. Snapshot
 A/B and the executor hold those external facts. This avoids a self-hash
-cycle. The manifest is the last Stage 20 commit point and is accepted only by
-an independent expected rebuild of every field and every referenced byte.
+cycle. The manifest is published last as the Stage 20 commit candidate and is
+accepted as the current authority commit point only by an independent expected
+rebuild of every field and every referenced byte.
 
 ### 18.5 Exact structured degradation signal
 
@@ -1665,17 +1667,88 @@ fabrication_flags.json
 quality_gate_manifest.json
 ```
 
-The structured staging and temporary names are exactly:
+Structured Stage 20 has no staging directory. Its four temporary ordinary-file
+names are exactly:
 
 ```text
-.stage20-structured-publication.staging
-.stage20-structured-publication.staging/quality_report.json
-.stage20-structured-publication.staging/fabrication_flags.json
-.stage20-structured-publication.staging/quality_report.json.tmp
-.stage20-structured-publication.staging/fabrication_flags.json.tmp
-quality_gate_manifest.json.tmp
+stage-20/quality_report.json.tmp
+stage-20/fabrication_flags.json.tmp
+stage-20/quality_gate_manifest.json.tmp
 degradation_signal.json.tmp
 ```
+
+Each temporary is a regular file created through the already-held Stage 20 or
+run-root directory fd with exact `O_CREAT|O_EXCL|O_NOFOLLOW`. The creating
+`openat` returns the only fd through which content may be written. The
+transaction immediately records that fd's `fstat` identity and MUST NOT reopen
+the temporary by path for writing. A pre-existing entry at any temporary name,
+whether a regular file, directory, symlink, FIFO, socket, device, or other
+special file, is a collision: admission fails before writing and MUST NOT
+overwrite, follow, enter, or otherwise mutate the collision target through the
+normal publication path. Later failure cleanup may unlink the injected
+reserved-name directory entry under the fixed-name rules below; it never
+follows or modifies the entry's target.
+
+Before publication, the transaction requires every temporary path still to
+bind the identity recorded from its creating fd. Missing names, replacement,
+or any identity mismatch fail closed and block normal publication. Formal
+publication does not link, rename, or reopen a temporary path. Instead, each
+absent formal target is created through its held directory fd with exact
+`O_CREAT|O_EXCL|O_NOFOLLOW`, its creating-fd identity is recorded, and the
+already-held temporary bytes are copied only into that newly created formal
+fd. A replacement after formal creation therefore receives no content writes,
+and identity verification cannot confer publication authority on it. Any
+formal target that exists or reappears after admission invalidation makes the
+exclusive create fail before content writing. No random or alternate staging
+name and no platform-specific publication primitive is authorized. This
+four-file ordinary-file transaction is specific to Stage 20. Stage 19 retains
+its existing exact staging-directory design unchanged.
+
+B4-D3 explicitly corrects the deletion claim made by B4-D2. Portable
+POSIX/macOS provides no atomic `unlink-if-inode`; an identity check followed by
+`unlinkat` is not an identity-conditional delete because another same-UID
+actor may replace the directory entry between those operations. Identity
+checks detect drift, reject publication, and support diagnostics. They MUST
+NOT be described as proof that a later `unlinkat` removed the checked inode.
+
+The writer epoch coordinates cooperating ResearchClaw writers only. It is not
+an operating-system isolation boundary against an arbitrary same-UID process.
+Such a process may inject or replace entries, force `FAILED` or denial of
+service, and continue mutating the run after validation. Structured Stage 20
+does not claim to prevent those actions. Every consumer therefore captures
+through held directory fds and repeats strict schema, source binding,
+generation, Snapshot/fixpoint, and semantic replay on every consumption.
+
+The three formal Stage 20 names, the four exact temporary names, the root
+signal name, and the two diagnostic names are a code-owned reserved namespace.
+A non-cooperating actor that injects a directory entry at a reserved name does
+not obtain a guarantee that the reserved directory entry itself will never be
+unlinked. Cleanup MAY call descriptor-relative `unlinkat` on fixed reserved
+names. Identity comparison before cleanup remains drift evidence only and
+does not make the deletion conditional on inode identity.
+
+For this threat model, `external-zero-write/delete` means all of the following
+and nothing stronger:
+
+- never follow or modify a symlink target;
+- never recursively enter or delete unknown replacement-directory contents;
+- never write through a replacement path;
+- never modify a path outside the code-owned reserved namespace; and
+- the injected directory entry at a reserved name is not itself a protected
+  external target.
+
+A reserved-name directory collision is not recursively removed. A symlink,
+FIFO, socket, device, or other special-file collision is never opened for
+content I/O. Cleanup attempts the fixed-name non-following operation that is
+safe for that entry type, aggregates any refusal or error, and continues
+checking the other reserved names. If a reserved name cannot be reduced to a
+strict regular manifest whose bytes, schema, source binding, generation, and
+complete semantic replay all succeed, no successful Stage 20 authority exists.
+
+This correction changes only the Stage 20 operating-system threat and cleanup
+claims. It does not relax quality semantics, source authority, any frozen
+schema or outcome, capability `1000`, Stage 21-25 deferral, or any release
+check or gate.
 
 The only persisted Stage 20 diagnostic sidecar names are:
 
@@ -1720,9 +1793,10 @@ Structured publication follows this exact order:
    context before any structured source or output I/O;
 3. hold root-parent, run, stage, source, and output descriptors and reject
    unsafe identities or file types;
-4. invalidate the current manifest first, then independently invalidate the
-   other two success names, staging, their temporary entries, the root signal
-   and temporary signal, and both diagnostic names;
+4. perform authority-first invalidation by attempting descriptor-relative
+   `unlinkat` on the fixed manifest name first, then on the other formal,
+   temporary, root-signal, and diagnostic reserved names; never follow a
+   symlink or recursively enter a directory collision;
 5. aggregate every cleanup collision or error; a collision cannot hide
    another owned name;
 6. capture Snapshot A and complete all source replay and fixpoint checks;
@@ -1731,42 +1805,79 @@ Structured publication follows this exact order:
 8. issue each code-owned timestamp once into the live verified transaction
    context, then deterministically construct report v1, flags v3, the outcome,
    and all expected manifest fields in memory;
-9. write report and flags only into the held staging directory;
-10. replay the staged report and flags from held bytes against independent
-    evidence, CFS, generation, source, and fabrication state;
+9. create the report and flags temporary ordinary files, and only for a
+   degraded outcome the root signal temporary ordinary file, through held
+   directory fds with exact `O_CREAT|O_EXCL|O_NOFOLLOW`; record each creating
+   fd identity and write content only through that fd;
+10. replay report, flags, and any degradation signal from their held
+    transaction bytes against independent evidence, CFS, generation, source,
+    fabrication state, and the null/FileRef outcome branch;
 11. recapture the full Snapshot A source tuple and require an exact fixpoint;
-12. exclusively publish report first and flags second into the held final
-    namespace, without overwriting a collision;
-13. for `passed`, require root signal and temp absence; for `degraded`,
-    atomically publish the exact root signal and replay its held bytes;
-14. write `quality_gate_manifest.json` atomically and exclusively last;
-15. replay manifest v2 from held bytes against an independently rebuilt
+12. validate that every existing temporary path still binds its recorded
+    identity; for `passed`, require both root signal names absent;
+13. create the manifest temporary ordinary file through the held Stage 20 fd,
+    record its creating-fd identity, write only through that fd, and replay its
+    held bytes against the independently rebuilt expected manifest;
+14. validate the manifest temporary identity, then formally publish report
+    first, flags second, and the degraded root signal third when present; each
+    absent formal name is created with exact
+    `O_CREAT|O_EXCL|O_NOFOLLOW`, its creating-fd identity is recorded, and
+    exact held temporary bytes are written only through that formal fd;
+15. create and write formal `quality_gate_manifest.json` by the same
+    creating-fd rule strictly last; the complete, fsynced, identity-matched
+    formal manifest is only a publication commit candidate until the complete
+    replay and final captures below succeed;
+16. replay manifest v2 from held bytes against an independently rebuilt
     expected object, then replay report, flags, and the null/FileRef signal
     branch;
-16. require staging and every temporary name absent;
-17. capture Snapshot B over the complete source tuple, final Stage 20
+17. after each complete formal entry exists, attempt descriptor-relative
+    `unlinkat` on its fixed temporary reserved name; require all four
+    temporary names physically absent for success, while treating any
+    non-removable or reintroduced entry as `FAILED`/DoS rather than authority;
+18. capture Snapshot B over the complete source tuple, final Stage 20
     namespace, root signal state, and root-parent/run/stage identities;
-18. capture the same final state a second time and require exact equality;
-19. require Snapshot A source bytes, digests, sizes, modes, link counts, and
+19. capture the same final state a second time and require exact equality;
+20. require Snapshot A source bytes, digests, sizes, modes, link counts, and
     identities to equal the source portion of Snapshot B; and
-20. require both diagnostic names absent, publish the live private executor
+21. require both diagnostic names absent, publish the live private executor
     context, and return success only after the immediate postcondition
     succeeds.
 
-All reads, writes, renames, captures, invalidations, and cleanup are
-descriptor-relative. Direct-path rediscovery is not authority. Symlink, FIFO,
-socket, device, directory collision, hardlink (`st_nlink != 1`), unsafe path,
-late name collision, missing or extra direct entry, identity change, or
-parent replacement fails closed.
+All reads, writes, captures, invalidations, and cleanup are
+descriptor-relative. Direct-path rediscovery is not authority. Temporary
+creation and content writes use the creating fd; path lookup is permitted only
+to compare the current entry with the recorded identity before formal
+creating-fd publication or to operate on a fixed reserved name. Formal content
+writes likewise use only the fd returned by the successful exclusive create.
+Identity checks do not make a subsequent `unlinkat` identity-conditional.
+Symlink, FIFO, socket, device, directory collision, hardlink
+(`st_nlink != 1`), unsafe path, late name collision, missing or extra direct
+entry, identity change, or parent replacement fails closed. Same-UID
+non-cooperative replacement remains in the threat model and may force failure.
 
-Manifest-first cleanup invalidates all three success names and the root signal
-on every structured failure. Cleanup operates only on the held original
-writer epoch and may clean an already-held detached inode. It performs zero
-reads, writes, or deletes against a replacement root-parent, run, stage, or
-root-signal target. Cleanup errors are aggregated and appended to the original
-failure; they never change failure into success. Restoring a detached original
-cannot revive Stage 20 authority because its manifest and root signal commit
-points were invalidated first.
+Authority-first cleanup attempts the fixed manifest reserved name before the
+other formal, temporary, root-signal, and diagnostic names on every structured
+failure. It MAY unlink a non-directory entry at a fixed reserved name even
+after identity drift; this is a namespace cleanup operation, not an
+identity-conditional delete. It MUST NOT follow a symlink, recursively enter a
+directory, write through a replacement path, or operate outside the reserved
+namespace. Directory and unsafe special-file collisions are retained with
+aggregated diagnostics when a non-following fixed-name unlink is not safe or
+fails.
+
+`Authority-first invalidation` and `no stale authority` mean that no manifest
+at the reserved Stage 20 manifest name can pass the complete strict schema,
+source binding, generation binding, Snapshot/fixpoint, and semantic replay.
+The mechanical authority commit point is therefore a currently captured
+strict regular manifest at that exact reserved name that passes this complete
+replay, not merely a file created by the producer or a producer's earlier
+successful return.
+They do not require every canonical or temporary directory entry to be
+physically absent from a namespace writable by a malicious same-UID actor.
+Cleanup errors are appended to the original failure and never change failure
+into success. Restoring a detached original, leaving a malformed entry, or
+reintroducing a reserved name cannot revive authority without a manifest that
+passes the complete replay.
 
 ### 18.7 Exact terminal outcome matrix
 
@@ -1797,18 +1908,20 @@ string `structured-scientific-claim-v1` is never a quality outcome.
 |---|---|---|---|---|---|---|
 | `proceed` and score at or above threshold | `DONE` / `proceed` | required | required | required v2 `passed` | forbidden; manifest field null | exact success tuples; not consumable by current Stage 21 |
 | `revise`, low score, graceful degradation true | `DONE` / `degraded` | required | required | required v2 `degraded` | required exact bound file | exact success tuples; degraded operational state; not consumable by current Stage 21 |
-| `reject` at any score | `FAILED` / `retry` | forbidden after cleanup | forbidden after cleanup | forbidden | forbidden | diagnostics only; empty tuples; no downstream |
-| verdict/score contradiction | `FAILED` / `retry` | forbidden after cleanup | forbidden after cleanup | forbidden | forbidden | diagnostics only; empty tuples; no downstream |
-| fabrication suspected or no real data | `FAILED` / `retry` | forbidden after cleanup | forbidden after cleanup | forbidden | forbidden | deterministic block; empty tuples; no downstream |
-| Stage 19 replay or source fixpoint failure | `FAILED` / `retry` | forbidden | forbidden | forbidden | forbidden | zero model calls; empty tuples; no downstream |
-| quality transport or strict parser failure | `FAILED` / `retry` | forbidden | forbidden | forbidden | forbidden | bounded diagnostic sidecar may remain; empty tuples; no downstream |
-| `llm is None` | `FAILED` / `retry` | forbidden | forbidden | forbidden | forbidden | replay still required, zero calls, no default report or fallback |
-| post-publication replay, Snapshot B, or final-capture failure | `FAILED` / `retry` | removed | removed | removed first | removed | diagnostic only; empty tuples; no downstream |
-| immediate or terminal executor postcondition failure | `FAILED` / `retry` | removed | removed | removed first | removed | Stage 20 generation marked withdrawn in the live revocation interface; B5 owns later downstream recognition and invalidation; empty tuples; no downstream |
+| `reject` at any score | `FAILED` / `retry` | cleanup attempted | cleanup attempted | invalidated first | cleanup attempted | no replayable authority; diagnostics only; empty tuples; no downstream |
+| verdict/score contradiction | `FAILED` / `retry` | cleanup attempted | cleanup attempted | invalidated first | cleanup attempted | no replayable authority; diagnostics only; empty tuples; no downstream |
+| fabrication suspected or no real data | `FAILED` / `retry` | cleanup attempted | cleanup attempted | invalidated first | cleanup attempted | no replayable authority; deterministic block; empty tuples; no downstream |
+| Stage 19 replay or source fixpoint failure | `FAILED` / `retry` | not created; collision cleanup attempted | not created; collision cleanup attempted | invalidated first | cleanup attempted | no replayable authority; zero model calls; empty tuples; no downstream |
+| quality transport or strict parser failure | `FAILED` / `retry` | cleanup attempted | cleanup attempted | invalidated first | cleanup attempted | no replayable authority; bounded diagnostic sidecar may remain; empty tuples; no downstream |
+| `llm is None` | `FAILED` / `retry` | not created; collision cleanup attempted | not created; collision cleanup attempted | invalidated first | cleanup attempted | no replayable authority; replay still required, zero calls, no default report or fallback |
+| post-publication replay, Snapshot B, or final-capture failure | `FAILED` / `retry` | cleanup attempted | cleanup attempted | invalidated first | cleanup attempted | no replayable authority; diagnostic only; empty tuples; no downstream |
+| immediate or terminal executor postcondition failure | `FAILED` / `retry` | cleanup attempted | cleanup attempted | invalidated first | cleanup attempted | no replayable authority; generation marked withdrawn in the live revocation interface; B5 owns later downstream recognition and invalidation; empty tuples |
 
-Report, flags, or manifest bytes found after a failure are stale or cleanup
-failure evidence, never authority. A diagnostic sidecar may describe the
-failure but cannot use a success name or enter a tuple.
+Report, flags, signal, or manifest bytes found after a failure are injected,
+stale, or cleanup-failure evidence, never authority unless a new consumer
+captures and validates a complete current manifest by the full strict replay.
+A diagnostic sidecar may describe the failure but cannot use a success name or
+enter a tuple.
 
 ### 18.8 Admission and B4-B pre-activation
 
@@ -1848,7 +1961,7 @@ PRM, HITL, or gate hooks, the executor MUST:
 2. for `DONE`, require the live private context in published phase;
 3. require the exact success artifact and evidence-ref tuples;
 4. require the exact three-file report-v1, flags-v3, and manifest-v2 namespace
-   with no diagnostic, missing, empty, extra, staged, or temporary entry;
+   with no diagnostic, missing, empty, extra, or temporary entry;
 5. replay the Stage 19 source closure and Snapshot A fixpoint;
 6. independently rebuild and replay report, flags, outcome, manifest, and the
    passed-null/degraded-FileRef signal branch;
@@ -1869,13 +1982,15 @@ tuples.
 
 Late mutation of source, output, or manifest after a final read is caught by
 the second final capture or a postcondition. B4-B cleanup invalidates only the
-Stage 20 manifest, report, flags, signal, staging, and temporary commit points
-in the current Stage 20 generation. It records that generation as withdrawn in
-the live revocation interface but does not enumerate, open, mutate, or delete
-any Stage 21+ output. B5 consumers must later recognize the withdrawn
-generation and own actual invalidation or cleanup of their commit points.
-Replacement cleanup uses only held detached original inodes and never touches
-replacement targets.
+Stage 20 manifest, report, flags, signal, and four exact temporary ordinary
+files in the code-owned reserved namespace. Fixed-name cleanup is not
+identity-conditional and may unlink an injected reserved-name entry, but it
+does not follow symlink targets, recursively enter replacement directories,
+write through replacement paths, or touch any non-reserved path. It records
+the generation as withdrawn in the live revocation interface but does not
+enumerate, open, mutate, or delete any Stage 21+ output. B5 consumers must
+later recognize the withdrawn generation and own actual invalidation or
+cleanup of their commit points.
 
 ### 18.10 B5 downstream deferral
 
@@ -1910,17 +2025,19 @@ provider behavior, cleanup, and failure behavior remain unchanged. At map
 generic after its mandatory common canonical replay.
 
 Generic code does not enumerate, parse, require, publish, consume, block on, or
-clean any structured-only `scientific_claim_*` Stage 19 name or structured
-staging entry. Stale structured artifacts cannot activate the structured path
-and cannot affect generic bytes or results. Artifact presence, caller, config,
-environment, or persisted snapshot is never a discriminator.
+clean any structured-only `scientific_claim_*` Stage 19 name or any of the
+four structured Stage 20 temporary names. Stale structured artifacts cannot
+activate the structured path and cannot affect generic bytes or results.
+Artifact presence, caller, config, environment, or persisted snapshot is never
+a discriminator.
 
 Once a valid `1111` domain-v2 dispatch enters the structured path, every later
 error is `FAILED`; generic fallback is forbidden.
 
 Structured dispatch and parsing for Stages 21-25, E9, `release_check`, release
-gates, and fresh F0 are outside B4-D0, B4-D1, B4-A, and B4-B. B4-D0/D1 change
-no release authority. Fresh F0 requires separate explicit authorization.
+gates, and fresh F0 are outside B4-D0, B4-D1, B4-D2, B4-D3, B4-A, and B4-B.
+B4-D0/D1/D2/D3 change no release authority. Fresh F0 requires separate
+explicit authorization.
 
 ## 20. B1-B5 milestone split
 
@@ -1928,7 +2045,10 @@ B1 and B2 supplied strict records, identities, deterministic construction,
 rendering, and selection. B3 supplied structured Stage 17 publication and the
 separate `1000` declaration.
 
-B4-D0 freezes the Stage 19 design and B4-D1 freezes the Stage 20 success
+B4-D0 freezes the Stage 19 design, B4-D1 freezes the Stage 20 success
+authority, and B4-D2 replaces only the Stage 20 staging transaction with the
+four-file creating-fd transaction. B4-D3 corrects the Stage 20 deletion and
+same-UID threat claims without changing quality, source, schema, or release
 authority. Every B4 implementation commit keeps map `1000`. A separately
 reviewed B4 declaration may change it to `1110`, which still does not activate
 public/direct structured production. B4-A implements Stage 19 against this
@@ -1967,17 +2087,17 @@ full structured path.
 | Stage 20 schema | report v1, flags v3, and manifest v2 are synchronously forged | independent source, CFS, generation, fabrication, and outcome rebuild rejects |
 | Stage 20 schema | wrong or boolean schema version | exact-type/version rejection |
 | Stage 20 schema | duplicate, extra, or missing report/flags/manifest field | duplicate-safe exact-key rejection |
-| Stage 20 outcome | `proceed` below threshold or `revise` at/above threshold | `FAILED`; cleanup all success names and root signal |
+| Stage 20 outcome | `proceed` below threshold or `revise` at/above threshold | `FAILED`; authority-first invalidation; no replayable success manifest |
 | Stage 20 outcome | `reject` with a high score | `FAILED`; no manifest or root signal |
 | Stage 20 outcome | fabrication suspected or no real data despite high score | `FAILED`; deterministic fabrication block wins |
-| Stage 20 forgery | source replay fails, then a green report is forged | zero model calls; forged report cannot authorize; cleanup |
-| Stage 20 publication | report is published but flags or manifest publication fails | manifest-first aggregate cleanup leaves empty tuples |
+| Stage 20 forgery | source replay fails, then a green report is forged | zero model calls; forged report cannot authorize; authority-first invalidation |
+| Stage 20 publication | report is published but flags or manifest publication fails | authority-first aggregate cleanup leaves empty tuples and no replayable manifest |
 | Stage 20 publication | manifest is written, then source or source paper mutates | final replay/Snapshot B rejects and cleanup runs |
 | Stage 20 publication | output mutates after final read | second capture or executor postcondition rejects |
 | Degradation | passed outcome has any root signal or non-null manifest field | reject and cleanup |
 | Degradation | degraded outcome has null, missing, extra, wrong-path, or wrong-hash signal | reject and cleanup |
-| Degradation | root signal or temp is a symlink, directory, hardlink, or other collision | fail closed with external-zero-write/delete |
-| Stage 20 parent | replace root parent, run, stage, or root-signal parent | external-zero-write/delete; clean held detached original only |
+| Degradation | root signal or temp is a symlink, directory, hardlink, or other collision | fail closed; do not follow a symlink target or recurse into a directory; no replayable manifest |
+| Stage 20 parent | replace root parent, run, stage, or root-signal parent | no writes through replacement paths; operate through held original fds; no replayable manifest |
 | Stage 20 executor | producer returns `DONE` with tuple mismatch | immediate postcondition converts to `FAILED` and cleans |
 | Stage 20 executor | HITL/PRM/gate converts `DONE` to non-`DONE` | terminal cleanup; empty tuples |
 | Stage 20 executor | mutate source, report, flags, signal, or manifest after immediate validation | terminal postcondition rejects and cleans |
@@ -1985,10 +2105,12 @@ full structured path.
 | Source | mutate a Snapshot A source after provider calls | source fixpoint rejects and cleanup runs |
 | Final namespace | mutate an output after final replay/read | Snapshot B or executor postcondition rejects |
 | File type | canonical name is a hardlink, symlink, FIFO, device, socket, or directory | reject without following or overwriting |
-| Collision | staging or final name already exists | fail closed; aggregate cleanup owned names |
-| Staging | staging remains after publication | reject and cleanup |
-| Parent | replace run or stage parent during attempt | external-zero-write/zero-delete; clean detached original |
-| Revival | restore detached original run after failure | no manifest or revised-paper authority can revive |
+| Collision | a Stage 20 temporary name already exists, or a formal target appears after admission invalidation | fail closed before writing; reserved entry may be unlinked, but never follow its target, recurse into a directory, or modify a non-reserved path |
+| Stage 20 temporary | creating-fd identity differs from the temporary path before publication | reject publication and aggregate drift diagnostics; fixed-name cleanup is not identity-conditional |
+| Stage 20 temporary | any `.tmp` remains after publication | reject; success namespace/root closure requires every temporary absent |
+| Parent | replace run or stage parent during attempt | do not write through replacement path; held-original cleanup only; strict replay rejects |
+| Same-UID actor | inject or replace reserved entries before, during, or after validation | may force `FAILED`/DoS; cannot create authority without complete strict replay |
+| Revival | restore detached original run or reintroduce reserved names after failure | no authority unless the manifest passes complete strict semantic replay |
 | Executor | return `DONE` with wrong tuple, refs, context, or disk bytes | immediate/terminal postcondition converts to `FAILED` and cleans |
 | Stage 19 no LLM | empty strict ReviewLedger | zero calls; inherit selection; full rerender/replay/publication |
 | Stage 19 no LLM | nonempty strict ReviewLedger | `FAILED` before staging/success publication; no generic fallback |
@@ -2005,13 +2127,13 @@ full structured path.
 | Discriminator | domain-v2 marker exists but Stage 17/CFS/generation/replay is invalid | `FAILED`; never generic fallback |
 | Downstream | current Stage 21 or Stage 22 is asked to consume structured Stage 20 | reject; B5 parser/dispatch is not implemented |
 | Downstream | synchronously forge Stage 21/22 hashes around structured Stage 20 | independent reconstruction rejects; no B4 release authority |
-| Generic | stale structured-only Stage 19 names or `.stage20-structured-publication.staging` exist while inactive | generic does not use them as dispatch authority or consume them |
+| Generic | stale structured-only Stage 19 names or any structured Stage 20 `.tmp` name exists while inactive | generic does not use them as dispatch authority or consume them |
 | Generic | overlapping Stage 20 `quality_report.json`, `fabrication_flags.json`, or `quality_gate_manifest.json` is stale | unchanged generic entry cleanup may invalidate it; the name never discriminates structured dispatch |
 | Generic | legal generic-v1 input | exact existing schemas, bytes, artifacts, and failure behavior |
 
-## 22. B4-D1 acceptance and non-claims
+## 22. B4-D3 acceptance and non-claims
 
-B4-D1 is ready for a narrow docs-only commit only when:
+B4-D3 is ready for a narrow docs-only commit only when:
 
 - the original schema and lifecycle reviewers complete a read-only fixpoint;
 - no P0 or P1 remains and any new material disagreement returns `STOP`;
@@ -2020,11 +2142,13 @@ B4-D1 is ready for a narrow docs-only commit only when:
 - paths, names, versions, counts, capability states, call bounds, lifecycle
   steps, and Stage 20 handoff are internally consistent;
 - neither the Stage 19 nor Stage 20 manifest has a self-hash cycle;
-- tracked diff contains only this document and production/tests have zero diff;
+- the docs-only staged or proposed commit diff contains only this document;
+  preserved unstaged B4-B implementation and tests are excluded without
+  stash, reset, clean, overwrite, or deletion;
 - `git diff --check` passes;
 - the original nine untracked groups remain untouched.
 
-B4-D1 does not implement Stage 20, modify downstream consumers, activate a
+B4-D3 does not implement Stage 20, modify downstream consumers, activate a
 structured production path, change the capability map, authorize B4-B or a B4
 declaration, accept a release, authorize commit/push, or authorize API, resume,
 or fresh F0 work.
