@@ -1647,6 +1647,7 @@ def _execute_stage_under_release_scope_impl(
     invalidate_domain_authority = False
     structured_stage17_attempt = False
     structured_stage19_attempt = structured_stage19_exact_domain
+    structured_stage20_attempt = False
     if stage is Stage.PAPER_REVISION:
         from researchclaw.pipeline.stage19_structured_publication import (
             has_structured_stage19_published_context,
@@ -1668,6 +1669,31 @@ def _execute_stage_under_release_scope_impl(
                         "structured Stage 19 immediate cleanup requires writer epoch"
                     )
                 invalidate_structured_stage19_authority(release_lock)
+            except Exception as cleanup_exc:  # noqa: BLE001
+                result = _append_authority_cleanup_error(result, cleanup_exc)
+            result = _clear_authority_result_tuples(result)
+    if stage is Stage.QUALITY_GATE:
+        from researchclaw.pipeline.stage20_structured_publication import (
+            has_structured_stage20_attempt_context,
+            has_structured_stage20_published_context,
+            invalidate_structured_stage20_authority,
+        )
+
+        structured_stage20_attempt = (
+            has_structured_stage20_attempt_context(release_lock)
+            or has_structured_stage20_published_context(release_lock)
+        )
+        if structured_stage20_attempt and result.status is not StageStatus.DONE:
+            try:
+                if release_lock is None:
+                    raise RuntimeError(
+                        "structured Stage 20 immediate cleanup requires writer epoch"
+                    )
+                cleanup_errors = invalidate_structured_stage20_authority(
+                    release_lock
+                )
+                if cleanup_errors:
+                    raise RuntimeError("; ".join(cleanup_errors))
             except Exception as cleanup_exc:  # noqa: BLE001
                 result = _append_authority_cleanup_error(result, cleanup_exc)
             result = _clear_authority_result_tuples(result)
@@ -1751,6 +1777,47 @@ def _execute_stage_under_release_scope_impl(
                         result = _append_authority_cleanup_error(
                             result, cleanup_exc
                         )
+        if stage is Stage.QUALITY_GATE and structured_stage20_attempt:
+            from researchclaw.pipeline.stage20_structured_publication import (
+                invalidate_structured_stage20_authority,
+                validate_structured_stage20_executor_postcondition,
+            )
+
+            output_files = ()
+            try:
+                if release_lock is None:
+                    raise RuntimeError(
+                        "structured Stage 20 postcondition requires writer epoch"
+                    )
+                validate_structured_stage20_executor_postcondition(
+                    release_lock,
+                    artifacts=result.artifacts,
+                    evidence_refs=result.evidence_refs,
+                    decision=result.decision,
+                )
+            except Exception as exc:  # noqa: BLE001
+                result = StageResult(
+                    stage=stage,
+                    status=StageStatus.FAILED,
+                    artifacts=(),
+                    error=f"Structured Stage 20 postcondition failed: {exc}",
+                    decision="retry",
+                    evidence_refs=(),
+                )
+                try:
+                    if release_lock is None:
+                        raise RuntimeError(
+                            "structured Stage 20 cleanup requires writer epoch"
+                        )
+                    cleanup_errors = invalidate_structured_stage20_authority(
+                        release_lock
+                    )
+                    if cleanup_errors:
+                        raise RuntimeError("; ".join(cleanup_errors))
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    result = _append_authority_cleanup_error(
+                        result, cleanup_exc
+                    )
         try:
             domain_outputs = _domain_evaluator_output_contract(
                 stage, run_dir, config
@@ -2046,6 +2113,7 @@ def _execute_stage_under_release_scope_impl(
     exact_authority_namespace = (
         structured_stage17_attempt
         or structured_stage19_attempt
+        or structured_stage20_attempt
         or stage in _EXACT_AUTHORITY_NAMESPACE_STAGES
         or (
             stage is Stage.EXPERIMENT_DESIGN
@@ -2213,6 +2281,64 @@ def _execute_stage_under_release_scope_impl(
                         "structured Stage 19 terminal cleanup requires writer epoch"
                     )
                 invalidate_structured_stage19_authority(release_lock)
+            except Exception as cleanup_exc:  # noqa: BLE001
+                result = _append_authority_cleanup_error(result, cleanup_exc)
+        if result.status is not StageStatus.DONE:
+            result = _clear_authority_result_tuples(result)
+
+    if structured_stage20_attempt:
+        from researchclaw.pipeline.stage20_structured_publication import (
+            clear_structured_stage20_published_context,
+            invalidate_structured_stage20_authority,
+            validate_structured_stage20_executor_postcondition,
+        )
+
+        try:
+            if release_lock is None:
+                raise RuntimeError(
+                    "structured Stage 20 terminal guard requires writer epoch"
+                )
+            if result.status is StageStatus.DONE:
+                validate_structured_stage20_executor_postcondition(
+                    release_lock,
+                    artifacts=result.artifacts,
+                    evidence_refs=result.evidence_refs,
+                    decision=result.decision,
+                )
+                clear_structured_stage20_published_context(release_lock)
+            else:
+                cleanup_errors = invalidate_structured_stage20_authority(
+                    release_lock
+                )
+                if cleanup_errors:
+                    raise RuntimeError("; ".join(cleanup_errors))
+        except Exception as postcondition_exc:  # noqa: BLE001
+            if result.status is StageStatus.DONE:
+                result = StageResult(
+                    stage=stage,
+                    status=StageStatus.FAILED,
+                    artifacts=(),
+                    error=(
+                        "Structured Stage 20 terminal postcondition failed: "
+                        f"{postcondition_exc}"
+                    ),
+                    decision="retry",
+                    evidence_refs=(),
+                )
+            else:
+                result = _append_authority_cleanup_error(
+                    result, postcondition_exc
+                )
+            try:
+                if release_lock is None:
+                    raise RuntimeError(
+                        "structured Stage 20 terminal cleanup requires writer epoch"
+                    )
+                cleanup_errors = invalidate_structured_stage20_authority(
+                    release_lock
+                )
+                if cleanup_errors:
+                    raise RuntimeError("; ".join(cleanup_errors))
             except Exception as cleanup_exc:  # noqa: BLE001
                 result = _append_authority_cleanup_error(result, cleanup_exc)
         if result.status is not StageStatus.DONE:

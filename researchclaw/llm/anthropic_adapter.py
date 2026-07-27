@@ -147,28 +147,42 @@ class AnthropicAdapter:
             except Exception:  # noqa: BLE001
                 pass
             msg = f"{exc}: {detail}" if detail else str(exc)
-            raise urllib.error.HTTPError(
+            error = urllib.error.HTTPError(
                 url,
                 exc.response.status_code,
                 msg,
                 dict(exc.response.headers),
                 None,
-            ) from exc
+            )
+            error._researchclaw_response_content_received = bool(detail)
+            raise error from exc
         except httpx.HTTPError as exc:
             # Catch all transport errors (ConnectError, TimeoutException,
             # ReadError, RemoteProtocolError, PoolTimeout, etc.)
-            raise urllib.error.URLError(str(exc)) from exc
+            error = urllib.error.URLError(str(exc))
+            error._researchclaw_response_content_received = not isinstance(
+                exc,
+                (
+                    httpx.ConnectError,
+                    httpx.ConnectTimeout,
+                    httpx.PoolTimeout,
+                    httpx.WriteError,
+                ),
+            )
+            raise error from exc
 
         # Check for Anthropic error responses
         if data.get("type") == "error" or "error" in data:
             error_info = data.get("error", {})
-            raise urllib.error.HTTPError(
+            error = urllib.error.HTTPError(
                 url,
                 500,
                 f"{error_info.get('type', 'api_error')}: {error_info.get('message', str(data))}",
                 {},
                 None,
             )
+            error._researchclaw_response_content_received = True
+            raise error
 
         # Extract ALL text content blocks (not just the first)
         content = ""
