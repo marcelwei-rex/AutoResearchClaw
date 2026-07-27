@@ -395,15 +395,30 @@ class LLMClient:
         max_tokens: int,
         temperature: float,
         json_mode: bool,
+        *,
+        allow_endpoint_fallback: bool = True,
+        exact_max_tokens: bool = False,
+        exact_temperature: bool = False,
+        exact_json_instruction: bool = False,
     ) -> LLMResponse:
         """Make a single API call."""
 
         # Use Anthropic adapter if configured
         if self._anthropic:
+            if (
+                exact_temperature
+                and any(model.startswith(prefix) for prefix in ("claude-3-7", "claude-4"))
+                and temperature != 1.0
+            ):
+                raise ValueError(
+                    "Anthropic thinking model would rewrite exact temperature"
+                )
             data = self._anthropic.chat_completion(
                 model, messages, max_tokens, temperature, json_mode
             )
         else:
+            if exact_temperature and not self._supports_temperature(model):
+                raise ValueError("model wire format would omit exact temperature")
             # Original OpenAI logic
             # Copy messages to avoid mutating the caller's list (important for
             # retries and model-fallback — each attempt must start from the
@@ -415,7 +430,20 @@ class LLMClient:
             if "api.minimaxi.com" in self.config.base_url or "api.minimax.io" in self.config.base_url:
                 _temp = max(0.0, min(_temp, 1.0))
 
-            if self._normalize_wire_api(self.config.wire_api) == "responses":
+            _wire_is_responses = (
+                self._normalize_wire_api(self.config.wire_api) == "responses"
+            )
+            _json_hint = (
+                "You MUST respond with valid JSON only. "
+                "Do not include any text outside the JSON object."
+            )
+            if json_mode and exact_json_instruction and _wire_is_responses:
+                if msgs and msgs[0]["role"] == "system":
+                    msgs[0]["content"] = _json_hint + "\n\n" + msgs[0]["content"]
+                else:
+                    msgs.insert(0, {"role": "system", "content": _json_hint})
+
+            if _wire_is_responses:
                 body = self._build_responses_body(model, msgs, max_tokens, _temp)
             else:
                 body = {
@@ -427,8 +455,11 @@ class LLMClient:
 
                 # Use correct token parameter based on model
                 if any(model.startswith(prefix) for prefix in _NEW_PARAM_MODELS):
-                    reasoning_min = 32768
-                    body["max_completion_tokens"] = max(max_tokens, reasoning_min)
+                    body["max_completion_tokens"] = (
+                        max_tokens
+                        if exact_max_tokens
+                        else max(max_tokens, 32768)
+                    )
                 else:
                     body["max_tokens"] = max_tokens
 
@@ -452,18 +483,21 @@ class LLMClient:
                     or _model_lower.startswith("ernie")
                     or _model_lower.startswith("spark")
                     or _model_lower.startswith("gemma")
-                    or self._normalize_wire_api(self.config.wire_api) == "responses"
+                    or _wire_is_responses
                 )
                 if _no_response_format:
-                    _json_hint = (
-                        "You MUST respond with valid JSON only. "
-                        "Do not include any text outside the JSON object."
-                    )
-                    # Prepend to existing system message or add as new one
-                    if msgs and msgs[0]["role"] == "system":
-                        msgs[0]["content"] = _json_hint + "\n\n" + msgs[0]["content"]
-                    else:
-                        msgs.insert(0, {"role": "system", "content": _json_hint})
+                    if not (exact_json_instruction and _wire_is_responses):
+                        # Preserve the baseline ordering for generic calls. For
+                        # Responses, this occurs after body construction and
+                        # therefore does not alter the real request bytes.
+                        if msgs and msgs[0]["role"] == "system":
+                            msgs[0]["content"] = (
+                                _json_hint + "\n\n" + msgs[0]["content"]
+                            )
+                        else:
+                            msgs.insert(
+                                0, {"role": "system", "content": _json_hint}
+                            )
                 else:
                     body["response_format"] = {"type": "json_object"}
 
@@ -487,7 +521,7 @@ class LLMClient:
                     data = json.loads(resp.read())
             except (urllib.error.URLError, OSError) as exc:
                 # MetaClaw bridge: fallback to direct LLM if proxy unreachable
-                if self.config.fallback_url:
+                if allow_endpoint_fallback and self.config.fallback_url:
                     logger.warning(
                         "Primary endpoint unreachable, falling back to %s: %s",
                         self.config.fallback_url,

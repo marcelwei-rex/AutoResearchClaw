@@ -270,6 +270,17 @@ def _append_authority_cleanup_error(
     )
 
 
+def _clear_authority_result_tuples(result: StageResult) -> StageResult:
+    return StageResult(
+        stage=result.stage,
+        status=result.status,
+        artifacts=(),
+        error=result.error,
+        decision=result.decision,
+        evidence_refs=(),
+    )
+
+
 def _finalize_fixed_stage9_authority(
     result: StageResult,
     run_dir: Path,
@@ -601,6 +612,7 @@ def _guard_authority_human_input(
     authority_namespace: BoundOutputNamespace | _MissingAuthorityNamespace | None = None,
     *,
     fixed_stage9_authority: bool = False,
+    structured_stage19_authority: bool = False,
 ) -> StageResult | None:
     from researchclaw.hitl.intervention import HumanAction
 
@@ -615,12 +627,13 @@ def _guard_authority_human_input(
         human_input.edited_files
         or (
             (stage is Stage.DEAI_AUDIT or fixed_stage9_authority)
-            and human_input.guidance
+            or structured_stage19_authority
         )
+        and human_input.guidance
     )
     authority_hitl_forbidden = stage in SKIP_FORBIDDEN_STAGES or (
         stage is Stage.EXPERIMENT_DESIGN and fixed_stage9_authority
-    )
+    ) or structured_stage19_authority
     if authority_hitl_forbidden and (
         human_input.action != HumanAction.APPROVE or mutation_requested
     ):
@@ -631,7 +644,11 @@ def _guard_authority_human_input(
             authority_namespace=authority_namespace,
         )
     if (
-        (stage is Stage.DEAI_AUDIT or fixed_stage9_authority)
+        (
+            stage is Stage.DEAI_AUDIT
+            or fixed_stage9_authority
+            or structured_stage19_authority
+        )
         and authority_namespace is not None
     ):
         try:
@@ -651,6 +668,7 @@ def _run_hitl_pre_stage(
     config: RCConfig | None = None,
     *,
     fixed_stage9_authority: bool = False,
+    structured_stage19_authority: bool = False,
     authority_namespace: BoundOutputNamespace | _MissingAuthorityNamespace | None = None,
 ) -> StageResult | None:
     """HITL pre-stage hook: pause before execution if policy requires.
@@ -699,6 +717,7 @@ def _run_hitl_pre_stage(
             human_input,
             authority_namespace,
             fixed_stage9_authority=fixed_stage9_authority,
+            structured_stage19_authority=structured_stage19_authority,
         )
         if authority_guard is not None:
             return authority_guard
@@ -745,6 +764,8 @@ def _run_hitl_post_stage(
     fixed_stage9_authority: bool = False,
     release_lock: object | None = None,
     stage9_namespace: BoundOutputNamespace | None = None,
+    structured_stage19_authority: bool = False,
+    structured_stage19_namespace: BoundOutputNamespace | None = None,
 ) -> StageResult:
     """HITL post-stage hook: pause after execution for review.
 
@@ -768,6 +789,8 @@ def _run_hitl_post_stage(
 
             owns_authority_namespace = not (
                 fixed_stage9_authority and stage9_namespace is not None
+                or structured_stage19_authority
+                and structured_stage19_namespace is not None
             )
             if owns_authority_namespace:
                 try:
@@ -786,7 +809,11 @@ def _run_hitl_post_stage(
                         decision="abort",
                     )
             else:
-                authority_namespace = stage9_namespace
+                authority_namespace = (
+                    structured_stage19_namespace
+                    if structured_stage19_authority
+                    else stage9_namespace
+                )
             try:
                 session.pause(
                     stage_num,
@@ -801,6 +828,7 @@ def _run_hitl_post_stage(
                     human_input,
                     authority_namespace,
                     fixed_stage9_authority=fixed_stage9_authority,
+                    structured_stage19_authority=structured_stage19_authority,
                 )
                 if authority_result is not None:
                     return authority_result
@@ -828,7 +856,9 @@ def _run_hitl_post_stage(
             q_score = None
             stage_dir = run_dir / f"stage-{stage_num:02d}"
             prm_bytes = None
-            if fixed_stage9_authority and stage9_namespace is not None:
+            if structured_stage19_authority:
+                prm_bytes = None
+            elif fixed_stage9_authority and stage9_namespace is not None:
                 try:
                     prm_bytes = stage9_namespace.read_bytes("prm_score.json")
                 except FileNotFoundError:
@@ -869,7 +899,7 @@ def _run_hitl_post_stage(
         try:
             import json as _json_mod
             health_file = stage_dir / "stage_health.json"
-            if health_file.exists():
+            if not structured_stage19_authority and health_file.exists():
                 health = _json_mod.loads(health_file.read_text(encoding="utf-8"))
                 prm_bytes = None
                 if fixed_stage9_authority and stage9_namespace is not None:
@@ -891,7 +921,11 @@ def _run_hitl_post_stage(
 
     # Build context summary from stage artifacts
     contract = CONTRACTS.get(stage)
-    output_files = _select_output_files(contract, config)
+    output_files = (
+        result.artifacts
+        if structured_stage19_authority
+        else _select_output_files(contract, config)
+    )
     context_lines = [
         f"Stage {stage_num} ({stage.name}) completed: {result.status.value}",
     ]
@@ -903,7 +937,18 @@ def _run_hitl_post_stage(
     # Read first 500 chars of key output files for summary
     stage_dir = run_dir / f"stage-{stage_num:02d}"
     for fname in output_files[:3]:
-        if fixed_stage9_authority and stage9_namespace is not None:
+        if (
+            structured_stage19_authority
+            and structured_stage19_namespace is not None
+        ):
+            try:
+                text = structured_stage19_namespace.read_bytes(fname).decode(
+                    "utf-8"
+                )[:500]
+                context_lines.append(f"\n--- {fname} ---\n{text}")
+            except (OSError, UnicodeDecodeError, FileNotFoundError):
+                pass
+        elif fixed_stage9_authority and stage9_namespace is not None:
             try:
                 text = stage9_namespace.read_bytes(fname).decode("utf-8")[:500]
                 context_lines.append(f"\n--- {fname} ---\n{text}")
@@ -920,6 +965,8 @@ def _run_hitl_post_stage(
 
     owns_authority_namespace = not (
         fixed_stage9_authority and stage9_namespace is not None
+        or structured_stage19_authority
+        and structured_stage19_namespace is not None
     )
     if owns_authority_namespace:
         try:
@@ -938,7 +985,11 @@ def _run_hitl_post_stage(
                 decision="abort",
             )
     else:
-        authority_namespace = stage9_namespace
+        authority_namespace = (
+            structured_stage19_namespace
+            if structured_stage19_authority
+            else stage9_namespace
+        )
     try:
         session.pause(
             stage_num,
@@ -955,6 +1006,7 @@ def _run_hitl_post_stage(
             human_input,
             authority_namespace,
             fixed_stage9_authority=fixed_stage9_authority,
+            structured_stage19_authority=structured_stage19_authority,
         )
         if authority_result is not None:
             return authority_result
@@ -1197,6 +1249,16 @@ def execute_stage(
 ) -> StageResult:
     """Execute a stage inside the release writer epoch when it can alter authority."""
 
+    if stage is Stage.PAPER_REVISION:
+        from researchclaw.pipeline import (
+            structured_scientific_claim_capabilities as structured_capability,
+        )
+
+        if structured_capability.structured_publication_is_eligible():
+            structured_capability.require_complete_structured_capability(
+                "execute_stage.PAPER_REVISION"
+            )
+
     if int(stage) < int(Stage.LITERATURE_COLLECT):
         return _execute_stage_under_release_scope(
             stage,
@@ -1334,15 +1396,124 @@ def _execute_stage_under_release_scope_impl(
             decision="abort",
         )
 
+    structured_stage19_dispatch_capture = None
+    structured_stage19_exact_domain = False
+    if stage is Stage.PAPER_REVISION:
+        from researchclaw.pipeline import (
+            structured_scientific_claim_capabilities as structured_capability,
+        )
+
+        if structured_capability.structured_publication_is_eligible():
+            from researchclaw.pipeline.canonical_fact_sheet import (
+                _is_domain_evaluator_v2,
+            )
+            from researchclaw.pipeline.stage19_structured_publication import (
+                issue_structured_stage19_dispatch_capture,
+                replay_structured_stage19_dispatch_capture,
+            )
+
+            try:
+                structured_stage19_dispatch_capture = (
+                    issue_structured_stage19_dispatch_capture(run_dir)
+                )
+                dispatch_evidence = replay_structured_stage19_dispatch_capture(
+                    structured_stage19_dispatch_capture, run_dir
+                )
+                dispatch_manifest = dispatch_evidence.manifest
+                has_domain_discriminator = bool(
+                    dispatch_manifest.get("generation_kind")
+                    == "domain_evaluator"
+                    or (
+                        type(dispatch_manifest.get("schema_version")) is int
+                        and dispatch_manifest["schema_version"] == 2
+                    )
+                )
+                structured_stage19_exact_domain = _is_domain_evaluator_v2(
+                    dispatch_evidence
+                )
+                if (
+                    has_domain_discriminator
+                    and not structured_stage19_exact_domain
+                ):
+                    raise RuntimeError(
+                        "Canonical Stage 19 domain-v2 discriminator is inconsistent"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                result = StageResult(
+                    stage=stage,
+                    status=StageStatus.FAILED,
+                    artifacts=(),
+                    error=f"Canonical Stage 19 input replay failed: {exc}",
+                    decision="retry",
+                    evidence_refs=(),
+                )
+                return result
+
     # --- HITL pre-stage hook ---
-    hitl_result = _run_hitl_pre_stage(
-        stage,
-        run_dir,
-        adapters,
-        config=config,
-        fixed_stage9_authority=fixed_stage9_authority,
-        authority_namespace=stage9_namespace,
-    )
+    if structured_stage19_exact_domain:
+        if release_lock is None:
+            return StageResult(
+                stage=stage,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error="Structured Stage 19 requires writer epoch",
+                decision="retry",
+            )
+        release_lock.ensure_run_directory("stage-19")
+        with release_lock.open_stage_namespace("stage-19") as stage19_namespace:
+            from researchclaw.pipeline.stage19_structured_publication import (
+                STRUCTURED_STAGE19_MANIFEST,
+                STRUCTURED_STAGE19_OUTPUTS,
+                STRUCTURED_STAGE19_STAGING,
+                _cleanup_owned_namespace,
+            )
+
+            errors = _cleanup_owned_namespace(stage19_namespace)
+            if errors:
+                return StageResult(
+                    stage=stage,
+                    status=StageStatus.FAILED,
+                    artifacts=(),
+                    error=(
+                        "Structured Stage 19 admission cleanup failed: "
+                        + "; ".join(errors)
+                    ),
+                    decision="structured-scientific-claim-v1",
+                )
+            extras = set(stage19_namespace.direct_entries()) - {
+                *STRUCTURED_STAGE19_OUTPUTS,
+                STRUCTURED_STAGE19_MANIFEST,
+                STRUCTURED_STAGE19_STAGING,
+            }
+            if extras:
+                return StageResult(
+                    stage=stage,
+                    status=StageStatus.FAILED,
+                    artifacts=(),
+                    error=(
+                        "Structured Stage 19 extra namespace entries: "
+                        f"{sorted(extras)}"
+                    ),
+                    decision="structured-scientific-claim-v1",
+                )
+            hitl_result = _run_hitl_pre_stage(
+                stage,
+                run_dir,
+                adapters,
+                config=config,
+                fixed_stage9_authority=False,
+                structured_stage19_authority=True,
+                authority_namespace=stage19_namespace,
+            )
+    else:
+        hitl_result = _run_hitl_pre_stage(
+            stage,
+            run_dir,
+            adapters,
+            config=config,
+            fixed_stage9_authority=fixed_stage9_authority,
+            authority_namespace=stage9_namespace,
+        )
     if hitl_result is not None:
         return hitl_result
 
@@ -1351,7 +1522,9 @@ def _execute_stage_under_release_scope_impl(
         if stage9_namespace is not None
         else run_dir / f"stage-{int(stage):02d}"
     )
-    if stage9_namespace is None:
+    if structured_stage19_exact_domain:
+        pass
+    elif stage9_namespace is None:
         if stage_dir.is_symlink():
             return StageResult(
                 stage=stage,
@@ -1378,7 +1551,7 @@ def _execute_stage_under_release_scope_impl(
     _t_health_start = _time.monotonic()
     contract: StageContract = CONTRACTS[stage]
 
-    if contract.input_files:
+    if contract.input_files and not structured_stage19_exact_domain:
         for input_file in contract.input_files:
             found = _read_prior_artifact(run_dir, input_file)
             if found is None:
@@ -1420,13 +1593,17 @@ def _execute_stage_under_release_scope_impl(
     try:
         _ = advance(stage, StageStatus.PENDING, TransitionEvent.START)
         executor = _STAGE_EXECUTORS[stage]
-        prompts = PromptManager(
-            config.prompts.custom_file or None,  # type: ignore[attr-defined]
-            domain=_prompt_bank_domain_from_config(config),
-            extra_prompts={
-                stage_key: path_or_text
-                for stage_key, path_or_text in getattr(config.prompts, "extra_prompts", ())  # type: ignore[attr-defined]
-            } or None,
+        prompts = (
+            None
+            if structured_stage19_exact_domain
+            else PromptManager(
+                config.prompts.custom_file or None,  # type: ignore[attr-defined]
+                domain=_prompt_bank_domain_from_config(config),
+                extra_prompts={
+                    stage_key: path_or_text
+                    for stage_key, path_or_text in getattr(config.prompts, "extra_prompts", ())  # type: ignore[attr-defined]
+                } or None,
+            )
         )
         try:
             if stage9_namespace is not None:
@@ -1441,8 +1618,17 @@ def _execute_stage_under_release_scope_impl(
                     authority_selection=stage9_authority_selection,
                 )
             else:
+                executor_kwargs = {"llm": llm, "prompts": prompts}
+                if stage is Stage.PAPER_REVISION:
+                    executor_kwargs["structured_dispatch_capture"] = (
+                        structured_stage19_dispatch_capture
+                    )
                 result = executor(
-                    stage_dir, run_dir, config, adapters, llm=llm, prompts=prompts
+                    stage_dir,
+                    run_dir,
+                    config,
+                    adapters,
+                    **executor_kwargs,
                 )
         except TypeError as exc:
             if "unexpected keyword argument 'prompts'" not in str(exc):
@@ -1460,6 +1646,31 @@ def _execute_stage_under_release_scope_impl(
 
     invalidate_domain_authority = False
     structured_stage17_attempt = False
+    structured_stage19_attempt = structured_stage19_exact_domain
+    if stage is Stage.PAPER_REVISION:
+        from researchclaw.pipeline.stage19_structured_publication import (
+            has_structured_stage19_published_context,
+            invalidate_structured_stage19_authority,
+        )
+
+        structured_stage19_attempt = bool(
+            structured_stage19_exact_domain
+            or result.decision == "structured-scientific-claim-v1"
+            or has_structured_stage19_published_context(release_lock)
+        )
+        if (
+            structured_stage19_attempt
+            and result.status is not StageStatus.DONE
+        ):
+            try:
+                if release_lock is None:
+                    raise RuntimeError(
+                        "structured Stage 19 immediate cleanup requires writer epoch"
+                    )
+                invalidate_structured_stage19_authority(release_lock)
+            except Exception as cleanup_exc:  # noqa: BLE001
+                result = _append_authority_cleanup_error(result, cleanup_exc)
+            result = _clear_authority_result_tuples(result)
     if result.status == StageStatus.DONE:
         output_files = _select_output_files(contract, config)
         if stage is Stage.PAPER_DRAFT:
@@ -1503,6 +1714,43 @@ def _execute_stage_under_release_scope_impl(
                         result = _append_authority_cleanup_error(
                             result, cleanup_exc
                         )
+        if stage is Stage.PAPER_REVISION:
+            from researchclaw.pipeline.stage19_structured_publication import (
+                invalidate_structured_stage19_authority,
+                validate_structured_stage19_executor_postcondition,
+            )
+
+            if structured_stage19_attempt:
+                output_files = ()
+                try:
+                    if release_lock is None:
+                        raise RuntimeError(
+                            "structured Stage 19 postcondition requires writer epoch"
+                        )
+                    validate_structured_stage19_executor_postcondition(
+                        release_lock,
+                        artifacts=result.artifacts,
+                        evidence_refs=result.evidence_refs,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    result = StageResult(
+                        stage=stage,
+                        status=StageStatus.FAILED,
+                        artifacts=(),
+                        error=f"Structured Stage 19 postcondition failed: {exc}",
+                        decision="retry",
+                        evidence_refs=(),
+                    )
+                    try:
+                        if release_lock is None:
+                            raise RuntimeError(
+                                "structured Stage 19 cleanup requires writer epoch"
+                            )
+                        invalidate_structured_stage19_authority(release_lock)
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        result = _append_authority_cleanup_error(
+                            result, cleanup_exc
+                        )
         try:
             domain_outputs = _domain_evaluator_output_contract(
                 stage, run_dir, config
@@ -1528,13 +1776,13 @@ def _execute_stage_under_release_scope_impl(
                 result = StageResult(
                     stage=stage,
                     status=StageStatus.FAILED,
-                    artifacts=result.artifacts,
+                    artifacts=(),
                     error=(
                         "Canonical domain evaluator artifact contract mismatch: "
                         f"expected {domain_outputs!r}, got {result.artifacts!r}"
                     ),
                     decision="retry",
-                    evidence_refs=result.evidence_refs,
+                    evidence_refs=(),
                 )
                 invalidate_domain_authority = True
             else:
@@ -1639,6 +1887,7 @@ def _execute_stage_under_release_scope_impl(
             mc_bridge
             and getattr(mc_bridge, "enabled", False)
             and result.status == StageStatus.DONE
+            and not structured_stage19_attempt
         ):
             mc_prm = getattr(mc_bridge, "prm", None)
             if mc_prm and getattr(mc_prm, "enabled", False):
@@ -1712,6 +1961,21 @@ def _execute_stage_under_release_scope_impl(
     except Exception:  # noqa: BLE001
         logger.warning("MetaClaw PRM evaluation failed (non-blocking)")
 
+    if structured_stage19_attempt and result.status is not StageStatus.DONE:
+        from researchclaw.pipeline.stage19_structured_publication import (
+            invalidate_structured_stage19_authority,
+        )
+
+        try:
+            if release_lock is None:
+                raise RuntimeError(
+                    "structured Stage 19 post-PRM cleanup requires writer epoch"
+                )
+            invalidate_structured_stage19_authority(release_lock)
+        except Exception as cleanup_exc:  # noqa: BLE001
+            result = _append_authority_cleanup_error(result, cleanup_exc)
+        result = _clear_authority_result_tuples(result)
+
     profile_name = (
         getattr(getattr(config, "project", None), "profile", None) or None
     )
@@ -1732,6 +1996,22 @@ def _execute_stage_under_release_scope_impl(
                 decision="block",
                 evidence_refs=result.evidence_refs,
             )
+            if structured_stage19_attempt:
+                from researchclaw.pipeline.stage19_structured_publication import (
+                    invalidate_structured_stage19_authority,
+                )
+
+                try:
+                    if release_lock is None:
+                        raise RuntimeError(
+                            "structured Stage 19 HITL cleanup requires writer epoch"
+                        )
+                    invalidate_structured_stage19_authority(release_lock)
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    result = _append_authority_cleanup_error(
+                        result, cleanup_exc
+                    )
+                result = _clear_authority_result_tuples(result)
             if bridge.use_message and config.notifications.on_gate_required:
                 adapters.message.notify(
                     config.notifications.channel,
@@ -1765,6 +2045,7 @@ def _execute_stage_under_release_scope_impl(
     # retains its historical diagnostics namespace.
     exact_authority_namespace = (
         structured_stage17_attempt
+        or structured_stage19_attempt
         or stage in _EXACT_AUTHORITY_NAMESPACE_STAGES
         or (
             stage is Stage.EXPERIMENT_DESIGN
@@ -1804,16 +2085,30 @@ def _execute_stage_under_release_scope_impl(
             pass
 
     # --- HITL post-stage hook ---
-    result = _run_hitl_post_stage(
-        stage,
-        result,
-        run_dir,
-        adapters,
-        config=config,
-        fixed_stage9_authority=fixed_stage9_authority,
-        release_lock=release_lock,
-        stage9_namespace=stage9_namespace,
-    )
+    if structured_stage19_attempt and release_lock is not None:
+        with release_lock.open_stage_namespace("stage-19") as stage19_namespace:
+            result = _run_hitl_post_stage(
+                stage,
+                result,
+                run_dir,
+                adapters,
+                config=config,
+                fixed_stage9_authority=False,
+                release_lock=release_lock,
+                structured_stage19_authority=True,
+                structured_stage19_namespace=stage19_namespace,
+            )
+    else:
+        result = _run_hitl_post_stage(
+            stage,
+            result,
+            run_dir,
+            adapters,
+            config=config,
+            fixed_stage9_authority=fixed_stage9_authority,
+            release_lock=release_lock,
+            stage9_namespace=stage9_namespace,
+        )
 
     if fixed_stage9_authority:
         if stage9_namespace is None:
@@ -1873,5 +2168,54 @@ def _execute_stage_under_release_scope_impl(
                 invalidate_structured_stage17_authority(release_lock)
             except Exception as cleanup_exc:  # noqa: BLE001
                 result = _append_authority_cleanup_error(result, cleanup_exc)
+
+    if structured_stage19_attempt:
+        from researchclaw.pipeline.stage19_structured_publication import (
+            clear_structured_stage19_published_context,
+            invalidate_structured_stage19_authority,
+            validate_structured_stage19_executor_postcondition,
+        )
+
+        try:
+            if release_lock is None:
+                raise RuntimeError(
+                    "structured Stage 19 terminal guard requires writer epoch"
+                )
+            if result.status is StageStatus.DONE:
+                validate_structured_stage19_executor_postcondition(
+                    release_lock,
+                    artifacts=result.artifacts,
+                    evidence_refs=result.evidence_refs,
+                )
+                clear_structured_stage19_published_context(release_lock)
+            else:
+                invalidate_structured_stage19_authority(release_lock)
+        except Exception as postcondition_exc:  # noqa: BLE001
+            if result.status is StageStatus.DONE:
+                result = StageResult(
+                    stage=stage,
+                    status=StageStatus.FAILED,
+                    artifacts=(),
+                    error=(
+                        "Structured Stage 19 terminal postcondition failed: "
+                        f"{postcondition_exc}"
+                    ),
+                    decision="retry",
+                    evidence_refs=(),
+                )
+            else:
+                result = _append_authority_cleanup_error(
+                    result, postcondition_exc
+                )
+            try:
+                if release_lock is None:
+                    raise RuntimeError(
+                        "structured Stage 19 terminal cleanup requires writer epoch"
+                    )
+                invalidate_structured_stage19_authority(release_lock)
+            except Exception as cleanup_exc:  # noqa: BLE001
+                result = _append_authority_cleanup_error(result, cleanup_exc)
+        if result.status is not StageStatus.DONE:
+            result = _clear_authority_result_tuples(result)
 
     return result

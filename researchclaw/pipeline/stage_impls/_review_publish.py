@@ -52,11 +52,13 @@ from researchclaw.pipeline.canonical_experiment_evidence import (
 )
 from researchclaw.pipeline.canonical_fact_sheet import (
     CFSIntegrityError,
+    _is_domain_evaluator_v2,
     build_canonical_fact_sheet,
     is_exclusively_out_of_scope_request,
     render_complete_fact_sheet_text,
 )
 from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
+from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
 from researchclaw.pipeline.stage19_input_bundle import (
     BoundArtifact,
     Stage19InputBundle,
@@ -733,7 +735,129 @@ def _execute_paper_revision(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
     sectional_provider: object | None = None,
+    structured_dispatch_capture: object | None = None,
 ) -> StageResult:
+    from researchclaw.pipeline import (
+        structured_scientific_claim_capabilities as structured_capability,
+    )
+
+    dispatch_evidence: CanonicalExperimentEvidence | None = None
+    if structured_capability.structured_publication_is_eligible():
+        from researchclaw.pipeline.stage19_structured_publication import (
+            STRUCTURED_STAGE19_MANIFEST,
+            STRUCTURED_STAGE19_OUTPUTS,
+            STRUCTURED_STAGE19_STAGING,
+            _capture_snapshot_a_and_issue_context,
+            _cleanup_owned_namespace,
+            _publish_structured_stage19_from_context,
+            issue_structured_stage19_dispatch_capture,
+            replay_structured_stage19_dispatch_capture,
+        )
+
+        try:
+            dispatch_capture = (
+                structured_dispatch_capture
+                if structured_dispatch_capture is not None
+                else issue_structured_stage19_dispatch_capture(run_dir)
+            )
+            dispatch_evidence = replay_structured_stage19_dispatch_capture(
+                dispatch_capture, run_dir
+            )
+        except Exception as exc:  # noqa: BLE001
+            return StageResult(
+                stage=Stage.PAPER_REVISION,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=f"Canonical Stage 19 input replay failed: {exc}",
+                decision="structured-scientific-claim-v1",
+                evidence_refs=(),
+            )
+        dispatch_manifest = dispatch_evidence.manifest
+        has_domain_discriminator = bool(
+            dispatch_manifest.get("generation_kind") == "domain_evaluator"
+            or (
+                type(dispatch_manifest.get("schema_version")) is int
+                and dispatch_manifest["schema_version"] == 2
+            )
+        )
+        exact_domain = _is_domain_evaluator_v2(dispatch_evidence)
+        if has_domain_discriminator and not exact_domain:
+            return StageResult(
+                stage=Stage.PAPER_REVISION,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error="Canonical Stage 19 domain-v2 discriminator is inconsistent",
+                decision="structured-scientific-claim-v1",
+                evidence_refs=(),
+            )
+        if exact_domain:
+            try:
+                with ReleaseGraphLock.acquire(
+                    run_dir, "stage19_structured_dispatch", mode="write"
+                ) as lease:
+                    if stage_dir != run_dir / "stage-19":
+                        raise RuntimeError(
+                            "structured Stage 19 directory is not canonical"
+                    )
+                    lease.ensure_run_directory("stage-19")
+                    with lease.open_stage_namespace("stage-19") as namespace:
+                        try:
+                            errors = _cleanup_owned_namespace(namespace)
+                            if errors:
+                                raise RuntimeError(
+                                    "structured Stage 19 admission cleanup failed: "
+                                    + "; ".join(errors)
+                                )
+                            extras = set(namespace.direct_entries()) - {
+                                *STRUCTURED_STAGE19_OUTPUTS,
+                                STRUCTURED_STAGE19_MANIFEST,
+                                STRUCTURED_STAGE19_STAGING,
+                            }
+                            if extras:
+                                raise RuntimeError(
+                                    "structured Stage 19 extra namespace entries: "
+                                    f"{sorted(extras)}"
+                                )
+                            snapshot, context = (
+                                _capture_snapshot_a_and_issue_context(
+                                    lease,
+                                    namespace=namespace,
+                                    dispatch_capture=dispatch_capture,
+                                )
+                            )
+                        except Exception as exc:
+                            cleanup_errors = _cleanup_owned_namespace(namespace)
+                            if cleanup_errors:
+                                exc.add_note(
+                                    "structured Stage 19 dispatch cleanup also failed: "
+                                    + "; ".join(cleanup_errors)
+                                )
+                            raise
+                        _publish_structured_stage19_from_context(
+                            lease,
+                            namespace=namespace,
+                            snapshot=snapshot,
+                            context=context,
+                            llm=llm,
+                        )
+            except Exception as exc:  # deterministic structured stage boundary
+                return StageResult(
+                    stage=Stage.PAPER_REVISION,
+                    status=StageStatus.FAILED,
+                    artifacts=(),
+                    error=f"Structured Stage 19 revision failed: {exc}",
+                    decision="structured-scientific-claim-v1",
+                    evidence_refs=(),
+                )
+            artifacts = (*STRUCTURED_STAGE19_OUTPUTS, STRUCTURED_STAGE19_MANIFEST)
+            return StageResult(
+                stage=Stage.PAPER_REVISION,
+                status=StageStatus.DONE,
+                artifacts=artifacts,
+                decision="structured-scientific-claim-v1",
+                evidence_refs=tuple(f"stage-19/{name}" for name in artifacts),
+            )
+
     from researchclaw.pipeline.sectional_execution import clean_sectional_outputs
 
     clean_sectional_outputs(stage_dir)
@@ -745,7 +869,11 @@ def _execute_paper_revision(
     ):
         (stage_dir / artifact_name).unlink(missing_ok=True)
     try:
-        evidence = load_canonical_experiment_evidence(run_dir)
+        evidence = (
+            dispatch_evidence
+            if dispatch_evidence is not None
+            else load_canonical_experiment_evidence(run_dir)
+        )
     except (CanonicalExperimentEvidenceError, RuntimeError) as exc:
         return StageResult(
             stage=Stage.PAPER_REVISION,

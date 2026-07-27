@@ -318,6 +318,44 @@ def test_responses_wire_api_uses_responses_endpoint(monkeypatch: pytest.MonkeyPa
     assert resp.total_tokens == 18
 
 
+def test_responses_wire_api_json_mode_preserves_generic_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(req: urllib.request.Request, timeout: int) -> _DummyHTTPResponse:
+        captured["request"] = req
+        return _DummyHTTPResponse(
+            {
+                "model": "gpt-4.1",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "{}"}],
+                    }
+                ],
+                "usage": {},
+                "status": "completed",
+            }
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    client = _make_client(primary_model="gpt-4.1", wire_api="responses")
+    _ = client._raw_call(
+        "gpt-4.1", [{"role": "user", "content": "json"}], 50, 0.1, True
+    )
+
+    request = captured["request"]
+    assert isinstance(request, urllib.request.Request)
+    data = request.data
+    assert isinstance(data, bytes)
+    body = json.loads(data.decode("utf-8"))
+    assert body["input"] == [
+        {"role": "user", "content": [{"type": "input_text", "text": "json"}]}
+    ]
+    assert "response_format" not in body
+
+
 def test_responses_wire_api_includes_temperature_for_gpt5_models(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -521,6 +559,7 @@ def test_raw_call_adds_json_mode_response_format(monkeypatch: pytest.MonkeyPatch
     body = json.loads(data.decode("utf-8"))
     assert isinstance(body, dict)
     assert body["response_format"] == {"type": "json_object"}
+    assert body["messages"] == [{"role": "user", "content": "json"}]
 
 
 def test_raw_call_sets_auth_and_user_agent_headers(monkeypatch: pytest.MonkeyPatch):
