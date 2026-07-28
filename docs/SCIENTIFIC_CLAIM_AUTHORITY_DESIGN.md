@@ -1,19 +1,20 @@
 # Structured Scientific Claim Authority Design
 
-Status: `B4-D4 / STAGE 19-20 AUTHORITY AND B5 RECOGNITION BOUNDARY FROZEN / NOT ACTIVATED`
+Status: `B5-D1A / STRUCTURED STAGE 21 DETERMINISTIC ARCHIVE AUTHORITY FROZEN / NOT IMPLEMENTED / NOT ACTIVATED`
 
-Scope: Batch B4-D0/D1/D2/D3/D4 docs-only authority for structured Stage 19
-revision and structured Stage 20 replay of the
-`structured-scientific-claim-v1` capability.
+Scope: Batch B4-D0/D1/D2/D3/D4 authority for structured Stage 19 revision and
+structured Stage 20 replay, plus B5-D1A docs-only authority for deterministic
+structured Stage 21 archival under the `structured-scientific-claim-v1`
+capability.
 
-B3 Stage 17 implementation and its separate declaration are complete. The
-code-owned structured capability is now exactly `1000`: Stage 17 publication
-is declared, while Stage 19 revision, Stage 20 replay, and Stage 24/release
-integration remain undeclared. B4-A and B4-B have implemented but not declared
-Stages 19 and 20. B4-D0/D1/D2/D3/D4 freeze schemas, lifecycle, the Stage 20
-threat boundary, generation-withdrawal semantics, and the B5 recognition
-boundary only. These docs-only revisions do not change the capability map,
-declare B4, or activate the structured production path.
+B3 and B4 implementation and their separately reviewed declarations are
+complete. The code-owned structured capability is now exactly `1110`: Stage 17
+publication, Stage 19 revision, and Stage 20 replay are declared, while
+Stage 24/release integration remains undeclared. B5-D1A freezes only the
+structured Stage 21 deterministic archive schema, renderer, lifecycle,
+postconditions, and generic boundary. It does not implement Stage 21, change
+the capability map, activate the structured production path, define
+Stage 22-25 structured schemas, or change any release gate.
 
 ## 1. Normative boundary
 
@@ -93,7 +94,7 @@ structured production path.
 | 4 | strict canonical replay succeeds | malformed map: missing/unknown key, wrong root type, or wrong-typed value | unchanged `generic-v1`; malformed map is ineligible | capability-invalid before direct-entry I/O |
 | 5 | exact domain-v2, CFS-v1, one generation | any other partial state, including exact `1000` | unchanged `generic-v1` | incomplete capability before direct-entry I/O |
 | 6 | exact domain-v2, CFS-v1, one generation | internal B4 pre-activation test with repository still `1000` | ordinary dispatcher remains `generic-v1` | public/direct entry remains blocked; only the private verified-context helper in this section is eligible |
-| 7 | exact domain-v2, CFS-v1, one generation | future declared `1110` | unchanged `generic-v1` | incomplete capability before direct-entry I/O |
+| 7 | exact domain-v2, CFS-v1, one generation | current declared `1110` | unchanged `generic-v1` | incomplete capability before direct-entry I/O |
 | 8 | exact domain-v2, CFS-v1, one generation | future complete `1111` | structured path | continue under held-fd structured admission |
 
 `Legal non-domain-v2` means strict replay succeeded and the code-owned
@@ -2025,8 +2026,9 @@ structured schema oracle. Therefore no current Stage 21/22/24 or release
 consumer may consume structured Stage 20 output, and existing fields are not
 sufficient for safe structured recognition.
 
-B5 MUST independently freeze the downstream schemas before implementation.
-Every Stage 21+ structured authority MUST bind:
+B5 MUST independently freeze each downstream schema before its implementation.
+Section 18.11 freezes Stage 21 only; Stage 22-25 and release schemas remain
+deferred. Every Stage 21+ structured authority MUST bind:
 
 - the exact current `stage-20/quality_gate_manifest.json` FileRef, including
   its exact path and SHA-256 over held bytes;
@@ -2058,17 +2060,601 @@ propagation, Stage 24 binding, independent reconstruction, release-check and
 gate integration, and actual invalidation or cleanup of downstream commit
 points. Generic-v1 Stage 20, Stage 21, and Stage 22 schemas, paths, bytes, and
 behavior remain unchanged. Stale structured Stage 19 or Stage 20 files cannot
-discriminate generic dispatch. B4 implementation and a later `1110`
-declaration remain inactive; only completed B5 integration followed by a
+discriminate generic dispatch. The current `1110` declaration remains
+inactive; only completed B5 integration followed by a
 separately reviewed exact `1111` declaration can activate the full structured
 path.
 
+### 18.11 B5-D1A structured Stage 21 deterministic archive authority
+
+#### 18.11.1 Boundary, dispatch, and pre-admission
+
+Structured Stage 21 is a deterministic archival projection over one fully
+replayed structured Stage 20 success authority. It makes zero LLM calls, zero
+provider calls, zero semantic-repair calls, and zero HITL calls. It does not
+read a prompt, caller prose, runtime topic, stored summary, paper excerpt, or
+live config to construct its outputs.
+
+The exact current code-owned map is `1110`. Ordinary, public, and direct
+structured Stage 21 entry therefore calls the complete-capability guard and
+rejects before a lock, filesystem I/O, provider, prompt, or HITL operation.
+Only a private integration helper may exercise this design before global
+activation. That helper initially accepts exactly one code-issued,
+non-serializable, non-copyable `PreAdmissionContext`. The private issuance
+registry binds it only to:
+
+- the active `ReleaseGraphLock` owner and writer epoch;
+- the held root-parent, run, Stage 20, and root-signal-parent descriptors and
+  device/inode identities;
+- the canonical run path and logical target stage ID exact `stage21`;
+- structured capability schema version `1` and exact code-owned snapshot
+  `1110`;
+- the current Stage 20 manifest, generation binding, source paper, Stage 19
+  manifest, canonical evidence, CFS, and complete pre-admission source
+  bindings; and
+- the single-use phase exact `pre_admission`.
+
+`PreAdmissionContext` MUST NOT open, stat, enumerate, create, roll over, clean,
+or otherwise access any `stage-21` path. It MUST NOT contain or bind a Stage 21
+directory fd, device, inode, namespace identity, entry-existence fact, or
+output identity. The logical target stage ID is a lexical code-owned label, not
+a filesystem identity. Whether `stage-21` exists remains unknown until after
+complete Stage 20 pre-admission replay.
+
+A caller-created, copied, serialized, expired, reused, cross-run, cross-owner,
+cross-epoch, cross-stage, or cross-generation `PreAdmissionContext` rejects
+before Stage 20 or Stage 21 I/O. Config, environment, caller mode, persisted
+capability snapshot, artifact presence, and a test flag cannot create or
+select it.
+
+Before opening, creating, reading, rolling over, cleaning, or writing any
+`stage-21` path, the private route performs a `Pre-admission Capture` through
+held root/run/Stage 20 descriptors. It captures the exact current:
+
+- `stage-20/quality_report.json`;
+- `stage-20/fabrication_flags.json`;
+- `stage-20/quality_gate_manifest.json`;
+- root `degradation_signal.json` only for the degraded branch; and
+- recursively required Stage 19, Stage 17, canonical-evidence, CFS,
+  experiment-contract, run-config, and closure sources.
+
+Every captured file is a safe canonical run-relative, regular, single-link
+file. Capture records exact bytes, SHA-256, byte length, mode, link count,
+device, inode, and stable before/after metadata. Pre-admission duplicate-safely
+and strictly replays structured report schema v1, flags schema v3, manifest
+schema v2, and the conditional signal schema v1. It independently rebuilds the
+Stage 20 outcome, Stage 19 manifest v2, source paper, canonical evidence, CFS,
+generation binding, fabrication state, and complete source closure. It
+requires the current Stage 20 manifest name still to bind the captured
+identity.
+
+Only after that complete replay succeeds and the current Stage 20 manifest
+name still binds the captured identity may the code-owned registry consume the
+exact live `PreAdmissionContext`. As one registry-only, single-use transition,
+under the same owner, canonical run, writer epoch, target stage, capability,
+and replayed upstream bindings, it uses the already-held run fd to open or
+create the canonical `stage-21`, validates and captures the Stage 21 held fd,
+device, inode, and parent/name identity, and only then issues exactly one
+non-serializable, non-copyable `Stage21AttemptContext`. A failed open,
+creation, identity check, or transition consumes or expires the
+`PreAdmissionContext`, closes any newly opened fd, issues no attempt context,
+performs no Stage 21 deletion or output-file write, and fails closed. The
+transition cannot occur twice and has no caller-visible intermediate token.
+
+`Stage21AttemptContext` is the sole legal context for all later Stage 21
+manifest-first invalidation, Snapshot A, build, staging, publication, immediate
+postcondition, terminal postcondition, and cleanup. Its registry identity
+binds the original pre-admission tuple plus the captured Stage 21 held
+fd/device/inode/name identity. Caller code cannot construct, copy, serialize,
+replace, phase-advance, or bypass it. A forged context, wrong Stage 21
+identity, owner/run/epoch drift, or phase mismatch rejects before any deletion
+or write.
+
+The exact successful registry phase order is:
+
+```text
+PreAdmissionContext(pre_admission)
+  -> Stage21AttemptContext(namespace_bound)
+  -> invalidated
+  -> snapshot_a
+  -> staged
+  -> published
+  -> provisional_done
+  -> immediate_validated
+  -> terminal_validated
+  -> cleared
+```
+
+Every arrow is code-owned, one-way, and permitted once. From any
+`Stage21AttemptContext` phase, failure instead moves through
+`failed_cleanup -> cleared`; cleanup errors append to the original failure.
+Neither a cleared/failed context nor the consumed `PreAdmissionContext` can be
+revived or reused.
+
+For `passed`, the Stage 20 manifest signal is null and the root signal and its
+temporary name are absent. For `degraded`, the signal is an exact `FileRef` to
+root `degradation_signal.json`, that regular single-link file is present and
+fully replayed, and its temporary name is absent. A missing, non-regular,
+hard-linked, malformed, duplicate-key, extra-field, wrong-version,
+wrong-source, wrong-generation, mixed-generation, identity-drifted, or
+semantically unreplayable source fails with zero Stage 21 output-path I/O.
+There is no fallback to Stage 17, Stage 19, a generic paper, config, caller
+state, a stored Stage 21 index, or archive prose.
+
+#### 18.11.2 Exact namespace and deterministic `archive.md`
+
+The complete structured Stage 21 owned namespace is exactly:
+
+```text
+stage-21/archive.md
+stage-21/bundle_index.json
+stage-21/archive.md.tmp
+stage-21/bundle_index.json.tmp
+```
+
+The two `.tmp` names are fixed Stage 21 ordinary-file temporaries. No staging
+directory, random name, diagnostic sidecar, alternate suffix, symlink,
+hardlink, rename-based commit, or platform-specific publication primitive is
+permitted. Structured Stage 21 has no persisted diagnostics. Diagnostics are
+bounded in-memory data, exception notes, or `StageResult.error` text only.
+
+`archive.md` is a bound payload, not a manifest and not scientific-claim,
+numeric, citation, paper, or release authority. Stage 22 may later consume only
+a strict replay of `bundle_index.json` v2 and its upstream authority; it MUST
+NOT use archive prose as paper text, evidence, numeric support, citation
+support, a dispatch discriminator, or an authority oracle.
+
+The renderer has exactly the following grammar:
+
+```text
+# Structured Stage 21 Archive
+
+## Policy
+Archive-Schema-Version: 1
+Publication-Stage-ID: stage21
+Publication-Mode: structured-scientific-claim-v1
+
+## Stage 20 Outcome
+Quality-Outcome: <passed|degraded>
+Degradation-Signal-Path: <null|degradation_signal.json>
+Degradation-Signal-SHA256: <null|sha256>
+
+## Source Bindings
+Canonical-Evidence-Path: canonical_experiment_evidence.json
+Canonical-Evidence-SHA256: <sha256>
+Source-Paper-Path: stage-19/scientific_claim_paper_revised.md
+Source-Paper-SHA256: <sha256>
+Stage19-Manifest-Path: stage-19/scientific_claim_authority_manifest.json
+Stage19-Manifest-SHA256: <sha256>
+Stage20-Manifest-Path: stage-20/quality_gate_manifest.json
+Stage20-Manifest-SHA256: <sha256>
+Generation-Binding-SHA256: <sha256>
+CFS-Path: null
+CFS-Schema-Version: 1
+CFS-SHA256: <sha256>
+
+## Artifact Inventory
+Artifact-Count: <7|8>
+
+## Authority Boundary
+This archive is a deterministic operational projection only; it is not scientific claim, numeric, or citation authority.
+```
+
+Angle-bracket expressions are grammar metavariables, not stored characters.
+The renderer substitutes only values from Snapshot A. The passed branch writes
+literal `null` for both degradation lines and literal `7` for the count. The
+degraded branch writes literal `degradation_signal.json`, its lowercase
+SHA-256, and literal `8`.
+
+CFS is not a standalone persisted file. `CFS-Path: null` is therefore exact
+and MUST NOT be replaced by an invented path. The CFS schema and digest are
+independently rebuilt from canonical evidence.
+
+The complete archive uses the displayed line order and spelling, ASCII
+characters encoded as UTF-8, LF line endings, no BOM, no CR, no trailing
+spaces, no Unicode normalization step, and exactly one terminal LF. It
+contains no timestamp. Paths and digests are already canonical ASCII tokens
+with no newline or whitespace. Public replay independently rerenders these
+exact bytes. The renderer never copies a paper paragraph, provider response,
+review, weakness, recommendation, future work, comparison, causal statement,
+mechanism, generalization, scientific conclusion, caller string, config
+string, or stored summary.
+
+#### 18.11.3 Exact `bundle_index.json` schema v2
+
+`stage-21/bundle_index.json` is the sole structured Stage 21 manifest and
+commit point. It uses true-integer schema version `2` and exactly 17 root keys.
+A passed example is:
+
+```json
+{
+  "schema_version": 2,
+  "publication_stage_id": "stage21",
+  "publication_mode": "structured-scientific-claim-v1",
+  "structured_capability_schema_version": 1,
+  "structured_capability_snapshot": {
+    "stage17_publication": 1,
+    "stage19_revision": 1,
+    "stage20_replay": 1,
+    "stage24_and_release_integration": 0
+  },
+  "generation_binding_sha256": "<sha256>",
+  "canonical_experiment_evidence": {
+    "path": "canonical_experiment_evidence.json",
+    "sha256": "<sha256>"
+  },
+  "cfs": {
+    "schema_version": 1,
+    "sha256": "<sha256>"
+  },
+  "source_stage19_manifest": {
+    "path": "stage-19/scientific_claim_authority_manifest.json",
+    "sha256": "<sha256>"
+  },
+  "source_stage20_manifest": {
+    "path": "stage-20/quality_gate_manifest.json",
+    "sha256": "<sha256>"
+  },
+  "source_paper": {
+    "path": "stage-19/scientific_claim_paper_revised.md",
+    "sha256": "<sha256>"
+  },
+  "quality_outcome": "passed",
+  "degradation_signal": null,
+  "archive": {
+    "path": "stage-21/archive.md",
+    "sha256": "<sha256>"
+  },
+  "artifact_count": 7,
+  "artifacts": [
+    {
+      "role": "canonical_experiment_evidence",
+      "path": "canonical_experiment_evidence.json",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "source_stage19_manifest",
+      "path": "stage-19/scientific_claim_authority_manifest.json",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "source_paper",
+      "path": "stage-19/scientific_claim_paper_revised.md",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "stage20_quality_report",
+      "path": "stage-20/quality_report.json",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "stage20_fabrication_flags",
+      "path": "stage-20/fabrication_flags.json",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "source_stage20_manifest",
+      "path": "stage-20/quality_gate_manifest.json",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "stage21_archive",
+      "path": "stage-21/archive.md",
+      "sha256": "<sha256>",
+      "size": 1
+    }
+  ],
+  "generated": "2026-07-28T00:00:00+00:00"
+}
+```
+
+The exact root key set is `schema_version`, `publication_stage_id`,
+`publication_mode`, `structured_capability_schema_version`,
+`structured_capability_snapshot`, `generation_binding_sha256`,
+`canonical_experiment_evidence`, `cfs`, `source_stage19_manifest`,
+`source_stage20_manifest`, `source_paper`, `quality_outcome`,
+`degradation_signal`, `archive`, `artifact_count`, `artifacts`, and
+`generated`. Duplicate, unknown, or missing root or nested keys reject.
+
+`publication_stage_id` is exact `stage21`; `publication_mode` is exact
+`structured-scientific-claim-v1`. The capability schema is true integer `1`.
+The snapshot has exactly the four code-owned keys and, for B5 implementation
+and private pre-activation integration, exact true-integer values `1110`.
+Persisted `1110` records the private admission state but never activates
+public or direct structured entry. After a separately reviewed global
+activation, a new public publication must bind the then-current exact `1111`;
+an old `1110` manifest cannot be promoted or reused.
+
+`canonical_experiment_evidence`, `source_stage19_manifest`,
+`source_stage20_manifest`, `source_paper`, `degradation_signal` when non-null,
+and `archive` are exact two-key `FileRef`s. `cfs` is not a `FileRef`; it has
+exactly `schema_version` and `sha256`, and the version is true integer `1`.
+There is no authoritative standalone CFS path.
+
+Each artifact inventory entry has exactly `role`, `path`, `sha256`, and `size`.
+`size` is a true nonnegative integer, never a boolean, and equals both the held
+byte length and stable `fstat` size. Paths are safe NFC run-relative paths;
+digests are lowercase SHA-256. Source and output files are regular,
+single-link, stable-identity files. JSON sources are nonempty, duplicate-safe
+strict JSON; the source paper is nonempty valid UTF-8; the archive is exactly
+the nonempty deterministic bytes from Section 18.11.2. A role is the logical
+type; no separate caller-supplied MIME or type field exists.
+
+The passed role array is exactly this order:
+
+```text
+canonical_experiment_evidence
+source_stage19_manifest
+source_paper
+stage20_quality_report
+stage20_fabrication_flags
+source_stage20_manifest
+stage21_archive
+```
+
+The degraded role array has exactly eight entries and inserts
+`stage20_degradation_signal` after `stage20_fabrication_flags` and before
+`source_stage20_manifest`. Its path is exact root
+`degradation_signal.json`. No role may repeat.
+
+For every root `FileRef`, exactly one inventory row with its prescribed role
+has the same path and digest. The canonical-evidence, Stage 19, source-paper,
+Stage 20 manifest, conditional signal, and archive rows cross-match their root
+fields. The report and flags rows cross-match the exact `FileRef`s inside the
+fully replayed Stage 20 manifest. Their sizes come from held bytes. The
+inventory is the exact directly bound Stage 21 set; the recursively replayed
+Stage 17/19 source closure remains transitively bound by the independently
+rebuilt Stage 19 and Stage 20 manifests and is not redundantly copied here.
+
+For `passed`, `quality_outcome` is exact `passed`, `degradation_signal` is
+null, the signal and signal temporary are absent, the count is true integer
+`7`, and the seven-role array is exact. For `degraded`, the outcome is exact
+`degraded`, the signal is its exact `FileRef`, the signal is present and fully
+replayed, the count is true integer `8`, and the eight-role array is exact.
+Unknown outcomes, crossed branches, a passed signal, a degraded null, or
+wrong count/order/path/hash/size fail closed.
+
+`generated` is not a new Stage 21 clock reading. It is exactly the
+seconds-resolution UTC `generated` string in the fully replayed current
+Stage 20 manifest, with exact form `YYYY-MM-DDTHH:MM:SS+00:00`. `Z`,
+fractional seconds, other offsets, invalid calendar values, or a value that
+differs from Stage 20 reject. Stage 21 makes zero clock calls. The value is a
+non-authoritative deterministic source-generation timestamp and cannot select
+content, outcome, dispatch, or authority.
+
+Authority JSON follows Section 3: duplicate-safe strict parsing, sorted object
+keys, no insignificant whitespace, UTF-8, and one terminal LF. The displayed
+field order is explanatory; the array role order is normative. The manifest
+contains no field for its own path, hash, size, or identity. `artifacts` also
+excludes the manifest. Consumers capture and hash its exact bytes externally,
+so there is no manifest self-hash cycle.
+
+#### 18.11.4 Exact publication lifecycle
+
+Pre-admission and Snapshot A are two distinct full captures. Snapshot A is a
+post-invalidation revalidation and not the first Stage 20 admission:
+
+1. **Dispatch first.** Ordinary/public/direct entry requires exact `1111` and
+   rejects current `1110` before lock, filesystem, provider, prompt, or HITL
+   I/O. Only the code-owned private route may continue.
+2. **Pre-admission context.** Validate the single-use registry-issued
+   `PreAdmissionContext`, its upstream-only owner/run/epoch/identity/source
+   bindings, logical target stage, capability schema, and exact `1110`.
+   Assert that it has no Stage 21 fd, identity, existence fact, or output
+   binding; caller/config/environment/artifact presence cannot supply any
+   value.
+3. **Pre-admission capture.** Through held upstream descriptors only, capture
+   Stage 20 report, flags, manifest, conditional root signal, and the complete
+   recursively required source closure as rich regular-file snapshots.
+4. **Pre-admission replay.** Fully replay Stage 20 and independently rebuild
+   Stage 19, evidence, CFS, generation, fabrication, source, namespace, and
+   outcome. Require the current Stage 20 manifest name still to bind its
+   captured identity. Failure has zero `stage-21` I/O.
+5. **Single transition and first Stage 21 open.** Only now may the code-owned
+   registry consume the exact `PreAdmissionContext`. In one same-owner,
+   same-run, same-epoch transition it opens or creates the current canonical
+   `stage-21` through the held run descriptor, captures and validates its held
+   fd/device/inode/name identity, and then issues the sole
+   `Stage21AttemptContext` in `namespace_bound`. No Stage 21 stat, enumeration,
+   mkdir, rollover, cleanup, deletion, metadata write, or output write may
+   precede this operation. Transition failure issues no attempt context and
+   performs no deletion or output-file write.
+6. **Manifest-first invalidation.** Descriptor-relatively attempt
+   `bundle_index.json` first, then independently clean `archive.md`,
+   `bundle_index.json.tmp`, and `archive.md.tmp`. Preexisting temporary
+   collisions are errors even when fixed-name cleanup removes their
+   non-directory entries. Aggregate all cleanup errors and do not publish after
+   any error. The persisted diagnostic set is empty. This and every later step
+   requires the same live `Stage21AttemptContext` and its next legal registry
+   phase.
+7. **Snapshot A.** Recapture and fully replay the upstream closure through the
+   held descriptors. Require exact equality with Pre-admission Capture in
+   bytes, hashes, sizes, modes, link counts, device/inode identities,
+   generation, source bindings, branch, and namespace. This second capture is
+   the formal Snapshot A.
+8. **Deterministic build.** With zero LLM, provider, repair, HITL, prompt, and
+   clock calls, build exact archive and v2 manifest bytes in memory from
+   Snapshot A.
+9. **Archive temporary.** Create fixed `archive.md.tmp` with
+   `O_CREAT|O_EXCL|O_NOFOLLOW`, require a regular single-link file, record its
+   creating-fd identity, and write, flush, sync, and read back only through that
+   descriptor.
+10. **Manifest temporary.** Apply the same creating-fd-only rules to fixed
+    `bundle_index.json.tmp`. Do not replace, rename, link, or reopen either
+    temporary for writing.
+11. **Staged semantic replay.** Read held temporary descriptors, strictly parse
+    the index, independently rerender the archive, and require exact bytes,
+    root and nested keys, roles/order/count, FileRefs/hash/size, capability,
+    branch, timestamp, and no manifest self-reference.
+12. **Source fixpoint.** Capture the complete upstream closure again and
+    require exact Snapshot A equality and the current Stage 20 manifest-name
+    identity. Any late source or current-manifest mutation fails.
+13. **Formal archive.** Require `archive.md` absent, create it with
+    `O_CREAT|O_EXCL|O_NOFOLLOW`, record the formal creating-fd identity, and
+    copy only the exact held archive-temporary bytes through the formal
+    creating fd; flush, sync, and read back.
+14. **Formal manifest last.** Strictly last, require `bundle_index.json`
+    absent, create it with the same exclusive creating-fd-only rules, and copy
+    only the exact held manifest-temporary bytes. It is a commit candidate, not
+    final success.
+15. **Temporaries absent.** Fixed-name descriptor-relative unlink both
+    temporaries, require them physically absent, and require the direct Stage 21
+    namespace to contain exactly the two formal names.
+16. **Final semantic replay.** From held formal descriptors, strictly replay
+    the index and independently rebuild both archive and index from Snapshot A.
+    Reassert the archive authority boundary.
+17. **Snapshot B.** Capture the full upstream closure, both formal outputs,
+    root/run/stage/current-Stage20 identities, names, bytes, hashes, sizes,
+    modes, and link counts. Require its source portion equal Snapshot A.
+18. **Second final capture.** Capture the same complete state again and require
+    exact Snapshot B equality, detecting final-read mutation, late collision,
+    parent replacement, or name-to-inode drift.
+19. **Provisional producer handoff and executor postconditions.** After
+    publication and both final captures, the producer advances the same
+    `Stage21AttemptContext` to `provisional_done` and gives only the executor an
+    internal provisional `DONE`, the exact candidate tuples, and that live
+    context. It does not return a public `StageResult` or final `DONE`. The
+    context contains no executor result and therefore creates no circular
+    result dependency. The executor first runs the immediate validator over
+    exact tuples, bytes, namespace, source fixpoint, snapshots, identities, and
+    context. It then unconditionally skips PRM, HITL, edit, prompt,
+    semantic-repair, and repair hooks for structured Stage 21, and runs the
+    terminal validator against the same context and original writer epoch. No
+    second published context is issued. A changed provisional status, tuple,
+    byte, name, identity, source, phase, or context is failure.
+20. **Public DONE.** Only after both postconditions pass may public
+    `execute_stage` construct and return final `DONE` with exactly
+    `artifacts=("archive.md", "bundle_index.json")` and
+    `evidence_refs=("stage-21/archive.md",
+    "stage-21/bundle_index.json")`, then clear the live context. No reusable or
+    serializable activation capability remains. Failure at the producer,
+    handoff, immediate validator, skipped-hook assertion, terminal validator,
+    or public-result construction returns `FAILED` / `retry` with empty tuples
+    after manifest-first aggregate cleanup.
+
+Temp and formal publication use fixed-name exclusive creating descriptors, not
+the existing replace-based generic helper. Cleanup uses descriptor-relative
+`unlinkat(fixed_reserved_name)` as a reserved-namespace operation. It does not
+claim that a preceding inode check and later unlink form an atomic
+unlink-if-inode primitive. Under the B4-D3 same-UID boundary, replacement may
+cause `FAILED` or denial of service, but cannot authorize alternate bytes.
+Cleanup never follows a symlink, recurses into a directory, writes a
+replacement target, changes an unowned name, or switches to a replacement
+parent. A directory or unsafe special-file collision is retained as an
+aggregate cleanup error. Parent replacement cleanup uses only the held
+original descriptors.
+
+Rollover, resume, `FAILED`, and `PAUSED` do not inherit Stage 21 authority. Any
+rollover may occur only after successful current Stage 20 pre-admission and
+inside the registry-only one-time transition under the same owner, run, and
+writer epoch; the transition captures the resulting canonical `stage-21`
+identity before issuing `Stage21AttemptContext`. The new canonical `stage-21`
+starts without a v2 manifest. Archived `stage-21_vN` directories are
+historical bytes, not current authority. Resume must repeat dispatch,
+pre-admission, the one-time context transition, manifest-first invalidation,
+Snapshot A, publication, and both postconditions from the beginning. It cannot
+adopt a temporary, formal archive, stored index, issued context, provisional
+handoff, or prior producer result. Any non-`DONE` status, including `FAILED`,
+`PAUSED`, retry, cancellation, or exception, withdraws the current attempt
+through manifest-first aggregate cleanup. PRM, HITL, edit, and repair
+conversion cannot occur because structured Stage 21 skips those hooks;
+attempting to invoke one is itself an executor contract failure.
+
+#### 18.11.5 Passed, degraded, and failure semantics
+
+| Input or event | Stage 21 result | Manifest/signal branch | Calls | Result tuples |
+|---|---|---|---:|---|
+| valid Stage 20 `passed` | deterministic `DONE` after both postconditions | v2 passed; null signal; seven roles | 0 | exact success tuples |
+| valid Stage 20 `degraded` | deterministic `DONE` after both postconditions | v2 degraded; exact root signal `FileRef`; eight roles | 0 | exact success tuples |
+| Stage 20 failed, missing, invalid, or unreplayable | `FAILED` / `retry` before Stage 21 output I/O | no Stage 21 publication | 0 | empty |
+| mixed Stage 19/20 generation, source, evidence, CFS, or current manifest | `FAILED` / `retry` before Stage 21 output I/O | no Stage 21 publication | 0 | empty |
+| passed with a signal, or degraded without the exact signal | `FAILED` / `retry` before Stage 21 output I/O | no Stage 21 publication | 0 | empty |
+| any Stage 21 build, collision, replay, fixpoint, publication, capture, or postcondition failure | `FAILED` / `retry` | manifest-first aggregate cleanup | 0 | empty |
+| cleanup also fails | original failure remains primary; cleanup errors append | no success claim; v2 index must be absent or unreplayable at final check | 0 | empty |
+
+A degraded Stage 20 changes only the exact code-owned outcome and signal
+projection in the archive and manifest. It does not change facts, claims,
+paper, numeric support, citation support, release status, or scientific
+authority. The archive remains non-authoritative in both branches. Future
+Stage 22 structured admission may accept only a complete replay of the v2
+manifest and the current Stage 20 authority; it cannot trust archive prose.
+
+Every failure attempts cleanup in manifest-first order and returns empty
+artifact and evidence tuples. Cleanup error text is appended after the
+original error and cannot replace it. Success requires that no complete
+replayable current v2 index remains after a failed attempt. This is a
+current-epoch operating contract, not a claim that same-UID reinjection is
+physically impossible. A later consumer must re-admit the then-current Stage 20
+manifest and independently replay all expected bytes; it cannot inherit an old
+producer success, stored archive/index mutual hashes, or a stale live context.
+
+#### 18.11.6 Generic boundary and required adversarial coverage
+
+Generic-v1 Stage 21 retains its current LLM and no-LLM behavior, bundle-index
+schema v1, output names, retries, bytes, and cleanup. Exact `1110` ordinary
+dispatch remains generic after the mandatory common canonical replay and
+cannot enter the private structured helper. A stale v2 index, deterministic
+archive, temporary, domain-v2 artifact, or synchronized hash set cannot select
+structured dispatch. Generic-v1 does not parse a v2 index as v1 authority and
+structured-only semantics do not alter generic bytes.
+
+B5-D1A implementation tests MUST cover:
+
+1. a spy proving zero `stage-21` open, stat, mkdir, rollover, unlink, cleanup,
+   metadata write, or output write before complete Stage 20 pre-admission;
+2. missing, plain, copied, serialized, expired, reused, wrong-owner, wrong-run,
+   wrong-epoch, wrong-stage, or inactive `PreAdmissionContext`; a caller-made
+   or forged `Stage21AttemptContext`; transition reuse; and any transition not
+   preserving the same registry, owner, run, and writer epoch;
+3. exact `1110` public/direct entry; malformed, boolean, missing, or extra
+   capability fields; a caller-supplied `1111`; a wrong Stage 21 identity
+   rejected before deletion or write; and proof that transition occurs once
+   only after complete Stage 20 replay;
+4. forged, missing, extra, duplicate, wrong, or boolean Stage 20 report,
+   flags, manifest, signal, and Stage 21 schema fields;
+5. wrong FileRef path/hash, inventory size/role/order/count, unsafe path,
+   hardlink, non-regular file, and mixed Stage 19/20 generation;
+6. passed with a signal, degraded with null or wrong signal, and unknown
+   outcome or publication mode;
+7. stored archive plus manifest with synchronously recomputed hashes, including
+   a changed generated value or authority disclaimer;
+8. preexisting and late temp/formal collision using regular file, symlink,
+   hardlink, FIFO, socket, device, or directory;
+9. creating-fd identity differing from the fixed temp/formal name identity;
+10. Stage 20 current-manifest or source mutation between Pre-admission,
+    Snapshot A, source fixpoint, Snapshot B, and second final capture;
+11. archive or index mutation after staged replay, formal publication, final
+    read, immediate postcondition, or before terminal postcondition;
+12. root, run, Stage 20, root-signal-parent, or Stage 21 parent replacement,
+    including identity drift before the first invalidation;
+13. producer provisional status, tuple, evidence-ref, order, context, or phase
+    mutation; public `execute_stage` returning before both postconditions;
+    context-to-result circular reference; context copy/replacement between
+    postconditions; and invocation of a PRM, HITL, edit, prompt,
+    semantic-repair, or repair hook;
+14. generic-v1 with stale structured v2 formal and temporary names;
+15. caller-supplied context, config, mode, map, timestamp, summary, or artifact
+    presence; and
+16. raising LLM, provider, prompt, semantic-repair, PRM, HITL, and clock spies,
+    all of which must remain at zero calls on structured success.
+
+These tests may exercise only the registry-issued `PreAdmissionContext` and its
+single resulting `Stage21AttemptContext` while the repository remains `1110`.
+They do not activate production, authorize Stage 22-25, reconstruction,
+`release_check`, a release gate, resume, API use, or fresh F0.
+
 ## 19. Generic and release boundary
 
-`generic-v1` Stage 18, Stage 19, and Stage 20 schemas, bytes, artifact names,
-provider behavior, cleanup, and failure behavior remain unchanged. At map
-`1000`, malformed/partial states, and future `1110`, ordinary dispatch remains
-generic after its mandatory common canonical replay.
+`generic-v1` Stage 18, Stage 19, Stage 20, and Stage 21 schemas, bytes,
+artifact names, provider behavior, cleanup, and failure behavior remain
+unchanged. At map `1000`, malformed/partial states, and the current `1110`,
+ordinary dispatch remains generic after its mandatory common canonical replay.
 
 Generic code does not enumerate, parse, require, publish, consume, block on, or
 clean any structured-only `scientific_claim_*` Stage 19 name or any of the
@@ -2080,10 +2666,10 @@ a discriminator.
 Once a valid `1111` domain-v2 dispatch enters the structured path, every later
 error is `FAILED`; generic fallback is forbidden.
 
-Structured dispatch and parsing for Stages 21-25, E9, `release_check`, release
-gates, and fresh F0 are outside B4-D0, B4-D1, B4-D2, B4-D3, B4-D4, B4-A, and
-B4-B. B4-D0/D1/D2/D3/D4 change no release authority. Fresh F0 requires
-separate explicit authorization.
+Structured Stage 21 implementation and structured dispatch or parsing for
+Stages 22-25, E9, `release_check`, release gates, and fresh F0 are outside
+B5-D1A. B5-D1A changes no release authority. Fresh F0 requires separate
+explicit authorization.
 
 ## 20. B1-B5 milestone split
 
@@ -2097,17 +2683,19 @@ four-file creating-fd transaction. B4-D3 corrects the Stage 20 deletion and
 same-UID threat claims without changing quality, source, schema, or release
 authority. B4-D4 removes the undefined revocation-interface promise, freezes
 current-epoch Stage 20 withdrawal, and defines the B5 current-manifest
-recognition boundary without adding a persistent schema. Every B4
-implementation commit keeps map `1000`. A separately reviewed B4 declaration
-may change it to `1110`, which still does not activate public/direct structured
-production. B4-A implements Stage 19 against this frozen schema; B4-B
-implements only the private Stage 20 handoff and may not revise Stage 19 or any
-downstream schema.
+recognition boundary without adding a persistent schema. B4-A and B4-B
+implemented Stage 19 and the private Stage 20 handoff while the map remained
+`1000`; their separately reviewed declaration changed it to the current
+`1110`, which still does not activate public/direct structured production.
 
-B5 owns structured Stage 21/22 parsing and dispatch, Stage 24, independent
-reconstruction, `release_check`, release gates, and full release integration.
-Only a separately named, reviewed `1111` declaration after B5 activates the
-full structured path.
+B5 is split into independently frozen and reviewed slices. B5-D1A freezes only
+the structured Stage 21 deterministic archive authority. A separate Stage 21
+implementation slice must keep `1110`. Later separately frozen and implemented
+slices own Stage 22/23, Stage 24/25, independent reconstruction,
+`pipeline_validation`, `research_release`, `release_check`, release gates, and
+full release integration; every implementation and pre-activation commit
+keeps `1110`. Only a separately named, separately reviewed, implementation-free
+global activation declaration may change exact `1110` to exact `1111`.
 
 ## 21. Adversarial test matrix
 
@@ -2171,10 +2759,10 @@ full structured path.
 | Stage 20 semantic | first empty/truncated/malformed/duplicate/extra/missing/wrong-type response | permit exactly one repair semantic call |
 | Stage 20 semantic | second invalid response or third semantic call | `FAILED`; diagnostics only; cleanup |
 | Capability | malformed or partial map | ordinary generic unchanged; direct rejects before I/O |
-| Capability | exact `1000` or future `1110` | public/direct structured remains blocked |
+| Capability | exact `1000` or current `1110` | public/direct structured remains blocked |
 | Test seam | forged, copied, expired, cross-run, or cross-epoch verified context | reject before provider/publication |
 | Discriminator | domain-v2 marker exists but Stage 17/CFS/generation/replay is invalid | `FAILED`; never generic fallback |
-| Downstream | current Stage 21 or Stage 22 is asked to consume structured Stage 20 | reject; B5 parser/dispatch is not implemented |
+| Downstream | current public/direct Stage 21 or Stage 22 is asked to consume structured Stage 20 | reject; B5-D1A is design-only and no structured parser/dispatch is implemented |
 | Downstream | synchronously forge Stage 21/22 hashes around structured Stage 20 | independent reconstruction rejects; no B4 release authority |
 | Downstream current manifest | current Stage 20 manifest is missing, non-regular, malformed, cannot complete strict replay, or changes identity during held-fd capture, replay, or source fixpoint | reject before opening any Stage 21+ path; no old downstream authority |
 | Downstream generation | current Stage 20 generation or source identity differs from independently rebuilt current-run identity | reject before any Stage 21+ artifact read or write |
@@ -2184,26 +2772,29 @@ full structured path.
 | Generic | overlapping Stage 20 `quality_report.json`, `fabrication_flags.json`, or `quality_gate_manifest.json` is stale | unchanged generic entry cleanup may invalidate it; the name never discriminates structured dispatch |
 | Generic | legal generic-v1 input | exact existing schemas, bytes, artifacts, and failure behavior |
 
-## 22. B4-D4 acceptance and non-claims
+## 22. B5-D1A acceptance and non-claims
 
-B4-D4 is ready for a narrow docs-only commit only when:
+B5-D1A is ready for a narrow docs-only commit only when:
 
-- the independent authority/generation and lifecycle/downstream reviewers
-  complete a read-only fixpoint;
-- no P0 or P1 remains and any new material disagreement returns `STOP`;
+- the independent Stage 21 schema/semantic and held-fd lifecycle/dispatch
+  reviewers complete a read-only fixpoint;
+- no P0 remains and any material safety disagreement returns `STOP`;
 - every JSON fence parses with a duplicate-safe strict parser;
 - Markdown fences are paired;
 - paths, names, versions, counts, capability states, call bounds, lifecycle
-  steps, and Stage 20 handoff are internally consistent;
-- neither the Stage 19 nor Stage 20 manifest has a self-hash cycle;
+  steps, Stage 20 handoff, archive grammar, and passed/degraded branch are
+  internally consistent;
+- no Stage 17, Stage 19, Stage 20, or designed Stage 21 manifest has a
+  self-hash cycle;
 - the docs-only staged or proposed diff contains only this document, and
-  production code and tests have zero diff relative to the B4-D4 baseline;
+  production code and tests have zero diff relative to `B5D1A_BASELINE`;
 - `git diff --check` passes;
-- the original nine untracked groups remain untouched.
+- all preexisting untracked files and directories remain untouched.
 
-B4-D4 does not modify Stage 20 production code or tests, implement or modify
-downstream consumers, activate a structured production path, change the
-capability map, authorize a B4 declaration or B5, accept a release, authorize
-commit/push, or authorize API, resume, or fresh F0 work. It creates no
-persistent or serialized revocation authority and makes no durable historical
-tombstone claim.
+B5-D1A does not modify production code or tests, implement Stage 21, define or
+implement Stage 22-25, reconstruction, or release integration, activate a
+structured production path, change the capability map, weaken Stage 19, E9,
+`release_check`, or a release gate, accept a release, authorize commit/push, or
+authorize API, resume, or fresh F0 work. It creates no reusable or serialized
+activation authority. A separate adjudication is required both for a
+docs-only commit and for entry into Stage 21 implementation.
