@@ -1,7 +1,7 @@
-"""Inactive capability gate for structured scientific-claim publication.
+"""Code-owned capability gate for structured scientific-claim publication.
 
 This declaration is independent from canonical-evidence migration authority.
-B3 implementation commits must leave every component at zero.
+B4 declares reviewed Stage 17/19/20 capability; release integration remains off.
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ REQUIRED_STRUCTURED_CAPABILITIES = (
 
 STRUCTURED_SCIENTIFIC_CLAIM_CAPABILITIES: dict[str, int] = {
     "stage17_publication": 1,
-    "stage19_revision": 0,
-    "stage20_replay": 0,
+    "stage19_revision": 1,
+    "stage20_replay": 1,
     "stage24_and_release_integration": 0,
 }
 

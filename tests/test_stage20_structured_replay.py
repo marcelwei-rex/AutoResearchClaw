@@ -37,11 +37,11 @@ from tests.test_stage19_structured_revision import (
 )
 
 
-def test_b4b_keeps_capability_exactly_1000() -> None:
+def test_b4_declares_capability_exactly_1110() -> None:
     assert capability.STRUCTURED_SCIENTIFIC_CLAIM_CAPABILITIES == {
         "stage17_publication": 1,
-        "stage19_revision": 0,
-        "stage20_replay": 0,
+        "stage19_revision": 1,
+        "stage20_replay": 1,
         "stage24_and_release_integration": 0,
     }
 
@@ -80,7 +80,7 @@ def test_public_entry_has_no_caller_authority() -> None:
     assert tuple(parameters) == ("run_dir", "stage_dir", "llm")
 
 
-def test_public_entry_rejects_1000_before_io(
+def test_public_entry_rejects_1110_before_io(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

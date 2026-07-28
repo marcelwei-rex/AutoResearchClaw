@@ -17,20 +17,20 @@ EXPECTED_KEYS = (
 )
 
 
-def test_b3_declaration_is_independent_exact_1000_and_inactive() -> None:
+def test_b4_declaration_is_independent_exact_1110_and_inactive() -> None:
     assert capability.STRUCTURED_CAPABILITY_SCHEMA_VERSION == 1
     assert type(capability.STRUCTURED_CAPABILITY_SCHEMA_VERSION) is int
     assert tuple(capability.STRUCTURED_SCIENTIFIC_CLAIM_CAPABILITIES) == EXPECTED_KEYS
     assert capability.STRUCTURED_SCIENTIFIC_CLAIM_CAPABILITIES == {
         "stage17_publication": 1,
-        "stage19_revision": 0,
-        "stage20_replay": 0,
+        "stage19_revision": 1,
+        "stage20_replay": 1,
         "stage24_and_release_integration": 0,
     }
     assert capability.code_owned_structured_capability_snapshot() == {
         "stage17_publication": 1,
-        "stage19_revision": 0,
-        "stage20_replay": 0,
+        "stage19_revision": 1,
+        "stage20_replay": 1,
         "stage24_and_release_integration": 0,
     }
     assert capability.structured_publication_is_eligible() is False
@@ -47,8 +47,6 @@ def test_ordinary_eligibility_and_direct_guard_accept_no_authority_map() -> None
     ) as exc_info:
         capability.require_complete_structured_capability("test")
     assert exc_info.value.incomplete == (
-        "stage19_revision",
-        "stage20_replay",
         "stage24_and_release_integration",
     )
 
