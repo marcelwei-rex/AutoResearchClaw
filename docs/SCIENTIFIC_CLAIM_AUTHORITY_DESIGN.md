@@ -1,11 +1,12 @@
 # Structured Scientific Claim Authority Design
 
-Status: `B5-D1B-R1 / STRUCTURED STAGE 22-23 AUTHORITY SCHEMAS FROZEN / NOT IMPLEMENTED / NOT ACTIVATED`
+Status: `B5-D1D / TRUSTED-LOCAL FILESYSTEM THREAT MODEL NORMALIZED / STAGE 22-23 SCHEMAS FROZEN / B5-A2 PAUSED / NOT ACTIVATED`
 
 Scope: Batch B4-D0/D1/D2/D3/D4 authority for structured Stage 19 revision and
 structured Stage 20 replay, B5-D1A docs-only authority for deterministic
-structured Stage 21 archival, and B5-D1B-R1 docs-only authority for structured
-Stage 22 export and Stage 23 citation verification under the
+structured Stage 21 archival, B5-D1B-R1 docs-only authority for structured
+Stage 22 export and Stage 23 citation verification, and B5-D1D project-wide
+trusted-local filesystem normalization under the
 `structured-scientific-claim-v1` capability.
 
 B3 and B4 implementation and their separately reviewed declarations are
@@ -14,9 +15,11 @@ publication, Stage 19 revision, and Stage 20 replay are declared, while
 Stage 24/release integration remains undeclared. B5-D1A freezes the structured
 Stage 21 deterministic archive; B5-D1B-R1 freezes the structured Stage 22-23
 schemas, transport, outcomes, lifecycles, postconditions, and generic
-boundary. It does not implement Stage 21-23, change the capability map,
-activate the structured production path, define Stage 24-25 structured
-schemas, reconstruct a release, or change any release gate.
+boundary. B5-D1D changes only the project-wide filesystem threat boundary and
+restores the frozen Stage 22 manifest v2 nested-code schema unchanged. It does
+not implement or resume Stage 21-23, change the capability map, activate the
+structured production path, define Stage 24-25 structured schemas,
+reconstruct a release, or change any release gate.
 
 ## 1. Normative boundary
 
@@ -43,6 +46,77 @@ The words MUST, MUST NOT, SHOULD, and MAY are normative.
 The current non-sectional and sectional Stage 19 prose paths remain
 `generic-v1`. The current conditional Stage 20 replay is also not structured
 authority. This design does not describe either blocker as already closed.
+
+### 1.1 Project-wide trusted-local filesystem threat model
+
+This boundary applies uniformly to structured Stages 17-23. It separates
+untrusted authority data from the trusted local execution environment; it
+does not infer trust from a manifest, hash, path, caller, provider, or LLM.
+
+The trusted execution boundary contains:
+
+- the ResearchClaw main process and code-owned helpers executing in one active
+  writer epoch;
+- code-owned in-process state, registry tokens, held file descriptors, and the
+  operating-system kernel semantics required by those descriptors;
+- cooperating ResearchClaw writers, all of which obey the
+  `ReleaseGraphLock` and writer-epoch lifecycle; and
+- one supported local filesystem with stable mount topology, descriptor-
+  relative operations, `O_DIRECTORY`, `O_NOFOLLOW`, `O_EXCL`, stable live
+  device/inode identity, and the documented sync/stat/list/unlink semantics.
+
+Provider and LLM responses, caller arguments, configuration and environment
+content, persisted capability snapshots, stored artifacts, manifests, hashes,
+paths, and artifact presence are untrusted inputs. They never select a route
+or become authority without code-owned reconstruction and complete replay.
+
+The application-level threat and failure model includes:
+
+- malformed, duplicate, missing, extra, or wrong-typed fields;
+- stale, mixed-generation, wrong-source, partially published, or internally
+  hash-consistent stored artifact forgery;
+- preexisting symlink, hardlink, FIFO, socket, device, directory, wrong-
+  filesystem, case/NFC/prefix alias, or other reserved-name collision;
+- cooperating-writer conflicts and deterministic fault injection at the
+  documented capture, phase, fixpoint, and postcondition boundaries;
+- parent or canonical-name drift detected after an fd has been captured;
+- late mutation, ordinary I/O failure, cleanup failure, crash/restart
+  residue, and partial publication;
+- caller/config/environment/artifact-presence route injection; and
+- provider or LLM fallback, retry, cache, transport, or authority injection.
+
+The following are explicitly outside the ResearchClaw process-internal
+authority model:
+
+- an arbitrary malicious, noncooperating same-UID process racing namespace or
+  content syscalls between any two application operations;
+- debugger, `ptrace`, process-memory, inherited-fd, or in-process compromise;
+- privileged mount, bind-mount, namespace, or mount-topology manipulation
+  during an attempt;
+- a compromised kernel, filesystem implementation, storage stack, or OS
+  account; and
+- cryptographic or historical proof of which process originally created an
+  inode, plus crash-atomic multi-file directory transactions.
+
+If untrusted same-UID code must be resisted, deployment MUST use a separate OS
+user, container, sandbox, VM, or equivalent kernel-enforced isolation.
+ResearchClaw manifests, hashes, writer locks, identity checks, and semantic
+replay do not replace that isolation.
+
+This scope does not relax untrusted-data authority. Every consumer still
+captures current bytes through held descriptors, independently rebuilds the
+expected schema/content/source/generation closure, and performs complete
+semantic replay. Altered, unknown, incomplete, stale, mixed-generation, or
+merely self-consistent stored bytes reject. An exact byte-for-byte copy of
+independently expected content is semantically equivalent content; replay
+does not and need not attribute it to a historical producer.
+
+Held-fd and identity rules are current-epoch integrity and fault-detection
+mechanisms inside this boundary. They MUST NOT be described as proof against
+the excluded syscall adversary. Device/inode values are live-epoch identity,
+not persistent creator provenance. An unknown or unsupported filesystem,
+including a network, FUSE, or cloud filesystem without the required
+semantics, fails closed unless a separate support contract admits it.
 
 ## 2. Structured capability admission and mixed generations
 
@@ -1281,12 +1355,14 @@ descriptor-relative. Symlink, FIFO, socket, device, special file, directory
 collision, hardlink (`st_nlink != 1`), late name collision, unsafe path, or
 identity change fails closed.
 
-If the live run or stage parent is replaced, the transaction performs zero
-reads, writes, or deletes against the replacement target. Cleanup may operate
-only on the already-held detached original inode. It invalidates every
+If deterministic fault injection or a cooperating-lifecycle defect replaces
+the live run or stage parent after fd capture, the transaction does not
+rediscover, read, write, or delete through the replacement path. Cleanup may
+operate only on the already-held detached original inode. It invalidates every
 reachable commit point there so detached authority cannot revive if the
-original parent is restored. Replacement-target behavior is
-external-zero-write and external-zero-delete.
+original parent is restored. Within Section 1.1, replacement-target behavior
+is external-zero-write and external-zero-delete; this is not a claim against
+excluded arbitrary syscall interleavings.
 
 Cleanup failure is appended to the original error and never changes failure to
 success. A malformed current manifest, paper, staging tree, or other artifact
@@ -1710,36 +1786,34 @@ its existing exact staging-directory design unchanged.
 
 B4-D3 explicitly corrects the deletion claim made by B4-D2. Portable
 POSIX/macOS provides no atomic `unlink-if-inode`; an identity check followed by
-`unlinkat` is not an identity-conditional delete because another same-UID
-actor may replace the directory entry between those operations. Identity
-checks detect drift, reject publication, and support diagnostics. They MUST
-NOT be described as proof that a later `unlinkat` removed the checked inode.
+`unlinkat` is not an OS-level identity-conditional delete. Identity checks
+detect in-scope drift, reject publication, and support diagnostics. They MUST
+NOT be described as proof that a later `unlinkat` removed the checked inode
+against an excluded malicious syscall race. Inside the trusted-local boundary,
+cooperating writers do not mutate the name between the check and cleanup.
 
-The writer epoch coordinates cooperating ResearchClaw writers only. It is not
-an operating-system isolation boundary against an arbitrary same-UID process.
-Such a process may inject or replace entries, force `FAILED` or denial of
-service, and continue mutating the run after validation. Structured Stage 20
-does not claim to prevent those actions. Every consumer therefore captures
-through held directory fds and repeats strict schema, source binding,
-generation, Snapshot/fixpoint, and semantic replay on every consumption.
+The writer epoch coordinates all in-model ResearchClaw writers. An arbitrary
+noncooperating same-UID process racing these operations is outside Section
+1.1 and requires OS isolation. Every consumer nevertheless captures through
+held directory fds and repeats strict schema, source binding, generation,
+Snapshot/fixpoint, and semantic replay on every consumption because stored
+artifacts, crash residue, and cooperating-lifecycle faults remain untrusted.
 
 The three formal Stage 20 names, the four exact temporary names, the root
 signal name, and the two diagnostic names are a code-owned reserved namespace.
-A non-cooperating actor that injects a directory entry at a reserved name does
-not obtain a guarantee that the reserved directory entry itself will never be
-unlinked. Cleanup MAY call descriptor-relative `unlinkat` on fixed reserved
-names. Identity comparison before cleanup remains drift evidence only and
-does not make the deletion conditional on inode identity.
+Cleanup MAY call descriptor-relative `unlinkat` on fixed reserved names.
+Identity comparison before cleanup remains drift evidence and a trusted-local
+check; it does not create an atomic OS unlink-if-inode primitive.
 
 For this threat model, `external-zero-write/delete` means all of the following
 and nothing stronger:
 
 - never follow or modify a symlink target;
 - never recursively enter or delete unknown replacement-directory contents;
-- never write through a replacement path;
+- never rediscover or write through a replacement path after held-fd capture;
 - never modify a path outside the code-owned reserved namespace; and
-- the injected directory entry at a reserved name is not itself a protected
-  external target.
+- a fixed reserved-name entry is code-owned namespace state and may itself be
+  removed by the defined cleanup.
 
 A reserved-name directory collision is not recursively removed. A symlink,
 FIFO, socket, device, or other special-file collision is never opened for
@@ -1856,8 +1930,10 @@ writes likewise use only the fd returned by the successful exclusive create.
 Identity checks do not make a subsequent `unlinkat` identity-conditional.
 Symlink, FIFO, socket, device, directory collision, hardlink
 (`st_nlink != 1`), unsafe path, late name collision, missing or extra direct
-entry, identity change, or parent replacement fails closed. Same-UID
-non-cooperative replacement remains in the threat model and may force failure.
+entry, identity change, or parent replacement detected at an in-scope phase
+boundary fails closed. Parent/name replacement tests are deterministic
+held-fd fault injection or cooperating-lifecycle checks, not claims against
+the excluded same-UID syscall adversary.
 
 Authority-first cleanup attempts the fixed manifest reserved name before the
 other formal, temporary, root-signal, and diagnostic names on every structured
@@ -1877,11 +1953,12 @@ strict regular manifest at that exact reserved name that passes this complete
 replay, not merely a file created by the producer or a producer's earlier
 successful return.
 They do not require every canonical or temporary directory entry to be
-physically absent from a namespace writable by a malicious same-UID actor.
-Cleanup errors are appended to the original failure and never change failure
-into success. Restoring a detached original, leaving a malformed entry, or
-reintroducing a reserved name cannot revive authority without a manifest that
-passes the complete replay.
+physically absent after an ordinary cleanup or crash failure. Cleanup errors
+are appended to the original failure and never change failure into success.
+Restoring a detached original, leaving a malformed entry, or reintroducing a
+reserved name cannot revive authority without a newly captured current
+manifest that passes complete replay. This is stored-state recognition, not
+historical producer attribution.
 
 ### 18.7 Exact terminal outcome matrix
 
@@ -2545,13 +2622,13 @@ Temp and formal publication use fixed-name exclusive creating descriptors, not
 the existing replace-based generic helper. Cleanup uses descriptor-relative
 `unlinkat(fixed_reserved_name)` as a reserved-namespace operation. It does not
 claim that a preceding inode check and later unlink form an atomic
-unlink-if-inode primitive. Under the B4-D3 same-UID boundary, replacement may
-cause `FAILED` or denial of service, but cannot authorize alternate bytes.
-Cleanup never follows a symlink, recurses into a directory, writes a
-replacement target, changes an unowned name, or switches to a replacement
-parent. A directory or unsafe special-file collision is retained as an
-aggregate cleanup error. Parent replacement cleanup uses only the held
-original descriptors.
+unlink-if-inode primitive. Under the Section 1.1 trusted-local boundary,
+detected replacement or identity drift causes `FAILED` and cannot authorize
+alternate bytes. Cleanup never follows a symlink, recurses into a directory,
+writes through a rediscovered parent, changes a non-reserved name, or switches
+to a replacement parent. A directory or unsafe special-file collision is
+retained as an aggregate cleanup error. Parent replacement fault injection
+uses only the held original descriptors.
 
 Rollover, resume, `FAILED`, and `PAUSED` do not inherit Stage 21 authority. Any
 rollover may occur only after successful current Stage 20 pre-admission and
@@ -2585,17 +2662,19 @@ A degraded Stage 20 changes only the exact code-owned outcome and signal
 projection in the archive and manifest. It does not change facts, claims,
 paper, numeric support, citation support, release status, or scientific
 authority. The archive remains non-authoritative in both branches. Future
-Stage 22 structured admission may accept only a complete replay of the v2
-manifest and the current Stage 20 authority; it cannot trust archive prose.
+Stage 22 structured admission may accept only a complete replay of the Stage
+21 v2 manifest and the current Stage 20 authority; it cannot trust archive
+prose.
 
 Every failure attempts cleanup in manifest-first order and returns empty
 artifact and evidence tuples. Cleanup error text is appended after the
 original error and cannot replace it. Success requires that no complete
 replayable current v2 index remains after a failed attempt. This is a
-current-epoch operating contract, not a claim that same-UID reinjection is
-physically impossible. A later consumer must re-admit the then-current Stage 20
-manifest and independently replay all expected bytes; it cannot inherit an old
-producer success, stored archive/index mutual hashes, or a stale live context.
+current-epoch operating contract, not historical creator provenance or a
+claim against excluded same-UID syscall interference. A later consumer must
+re-admit the then-current Stage 20 manifest and independently replay all
+expected bytes; it cannot inherit an old producer success, stored
+archive/index mutual hashes, or a stale live context.
 
 #### 18.11.6 Generic boundary and required adversarial coverage
 
@@ -2702,13 +2781,34 @@ identities.
 
 Only after this upstream replay succeeds may the registry consume the exact
 pre-admission context and, in one same-owner/run/epoch/generation transition,
-open or create canonical `stage-22` through the held run fd. It validates and
-captures the Stage 22 held fd, device, inode, and parent/name identity, then
-issues exactly one `Stage22AttemptContext`. Transition failure consumes the
-pre-admission context, closes any new fd, issues no attempt context, performs
-no output-file deletion or write, and fails closed. A caller-created, copied,
-serialized, expired, reused, cross-run, cross-owner, cross-epoch, cross-stage,
-or cross-generation context rejects.
+observe canonical `stage-22` absent, create it, and open it through the held
+run fd. It validates and captures the Stage 22 held fd, device, inode, and
+parent/name identity, then issues exactly one `Stage22AttemptContext`.
+Transition failure consumes the pre-admission context, closes any new fd,
+issues no attempt context, performs no output-file deletion or write, and
+fails closed. A caller-created, copied, serialized, expired, reused, cross-run,
+cross-owner, cross-epoch, cross-stage, or cross-generation context rejects.
+
+The canonical stage directory is a code-owned reserved stage namespace under
+the held trusted run fd. Its canonical name must be absent on the initial
+non-following descriptor-relative observation. Any preexisting entry,
+including a real empty directory, recorded prior-epoch directory, crash
+residue, symlink, special file, different-device object, or mount-point
+collision rejects without adoption, cleanup, or downstream output write. The
+transition calls descriptor-relative `mkdirat`, requires success, and
+immediately opens the new name with
+`O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`; these are two operations, not an
+atomic mkdir-and-return-fd primitive. Before issuing the attempt context or
+performing any child write, code requires a real empty directory, supported
+same-filesystem/device boundary, expected owner/mode/link semantics, stable fd
+identity, expected held-parent binding, and equality between the held identity
+and the current non-following parent/name stat. A failed open or validation
+may attempt only best-effort removal of the newly created empty reserved
+directory through the held parent and then rejects. Rollover or retry may
+start a new acquisition only after a separately authorized prior lifecycle
+has ended and the canonical name is again observed absent; this transition
+never reuses or rediscovers an existing stage. These guarantees are
+conditioned on the Section 1.1 trusted-local boundary.
 
 The successful registry phases are exact:
 
@@ -2730,7 +2830,10 @@ Stage22PreAdmissionContext(pre_admission)
 
 Every arrow is code-owned, one-way, and usable once. Any failure from an
 attempt phase moves through `failed_cleanup -> cleared`; cleanup errors append
-to the original error. No context can be revived or replaced.
+to the original error. Because stage acquisition is absent-only, the
+`invalidated` phase means an idempotent absence/emptiness verification of the
+newly created namespace; it does not delete a preexisting stage or a
+post-acquisition foreign collision. No context can be revived or replaced.
 
 #### 18.12.2 Exact common shapes and Stage 22 namespace
 
@@ -2856,10 +2959,13 @@ Each directory below `code/` is opened or created descriptor-relatively,
 component by component, with no symlink following. Every directory must be a
 real directory with stable identity and link semantics appropriate to the
 platform; every leaf must be a regular, single-link file. A symlink,
-hardlinked leaf, FIFO, socket, device, mount substitution, special file,
-unexpected directory, empty directory, extra leaf, missing leaf, or
-file/directory prefix collision fails. Cleanup never follows a symlink,
-recurses through an unvalidated directory, or modifies a non-reserved path.
+hardlinked leaf, FIFO, socket, device, static different-device directory,
+preexisting observable mount-point collision, special file, unexpected
+directory, empty directory, extra leaf, missing leaf, or file/directory prefix
+collision fails.
+Privileged or same-filesystem mount injection during the attempt is outside
+Section 1.1. Cleanup never follows a symlink, recurses through an unvalidated
+directory, or modifies a non-reserved path.
 
 #### 18.12.3 Exact compiler contract and deterministic payloads
 
@@ -2930,6 +3036,15 @@ The Stage 21 archive is never copied into them.
 `stage-22/stage22_export_manifest.json` is the sole structured Stage 22 commit
 point. It has true-integer schema version `2` and exactly 23 root keys. This
 compiler-success, upstream-passed example is exact:
+
+For persistent/current recognition, `commit point` means the newly captured
+canonical v2 manifest and its complete namespace pass strict parsing,
+independent expected rebuild, upstream/source/generation closure, and full
+semantic replay. A stored manifest or an earlier producer return alone is not
+authority. For the live producer, public `DONE` additionally requires the
+same live attempt context, held identities, Snapshot/fixpoint, and both
+immediate and terminal postconditions. Manifest-last creation is only a
+commit candidate until those producer checks pass.
 
 ```json
 {
@@ -3258,11 +3373,13 @@ independent reconstruction, and release-gate adjudication.
 
 After the two-stage admission in Section 18.12.1:
 
-1. **Manifest-first invalidation.** Through the held Stage 22 fd, attempt the
-   fixed manifest name first. Then independently clean every fixed direct
-   formal and the exact expected template/code tree. Cleanup aggregates
-   errors. A preexisting unknown, special, aliased, or unsafe entry is a
-   collision, not an authority source.
+1. **Manifest-first absence verification.** Through the newly acquired held
+   Stage 22 fd, verify the fixed manifest name absent first, then independently
+   verify every fixed direct formal and expected template/code root absent and
+   the directory still empty. Any entry means post-acquisition collision or
+   identity drift and rejects without adoption or deletion. This phase is the
+   idempotent `invalidated` state transition; it performs no stale-stage
+   cleanup.
 2. **Snapshot A.** Recapture and completely replay upstream through held
    descriptors. Require exact equality with pre-admission bytes, hashes,
    sizes, modes, link counts, device/inode identities, generation, outcome,
@@ -3274,12 +3391,21 @@ After the two-stage admission in Section 18.12.1:
    `max_attempts=2` in an isolated workspace outside the run. Capture its
    bounded result in memory. Revalidate that every input byte is unchanged.
 5. **Absent-only directories.** Require `code/` and every required nested
-   directory component physically absent after owned cleanup. Create each
-   component exactly once through its held parent fd with exclusive,
-   no-follow directory creation, immediately open and capture its held-fd
-   identity, and never adopt or reopen a preexisting component. Any existing
-   component, including an expected real empty directory, is a collision,
-   fails publication, and enters manifest-first aggregate cleanup.
+   directory component physically absent after namespace verification. For each safe
+   single component, require a non-following absent observation through the
+   held trusted parent fd, call descriptor-relative `mkdirat` and require
+   success, then immediately call
+   `openat(O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`. Before any child write,
+   require a real directory, strict initial emptiness, supported
+   same-filesystem/device boundary, expected owner/mode/link semantics, stable
+   held-fd identity, and equality between the held identity and the current
+   non-following parent/name stat. Retain that fd for all child operations.
+   This is trusted-local create-then-acquire, not an atomic mkdir-and-fd
+   primitive or historical creator proof. `EEXIST` and every preexisting
+   component, including an expected real empty directory, are collisions;
+   never adopt or reopen them. A failed open/validation attempts only
+   best-effort reserved-name cleanup through the held parent and then fails
+   publication.
 6. **Absent-only payloads.** In normative output-array order, require each
    formal name absent, create it descriptor-relatively with
    `O_CREAT|O_EXCL|O_NOFOLLOW`, require a regular single-link file, and retain
@@ -3322,11 +3448,28 @@ After the two-stage admission in Section 18.12.1:
     failure triggers manifest-first aggregate cleanup and returns exact
     `status=FAILED`, `decision="retry"`, and empty tuples.
 
-Cleanup uses only the held original parent and directory fds. Parent
-replacement never redirects cleanup into a replacement path. A collision that
+After acquisition, all child creation uses the held directory fd. If a
+deterministic phase-boundary fault or cooperating-lifecycle bug changes the
+canonical name, no operation reopens or rediscovers the replacement. Every
+documented capture boundary rechecks canonical name-to-fd identity; once
+drift is detected, payload and manifest writes stop and only cleanup through
+the held original may continue. If drift is first observed by final replay,
+all earlier writes necessarily targeted only the held original, the
+replacement remains external-zero, and authority is withdrawn. Cleanup never
+follows or recursively traverses an unvalidated replacement. These are
+held-fd invariants inside Section 1.1, not an absolute claim against excluded
+syscall races.
+
+Cleanup uses only the held original parent and directory fds. A collision that
 cannot safely be classified and unlinked remains an error; cleanup does not
-follow, overwrite, truncate, or recursively traverse it. The original failure
-remains primary and cleanup errors append.
+follow, overwrite, truncate, or recursively traverse it. A fully validated
+expected nested code tree may be cleaned bottom-up through held fds; an
+unknown directory is never recursively cleaned. Identity-check-then-unlink is
+not an atomic OS unlink-if-inode guarantee. The original failure remains
+primary and cleanup errors append. If canonical name drift makes the held
+directory's outer inode unreachable by name, POSIX cleanup may leave detached
+non-authoritative residue; it never rediscovers or acts through the
+replacement merely to remove that residue.
 
 ### 18.13 B5-D1B-R1 structured Stage 23 citation-verification authority
 
@@ -3351,8 +3494,21 @@ current Stage 20 v2, Stage 19/17, canonical evidence, CFS, source paper,
 bibliography, and citation closure. Pre-admission itself requires the exact
 unique sorted cited-key count `1..32`; an out-of-range or malformed closure
 therefore fails with zero Stage 23 path I/O. Only then may one code-owned
-transition open/create canonical `stage-23` through the held run fd and issue
-one `Stage23AttemptContext`.
+transition observe canonical `stage-23` absent, create it, and open the newly
+created directory through the held run fd before issuing one
+`Stage23AttemptContext`.
+
+That transition uses the same trusted stage-namespace acquisition contract as
+Stage 22: initial non-following absence through the held parent,
+descriptor-relative `mkdirat`, immediate
+`openat(O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`, real-directory and strict
+emptiness checks, supported filesystem, expected owner/mode/link and held
+parent binding, stable fd identity, and current non-following name-to-fd
+identity before child write. Every preexisting entry, including a known old
+stage or crash residue, rejects without adoption or cleanup by this
+transition. Stored state, caller claims, process restart, matching disk bytes,
+or a prior registry record cannot waive absence. It makes no claim against
+excluded same-UID or privileged-mount races.
 
 The final cited-key closure is extracted independently from both held
 `stage-22/paper_final.md` and `stage-22/paper.tex`. The two sets must be
@@ -3873,14 +4029,17 @@ availability of scores.
    validate the upstream-only single-use context. Fully capture/replay current
    Stage 22 and recursive authority, and validate the exact `1..32` cited-key
    closure, before any Stage 23 path or provider I/O.
-2. **Single transition.** Consume pre-admission, open/create `stage-23`
-   through the held run fd, validate held identity, and issue one attempt
-   context. No prior Stage 23 existence observation is legal.
-3. **Manifest-first invalidation.** Through the held Stage 23 fd, attempt
-   `stage23_verification_manifest.json` first, then
+2. **Single transition.** Consume pre-admission, observe canonical `stage-23`
+   absent through the held run fd, create it, open the newly created directory,
+   validate held identity, and issue one attempt context. No prior Stage 23
+   existence observation is legal.
+3. **Manifest-first absence verification.** Through the newly acquired held
+   Stage 23 fd, verify `stage23_verification_manifest.json` absent first, then
    `verification_report.json`, `references_verified.bib`, and
-   `paper_final_verified.md` in that order. Aggregate errors; do not publish
-   after any cleanup error.
+   `paper_final_verified.md` absent in that order, and require the directory
+   still empty. Any entry means post-acquisition collision or identity drift
+   and rejects without adoption or deletion. This is the idempotent
+   `invalidated` transition, not stale-stage cleanup.
 4. **Snapshot A and cited closure.** Recapture/replay all upstream bindings and
    require exact pre-admission equality. Independently rebuild and revalidate
    the same exact sorted `1..32` cited-key closure.
@@ -3937,26 +4096,32 @@ entry, or identity mismatch at any of the four reserved flat names is a
 collision. Cleanup must not follow, truncate, overwrite, or recurse into it.
 The original error remains primary; cleanup errors append. A failed current
 epoch must not leave a completely replayable current v2 manifest. Later
-same-UID reinjection can cause denial of service but cannot create authority
-without a fresh complete admission and strict semantic replay.
+stored-state reappearance cannot create authority without a fresh complete
+admission and strict semantic replay. This is an in-scope content-recognition
+rule, not protection against excluded same-UID syscall interference or proof
+of historical producer identity.
 
 ### 18.14 B5-D1B-R1 adversarial contract
 
-The Stage 22-23 implementation slice MUST add all of these tests without
-changing the frozen outcomes:
+The Stage 22-23 implementation slice MUST add all of these untrusted-data and
+deterministic filesystem-fault tests without changing the frozen outcomes.
+Filesystem replacement rows mean mutation injected at a documented
+phase/capture boundary under Section 1.1, not arbitrary syscall
+interleavings:
 
 | Area | Attack | Required result |
 |---|---|---|
 | Capability | exact current `1110` public/direct structured entry; caller/persisted `1111`; boolean, missing, extra, or unknown capability key | ordinary dispatch remains generic-v1; direct structured rejects before lock/fs/compiler/provider |
 | Pre-admission | forged, copied, serialized, reused, cross-run/owner/epoch/stage/generation context | reject before downstream namespace or provider I/O |
-| Parent replacement | replace root, run, Stage 20/21/22/23, code parent, or signal parent before/after transition | no writes through replacement path; held-original cleanup; fail closed |
+| Stage namespace acquisition | initially preexist canonical `stage-22` or `stage-23` as a real empty directory, prior stage, crash residue, symlink, special object, different-device directory, or observable mount-point collision; or fault-inject a newly created directory's pre-write emptiness, parent, name, or fd identity check | reject before compiler/provider/output I/O; no adoption, stale-stage cleanup, or attempt context; validation failure may best-effort remove only its own newly created empty reserved directory through the held parent |
+| Parent replacement fault | at a documented boundary replace root, run, Stage 20/21/22/23, code parent, or signal parent after fd capture | no path rediscovery; held-original operations only; final name/identity replay fails closed |
 | Upstream withdrawal | remove, replace, or mutate current Stage 20, 21, or 22 manifest between pre-admission, Snapshot A, fixpoint, Snapshot B, or postconditions | reject/withdraw current success; manifest-first cleanup; empty tuples |
 | Late mutation | mutate a Stage 22/23 payload or manifest after publication, immediate validation, or final capture | terminal postcondition fails and cleans |
-| Synchronous forgery | rewrite payloads, reports, nested hashes, sizes, manifests, and timestamps consistently | independent upstream rebuild and exact-byte replay reject |
-| Stage 22 nested tree | inject symlink, hardlink, FIFO, socket, device, mount, empty directory, extra leaf, missing leaf, prefix collision, case/NFC alias, or changed creating-fd identity | fail closed; never follow or recursively clean an unvalidated entry |
+| Synchronous stored forgery | rewrite payloads, reports, nested hashes, sizes, manifests, and timestamps consistently while changing independently expected content, source, or generation | independent expected rebuild and exact-byte replay reject; an exact expected-byte copy is semantically equivalent and makes no historical-producer claim |
+| Stage 22 nested tree | preexist or inject at a documented boundary a symlink, hardlink, FIFO, socket, device, static different-device directory, preexisting observable mount-point collision, empty directory, extra leaf, missing leaf, prefix collision, case/NFC alias, or changed held identity | fail closed; never follow or recursively clean an unvalidated entry |
 | Stage 23 flat namespace | inject any nested directory or special file at a reserved name | fail closed; exact four-file namespace not published |
-| Cleanup collision | precreate or race a formal name with regular/special/directory entry; manifest cleanup succeeds but payload cleanup fails | no later create; aggregate cleanup error; no replayable manifest |
-| Absent-only publication | intercept `O_EXCL`, substitute name after create, or request rename/replace/link/reopen-for-write | identity/fd contract rejects; cleanup; empty tuples |
+| Cleanup collision | precreate a formal name or fault-inject a regular/special/directory collision at a documented boundary; manifest cleanup succeeds but payload cleanup fails | no later create; aggregate cleanup error; no replayable manifest |
+| Absent-only publication | fault-inject `O_EXCL` collision or canonical-name drift at a documented boundary, or request rename/replace/link/reopen-for-write | identity/fd contract rejects; cleanup; empty tuples |
 | Stage 22 compiler | call LLM/provider; second semantic compile; `max_attempts != 2`; third internal attempt; mutate input; claim success without valid PDF; retain PDF on failure | fail and clean; no success tuples |
 | Stage 22 schema | use any withdrawn root; two-key FileRef; output `kind`; non-null fixed logical name; null template/project/support logical name; PDF after template/project; wrong template/project sort; missing or reordered README/requirements | exact 23-key/nested/order replay rejects |
 | Stage 22 tuple | substitute `paper.tex` for `code/`; omit `code/`; use `code` or another wrong directory slash/prefix; reorder, omit, or duplicate any tuple member; or return `DONE` before validators | immediate/terminal reject; exact empty failure tuples |
@@ -3976,6 +4141,16 @@ rejects every directory. All cleanup is reserved-name, descriptor-relative,
 manifest-first, non-following, and non-recursive unless a Stage 22 code
 directory has first passed the exact expected-tree identity validation.
 
+The following are OS-isolation stress/non-goal cases, not ResearchClaw
+application acceptance gates: a malicious noncooperating same-UID replacement
+in the exact `mkdirat -> openat`, check -> unlink, validation -> write, or
+final-capture syscall window; debugger/process-memory/fd interference; and
+privileged or same-filesystem bind-mount injection during an attempt. Such
+tests may be diagnostic, but their result cannot establish or invalidate the
+trusted-local contract. A static preexisting symlink, special object,
+wrong-filesystem object, or directory collision remains an in-scope
+fail-closed test.
+
 ## 19. Generic and release boundary
 
 `generic-v1` Stage 18, Stage 19, Stage 20, Stage 21, Stage 22, and Stage 23
@@ -3994,10 +4169,10 @@ a discriminator.
 Once a valid `1111` domain-v2 dispatch enters the structured path, every later
 error is `FAILED`; generic fallback is forbidden.
 
-Structured Stage 21-23 implementation is outside the B5-D1A/B5-D1B-R1
-docs-only slices. Stage 24/25, independent reconstruction, E9,
+Structured Stage 21-23 implementation is outside the
+B5-D1A/B5-D1B-R1/B5-D1D docs-only slices. Stage 24/25, independent reconstruction, E9,
 `release_check`, release gates, and fresh F0 are deferred to B5-D2 or later.
-Neither design slice changes release authority. Fresh F0 requires separate
+None of these design slices changes release authority. Fresh F0 requires separate
 explicit authorization.
 
 ## 20. B1-B5 milestone split
@@ -4009,7 +4184,7 @@ separate `1000` declaration.
 B4-D0 freezes the Stage 19 design, B4-D1 freezes the Stage 20 success
 authority, and B4-D2 replaces only the Stage 20 staging transaction with the
 four-file creating-fd transaction. B4-D3 corrects the Stage 20 deletion and
-same-UID threat claims without changing quality, source, schema, or release
+portable cleanup claims without changing quality, source, schema, or release
 authority. B4-D4 removes the undefined revocation-interface promise, freezes
 current-epoch Stage 20 withdrawal, and defines the B5 current-manifest
 recognition boundary without adding a persistent schema. B4-A and B4-B
@@ -4020,7 +4195,10 @@ implemented Stage 19 and the private Stage 20 handoff while the map remained
 B5 is split into independently frozen and reviewed slices. B5-D1A freezes the
 structured Stage 21 deterministic archive authority. B5-D1B-R1 freezes the
 structured Stage 22 export and Stage 23 citation-verification authority.
-Separate Stage 21-23 implementation slices must keep `1110`. B5-D2 or later
+B5-D1D normalizes the trusted-local filesystem boundary across Stages 17-23
+without changing the frozen Stage 22 manifest v2, nested `code/` tree, Stage
+23 provider/outcome contracts, or capability. Separate Stage 21-23
+implementation slices must keep `1110`. B5-D2 or later
 separately freezes and implements Stage 24/25, independent reconstruction,
 `pipeline_validation`, `research_release`, `release_check`, release gates, and
 full release integration; every implementation and pre-activation commit
@@ -4076,9 +4254,9 @@ exact `1111`.
 | Collision | a Stage 20 temporary name already exists, or a formal target appears after admission invalidation | fail closed before writing; reserved entry may be unlinked, but never follow its target, recurse into a directory, or modify a non-reserved path |
 | Stage 20 temporary | creating-fd identity differs from the temporary path before publication | reject publication and aggregate drift diagnostics; fixed-name cleanup is not identity-conditional |
 | Stage 20 temporary | any `.tmp` remains after publication | reject; success namespace/root closure requires every temporary absent |
-| Parent | replace run or stage parent during attempt | do not write through replacement path; held-original cleanup only; strict replay rejects |
-| Same-UID actor | inject or replace reserved entries before, during, or after validation | may force `FAILED`/DoS; cannot create authority without complete strict replay |
-| Revival | restore detached original run or reintroduce reserved names after failure | no authority unless the manifest passes complete strict semantic replay |
+| Parent fault injection | at a documented phase boundary, replace run or stage parent during attempt | do not rediscover the replacement path; held-original cleanup only; strict replay rejects |
+| Out-of-scope OS-isolation stress | malicious noncooperating same-UID syscall race, debugger/fd interference, or privileged/same-filesystem mount injection | not an application-level acceptance test; require separate OS isolation; never claim manifests cover it |
+| Stored-state revival | restore detached crash residue or reintroduce reserved names before a new admission | no authority unless a newly captured current manifest passes complete strict semantic replay |
 | Executor | return `DONE` with wrong tuple, refs, context, or disk bytes | immediate/terminal postcondition converts to `FAILED` and cleans |
 | Stage 19 no LLM | empty strict ReviewLedger | zero calls; inherit selection; full rerender/replay/publication |
 | Stage 19 no LLM | nonempty strict ReviewLedger | `FAILED` before staging/success publication; no generic fallback |
@@ -4103,12 +4281,12 @@ exact `1111`.
 | Generic | overlapping Stage 20 `quality_report.json`, `fabrication_flags.json`, or `quality_gate_manifest.json` is stale | unchanged generic entry cleanup may invalidate it; the name never discriminates structured dispatch |
 | Generic | legal generic-v1 input | exact existing schemas, bytes, artifacts, and failure behavior |
 
-## 22. B5-D1B-R1 acceptance and non-claims
+## 22. B5-D1D acceptance and non-claims
 
-B5-D1B-R1 is ready for a narrow docs-only commit only when:
+B5-D1D is ready for a narrow docs-only commit only when:
 
-- the independent Stage 22 schema/nested-tree/lifecycle reviewer and Stage 23
-  transport/outcome/manifest reviewer complete a read-only fixpoint;
+- the independent filesystem/threat-model reviewer and
+  authority/replay/lifecycle reviewer complete a read-only fixpoint;
 - no P0 remains and any material safety disagreement returns `STOP`;
 - every JSON fence parses with a duplicate-safe strict parser;
 - Markdown fences are paired;
@@ -4117,20 +4295,19 @@ B5-D1B-R1 is ready for a narrow docs-only commit only when:
   passed/degraded/FAILED matrices are internally consistent;
 - no Stage 17, Stage 19, Stage 20, Stage 21, Stage 22, or Stage 23 manifest
   example has a self-hash cycle;
-- the docs-only staged or proposed diff contains only this document, and
-  production code and tests have zero diff relative to
-  `B5D1BR1_BASELINE`;
+- the task-added tracked diff contains only this document, and the three
+  preexisting tracked plus two new B5-A2 file fingerprints remain byte-exact
+  to the B5-D1D starting capture;
 - `git diff --check` passes;
 - all preexisting untracked files and directories remain untouched.
 
-B5-D1B-R1 does not modify production code or tests, implement Stage 21-23,
-define or implement Stage 24-25, reconstruct or integrate a release, activate
-a structured production path, change the capability map, weaken Stage 19, E9,
-`release_check`, or a release gate, accept a release, authorize commit/push,
-or authorize API, resume, or fresh F0 work. It creates no reusable or
-serialized activation authority. Remaining P0 work is Stage 22-23
-implementation and independent review under exact `1110`, followed by B5-D2
-schema/reconstruction/release adjudication. P1 and P2 refinements cannot alter
-the exact schemas, roles, ordering, calls, outcomes, lifecycle, or blocking
-boundary frozen here. Separate adjudication is required for a docs-only
-commit, implementation entry, B5-D2, and eventual activation.
+B5-D1D does not modify production code or tests, implement or resume Stage
+21-23, define or implement Stage 24-25, reconstruct or integrate a release,
+activate a structured production path, change the capability map, weaken
+untrusted LLM/provider/caller/stored-artifact or release semantics, accept a
+release, authorize commit/push, or authorize API, resume, or fresh F0 work.
+It creates no reusable or serialized activation authority. Remaining work is
+Stage 22-23 implementation and independent review under exact `1110`,
+followed by B5-D2 schema/reconstruction/release adjudication. Separate
+adjudication is required for a docs-only commit, B5-A2 continuation, B5-A3,
+B5-D2, and eventual activation.
