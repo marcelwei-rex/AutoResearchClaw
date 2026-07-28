@@ -1,20 +1,22 @@
 # Structured Scientific Claim Authority Design
 
-Status: `B5-D1A / STRUCTURED STAGE 21 DETERMINISTIC ARCHIVE AUTHORITY FROZEN / NOT IMPLEMENTED / NOT ACTIVATED`
+Status: `B5-D1B-R1 / STRUCTURED STAGE 22-23 AUTHORITY SCHEMAS FROZEN / NOT IMPLEMENTED / NOT ACTIVATED`
 
 Scope: Batch B4-D0/D1/D2/D3/D4 authority for structured Stage 19 revision and
-structured Stage 20 replay, plus B5-D1A docs-only authority for deterministic
-structured Stage 21 archival under the `structured-scientific-claim-v1`
-capability.
+structured Stage 20 replay, B5-D1A docs-only authority for deterministic
+structured Stage 21 archival, and B5-D1B-R1 docs-only authority for structured
+Stage 22 export and Stage 23 citation verification under the
+`structured-scientific-claim-v1` capability.
 
 B3 and B4 implementation and their separately reviewed declarations are
 complete. The code-owned structured capability is now exactly `1110`: Stage 17
 publication, Stage 19 revision, and Stage 20 replay are declared, while
-Stage 24/release integration remains undeclared. B5-D1A freezes only the
-structured Stage 21 deterministic archive schema, renderer, lifecycle,
-postconditions, and generic boundary. It does not implement Stage 21, change
-the capability map, activate the structured production path, define
-Stage 22-25 structured schemas, or change any release gate.
+Stage 24/release integration remains undeclared. B5-D1A freezes the structured
+Stage 21 deterministic archive; B5-D1B-R1 freezes the structured Stage 22-23
+schemas, transport, outcomes, lifecycles, postconditions, and generic
+boundary. It does not implement Stage 21-23, change the capability map,
+activate the structured production path, define Stage 24-25 structured
+schemas, reconstruct a release, or change any release gate.
 
 ## 1. Normative boundary
 
@@ -2027,8 +2029,9 @@ consumer may consume structured Stage 20 output, and existing fields are not
 sufficient for safe structured recognition.
 
 B5 MUST independently freeze each downstream schema before its implementation.
-Section 18.11 freezes Stage 21 only; Stage 22-25 and release schemas remain
-deferred. Every Stage 21+ structured authority MUST bind:
+Sections 18.11-18.13 now freeze Stage 21-23 design authority; Stage 24-25,
+independent reconstruction, and release schemas remain deferred to B5-D2.
+Every Stage 21+ structured authority MUST bind:
 
 - the exact current `stage-20/quality_gate_manifest.json` FileRef, including
   its exact path and SHA-256 over held bytes;
@@ -2646,15 +2649,1340 @@ B5-D1A implementation tests MUST cover:
 
 These tests may exercise only the registry-issued `PreAdmissionContext` and its
 single resulting `Stage21AttemptContext` while the repository remains `1110`.
-They do not activate production, authorize Stage 22-25, reconstruction,
-`release_check`, a release gate, resume, API use, or fresh F0.
+Those Stage 21 tests do not activate production or authorize Stage 22-25
+implementation, reconstruction, `release_check`, a release gate, resume, API
+use, or fresh F0. Sections 18.12-18.14 separately freeze only the Stage 22-23
+design contracts.
+
+### 18.12 B5-D1B-R1 structured Stage 22 export authority
+
+#### 18.12.1 Boundary, dispatch, and two-stage admission
+
+Structured Stage 22 is a deterministic export of one fully replayed current
+structured Stage 21 publication and its complete Stage 20/19/17/evidence
+closure. It makes exactly zero LLM, provider, semantic-repair, PRM, HITL,
+prompt, edit, and clock calls. It does not use `archive.md` prose as paper,
+claim, evidence, citation, numeric, or dispatch authority. The sole Stage 21
+commit point is the current, strict, fully replayed
+`stage-21/bundle_index.json` schema v2.
+
+The exact current code-owned capability map remains `1110`. Ordinary dispatch
+therefore retains unchanged `generic-v1` behavior after common canonical
+replay. Public or direct structured Stage 22 entry invokes the complete
+capability guard and rejects before lock, filesystem, compiler, provider, or
+output I/O. Artifact presence, a persisted capability snapshot, caller mode,
+configuration, environment, a test flag, or a v2 manifest cannot select the
+structured route.
+
+Only a private implementation seam may exercise this design before global
+activation. It accepts one registry-issued, non-serializable, non-copyable,
+single-use `Stage22PreAdmissionContext`. That context binds only:
+
+- the active `ReleaseGraphLock` owner and writer epoch;
+- held root-parent, run, Stage 20, Stage 21, and conditional root-signal parent
+  descriptors and their device/inode identities;
+- the canonical run path and lexical target stage ID exact `stage22`;
+- capability schema version true integer `1` and exact snapshot `1110`;
+- the current Stage 20 and Stage 21 manifest identities; and
+- the complete Stage 21/20/19/17/canonical-evidence/CFS generation closure.
+
+`Stage22PreAdmissionContext` contains no Stage 22 fd, device, inode,
+existence fact, namespace snapshot, output identity, compiler state, or
+cleanup permission. Before any `stage-22` stat, enumeration, open, creation,
+rollover, cleanup, deletion, compiler workspace creation, or write, code uses
+only the held upstream descriptors to capture and fully replay the current
+Stage 21 manifest v2 and archive bytes, the current Stage 20 manifest v2 and
+its passed/degraded branch, the Stage 19 manifest v2, Stage 17 authority,
+canonical experiment evidence, exact CFS-v1 bytes, generation, source paper,
+bibliography, project artifacts, template selection inputs, and all recursive
+closure bindings. Every file capture records exact bytes, digest, length,
+mode, link count, device, inode, and stable before/after metadata. The current
+Stage 20 and Stage 21 manifest names must still bind their captured
+identities.
+
+Only after this upstream replay succeeds may the registry consume the exact
+pre-admission context and, in one same-owner/run/epoch/generation transition,
+open or create canonical `stage-22` through the held run fd. It validates and
+captures the Stage 22 held fd, device, inode, and parent/name identity, then
+issues exactly one `Stage22AttemptContext`. Transition failure consumes the
+pre-admission context, closes any new fd, issues no attempt context, performs
+no output-file deletion or write, and fails closed. A caller-created, copied,
+serialized, expired, reused, cross-run, cross-owner, cross-epoch, cross-stage,
+or cross-generation context rejects.
+
+The successful registry phases are exact:
+
+```text
+Stage22PreAdmissionContext(pre_admission)
+  -> Stage22AttemptContext(namespace_bound)
+  -> invalidated
+  -> snapshot_a
+  -> built
+  -> compiler_complete
+  -> payloads_published
+  -> source_fixpoint
+  -> manifest_published
+  -> provisional_done
+  -> immediate_validated
+  -> terminal_validated
+  -> cleared
+```
+
+Every arrow is code-owned, one-way, and usable once. Any failure from an
+attempt phase moves through `failed_cleanup -> cleared`; cleanup errors append
+to the original error. No context can be revived or replaced.
+
+#### 18.12.2 Exact common shapes and Stage 22 namespace
+
+Every Stage 22 `FileRef` has exactly three keys:
+
+```json
+{
+  "path": "stage-21/bundle_index.json",
+  "sha256": "<sha256>",
+  "size": 1
+}
+```
+
+`path` is one safe NFC run-relative path with no empty, `.`, or `..` segment,
+no leading slash, backslash, NUL, control character, or platform alias.
+`sha256` is exactly 64 lowercase hexadecimal characters over the held exact
+bytes. `size` is a true nonnegative integer, never a boolean, and equals both
+the held byte length and stable `fstat` size. A missing, extra, duplicate, or
+wrong-typed field rejects. Stage 22 does not accept any older two-key
+`FileRef`.
+
+An exact CFS binding has exactly two keys and deliberately has no path:
+
+```json
+{
+  "schema_version": 1,
+  "sha256": "<sha256>"
+}
+```
+
+The version is the true integer `1`, never a boolean. The digest is rebuilt
+from held canonical experiment evidence. No standalone CFS file may be
+invented.
+
+Every Stage 22 output entry has exactly five keys:
+
+```json
+{
+  "role": "paper_markdown",
+  "logical_name": null,
+  "path": "stage-22/paper_final.md",
+  "sha256": "<sha256>",
+  "size": 1
+}
+```
+
+The exact key set is `role`, `logical_name`, `path`, `sha256`, and `size`;
+there is no `kind` field. `path`, `sha256`, and `size` obey the Stage 22
+`FileRef` rules. The eight fixed direct roles and optional `paper_pdf` have
+`logical_name=null`. `template_file`, `project_file`, and
+`code_support_file` have one nonempty safe canonical logical name derived by
+code from their frozen source set. Caller-supplied logical names, aliases,
+media types, or output roles reject.
+
+The complete structured Stage 22 namespace contains only:
+
+```text
+stage-22/paper_final.md
+stage-22/paper_final_latex.md
+stage-22/references.bib
+stage-22/paper.tex
+stage-22/compile_status.json
+stage-22/paper_verification.json
+stage-22/sanitization_report.json
+stage-22/canonical_source.json
+stage-22/<template-direct-file>...
+stage-22/code/<project-relative-regular-file>...
+stage-22/code/README.md
+stage-22/code/requirements.txt
+stage-22/paper.pdf                         # compiler-success only
+stage-22/stage22_export_manifest.json      # always last
+```
+
+There is no run-internal `.tmp`, staging, quarantine, backup, random,
+rollover, work, cache, compiler, log, auxiliary, or diagnostic entry. There is
+no `charts/` branch in this structured schema. Compiler logs and bounded
+diagnostics exist only in memory and in the exact `compile_status.json`
+payload. A compiler may use an isolated workspace outside the run directory;
+no file from that workspace is authoritative unless its exact bytes are
+copied through an absent-only formal creating fd and bound by the manifest.
+
+Template direct names are the code-owned, sorted, nonempty style-file set for
+the independently rebuilt template selection. They may not equal or be a
+prefix of a reserved direct name, `code`, or the manifest name. Project
+logical paths are the independently rebuilt canonical project-artifact set.
+They are nonempty safe relative paths below `code/`; their implied directory
+tree is prefix-closed and contains no empty directory. A path may not be both
+a file and a directory prefix. Project logical names may not equal
+`README.md` or `requirements.txt`; those names are reserved for the two
+code-owned support files. Case-fold, Unicode-normalization, slash, or platform
+aliases are rejected before publication.
+
+The output array order and role groups are normative:
+
+```text
+1  paper_markdown          logical_name=null  stage-22/paper_final.md
+2  paper_latex_markdown    logical_name=null  stage-22/paper_final_latex.md
+3  bibliography            logical_name=null  stage-22/references.bib
+4  paper_latex             logical_name=null  stage-22/paper.tex
+5  compile_status          logical_name=null  stage-22/compile_status.json
+6  paper_verification      logical_name=null  stage-22/paper_verification.json
+7  sanitization_report     logical_name=null  stage-22/sanitization_report.json
+8  canonical_source        logical_name=null  stage-22/canonical_source.json
+9  paper_pdf               logical_name=null  optional; compiler-success only
+10 template_file           canonical logical name; sorted by logical_name
+11 project_file            canonical logical name; sorted by logical_name
+12 code_support_file       README.md
+13 code_support_file       requirements.txt
+```
+
+The first eight roles occur exactly once and in the displayed order.
+`paper_pdf` is absent for compiler-failure and otherwise occurs exactly once
+immediately after `canonical_source`, never at the end. `template_file`
+occurs once per frozen template file and is sorted by canonical
+`logical_name`. `project_file` occurs once per canonical project artifact,
+is nonempty, and is sorted by canonical `logical_name`. The final two entries
+are always `code_support_file` with exact logical names and exact order
+`README.md`, then `requirements.txt`. Within each repeated role, canonical
+logical names and paths are unique. No other role, logical-name branch,
+repetition, order, count, path, or digest is legal.
+
+Each directory below `code/` is opened or created descriptor-relatively,
+component by component, with no symlink following. Every directory must be a
+real directory with stable identity and link semantics appropriate to the
+platform; every leaf must be a regular, single-link file. A symlink,
+hardlinked leaf, FIFO, socket, device, mount substitution, special file,
+unexpected directory, empty directory, extra leaf, missing leaf, or
+file/directory prefix collision fails. Cleanup never follows a symlink,
+recurses through an unvalidated directory, or modifies a non-reserved path.
+
+#### 18.12.3 Exact compiler contract and deterministic payloads
+
+Structured Stage 22 invokes the code-owned `compile_latex` semantic operation
+exactly once. That single invocation receives exact held `paper.tex`,
+bibliography, and template bytes and literal `max_attempts=2`. The compiler
+adapter may therefore perform at most two internal compiler attempts. It may
+not invoke an LLM, provider, fallback template, source rewrite, missing-figure
+rewrite, citation repair, numeric repair, cache, or a second semantic
+`compile_latex` call. Compiler-produced changes to `paper.tex`, bibliography,
+template, code, or any non-PDF payload fail.
+
+`compile_status.json` is canonical authority JSON with exactly:
+
+```json
+{
+  "schema_version": 2,
+  "semantic_calls": 1,
+  "max_attempts": 2,
+  "attempts": 1,
+  "status": "success",
+  "tooling_available": true,
+  "errors": [],
+  "paper_pdf": {
+    "path": "stage-22/paper.pdf",
+    "sha256": "<sha256>",
+    "size": 1
+  }
+}
+```
+
+The exact key set is `schema_version`, `semantic_calls`, `max_attempts`,
+`attempts`, `status`, `tooling_available`, `errors`, and `paper_pdf`.
+`schema_version` is true integer `2`; `semantic_calls` is true integer `1`;
+`max_attempts` is true integer `2`; `attempts` is a true integer in `0..2`.
+`errors` is empty on success and contains only code-owned error codes on
+failure. The exact legal arrays are `["toolchain_missing"]` when status is
+`toolchain_missing`, `["compiler_attempt_1_failed"]` for a one-attempt
+`latex_error`, and
+`["compiler_attempt_1_failed", "compiler_attempt_2_failed"]` for a
+two-attempt `latex_error`. Raw compiler text, paths, secrets, exceptions, and
+provider text are never persisted, so no truncation, redaction, normalization,
+or platform-dependent diagnostic bytes enter authority.
+
+For success, `status` is exact `success`, `tooling_available` is true,
+`attempts` is `1` or `2`, `errors` is empty, `paper_pdf` is the exact formal
+PDF `FileRef`, and PDF bytes start with `%PDF-`, contain a terminal `%%EOF`
+within the last 1024 bytes, and pass the code-owned structural validator. For
+failure, `status` is exact `toolchain_missing` or `latex_error`,
+`paper_pdf` is null, `errors` is nonempty, and formal `paper.pdf` is absent.
+`toolchain_missing` requires `tooling_available=false` and `attempts=0`;
+`latex_error` requires `tooling_available=true` and `attempts` in `1..2`.
+No placeholder, stale, empty, touched, or prior PDF is legal.
+
+The other seven fixed direct payloads and every template, project, and
+code-support leaf are rebuilt deterministically from Snapshot A under the
+frozen Stage 17-21 authority.
+`paper_final.md` is the exact structured Stage 19 revised paper plus only the
+code-owned Stage 20 degradation notice when the replayed outcome is degraded.
+`paper_final_latex.md`, `references.bib`, `paper.tex`,
+`paper_verification.json`, `sanitization_report.json`, and
+`canonical_source.json` are exact deterministic projections. They cannot
+change scientific claims, numbers, citations, source bindings, or generation.
+The Stage 21 archive is never copied into them.
+
+#### 18.12.4 Exact Stage 22 manifest schema v2
+
+`stage-22/stage22_export_manifest.json` is the sole structured Stage 22 commit
+point. It has true-integer schema version `2` and exactly 23 root keys. This
+compiler-success, upstream-passed example is exact:
+
+```json
+{
+  "schema_version": 2,
+  "publication_stage_id": "stage22",
+  "publication_mode": "structured-scientific-claim-v1",
+  "structured_capability_schema_version": 1,
+  "structured_capability_snapshot": {
+    "stage17_publication": 1,
+    "stage19_revision": 1,
+    "stage20_replay": 1,
+    "stage24_and_release_integration": 0
+  },
+  "generation_binding_sha256": "<sha256>",
+  "canonical_experiment_evidence": {
+    "path": "canonical_experiment_evidence.json",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "cfs": {
+    "schema_version": 1,
+    "sha256": "<sha256>"
+  },
+  "selected_result_manifest": {
+    "path": "stage-12/selected_result_manifest.json",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "source_stage19_manifest": {
+    "path": "stage-19/scientific_claim_authority_manifest.json",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "source_stage20_manifest": {
+    "path": "stage-20/quality_gate_manifest.json",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "source_stage21_manifest": {
+    "path": "stage-21/bundle_index.json",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "source_stage21_archive": {
+    "path": "stage-21/archive.md",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "source_paper": {
+    "path": "stage-19/scientific_claim_paper_revised.md",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "quality_outcome": "passed",
+  "degradation_signal": null,
+  "bibliography_source": {
+    "path": "stage-4/references.bib",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "template": {
+    "name": "example-template",
+    "files": [
+      {
+        "role": "template_file",
+        "logical_name": "template.cls",
+        "path": "stage-22/template.cls",
+        "sha256": "<sha256>",
+        "size": 1
+      }
+    ]
+  },
+  "project_files": [
+    {
+      "role": "project_file",
+      "logical_name": "main.py",
+      "path": "stage-22/code/main.py",
+      "sha256": "<sha256>",
+      "size": 1
+    }
+  ],
+  "compile": {
+    "outcome": "compiler-success",
+    "semantic_calls": 1,
+    "max_attempts": 2,
+    "attempts": 1,
+    "status": "success",
+    "tooling_available": true,
+    "errors": [],
+    "status_file": {
+      "path": "stage-22/compile_status.json",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    "paper_pdf": {
+      "path": "stage-22/paper.pdf",
+      "sha256": "<sha256>",
+      "size": 1
+    }
+  },
+  "output_count": 13,
+  "outputs": [
+    {
+      "role": "paper_markdown",
+      "logical_name": null,
+      "path": "stage-22/paper_final.md",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "paper_latex_markdown",
+      "logical_name": null,
+      "path": "stage-22/paper_final_latex.md",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "bibliography",
+      "logical_name": null,
+      "path": "stage-22/references.bib",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "paper_latex",
+      "logical_name": null,
+      "path": "stage-22/paper.tex",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "compile_status",
+      "logical_name": null,
+      "path": "stage-22/compile_status.json",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "paper_verification",
+      "logical_name": null,
+      "path": "stage-22/paper_verification.json",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "sanitization_report",
+      "logical_name": null,
+      "path": "stage-22/sanitization_report.json",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "canonical_source",
+      "logical_name": null,
+      "path": "stage-22/canonical_source.json",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "paper_pdf",
+      "logical_name": null,
+      "path": "stage-22/paper.pdf",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "template_file",
+      "logical_name": "template.cls",
+      "path": "stage-22/template.cls",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "project_file",
+      "logical_name": "main.py",
+      "path": "stage-22/code/main.py",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "code_support_file",
+      "logical_name": "README.md",
+      "path": "stage-22/code/README.md",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "code_support_file",
+      "logical_name": "requirements.txt",
+      "path": "stage-22/code/requirements.txt",
+      "sha256": "<sha256>",
+      "size": 1
+    }
+  ],
+  "generated": "2026-07-28T00:00:00+00:00"
+}
+```
+
+The exact root key set is:
+
+```text
+schema_version
+publication_stage_id
+publication_mode
+structured_capability_schema_version
+structured_capability_snapshot
+generation_binding_sha256
+canonical_experiment_evidence
+cfs
+selected_result_manifest
+source_stage19_manifest
+source_stage20_manifest
+source_stage21_manifest
+source_stage21_archive
+source_paper
+quality_outcome
+degradation_signal
+bibliography_source
+template
+project_files
+compile
+output_count
+outputs
+generated
+```
+
+Duplicate, unknown, or missing root or nested keys reject.
+`publication_stage_id` is exact `stage22`; `publication_mode` is exact
+`structured-scientific-claim-v1`. The capability schema is true integer `1`;
+the snapshot has exactly the four code-owned keys and exact true-integer
+`1110` for this implementation slice. It records private admission state and
+does not activate public entry.
+
+`generation_binding_sha256`, `canonical_experiment_evidence`, `cfs`,
+`selected_result_manifest`, `source_stage19_manifest`,
+`source_stage20_manifest`, `source_stage21_manifest`,
+`source_stage21_archive`, `source_paper`, `quality_outcome`,
+`degradation_signal`, `bibliography_source`, and `generated` are independently
+rebuilt from the held Stage 21/20/19/17/evidence closure. Every named file is
+an exact three-key Stage 22 `FileRef`. `degradation_signal` is null for
+`passed` and the exact root `degradation_signal.json` `FileRef` for
+`degraded`; crossed branches reject. `generated` is copied exactly from the
+replayed Stage 21 manifest and causes zero clock calls.
+
+`template` has exactly `name` and `files`. `name` is the independently
+selected canonical template name. `files` contains exactly the
+`template_file` output-entry subsequence, including canonical logical names,
+in the same sorted order and with byte-for-byte identical path/hash/size
+bindings. `project_files` is exactly the nonempty `project_file`
+output-entry subsequence in the same canonical logical-name order. Neither
+nested field accepts a different output-entry shape or caller-supplied name.
+
+`compile` has exactly `outcome`, `semantic_calls`, `max_attempts`, `attempts`,
+`status`, `tooling_available`, `errors`, `status_file`, and `paper_pdf`.
+`status_file` is the exact three-key `FileRef` for
+`stage-22/compile_status.json`. `paper_pdf` is the exact three-key PDF
+`FileRef` for compiler-success and null for compiler-failure. The other values
+cross-match the exact compile-status payload and Section 18.12.3.
+`outcome` is exact `compiler-success` iff `status=success`; otherwise it is
+exact `compiler-failure`.
+
+`output_count` is a true positive integer equal to `len(outputs)` and exactly
+`10 + template_file_count + project_file_count + pdf_present`: eight fixed
+direct rows, two fixed support rows, all template/project rows, and one PDF
+row iff compiler-success. `outputs` has the exact five-key shape,
+logical-name branches, role multiplicity, paths, and normative order in
+Section 18.12.2. Every output is a regular, single-link held file whose bytes,
+digest, size, identity, and independent deterministic rebuild match. The
+manifest is not an output.
+
+The compiler-failure manifest uses the same exact 23 root keys, sets
+`compile.outcome` to `compiler-failure`, sets `compile.paper_pdf` to null,
+omits the optional `paper_pdf` output row, decrements `output_count` by one,
+and binds an exact failure `compile_status.json`. No alternate root union
+exists.
+
+Authority JSON follows Section 3. Displayed object-key order is explanatory;
+array order is normative. The manifest contains no field for its own path,
+digest, size, identity, or inventory row. Its exact bytes are captured and
+hashed externally by Stage 23. Therefore no edge originates at the manifest
+and points back to itself: source manifests -> payloads -> Stage 22 manifest
+is a directed acyclic binding graph, not a self-hash cycle.
+
+#### 18.12.5 Exact result tuples and outcome matrix
+
+Structured Stage 22 deliberately exposes coarse stable result tuples even
+though its manifest binds the complete direct and nested namespace:
+
+```text
+artifacts = (
+  "paper_final.md",
+  "code/",
+  "stage22_export_manifest.json",
+)
+
+evidence_refs = (
+  "stage-22/paper_final.md",
+  "stage-22/code/",
+  "stage-22/stage22_export_manifest.json",
+)
+```
+
+The tuples are exact three-tuples in this order for all four publishable
+branches. The trailing slash on `code/` and `stage-22/code/` is normative and
+denotes the complete manifest-bound code directory tree, not a regular file,
+glob, or caller-normalized alias. `paper.tex`, `paper.pdf`, template,
+bibliography, reports, and status remain manifest-bound but are not added to
+the coarse tuple. Any failure returns `status=FAILED`,
+`decision="retry"`, `artifacts=()`, and `evidence_refs=()`.
+
+| Upstream quality | Compiler | Stage 22 result | PDF branch | Release meaning |
+|---|---|---|---|---|
+| `passed` | success | `DONE`, exact three-tuples | required exact PDF and `compile.outcome=compiler-success` | no release verdict in B5-D1B-R1 |
+| `degraded` | success | `DONE`, exact three-tuples | required exact PDF and `compile.outcome=compiler-success` | preserves degraded upstream state; no release verdict |
+| `passed` | failure | `DONE`, exact three-tuples | PDF forbidden; exact `compile.outcome=compiler-failure` | publishable no-PDF export state; release decision deferred |
+| `degraded` | failure | `DONE`, exact three-tuples | PDF forbidden; exact `compile.outcome=compiler-failure` | degraded no-PDF state; release decision deferred |
+| invalid/unreplayable/withdrawn upstream | not called | `status=FAILED`, `decision="retry"`, empty tuples | no publication | fail closed |
+| deterministic build, compiler-contract, collision, publication, replay, fixpoint, or postcondition failure | irrelevant | `status=FAILED`, `decision="retry"`, empty tuples | manifest-first cleanup | fail closed |
+
+A compiler failure is an honest publishable Stage 22 operational state, not a
+release success, PDF substitute, or permission to package Markdown. Whether
+either compiler branch is release-eligible is owned only by B5-D2 Stage 24/25,
+independent reconstruction, and release-gate adjudication.
+
+#### 18.12.6 Held-fd publication and executor lifecycle
+
+After the two-stage admission in Section 18.12.1:
+
+1. **Manifest-first invalidation.** Through the held Stage 22 fd, attempt the
+   fixed manifest name first. Then independently clean every fixed direct
+   formal and the exact expected template/code tree. Cleanup aggregates
+   errors. A preexisting unknown, special, aliased, or unsafe entry is a
+   collision, not an authority source.
+2. **Snapshot A.** Recapture and completely replay upstream through held
+   descriptors. Require exact equality with pre-admission bytes, hashes,
+   sizes, modes, link counts, device/inode identities, generation, outcome,
+   current Stage 20/21 manifest-name identities, and namespace closure.
+3. **Build in memory.** Deterministically build all non-compiler payload bytes,
+   expected code/template paths, manifest inputs, and expected result tuples
+   with zero LLM/provider/repair/HITL/clock calls.
+4. **Compiler call.** Invoke `compile_latex` exactly once with
+   `max_attempts=2` in an isolated workspace outside the run. Capture its
+   bounded result in memory. Revalidate that every input byte is unchanged.
+5. **Absent-only directories.** Require `code/` and every required nested
+   directory component physically absent after owned cleanup. Create each
+   component exactly once through its held parent fd with exclusive,
+   no-follow directory creation, immediately open and capture its held-fd
+   identity, and never adopt or reopen a preexisting component. Any existing
+   component, including an expected real empty directory, is a collision,
+   fails publication, and enters manifest-first aggregate cleanup.
+6. **Absent-only payloads.** In normative output-array order, require each
+   formal name absent, create it descriptor-relatively with
+   `O_CREAT|O_EXCL|O_NOFOLLOW`, require a regular single-link file, and retain
+   its creating fd. Write, flush, sync, read back, hash, and validate only
+   through that fd. Never rename, replace, link, reopen for writing, or publish
+   via a run-internal temporary.
+7. **Nested-tree replay.** From held directory and leaf fds, require the exact
+   prefix tree, no extra or special entries, exact code bytes, and exact
+   template/code output entries. Directory enumeration is validation only,
+   never authority.
+8. **Source fixpoint.** Recapture the complete upstream closure and require
+   exact Snapshot A equality plus current Stage 20/21 manifest-name identity.
+9. **Manifest last.** Only after all payloads and source fixpoint pass, require
+   `stage22_export_manifest.json` absent and create it with the same
+   exclusive creating-fd protocol. Write exact v2 bytes through that fd. It is
+   only a commit candidate.
+10. **Final replay and Snapshot B.** Duplicate-safely parse and independently
+    rebuild the manifest, payloads, compiler branch, code tree, namespace,
+    tuples, and all upstream bindings. Snapshot B's upstream/source portion
+    must exactly equal Snapshot A. Snapshot B additionally captures the
+    complete formal outputs, manifest, namespace, and held parent/leaf
+    identities. A second final capture must exactly equal that complete
+    Snapshot B, including current upstream manifest-name identities.
+11. **Provisional producer handoff.** The producer may advance only the same
+    live attempt context to `provisional_done` and hand the executor an
+    internal provisional `DONE`, exact three-tuples, and that context. It
+    cannot return a public `StageResult`.
+12. **Immediate postcondition.** Before any hook or public return, verify
+    status, decision, exact tuple count/order, complete disk namespace,
+    manifest-last replay, Snapshot A/B, source fixpoint, current upstream
+    authority, writer epoch, held identities, and live context.
+13. **Terminal postcondition.** Structured Stage 22 skips PRM, HITL, edit,
+    prompt, semantic-repair, and repair hooks. Immediately before public
+    return, repeat capture/replay and require unchanged provisional result,
+    context, tuples, bytes, identities, upstream current manifests, and
+    compiler call counters.
+14. **Public result or withdrawal.** Only both postconditions permit public
+    `DONE` with the exact three-tuples. A non-`DONE` conversion, tuple drift,
+    late mutation, upstream withdrawal, identity drift, or postcondition
+    failure triggers manifest-first aggregate cleanup and returns exact
+    `status=FAILED`, `decision="retry"`, and empty tuples.
+
+Cleanup uses only the held original parent and directory fds. Parent
+replacement never redirects cleanup into a replacement path. A collision that
+cannot safely be classified and unlinked remains an error; cleanup does not
+follow, overwrite, truncate, or recursively traverse it. The original failure
+remains primary and cleanup errors append.
+
+### 18.13 B5-D1B-R1 structured Stage 23 citation-verification authority
+
+#### 18.13.1 Authority boundary, admission, and cited closure
+
+Structured Stage 23 verifies only citation existence/identity metadata and
+paper-level relevance for the exact current structured Stage 22 paper. Its
+report is citation metadata and relevance evidence only. It is not scientific
+claim authority, numeric authority, experimental evidence, claim-support
+authority, a replacement for the Stage 17 citation plan/allowlist, or release
+authority. It cannot add, delete, rewrite, weaken, or strengthen a paper
+sentence or citation marker. `paper_final_verified.md` is byte-identical to
+the held `stage-22/paper_final.md`.
+
+Admission uses the same two-stage pattern. A registry-issued,
+upstream-only `Stage23PreAdmissionContext` binds the active owner/epoch, held
+root/run/Stage 20/21/22 descriptors, exact current manifest identities,
+generation, CFS, capability `1110`, and lexical target `stage23`, but no Stage
+23 identity or existence fact. Before any Stage 23 I/O, code fully replays
+Stage 22 manifest v2, its exact namespace and compiler branch, Stage 21 v2,
+current Stage 20 v2, Stage 19/17, canonical evidence, CFS, source paper,
+bibliography, and citation closure. Pre-admission itself requires the exact
+unique sorted cited-key count `1..32`; an out-of-range or malformed closure
+therefore fails with zero Stage 23 path I/O. Only then may one code-owned
+transition open/create canonical `stage-23` through the held run fd and issue
+one `Stage23AttemptContext`.
+
+The final cited-key closure is extracted independently from both held
+`stage-22/paper_final.md` and `stage-22/paper.tex`. The two sets must be
+identical. It is then required to be unique, strict bytewise sorted, fully
+present exactly once in the held bibliography, and have exact count `1..32`.
+Zero citations, 33 or more citations, a duplicate bibliography key, missing
+key, unplanned key, unknown key, Markdown/LaTeX mismatch, or changed paper
+fails before provider and Stage 23 output I/O. No full-bibliography
+verification and no same-name shadow bibliography are permitted.
+
+At current `1110`, ordinary dispatch remains unchanged `generic-v1`; public or
+direct structured Stage 23 mechanically rejects before lock, filesystem,
+provider, or output I/O. Only the private registry-issued seam is eligible for
+implementation tests. Stale v2 files, config, caller state, cache state, or
+artifact presence cannot select it.
+
+#### 18.13.2 Exact provider, semantic, and outbound contract
+
+For each cited key, code selects exactly one deterministic provider route from
+held bibliography metadata:
+
+```text
+normalized nonempty DOI present  -> crossref-doi
+else normalized arXiv ID present -> arxiv-id
+else nonempty normalized title   -> openalex-title
+```
+
+The DOI, arXiv-ID, and title normalization and exact request bytes are
+code-owned and independently rebuilt. Precedence is mandatory: a DOI always
+routes only to Crossref; without DOI, an arXiv ID routes only to arXiv; only
+the absence of both permits a title route to OpenAlex. A citation has exactly
+one semantic metadata-verification operation and at most one outbound
+request. There is no fallback, retry, alternate provider/endpoint, cache read,
+cache write, stale result, batched substitution, hidden SDK retry, redirect
+to another provider, or semantic repair. A connection error, timeout, DNS/TLS
+error, 429, 5xx, truncated body, invalid JSON, duplicate key, extra/missing
+field, wrong key/DOI/arXiv-ID/title, empty result, ambiguous result, or
+metadata mismatch yields a non-`verified` existence result. By the fixed
+outcome matrix, any non-`verified` existence result is `FAILED` for every
+claim scope. Receiving no response is not permission to try again.
+
+Citation routes run in cited-key order. Provider spies and the terminal
+postcondition require:
+
+```text
+metadata semantic calls per citation = 1
+metadata outbound requests per citation <= 1
+metadata semantic calls total = cited_count
+metadata outbound requests total <= cited_count <= 32
+metadata fallback calls = 0
+metadata retry calls = 0
+metadata cache reads/writes = 0
+```
+
+Only after all citation metadata results are exact `verified` does Stage 23
+make at most one semantic paper-level relevance call over the ordered verified
+metadata and exact paper identity. That semantic call has at most two outbound
+attempts. A second outbound is legal only when the first failed with a pure
+transport error before any response status, header, or body byte was received.
+It must use the identical provider, model, endpoint, prompt bytes, request
+bytes, timeout policy, and request fingerprint. HTTP 429/5xx, redirects,
+partial content, invalid content, decoding/schema/key-closure error, tool
+error after response content, or semantic rejection is not pure transport and
+cannot retry. There is no fallback, cache, repair, second semantic call, or
+third outbound.
+
+The relevance semantic-call count is `0` only for the exact code-owned
+`missing` branch and otherwise exactly `1`, always within the frozen maximum.
+Its outbound count is `0` for `missing`, `1` on first-attempt response or
+failure, `2` on an identical pure-transport retry, or `1..2` when all legal
+attempts end in pure transport failure. Complete output has one finite
+canonical decimal string in `[0,1]` for each cited key and exact key/order
+closure. Malformed, duplicate, extra, missing, nonfinite, out-of-range, or
+wrong-ordered semantic content is relevance `failed` without retry. Exhausted
+pure transport is relevance `unavailable`. These adverse branches are routed
+strictly by `claim_scope`: `research_release` fails;
+`pipeline_validation` and `exploratory` degrade.
+
+The aggregate hard bounds are:
+
+```text
+provider semantic calls <= 32
+provider outbound requests <= 32
+relevance semantic calls <= 1
+relevance outbound requests <= 2
+all outbound requests <= 34
+fallback/cache/repair calls = 0
+```
+
+Any wrapper, SDK, redirect, or background task counts toward these bounds.
+An attempt to exceed one of them fails even if returned bytes would otherwise
+verify.
+
+#### 18.13.3 Exact verification report schema v2
+
+`verification_report.json` has exactly 13 root keys. A complete passed example
+for one citation is:
+
+```json
+{
+  "schema_version": 2,
+  "publication_stage_id": "stage23",
+  "paper": {
+    "path": "stage-22/paper_final.md",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "bibliography": {
+    "path": "stage-22/references.bib",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "cited_count": 1,
+  "cited_keys": [
+    "Example2026"
+  ],
+  "claim_scope": "research_release",
+  "provider_policy": {
+    "route_policy": "doi-else-arxiv-else-title-v1",
+    "max_outbound_per_citation": 1,
+    "fallback": false,
+    "retry": false,
+    "cache": false
+  },
+  "relevance_policy": {
+    "max_semantic_calls": 1,
+    "max_outbound_attempts": 2,
+    "retry_class": "pure-transport-before-response-only",
+    "threshold": "0.500000"
+  },
+  "citations": [
+    {
+      "cite_key": "Example2026",
+      "route_class": "crossref-doi",
+      "endpoint_class": "crossref",
+      "request_sha256": "<sha256>",
+      "response_sha256": "<sha256>",
+      "outbound_count": 1,
+      "status": "verified",
+      "metadata": {
+        "title": "Example title",
+        "doi": "10.1000/example",
+        "arxiv_id": null,
+        "year": 2026,
+        "source": "crossref"
+      }
+    }
+  ],
+  "relevance": {
+    "status": "complete",
+    "semantic_calls": 1,
+    "outbound_attempts": 1,
+    "retry_fingerprint": null,
+    "scores": [
+      {
+        "cite_key": "Example2026",
+        "score": "0.750000"
+      }
+    ],
+    "error_class": null
+  },
+  "outcome": "passed",
+  "generated": "2026-07-28T00:00:00+00:00"
+}
+```
+
+The exact root key set is `schema_version`, `publication_stage_id`, `paper`,
+`bibliography`, `cited_count`, `cited_keys`, `claim_scope`,
+`provider_policy`, `relevance_policy`, `citations`, `relevance`, `outcome`,
+and `generated`. Duplicate, extra, or missing root/nested keys reject.
+
+`schema_version` is true integer `2`; the stage ID is exact `stage23`.
+`paper` and `bibliography` are exact Stage 22 `FileRef`s. `cited_count` is a
+true integer `1..32` equal to both array lengths. `cited_keys` is the exact
+unique sorted closure.
+
+`claim_scope` is exact `pipeline_validation`, `exploratory`, or
+`research_release` and comes only from the replayed canonical experiment
+contract. `provider_policy` has exactly `route_policy`,
+`max_outbound_per_citation`, `fallback`, `retry`, and `cache`, with values
+exact `doi-else-arxiv-else-title-v1`, true integer `1`, false, false, false.
+`relevance_policy` has exactly `max_semantic_calls`,
+`max_outbound_attempts`, `retry_class`, and `threshold`, with exact values true
+integer `1`, true integer `2`,
+`pure-transport-before-response-only`, and canonical decimal string
+`0.500000`.
+
+Every `citations` entry has exactly `cite_key`, `route_class`,
+`endpoint_class`, `request_sha256`, `response_sha256`, `outbound_count`,
+`status`, and `metadata`; array order equals `cited_keys`. Route is exact
+`crossref-doi`, `arxiv-id`, or `openalex-title`, and endpoint class is exact
+`crossref`, `arxiv`, or `openalex` under the fixed precedence rule.
+`request_sha256` binds the exact code-owned outbound request bytes;
+`response_sha256` binds the exact response bytes consumed by the strict
+parser. Both are lowercase SHA-256 and are independently recomputed from held
+in-memory transport captures before those captures are discarded.
+`outbound_count` is the true integer `1` for every publishable metadata result
+and cross-matches transport telemetry; a publishable metadata result has exact
+status `verified`.
+`metadata` has exactly `title`, `doi`, `arxiv_id`, `year`, and `source`.
+Title is nonempty normalized metadata text. DOI is a normalized DOI string
+for the Crossref route and otherwise null. `arxiv_id` is a normalized arXiv ID
+for the arXiv route and otherwise null. Year is a true integer in
+`1000..2999`; source is exact `crossref`, `arxiv`, or `openalex` matching the
+route.
+Metadata is evidence of bibliographic identity, not evidence that a paper
+supports a manuscript claim.
+
+`relevance` has exactly `status`, `semantic_calls`, `outbound_attempts`,
+`retry_fingerprint`, `scores`, and `error_class`. For `complete`, status is
+exact `complete`, semantic calls is true integer `1`, outbound attempts is
+`1` or `2`, scores has exact cited-key closure/order, and error class is null.
+Each score has exactly `cite_key` and `score`; score is a six-place canonical
+decimal string in `[0.000000,1.000000]`. `retry_fingerprint` is null for one
+outbound and the lowercase SHA-256 of the identical request bytes for two.
+
+For exhausted pure transport, status is exact `unavailable`, semantic calls
+is true integer `1`, outbound attempts is `1` or `2`, scores is the empty
+array, and `error_class` is exact `pure_transport_exhausted`.
+`retry_fingerprint` is null after one non-retryable-at-runtime transport
+attempt, or the exact request SHA-256 after two identical attempts. No raw
+provider body, prompt, secret, URL query credential, traceback, or unbounded
+diagnostic is persisted.
+
+For the exact missing branch, status is `missing`, semantic calls and outbound
+attempts are true integer `0`, retry fingerprint is null, scores is empty, and
+error class is exact `relevance_missing`. For a response-level semantic or
+schema failure, status is `failed`, semantic calls and outbound attempts are
+true integer `1`, retry fingerprint is null, scores is empty, and error class
+is exact `relevance_semantic_failure`. No missing, unavailable, or failed
+branch fabricates a score. Low relevance is represented only by a complete
+score array containing at least one value below `0.500000`.
+
+`outcome` is exact `passed` or `degraded` and is mechanically derived from
+`claim_scope`, upstream quality, existence closure, and relevance under
+Section 18.13.5. The report persists no raw response, raw request, prompt, API
+key, credential, reasoning, chain-of-thought, or provider body. Only exact
+request/response digests and the bounded parsed metadata are retained.
+`generated` is copied exactly from the fully replayed Stage 22 manifest;
+Stage 23 makes zero clock calls.
+
+#### 18.13.4 Exact Stage 23 manifest schema v2 and four-file tuples
+
+The complete structured Stage 23 namespace is exactly four regular,
+single-link formal files:
+
+```text
+stage-23/verification_report.json
+stage-23/references_verified.bib
+stage-23/paper_final_verified.md
+stage-23/stage23_verification_manifest.json
+```
+
+There is no run-internal temporary, staging, nested directory, cache,
+diagnostic, raw response, repair output, or alternate name. The first three
+are payloads; the manifest is strictly last.
+
+`stage23_verification_manifest.json` has true-integer schema version `2` and
+exactly 26 root keys:
+
+```json
+{
+  "schema_version": 2,
+  "publication_stage_id": "stage23",
+  "publication_mode": "structured-scientific-claim-v1",
+  "structured_capability_schema_version": 1,
+  "structured_capability_snapshot": {
+    "stage17_publication": 1,
+    "stage19_revision": 1,
+    "stage20_replay": 1,
+    "stage24_and_release_integration": 0
+  },
+  "generation_binding_sha256": "<sha256>",
+  "canonical_experiment_evidence": {
+    "path": "canonical_experiment_evidence.json",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "cfs": {
+    "schema_version": 1,
+    "sha256": "<sha256>"
+  },
+  "source_stage19_manifest": {
+    "path": "stage-19/scientific_claim_authority_manifest.json",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "source_stage20_manifest": {
+    "path": "stage-20/quality_gate_manifest.json",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "source_stage21_manifest": {
+    "path": "stage-21/bundle_index.json",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "source_stage22_manifest": {
+    "path": "stage-22/stage22_export_manifest.json",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "source_paper": {
+    "path": "stage-22/paper_final.md",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "source_bibliography": {
+    "path": "stage-22/references.bib",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "source_latex": {
+    "path": "stage-22/paper.tex",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "quality_outcome": "passed",
+  "degradation_signal": null,
+  "claim_scope": "research_release",
+  "verification_policy": {
+    "route_policy": "doi-else-arxiv-else-title-v1",
+    "min_cited_count": 1,
+    "max_cited_count": 32,
+    "max_provider_outbound_per_citation": 1,
+    "provider_fallback": false,
+    "provider_retry": false,
+    "provider_cache": false,
+    "relevance_max_semantic_calls": 1,
+    "relevance_max_outbound_attempts": 2,
+    "relevance_retry_class": "pure-transport-before-response-only",
+    "relevance_threshold": "0.500000"
+  },
+  "outcome": "passed",
+  "verification_report": {
+    "path": "stage-23/verification_report.json",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "verified_bibliography": {
+    "path": "stage-23/references_verified.bib",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "verified_paper": {
+    "path": "stage-23/paper_final_verified.md",
+    "sha256": "<sha256>",
+    "size": 1
+  },
+  "output_count": 3,
+  "outputs": [
+    {
+      "role": "verification_report",
+      "logical_name": null,
+      "path": "stage-23/verification_report.json",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "verified_bibliography",
+      "logical_name": null,
+      "path": "stage-23/references_verified.bib",
+      "sha256": "<sha256>",
+      "size": 1
+    },
+    {
+      "role": "verified_paper",
+      "logical_name": null,
+      "path": "stage-23/paper_final_verified.md",
+      "sha256": "<sha256>",
+      "size": 1
+    }
+  ],
+  "generated": "2026-07-28T00:00:00+00:00"
+}
+```
+
+The exact root key set is:
+
+```text
+schema_version
+publication_stage_id
+publication_mode
+structured_capability_schema_version
+structured_capability_snapshot
+generation_binding_sha256
+canonical_experiment_evidence
+cfs
+source_stage19_manifest
+source_stage20_manifest
+source_stage21_manifest
+source_stage22_manifest
+source_paper
+source_bibliography
+source_latex
+quality_outcome
+degradation_signal
+claim_scope
+verification_policy
+outcome
+verification_report
+verified_bibliography
+verified_paper
+output_count
+outputs
+generated
+```
+
+Every Stage 23 `FileRef` has exact keys `path`, `sha256`, and `size` under the
+Stage 22 rules. CFS, capability, generation, and timestamp rules remain exact.
+`source_stage19_manifest`, `source_stage20_manifest`,
+`source_stage21_manifest`, `source_stage22_manifest`, the three Stage 22
+source files, `quality_outcome`, and `degradation_signal` are independently
+rebuilt from held recursive authority; stored Stage 23 values are never an
+oracle. `degradation_signal` is null for upstream `passed` and the exact
+three-key root signal `FileRef` for upstream `degraded`.
+
+`claim_scope` is exact `pipeline_validation`, `exploratory`, or
+`research_release` from the canonical experiment contract.
+`verification_policy` has exactly `route_policy`, `min_cited_count`,
+`max_cited_count`, `max_provider_outbound_per_citation`,
+`provider_fallback`, `provider_retry`, `provider_cache`,
+`relevance_max_semantic_calls`, `relevance_max_outbound_attempts`,
+`relevance_retry_class`, and `relevance_threshold`, with exactly the values
+shown in the example. `outcome` is exact `passed` or `degraded` and
+cross-matches the strict report and Section 18.13.5.
+`verification_report`, `verified_bibliography`, and `verified_paper` are exact
+three-key `FileRef`s and cross-match exactly one output row each.
+
+`output_count` is the true integer `3`. `outputs` contains exactly three
+five-key output entries in exact order `verification_report`,
+`verified_bibliography`, `verified_paper`; every fixed row has
+`logical_name=null`. The verified paper
+bytes exactly equal the Stage 22 source paper. The verified bibliography
+contains exactly the cited keys, in their exact source BibTeX entry bytes and
+source order, and contains no uncited or rewritten entry. The report is the
+exact schema-v2 metadata/relevance evidence. No fourth output row or nested
+entry is legal.
+
+The exact structured success tuples are:
+
+```text
+artifacts = (
+  "verification_report.json",
+  "references_verified.bib",
+  "paper_final_verified.md",
+  "stage23_verification_manifest.json",
+)
+
+evidence_refs = (
+  "stage-23/verification_report.json",
+  "stage-23/references_verified.bib",
+  "stage-23/paper_final_verified.md",
+  "stage-23/stage23_verification_manifest.json",
+)
+```
+
+These exact four-file tuples, in this order, are used for both `passed` and
+`degraded`. The manifest itself is deliberately excluded from its `outputs`
+array and has no root field for its own path/hash/size/identity. Only the
+external result tuple and a future consumer capture the manifest bytes and
+digest. Thus the binding DAG is upstream manifests -> three payloads -> Stage
+23 manifest; there is no manifest-to-itself edge and no self-hash cycle.
+
+#### 18.13.5 Fixed Stage 23 outcome matrix
+
+The matrix is exhaustive and code-owned:
+
+| Citation existence | Relevance | Claim scope | Upstream quality | Structured Stage 23 result |
+|---|---|---|---|---|
+| any result not exact `verified`, or cited closure invalid | any/not called | any | either | exact `FAILED`, manifest-first cleanup, empty tuples |
+| all exact `verified` | complete and every score `>=0.500000` | any | `passed` | `DONE`, `outcome=passed`, exact four-tuples |
+| all exact `verified` | complete and every score `>=0.500000` | any | `degraded` | `DONE`, `outcome=degraded`, exact four-tuples |
+| all exact `verified` | missing, unavailable, failed, incomplete, or any score `<0.500000` | `research_release` | either | exact `FAILED`, manifest-first cleanup, empty tuples |
+| all exact `verified` | missing, unavailable, failed, incomplete, or any score `<0.500000` | `pipeline_validation` | either | `DONE`, `outcome=degraded`, exact four-tuples |
+| all exact `verified` | missing, unavailable, failed, incomplete, or any score `<0.500000` | `exploratory` | either | `DONE`, `outcome=degraded`, exact four-tuples |
+| provider/relevance call-bound, retry-class, fallback, cache, or route violation | any | any | either | exact `FAILED`, cleanup, empty tuples |
+| publication, source fixpoint, namespace, tuple, immediate, or terminal postcondition fails | irrelevant | any | either | exact `FAILED`, cleanup, empty tuples |
+
+Existence verification is mandatory for every scope. Relevance is
+claim-scope-sensitive exactly as shown: any adverse relevance state fails
+`research_release` and degrades only `pipeline_validation` or `exploratory`.
+A low score is paper-level relevance evidence; it neither deletes the
+citation nor decides scientific support. Pure-transport exhaustion records
+absence of relevance evidence, not a fabricated score. Upstream `degraded`
+always remains degraded even when relevance is complete and high. No Stage 23
+outcome is a release verdict; B5-D2 owns that decision. For every exact
+`FAILED` authority outcome the outer framework disposition is separately and
+invariably `decision="retry"`; that disposition is not a Stage 23 authority
+outcome and cannot change cleanup, empty tuples, transport limits, or
+dispatch.
+
+#### 18.13.6 Held-fd publication and executor lifecycle
+
+The successful context phases are exact:
+
+```text
+Stage23PreAdmissionContext(pre_admission)
+  -> Stage23AttemptContext(namespace_bound)
+  -> invalidated
+  -> snapshot_a
+  -> metadata_verified
+  -> relevance_complete
+  -> payloads_published
+  -> source_fixpoint
+  -> manifest_published
+  -> provisional_done
+  -> immediate_validated
+  -> terminal_validated
+  -> cleared
+```
+
+For the unavailable-relevance degraded branch,
+`relevance_complete` names completion of the bounded relevance operation, not
+availability of scores.
+
+1. **Dispatch and pre-admission.** Apply the `1110` mechanical boundary and
+   validate the upstream-only single-use context. Fully capture/replay current
+   Stage 22 and recursive authority, and validate the exact `1..32` cited-key
+   closure, before any Stage 23 path or provider I/O.
+2. **Single transition.** Consume pre-admission, open/create `stage-23`
+   through the held run fd, validate held identity, and issue one attempt
+   context. No prior Stage 23 existence observation is legal.
+3. **Manifest-first invalidation.** Through the held Stage 23 fd, attempt
+   `stage23_verification_manifest.json` first, then
+   `verification_report.json`, `references_verified.bib`, and
+   `paper_final_verified.md` in that order. Aggregate errors; do not publish
+   after any cleanup error.
+4. **Snapshot A and cited closure.** Recapture/replay all upstream bindings and
+   require exact pre-admission equality. Independently rebuild and revalidate
+   the same exact sorted `1..32` cited-key closure.
+5. **Bounded metadata transport.** Execute the single deterministic route and
+   at-most-one outbound contract for each key. Validate exact metadata closure
+   and counters before relevance.
+6. **Bounded relevance transport.** Execute at most one semantic call and at
+   most two outbounds under the pure-transport-only identical retry rule.
+   Mechanically derive the exact outcome matrix.
+7. **Build payloads.** In memory, build strict report bytes containing only
+   parsed metadata plus exact request/response digests, select exact
+   cited-entry bibliography bytes without rewriting, and byte-copy the held
+   paper. Raw requests, responses, prompts, credentials, reasoning, and
+   transport logs are discarded and never persisted.
+8. **Three exclusive creates.** In exact output/tuple order
+   `verification_report.json`, `references_verified.bib`,
+   `paper_final_verified.md`, require each payload name absent and create it
+   through the held Stage 23 fd with
+   `O_CREAT|O_EXCL|O_NOFOLLOW`; require regular single-link identity; write,
+   flush, sync, read back, hash, and validate only through the creating fd.
+   There is no rename, replace, reopen-for-write, temp, or staging.
+9. **Payload replay and source fixpoint.** Require exact three-file flat
+   namespace, bytes, identities, report semantics, paper byte identity,
+   bibliography closure, call counters, and outcome. Recapture upstream and
+   require Snapshot A equality and current Stage 20/21/22 manifest-name
+   identities.
+10. **Manifest last.** Require the formal manifest absent and create/write it
+    through the same exclusive creating-fd protocol. Strictly parse and
+    independently rebuild it; it is only a commit candidate.
+11. **Final replay and Snapshot B.** Replay manifest, payloads, provider route
+    decisions, request/response digests, counters, claim-scope outcome, exact
+    tuples, and recursive upstream bindings. Require Snapshot B's
+    upstream/source portion equal Snapshot A; the complete Snapshot B also
+    captures all payload/manifest bytes and parent/leaf identities. Require a
+    second final capture to equal that complete Snapshot B.
+12. **Immediate postcondition.** Before a public return, validate provisional
+    `DONE`, `degraded` flag, exact four-tuple count/order, disk namespace,
+    manifest-last replay, transport bounds, live context, writer epoch,
+    Snapshot A/B, and upstream current authority.
+13. **Terminal postcondition.** Structured Stage 23 skips PRM, HITL, edit,
+    prompt, semantic-repair, and repair hooks. Immediately before return,
+    repeat the capture/replay and reject any changed status, tuple, flag,
+    byte, identity, route, counter, context, source, or current upstream
+    manifest.
+14. **Public result or withdrawal.** Only both validators permit public
+    `DONE` with the exact four-tuples and the matrix-derived degraded flag.
+    Any producer, cleanup, provider, publication, handoff, immediate, terminal,
+    or public-result failure performs manifest-first aggregate cleanup and
+    returns exact `status=FAILED`, outer `decision="retry"`, and empty tuples.
+
+Cleanup uses held original fds, never a replaced parent path. A preexisting or
+late directory, symlink, hardlink, FIFO, socket, device, special file, nested
+entry, or identity mismatch at any of the four reserved flat names is a
+collision. Cleanup must not follow, truncate, overwrite, or recurse into it.
+The original error remains primary; cleanup errors append. A failed current
+epoch must not leave a completely replayable current v2 manifest. Later
+same-UID reinjection can cause denial of service but cannot create authority
+without a fresh complete admission and strict semantic replay.
+
+### 18.14 B5-D1B-R1 adversarial contract
+
+The Stage 22-23 implementation slice MUST add all of these tests without
+changing the frozen outcomes:
+
+| Area | Attack | Required result |
+|---|---|---|
+| Capability | exact current `1110` public/direct structured entry; caller/persisted `1111`; boolean, missing, extra, or unknown capability key | ordinary dispatch remains generic-v1; direct structured rejects before lock/fs/compiler/provider |
+| Pre-admission | forged, copied, serialized, reused, cross-run/owner/epoch/stage/generation context | reject before downstream namespace or provider I/O |
+| Parent replacement | replace root, run, Stage 20/21/22/23, code parent, or signal parent before/after transition | no writes through replacement path; held-original cleanup; fail closed |
+| Upstream withdrawal | remove, replace, or mutate current Stage 20, 21, or 22 manifest between pre-admission, Snapshot A, fixpoint, Snapshot B, or postconditions | reject/withdraw current success; manifest-first cleanup; empty tuples |
+| Late mutation | mutate a Stage 22/23 payload or manifest after publication, immediate validation, or final capture | terminal postcondition fails and cleans |
+| Synchronous forgery | rewrite payloads, reports, nested hashes, sizes, manifests, and timestamps consistently | independent upstream rebuild and exact-byte replay reject |
+| Stage 22 nested tree | inject symlink, hardlink, FIFO, socket, device, mount, empty directory, extra leaf, missing leaf, prefix collision, case/NFC alias, or changed creating-fd identity | fail closed; never follow or recursively clean an unvalidated entry |
+| Stage 23 flat namespace | inject any nested directory or special file at a reserved name | fail closed; exact four-file namespace not published |
+| Cleanup collision | precreate or race a formal name with regular/special/directory entry; manifest cleanup succeeds but payload cleanup fails | no later create; aggregate cleanup error; no replayable manifest |
+| Absent-only publication | intercept `O_EXCL`, substitute name after create, or request rename/replace/link/reopen-for-write | identity/fd contract rejects; cleanup; empty tuples |
+| Stage 22 compiler | call LLM/provider; second semantic compile; `max_attempts != 2`; third internal attempt; mutate input; claim success without valid PDF; retain PDF on failure | fail and clean; no success tuples |
+| Stage 22 schema | use any withdrawn root; two-key FileRef; output `kind`; non-null fixed logical name; null template/project/support logical name; PDF after template/project; wrong template/project sort; missing or reordered README/requirements | exact 23-key/nested/order replay rejects |
+| Stage 22 tuple | substitute `paper.tex` for `code/`; omit `code/`; use `code` or another wrong directory slash/prefix; reorder, omit, or duplicate any tuple member; or return `DONE` before validators | immediate/terminal reject; exact empty failure tuples |
+| Stage 23 cited closure | 0, 33, duplicate, missing, unplanned, Markdown/LaTeX mismatch, or shadow bibliography key | fail before provider/output I/O |
+| Provider route | violate DOI -> Crossref, else arXiv ID -> arXiv, else title -> OpenAlex precedence; choose alternate provider, fallback, retry, cache, batch substitution, redirect, or second outbound | call-bound/route failure; cleanup; empty tuples |
+| Provider evidence | change or omit endpoint/route class, request SHA-256, response SHA-256, or recompute a digest over bytes not consumed by the strict parser | report/manifest replay rejects; raw request/response remains unpersisted |
+| Relevance retry | retry after response bytes/HTTP status, change request fingerprint, make second semantic call, third outbound, fallback, cache, or repair | `FAILED`; not degraded; cleanup |
+| Relevance semantics | missing/failed/low relevance, duplicate/extra/missing key, wrong order, malformed/nonfinite/out-of-range score | no retry/repair; `research_release` fails, `pipeline_validation`/`exploratory` degrade |
+| Outcome crossing | publish passed with adverse relevance or degraded upstream; degrade `research_release`; degrade a non-verified citation; mismatch claim scope/report/manifest/degraded flag | exact claim-scope matrix rejects |
+| Stage 23 schema | use a withdrawn 23-key root set, two-key FileRef, wrong 26-key set, old output role/order, non-null fixed logical name, or omit claim scope/policy/upstream quality binding | exact schema and output replay rejects |
+| Manifest tuple | retain withdrawn root names; wrong role/logical_name/path/hash/size/count/order; add `kind`; include manifest in outputs; or add manifest self path/hash | exact-key/replay rejection; no self-hash cycle |
+| Executor | producer mutates provisional status/decision/degraded flag/context/tuple; hook converts `DONE`; circular context/result; public return before terminal validation | withdraw and clean; exact `status=FAILED`, outer `decision="retry"`, empty tuples |
+| Generic-v1 | legal generic input with stale structured v2 formal names | unchanged generic schemas, bytes, calls, retries, cleanup, and result behavior |
+
+Nested-tree attacks are Stage 22-specific. Stage 23 is intentionally flat and
+rejects every directory. All cleanup is reserved-name, descriptor-relative,
+manifest-first, non-following, and non-recursive unless a Stage 22 code
+directory has first passed the exact expected-tree identity validation.
 
 ## 19. Generic and release boundary
 
-`generic-v1` Stage 18, Stage 19, Stage 20, and Stage 21 schemas, bytes,
-artifact names, provider behavior, cleanup, and failure behavior remain
-unchanged. At map `1000`, malformed/partial states, and the current `1110`,
-ordinary dispatch remains generic after its mandatory common canonical replay.
+`generic-v1` Stage 18, Stage 19, Stage 20, Stage 21, Stage 22, and Stage 23
+schemas, bytes, artifact names, provider behavior, retries, caches, cleanup,
+and failure behavior remain unchanged. At map `1000`, malformed/partial
+states, and the current `1110`, ordinary dispatch remains generic after its
+mandatory common canonical replay.
 
 Generic code does not enumerate, parse, require, publish, consume, block on, or
 clean any structured-only `scientific_claim_*` Stage 19 name or any of the
@@ -2666,9 +3994,10 @@ a discriminator.
 Once a valid `1111` domain-v2 dispatch enters the structured path, every later
 error is `FAILED`; generic fallback is forbidden.
 
-Structured Stage 21 implementation and structured dispatch or parsing for
-Stages 22-25, E9, `release_check`, release gates, and fresh F0 are outside
-B5-D1A. B5-D1A changes no release authority. Fresh F0 requires separate
+Structured Stage 21-23 implementation is outside the B5-D1A/B5-D1B-R1
+docs-only slices. Stage 24/25, independent reconstruction, E9,
+`release_check`, release gates, and fresh F0 are deferred to B5-D2 or later.
+Neither design slice changes release authority. Fresh F0 requires separate
 explicit authorization.
 
 ## 20. B1-B5 milestone split
@@ -2688,14 +4017,16 @@ implemented Stage 19 and the private Stage 20 handoff while the map remained
 `1000`; their separately reviewed declaration changed it to the current
 `1110`, which still does not activate public/direct structured production.
 
-B5 is split into independently frozen and reviewed slices. B5-D1A freezes only
-the structured Stage 21 deterministic archive authority. A separate Stage 21
-implementation slice must keep `1110`. Later separately frozen and implemented
-slices own Stage 22/23, Stage 24/25, independent reconstruction,
+B5 is split into independently frozen and reviewed slices. B5-D1A freezes the
+structured Stage 21 deterministic archive authority. B5-D1B-R1 freezes the
+structured Stage 22 export and Stage 23 citation-verification authority.
+Separate Stage 21-23 implementation slices must keep `1110`. B5-D2 or later
+separately freezes and implements Stage 24/25, independent reconstruction,
 `pipeline_validation`, `research_release`, `release_check`, release gates, and
 full release integration; every implementation and pre-activation commit
-keeps `1110`. Only a separately named, separately reviewed, implementation-free
-global activation declaration may change exact `1110` to exact `1111`.
+keeps `1110`. Only a separately named, separately reviewed,
+implementation-free global activation declaration may change exact `1110` to
+exact `1111`.
 
 ## 21. Adversarial test matrix
 
@@ -2762,7 +4093,7 @@ global activation declaration may change exact `1110` to exact `1111`.
 | Capability | exact `1000` or current `1110` | public/direct structured remains blocked |
 | Test seam | forged, copied, expired, cross-run, or cross-epoch verified context | reject before provider/publication |
 | Discriminator | domain-v2 marker exists but Stage 17/CFS/generation/replay is invalid | `FAILED`; never generic fallback |
-| Downstream | current public/direct Stage 21 or Stage 22 is asked to consume structured Stage 20 | reject; B5-D1A is design-only and no structured parser/dispatch is implemented |
+| Downstream | current public/direct Stage 21, 22, or 23 is asked to consume structured upstream authority | reject; B5-D1A/B5-D1B-R1 are design-only and no structured parser/dispatch is implemented |
 | Downstream | synchronously forge Stage 21/22 hashes around structured Stage 20 | independent reconstruction rejects; no B4 release authority |
 | Downstream current manifest | current Stage 20 manifest is missing, non-regular, malformed, cannot complete strict replay, or changes identity during held-fd capture, replay, or source fixpoint | reject before opening any Stage 21+ path; no old downstream authority |
 | Downstream generation | current Stage 20 generation or source identity differs from independently rebuilt current-run identity | reject before any Stage 21+ artifact read or write |
@@ -2772,29 +4103,34 @@ global activation declaration may change exact `1110` to exact `1111`.
 | Generic | overlapping Stage 20 `quality_report.json`, `fabrication_flags.json`, or `quality_gate_manifest.json` is stale | unchanged generic entry cleanup may invalidate it; the name never discriminates structured dispatch |
 | Generic | legal generic-v1 input | exact existing schemas, bytes, artifacts, and failure behavior |
 
-## 22. B5-D1A acceptance and non-claims
+## 22. B5-D1B-R1 acceptance and non-claims
 
-B5-D1A is ready for a narrow docs-only commit only when:
+B5-D1B-R1 is ready for a narrow docs-only commit only when:
 
-- the independent Stage 21 schema/semantic and held-fd lifecycle/dispatch
-  reviewers complete a read-only fixpoint;
+- the independent Stage 22 schema/nested-tree/lifecycle reviewer and Stage 23
+  transport/outcome/manifest reviewer complete a read-only fixpoint;
 - no P0 remains and any material safety disagreement returns `STOP`;
 - every JSON fence parses with a duplicate-safe strict parser;
 - Markdown fences are paired;
 - paths, names, versions, counts, capability states, call bounds, lifecycle
-  steps, Stage 20 handoff, archive grammar, and passed/degraded branch are
-  internally consistent;
-- no Stage 17, Stage 19, Stage 20, or designed Stage 21 manifest has a
-  self-hash cycle;
+  steps, Stage 21 handoff, compiler branches, citation routes, and
+  passed/degraded/FAILED matrices are internally consistent;
+- no Stage 17, Stage 19, Stage 20, Stage 21, Stage 22, or Stage 23 manifest
+  example has a self-hash cycle;
 - the docs-only staged or proposed diff contains only this document, and
-  production code and tests have zero diff relative to `B5D1A_BASELINE`;
+  production code and tests have zero diff relative to
+  `B5D1BR1_BASELINE`;
 - `git diff --check` passes;
 - all preexisting untracked files and directories remain untouched.
 
-B5-D1A does not modify production code or tests, implement Stage 21, define or
-implement Stage 22-25, reconstruction, or release integration, activate a
-structured production path, change the capability map, weaken Stage 19, E9,
-`release_check`, or a release gate, accept a release, authorize commit/push, or
-authorize API, resume, or fresh F0 work. It creates no reusable or serialized
-activation authority. A separate adjudication is required both for a
-docs-only commit and for entry into Stage 21 implementation.
+B5-D1B-R1 does not modify production code or tests, implement Stage 21-23,
+define or implement Stage 24-25, reconstruct or integrate a release, activate
+a structured production path, change the capability map, weaken Stage 19, E9,
+`release_check`, or a release gate, accept a release, authorize commit/push,
+or authorize API, resume, or fresh F0 work. It creates no reusable or
+serialized activation authority. Remaining P0 work is Stage 22-23
+implementation and independent review under exact `1110`, followed by B5-D2
+schema/reconstruction/release adjudication. P1 and P2 refinements cannot alter
+the exact schemas, roles, ordering, calls, outcomes, lifecycle, or blocking
+boundary frozen here. Separate adjudication is required for a docs-only
+commit, implementation entry, B5-D2, and eventual activation.
