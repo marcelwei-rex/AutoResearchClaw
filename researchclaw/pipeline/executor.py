@@ -1198,6 +1198,74 @@ def _run_collaboration_loop(
     return result
 
 
+def _execute_structured_stage21_private(
+    release_lock,
+    pre_admission_context,
+) -> StageResult:
+    """Run the private 1110 Stage 21 executor contract without generic hooks."""
+
+    from researchclaw.pipeline import stage21_structured_publication as stage21
+
+    attempt = None
+    try:
+        attempt = stage21.transition_stage21_pre_admission_context(
+            release_lock,
+            pre_admission_context,
+        )
+        provisional = stage21.produce_structured_stage21(
+            release_lock,
+            attempt,
+        )
+        stage21.validate_structured_stage21_immediate_postcondition(
+            release_lock,
+            provisional,
+            artifacts=provisional.artifacts,
+            evidence_refs=provisional.evidence_refs,
+            context=attempt,
+        )
+        # Structured Stage 21 intentionally invokes no PRM, HITL, edit,
+        # prompt, semantic-repair, or repair hook between postconditions.
+        stage21.validate_structured_stage21_terminal_postcondition(
+            release_lock,
+            provisional,
+            artifacts=provisional.artifacts,
+            evidence_refs=provisional.evidence_refs,
+            context=attempt,
+        )
+        result = StageResult(
+            stage=Stage.KNOWLEDGE_ARCHIVE,
+            status=StageStatus.DONE,
+            artifacts=stage21.STRUCTURED_STAGE21_ARTIFACTS,
+            evidence_refs=stage21.STRUCTURED_STAGE21_EVIDENCE_REFS,
+        )
+        stage21.clear_structured_stage21_context(release_lock, attempt)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        cleanup_errors = ()
+        if attempt is not None:
+            try:
+                cleanup_errors = stage21.fail_structured_stage21_attempt(
+                    release_lock,
+                    attempt,
+                )
+            except Exception as cleanup_exc:  # noqa: BLE001
+                cleanup_errors = (str(cleanup_exc),)
+        cleanup_suffix = (
+            "; structured Stage 21 cleanup also failed: "
+            + "; ".join(cleanup_errors)
+            if cleanup_errors
+            else ""
+        )
+        return StageResult(
+            stage=Stage.KNOWLEDGE_ARCHIVE,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error=f"Structured Stage 21 failed: {exc}{cleanup_suffix}",
+            decision="retry",
+        )
+
+
 _STAGE_EXECUTORS: dict[Stage, Callable[..., StageResult]] = {
     Stage.TOPIC_INIT: _execute_topic_init,
     Stage.PROBLEM_DECOMPOSE: _execute_problem_decompose,
