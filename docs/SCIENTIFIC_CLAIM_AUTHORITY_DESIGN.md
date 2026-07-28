@@ -1,18 +1,19 @@
 # Structured Scientific Claim Authority Design
 
-Status: `B4-D3 / STAGE 19-20 SUCCESS AUTHORITY FROZEN / NOT ACTIVATED`
+Status: `B4-D4 / STAGE 19-20 AUTHORITY AND B5 RECOGNITION BOUNDARY FROZEN / NOT ACTIVATED`
 
-Scope: Batch B4-D0/D1/D2/D3 docs-only authority for structured Stage 19
-revision and future Stage 20 replay of the
+Scope: Batch B4-D0/D1/D2/D3/D4 docs-only authority for structured Stage 19
+revision and structured Stage 20 replay of the
 `structured-scientific-claim-v1` capability.
 
 B3 Stage 17 implementation and its separate declaration are complete. The
 code-owned structured capability is now exactly `1000`: Stage 17 publication
 is declared, while Stage 19 revision, Stage 20 replay, and Stage 24/release
-integration remain undeclared. B4-A has implemented but not declared Stage 19.
-B4-D0/D1/D2/D3 freeze schemas, lifecycle, and the Stage 20 threat boundary
-only. They do not implement Stage 20, change the capability map, declare B4,
-or activate the structured production path.
+integration remain undeclared. B4-A and B4-B have implemented but not declared
+Stages 19 and 20. B4-D0/D1/D2/D3/D4 freeze schemas, lifecycle, the Stage 20
+threat boundary, generation-withdrawal semantics, and the B5 recognition
+boundary only. These docs-only revisions do not change the capability map,
+declare B4, or activate the structured production path.
 
 ## 1. Normative boundary
 
@@ -1915,7 +1916,7 @@ string `structured-scientific-claim-v1` is never a quality outcome.
 | quality transport or strict parser failure | `FAILED` / `retry` | cleanup attempted | cleanup attempted | invalidated first | cleanup attempted | no replayable authority; bounded diagnostic sidecar may remain; empty tuples; no downstream |
 | `llm is None` | `FAILED` / `retry` | not created; collision cleanup attempted | not created; collision cleanup attempted | invalidated first | cleanup attempted | no replayable authority; replay still required, zero calls, no default report or fallback |
 | post-publication replay, Snapshot B, or final-capture failure | `FAILED` / `retry` | cleanup attempted | cleanup attempted | invalidated first | cleanup attempted | no replayable authority; diagnostic only; empty tuples; no downstream |
-| immediate or terminal executor postcondition failure | `FAILED` / `retry` | cleanup attempted | cleanup attempted | invalidated first | cleanup attempted | no replayable authority; generation marked withdrawn in the live revocation interface; B5 owns later downstream recognition and invalidation; empty tuples |
+| immediate or terminal executor postcondition failure | `FAILED` / `retry` | cleanup attempted | cleanup attempted | invalidated first | cleanup attempted | current-epoch withdrawal is `FAILED` / `retry`, empty tuples, cleared live published context, and manifest-first invalidation; the current pipeline MUST NOT enter Stage 21 |
 
 Report, flags, signal, or manifest bytes found after a failure are injected,
 stale, or cleanup-failure evidence, never authority unless a new consumer
@@ -1986,11 +1987,28 @@ Stage 20 manifest, report, flags, signal, and four exact temporary ordinary
 files in the code-owned reserved namespace. Fixed-name cleanup is not
 identity-conditional and may unlink an injected reserved-name entry, but it
 does not follow symlink targets, recursively enter replacement directories,
-write through replacement paths, or touch any non-reserved path. It records
-the generation as withdrawn in the live revocation interface but does not
-enumerate, open, mutate, or delete any Stage 21+ output. B5 consumers must
-later recognize the withdrawn generation and own actual invalidation or
-cleanup of their commit points.
+write through replacement paths, or touch any non-reserved path.
+
+B4-B creates no persistent or serialized revocation authority. It adds no
+revocation registry, tombstone, marker, sidecar, config field, caller-provided
+state, or independent live revocation interface. Within the current
+writer/executor epoch, withdrawal is expressed only by the complete
+combination of:
+
+1. `StageResult.status == FAILED` and `decision == "retry"`;
+2. `artifacts == ()` and `evidence_refs == ()`;
+3. the live structured Stage 20 published context being cleared;
+4. manifest-first aggregate invalidation of the Stage 20 reserved success
+   namespace; and
+5. the current pipeline not entering Stage 21.
+
+This combination is current-authority state, not a durable historical
+tombstone. Files remaining after failed cleanup are not authority unless a new
+consumer captures a complete current manifest and passes the full strict
+semantic replay. If a fully replayable current manifest is later restored, it
+is evaluated anew under the current-manifest commit-point rules; B4-D4 makes no
+claim of irreversible historical revocation. B4-B does not enumerate, open,
+mutate, or delete any Stage 21+ output.
 
 ### 18.10 B5 downstream deferral
 
@@ -2007,15 +2025,43 @@ structured schema oracle. Therefore no current Stage 21/22/24 or release
 consumer may consume structured Stage 20 output, and existing fields are not
 sufficient for safe structured recognition.
 
+B5 MUST independently freeze the downstream schemas before implementation.
+Every Stage 21+ structured authority MUST bind:
+
+- the exact current `stage-20/quality_gate_manifest.json` FileRef, including
+  its exact path and SHA-256 over held bytes;
+- the exact independently replayed `generation_binding_sha256`; and
+- the exact Stage 20 source identity, including the source paper and Stage 19
+  authority-manifest FileRefs, while retaining the canonical-evidence and CFS
+  closure required by complete Stage 20 replay.
+
+Before opening any Stage 21+ path, a B5 consumer MUST use held run and Stage 20
+directory fds to capture the current Stage 20 manifest and source closure. It
+MUST require the manifest to be present, regular, single-link, strict-schema,
+and fully semantically replayable, then require its generation and source
+identity to equal the independently rebuilt current-run values. Missing,
+non-regular, malformed, incomplete, unreplayable, wrong-generation, or
+wrong-source current Stage 20 authority rejects before any downstream artifact
+read or write.
+
+Only after that upstream admission succeeds may the consumer capture a
+Stage 21+ authority manifest. Before reading or writing any other downstream
+artifact, it MUST require that downstream manifest to bind the exact current
+Stage 20 manifest FileRef and the same generation/source identity. A missing,
+stale, or inconsistent binding rejects the old downstream authority. A stored
+downstream hash is not an authority oracle. There is no fallback to Stage 17,
+Stage 19, a generic paper, a stored downstream hash, config, caller state, or
+artifact presence.
+
 B5 owns Stage 21/22 dual-schema dispatch, structured publication-mode
 propagation, Stage 24 binding, independent reconstruction, release-check and
-gate integration, recognition of a withdrawn Stage 20 generation, and actual
-invalidation of downstream commit points. Generic-v1 Stage 20, Stage 21, and
-Stage 22 schemas, paths, bytes, and behavior remain unchanged. Stale structured
-Stage 19 or Stage 20 files cannot discriminate generic dispatch. B4
-implementation and a later `1110` declaration remain inactive; only completed
-B5 integration followed by a separately reviewed exact `1111` declaration can
-activate the full structured path.
+gate integration, and actual invalidation or cleanup of downstream commit
+points. Generic-v1 Stage 20, Stage 21, and Stage 22 schemas, paths, bytes, and
+behavior remain unchanged. Stale structured Stage 19 or Stage 20 files cannot
+discriminate generic dispatch. B4 implementation and a later `1110`
+declaration remain inactive; only completed B5 integration followed by a
+separately reviewed exact `1111` declaration can activate the full structured
+path.
 
 ## 19. Generic and release boundary
 
@@ -2035,9 +2081,9 @@ Once a valid `1111` domain-v2 dispatch enters the structured path, every later
 error is `FAILED`; generic fallback is forbidden.
 
 Structured dispatch and parsing for Stages 21-25, E9, `release_check`, release
-gates, and fresh F0 are outside B4-D0, B4-D1, B4-D2, B4-D3, B4-A, and B4-B.
-B4-D0/D1/D2/D3 change no release authority. Fresh F0 requires separate
-explicit authorization.
+gates, and fresh F0 are outside B4-D0, B4-D1, B4-D2, B4-D3, B4-D4, B4-A, and
+B4-B. B4-D0/D1/D2/D3/D4 change no release authority. Fresh F0 requires
+separate explicit authorization.
 
 ## 20. B1-B5 milestone split
 
@@ -2049,11 +2095,14 @@ B4-D0 freezes the Stage 19 design, B4-D1 freezes the Stage 20 success
 authority, and B4-D2 replaces only the Stage 20 staging transaction with the
 four-file creating-fd transaction. B4-D3 corrects the Stage 20 deletion and
 same-UID threat claims without changing quality, source, schema, or release
-authority. Every B4 implementation commit keeps map `1000`. A separately
-reviewed B4 declaration may change it to `1110`, which still does not activate
-public/direct structured production. B4-A implements Stage 19 against this
-frozen schema; B4-B implements only the private Stage 20 handoff and may not
-revise Stage 19 or any downstream schema.
+authority. B4-D4 removes the undefined revocation-interface promise, freezes
+current-epoch Stage 20 withdrawal, and defines the B5 current-manifest
+recognition boundary without adding a persistent schema. Every B4
+implementation commit keeps map `1000`. A separately reviewed B4 declaration
+may change it to `1110`, which still does not activate public/direct structured
+production. B4-A implements Stage 19 against this frozen schema; B4-B
+implements only the private Stage 20 handoff and may not revise Stage 19 or any
+downstream schema.
 
 B5 owns structured Stage 21/22 parsing and dispatch, Stage 24, independent
 reconstruction, `release_check`, release gates, and full release integration.
@@ -2127,28 +2176,34 @@ full structured path.
 | Discriminator | domain-v2 marker exists but Stage 17/CFS/generation/replay is invalid | `FAILED`; never generic fallback |
 | Downstream | current Stage 21 or Stage 22 is asked to consume structured Stage 20 | reject; B5 parser/dispatch is not implemented |
 | Downstream | synchronously forge Stage 21/22 hashes around structured Stage 20 | independent reconstruction rejects; no B4 release authority |
+| Downstream current manifest | current Stage 20 manifest is missing, non-regular, malformed, cannot complete strict replay, or changes identity during held-fd capture, replay, or source fixpoint | reject before opening any Stage 21+ path; no old downstream authority |
+| Downstream generation | current Stage 20 generation or source identity differs from independently rebuilt current-run identity | reject before any Stage 21+ artifact read or write |
+| Downstream binding | a Stage 21+ authority manifest binds a stale Stage 20 FileRef, generation, or source identity | reject that downstream authority before reading or writing any other downstream artifact |
+| Downstream fallback | current Stage 20 admission fails, then a consumer tries Stage 17/19, a generic paper, stored downstream hash, config, caller state, or artifact presence | reject; none is a structured downstream authority oracle |
 | Generic | stale structured-only Stage 19 names or any structured Stage 20 `.tmp` name exists while inactive | generic does not use them as dispatch authority or consume them |
 | Generic | overlapping Stage 20 `quality_report.json`, `fabrication_flags.json`, or `quality_gate_manifest.json` is stale | unchanged generic entry cleanup may invalidate it; the name never discriminates structured dispatch |
 | Generic | legal generic-v1 input | exact existing schemas, bytes, artifacts, and failure behavior |
 
-## 22. B4-D3 acceptance and non-claims
+## 22. B4-D4 acceptance and non-claims
 
-B4-D3 is ready for a narrow docs-only commit only when:
+B4-D4 is ready for a narrow docs-only commit only when:
 
-- the original schema and lifecycle reviewers complete a read-only fixpoint;
+- the independent authority/generation and lifecycle/downstream reviewers
+  complete a read-only fixpoint;
 - no P0 or P1 remains and any new material disagreement returns `STOP`;
 - every JSON fence parses with a duplicate-safe strict parser;
 - Markdown fences are paired;
 - paths, names, versions, counts, capability states, call bounds, lifecycle
   steps, and Stage 20 handoff are internally consistent;
 - neither the Stage 19 nor Stage 20 manifest has a self-hash cycle;
-- the docs-only staged or proposed commit diff contains only this document;
-  preserved unstaged B4-B implementation and tests are excluded without
-  stash, reset, clean, overwrite, or deletion;
+- the docs-only staged or proposed diff contains only this document, and
+  production code and tests have zero diff relative to the B4-D4 baseline;
 - `git diff --check` passes;
 - the original nine untracked groups remain untouched.
 
-B4-D3 does not implement Stage 20, modify downstream consumers, activate a
-structured production path, change the capability map, authorize B4-B or a B4
-declaration, accept a release, authorize commit/push, or authorize API, resume,
-or fresh F0 work.
+B4-D4 does not modify Stage 20 production code or tests, implement or modify
+downstream consumers, activate a structured production path, change the
+capability map, authorize a B4 declaration or B5, accept a release, authorize
+commit/push, or authorize API, resume, or fresh F0 work. It creates no
+persistent or serialized revocation authority and makes no durable historical
+tombstone claim.
