@@ -41,6 +41,7 @@ class StageResult:
     error: str | None = None
     decision: str = "proceed"
     evidence_refs: tuple[str, ...] = ()
+    degraded: bool = False
 
 
 # ---------------------------------------------------------------------------

@@ -1334,6 +1334,123 @@ def _execute_structured_stage22_private(
         )
 
 
+def _execute_structured_stage23_private(
+    release_lock,
+    pre_admission_context,
+    *,
+    metadata_outbound,
+    relevance_outbound,
+) -> StageResult:
+    """Run the private 1110 Stage 23 contract without generic hooks."""
+
+    from researchclaw.pipeline import stage23_structured_publication as stage23
+
+    attempt = None
+    try:
+        attempt = stage23.transition_stage23_pre_admission_context(
+            release_lock,
+            pre_admission_context,
+        )
+        provisional = stage23.produce_structured_stage23(
+            release_lock,
+            attempt,
+            metadata_outbound=metadata_outbound,
+            relevance_outbound=relevance_outbound,
+        )
+        stage23.validate_structured_stage23_immediate_postcondition(
+            release_lock,
+            provisional,
+            artifacts=provisional.artifacts,
+            evidence_refs=provisional.evidence_refs,
+            context=attempt,
+        )
+        # Structured Stage 23 intentionally invokes no PRM, HITL, edit,
+        # prompt, semantic-repair, or repair hook between postconditions.
+        stage23.validate_structured_stage23_terminal_postcondition(
+            release_lock,
+            provisional,
+            artifacts=provisional.artifacts,
+            evidence_refs=provisional.evidence_refs,
+            context=attempt,
+        )
+        result = StageResult(
+            stage=Stage.CITATION_VERIFY,
+            status=StageStatus.DONE,
+            artifacts=stage23.authority.STRUCTURED_STAGE23_ARTIFACTS,
+            evidence_refs=stage23.authority.STRUCTURED_STAGE23_EVIDENCE_REFS,
+            decision="structured-scientific-claim-v1",
+            degraded=provisional.degraded,
+        )
+        stage23.clear_structured_stage23_context(release_lock, attempt)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        cleanup_errors = ()
+        if attempt is not None:
+            try:
+                cleanup_errors = stage23.fail_structured_stage23_attempt(
+                    release_lock,
+                    attempt,
+                )
+            except Exception as cleanup_exc:  # noqa: BLE001
+                cleanup_errors = (str(cleanup_exc),)
+        cleanup_suffix = (
+            "; structured Stage 23 cleanup also failed: "
+            + "; ".join(cleanup_errors)
+            if cleanup_errors
+            else ""
+        )
+        return StageResult(
+            stage=Stage.CITATION_VERIFY,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error=f"Structured Stage 23 failed: {exc}{cleanup_suffix}",
+            decision="retry",
+        )
+
+
+def _execute_structured_stage23_with_pre_admission_private(
+    release_lock,
+    *,
+    llm,
+    metadata_outbound,
+    relevance_outbound,
+    canonical_stage_dir: bool = True,
+) -> StageResult:
+    """Include pre-admission system failures in the exact Stage 23 result."""
+
+    from researchclaw.pipeline import stage23_structured_publication as stage23
+
+    if canonical_stage_dir is not True:
+        return StageResult(
+            stage=Stage.CITATION_VERIFY,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error="Structured Stage 23 failed before attempt",
+            decision="retry",
+        )
+    try:
+        pre = stage23.issue_stage23_pre_admission_context(
+            release_lock, llm=llm
+        )
+    except Exception:  # noqa: BLE001
+        return StageResult(
+            stage=Stage.CITATION_VERIFY,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error="Structured Stage 23 failed before attempt",
+            decision="retry",
+        )
+    return _execute_structured_stage23_private(
+        release_lock,
+        pre,
+        metadata_outbound=metadata_outbound,
+        relevance_outbound=relevance_outbound,
+    )
+
+
 _STAGE_EXECUTORS: dict[Stage, Callable[..., StageResult]] = {
     Stage.TOPIC_INIT: _execute_topic_init,
     Stage.PROBLEM_DECOMPOSE: _execute_problem_decompose,
