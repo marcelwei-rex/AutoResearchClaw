@@ -1,12 +1,15 @@
 # Structured Scientific Claim Authority Design
 
-Status: `B5-D1D / TRUSTED-LOCAL FILESYSTEM THREAT MODEL NORMALIZED / STAGE 22-23 SCHEMAS FROZEN / B5-A2 PAUSED / NOT ACTIVATED`
+Status: `B5-D1E / STAGE 23 PROVIDER-RELEVANCE WIRE FROZEN / TRUSTED-LOCAL FILESYSTEM THREAT MODEL NORMALIZED / B5-A2 PAUSED / NOT ACTIVATED`
 
 Scope: Batch B4-D0/D1/D2/D3/D4 authority for structured Stage 19 revision and
 structured Stage 20 replay, B5-D1A docs-only authority for deterministic
 structured Stage 21 archival, B5-D1B-R1 docs-only authority for structured
-Stage 22 export and Stage 23 citation verification, and B5-D1D project-wide
-trusted-local filesystem normalization under the
+Stage 22 export and Stage 23 citation verification, B5-D1D project-wide
+release reconstruction, and B5-D1E exact Stage 23 provider/relevance wire
+contracts. B5-D1E changes only the Stage 23 report's nested relevance object;
+it does not change a report or manifest root schema.
+This document also records trusted-local filesystem normalization under the
 `structured-scientific-claim-v1` capability.
 
 B3 and B4 implementation and their separately reviewed declarations are
@@ -3545,8 +3548,10 @@ request. There is no fallback, retry, alternate provider/endpoint, cache read,
 cache write, stale result, batched substitution, hidden SDK retry, redirect
 to another provider, or semantic repair. A connection error, timeout, DNS/TLS
 error, 429, 5xx, truncated body, invalid JSON, duplicate key, extra/missing
-field, wrong key/DOI/arXiv-ID/title, empty result, ambiguous result, or
-metadata mismatch yields a non-`verified` existence result. By the fixed
+consumed-projection field, wrong key/DOI/arXiv-ID/title, empty result,
+ambiguous result, or metadata mismatch yields a non-`verified` existence
+result. Bounded unconsumed provider-envelope fields are ignored under Section
+18.13.2.2 rather than copied into authority. By the fixed
 outcome matrix, any non-`verified` existence result is `FAILED` for every
 claim scope. Receiving no response is not permission to try again.
 
@@ -3575,8 +3580,10 @@ error after response content, or semantic rejection is not pure transport and
 cannot retry. There is no fallback, cache, repair, second semantic call, or
 third outbound.
 
-The relevance semantic-call count is `0` only for the exact code-owned
-`missing` branch and otherwise exactly `1`, always within the frozen maximum.
+The relevance semantic-call count is `0` only when the structured relevance
+handle is exact `llm is None` before semantic request construction, producing
+the code-owned `missing` branch; otherwise it is exactly `1`, always within
+the frozen maximum.
 Its outbound count is `0` for `missing`, `1` on first-attempt response or
 failure, `2` on an identical pure-transport retry, or `1..2` when all legal
 attempts end in pure transport failure. Complete output has one finite
@@ -3601,6 +3608,464 @@ fallback/cache/repair calls = 0
 Any wrapper, SDK, redirect, or background task counts toward these bounds.
 An attempt to exceed one of them fails even if returned bytes would otherwise
 verify.
+
+##### 18.13.2.1 Canonical HTTP transcripts and bounded transport
+
+Stage 23 owns a private HTTP/1.1 transport. It does not reuse
+`ClaimVerifier`, a generic citation verifier, `LLMClient.chat()`, an SDK,
+environment proxy discovery, `netrc`, a cookie jar, cache, fallback chain,
+HTTP/2 negotiation, redirect handler, or hidden retry. TLS uses hostname
+verification, the system trust store, and TLS 1.2 or newer. Metadata and
+relevance transports have an exact 5-second connect timeout, 10-second read
+inactivity timeout, and 15-second monotonic total deadline. A transport may
+read a monotonic clock solely to enforce those limits; Stage 23 makes no
+authority wall-clock call and persists no transport time.
+
+Every actual request head is at most 16,384 bytes. Every response head is at
+most `MAX_RESPONSE_HEAD_BYTES = 16384` bytes and each response header line is
+at most 8,192 bytes. The first byte beyond either applicable limit is captured
+before rejection: total-head overflow therefore captures exactly 16,385
+bytes; line overflow includes its first over-limit byte without exceeding the
+16,385-byte total overflow capture. These limits and capture boundaries are
+byte counts independent of socket read chunking.
+
+`request_sha256` is lowercase SHA-256 over this canonical non-secret request
+transcript, with literal LF bytes and no terminal bytes beyond the entity:
+
+```text
+METHOD LF
+HTTPS_ORIGIN LF
+REQUEST_TARGET LF
+Header-Name: value LF
+Header-Name: value LF
+LF
+ENTITY_BODY
+```
+
+The header lines are the route-specific ordered non-secret headers frozen
+below. The transcript binds method, parsed HTTPS origin, complete path/query
+request target, header spelling/order/value, and exact entity bytes.
+Authorization values are excluded. A change to origin, path, query, header,
+or body changes the digest, except that the held Authorization value is
+cross-checked only by private telemetry as explicitly frozen. The transcript
+contains neither the report nor a manifest and therefore creates no self-hash
+edge.
+
+All outbound requests use `Accept-Encoding: identity`; a response
+`Content-Encoding` is legal only when absent or exact case-insensitive
+`identity`. No decompression occurs. Transfer-Encoding is either absent or
+one exact case-insensitive `chunked`; a simultaneous Content-Length, multiple
+transfer codings, chunk extension, or nonempty trailer rejects. Dechunked
+entity bytes, not chunk-size lines or chunk boundaries, enter the response
+transcript. A Content-Length must be one canonical nonnegative decimal, must
+not be duplicated, and must equal the complete entity size.
+
+`response_sha256` is lowercase SHA-256 of this canonical bounded response
+transcript:
+
+```text
+STATUS_CODE LF
+Content-Type: <value-or-absent> LF
+Content-Encoding: <value-or-absent> LF
+Content-Length: <value-or-absent> LF
+Transfer-Encoding: <value-or-absent> LF
+LF
+CAPTURED_ENTITY_BYTES
+```
+
+Header names have the spelling and order above. A completely parsed selected
+header has surrounding optional whitespace removed; an absent selected
+header uses exact `<absent>`. Duplicate, conflicting, malformed, overlong, or
+incompletely parsed response heads do not use first-value, last-value, or
+comma-join behavior. They use exactly:
+
+```text
+STATUS_OR_000 LF
+invalid-head LF
+raw-head-prefix-sha256:<sha256> LF
+raw-head-prefix-size:<decimal> LF
+head-overflow:<true|false> LF
+selected-fields:unavailable LF
+LF
+```
+
+`STATUS_OR_000` is the three-digit status only if it was completely and
+strictly parsed; otherwise it is `000`. The raw-head prefix begins at the
+first response byte. A normal complete head is captured through and including
+its terminating empty line. An early parser failure hashes every response-head
+byte actually received through the bytewise abort boundary. Head overflow
+hashes exactly the 16,385-byte prefix. Once an invalid head is recognized,
+Stage 23 reads no entity body. Raw head bytes and the transcript are held only
+in bounded memory and are never persisted.
+
+For a valid head, a normal response transcript contains the complete bounded
+entity. A truncated response contains every bounded entity byte actually
+received. Entity overflow reads and captures exactly
+`MAX_RESPONSE_BYTES + 1` bytes, then stops without reading an unbounded
+remainder. Thus chunking never changes a digest. Before any status, header, or
+body byte, pure transport has `response_sha256 = null`. Once any response
+material is observed, `response_sha256` is non-null, including status-only,
+invalid-head, empty-entity, truncation, and overflow failures. Raw response
+heads, bodies, and transcripts are discarded after the strict in-memory
+projection and digest cross-check.
+
+##### 18.13.2.2 Exact metadata provider wires
+
+All three routes issue exactly one `GET`, have an empty entity, accept only
+HTTP status `200`, use the common timeouts and response-head limits above, and
+send these on-wire headers in exact order:
+
+```text
+Host: <origin authority>
+User-Agent: AutoResearchClaw-Stage23/1
+Accept: <route media type>
+Accept-Encoding: identity
+Connection: close
+```
+
+There is no explicit default port in the fixed metadata origins. Query and
+path values are strict UTF-8 RFC 3986 encoding: only ASCII letters, digits,
+`-`, `.`, `_`, and `~` remain literal; every other byte uses uppercase `%HH`.
+Spaces are `%20`, never `+`. Parameter names, parameter order, separators, and
+empty/nonempty values are exact.
+
+| Route | Exact origin and request target | Accept and accepted response media type | Entity cap |
+|---|---|---|---:|
+| `crossref-doi` | `https://api.crossref.org` plus `/works/{doi-segment}`; normalized DOI is one encoded segment, so `/` is `%2F`; no query | request `application/json`; response media type exact `application/json` or `application/vnd.crossref-api-message+json`, charset absent or UTF-8 | 1,048,576 |
+| `arxiv-id` | `https://export.arxiv.org` plus `/api/query?id_list={arxiv-id}&start=0&max_results=2` | request `application/atom+xml`; response media type exact `application/atom+xml` or `application/xml`, charset absent or UTF-8 | 1,048,576 |
+| `openalex-title` | `https://api.openalex.org` plus `/works?search={title-match-key}&select=id%2Cdoi%2Ctitle%2Cpublication_year%2Cids&per-page=200` | request `application/json`; response media type exact `application/json`, charset absent or UTF-8 | 2,097,152 |
+
+Media-type tokens and the optional charset name are compared
+case-insensitively after strict parsing; no other parameter is accepted.
+A redirect, 206, 3xx, 4xx including 429, 5xx, wrong content type, illegal
+encoding, header failure, truncation, overflow, malformed payload, ambiguity,
+or transport failure is non-`verified`. Metadata never retries and never
+falls back.
+
+Private in-memory metadata telemetry uses this exact exhaustive
+classification before all classes collapse to non-`verified`:
+`provider_dns`, `provider_connection`, `provider_tls`, `provider_timeout`,
+`provider_http_status`, `provider_redirect`, `provider_header_invalid`,
+`provider_content_type`, `provider_content_encoding`, `provider_truncated`,
+`provider_oversized`, `provider_malformed`, `provider_identity_mismatch`, and
+`provider_ambiguous`. Status 429 and 5xx are `provider_http_status`; a redirect
+is `provider_redirect`; duplicate, missing, or wrong-type consumed fields and
+JSON/XML/date/title rejection are `provider_malformed`. These are bounded
+diagnostics, not report fields, and contain no raw bytes, query value, title,
+identifier, or credential.
+
+JSON is strict UTF-8 without BOM. Duplicate object keys at any depth, NaN,
+Infinity, a depth over 16, more than 4,096 aggregate arrays/objects, or a
+string over 16,384 UTF-8 bytes rejects. A JSON boolean is never an integer.
+Provider envelope fields outside the consumed projection may be ignored only
+after the entire envelope has passed these bounds and duplicate checks; they
+never enter authority.
+
+The arXiv parser is namespace-aware strict XML: UTF-8 without BOM, depth at
+most 16, at most 4,096 elements, each text node at most 16,384 UTF-8 bytes,
+and aggregate text at most 1,048,576 UTF-8 bytes. DTDs, entity declarations or
+expansion, XInclude, external resources, and network reads are forbidden.
+Element expanded-name namespace URIs form this exact closed set:
+
+```text
+http://www.w3.org/2005/Atom
+http://a9.com/-/spec/opensearch/1.1/
+http://arxiv.org/schemas/atom
+http://www.w3.org/XML/1998/namespace
+```
+
+The URI, not a prefix spelling, is compared. An element with no namespace, a
+fifth namespace, or namespace rebinding rejects. Ordinary unnamespaced
+attributes are never authority inputs. Only Atom `feed/entry/id`, `title`,
+and `published` are consumed. OpenSearch and arXiv extension elements are
+bounded-parsed and then ignored; they cannot affect candidate selection,
+identity, title, year, or outcome.
+
+##### 18.13.2.3 Identity normalization and matching
+
+Normalization exists only for provider identity matching. It cannot change
+the held paper, bibliography, citation plan, scientific claim registry,
+rendered claim sentence, or any scientific-authority text.
+
+**DOI.** The input is one Unicode scalar string. Code trims Unicode White_Space,
+applies NFKC once, and removes at most one case-insensitive prefix from exact
+`doi:`, `https://doi.org/`, or `https://dx.doi.org/`. The remainder must be
+ASCII, is ASCII-lowercased, has 7..255 bytes, contains no whitespace, percent
+sign, control, or DEL, and must fully match:
+
+```text
+10\.[0-9]{4,9}/[-._;()/:a-z0-9]+
+```
+
+The Crossref root must be a bounded JSON object with exact provider status
+`ok`, message type `work`, and one message object. Its DOI is normalized by
+the same algorithm and must equal the requested normalized DOI exactly.
+Title-only similarity can never substitute for a DOI match. The message title
+must be an array containing exactly one nonempty string whose title match key
+equals the held bibliography title key. Year uses the first present field in
+the exact precedence `published-print`, `published-online`, `issued`; the
+selected field must contain exactly one usable first date-parts year.
+
+**arXiv request identity.** Held bibliography input is one scalar string. Code
+trims Unicode White_Space, applies NFKC once, lowercases ASCII, and removes at
+most one case-insensitive exact prefix: `arxiv:`,
+`https://arxiv.org/abs/`, or `https://arxiv.org/pdf/`. Only the PDF URL form
+may then remove one terminal `.pdf`. The result is ASCII, at most 64 bytes,
+and fully matches one of:
+
+```text
+[0-9]{4}\.[0-9]{4,5}(v[1-9][0-9]*)?
+[a-z][a-z0-9-]*(\.[a-z]{2})?/[0-9]{7}(v[1-9][0-9]*)?
+```
+
+Code splits that normalized request into `base_id` and optional `version`.
+An explicit version is preserved exactly. A versionless request denotes
+paper-level arXiv identity and is not rewritten to a caller-selected or
+guessed version. The normalized request string, including whether it carried
+a version, determines the fixed `id_list` request target and is bound by the
+held bibliography, canonical request transcript, and `request_sha256`.
+
+**arXiv response identity.** The Atom `entry/id` string is parsed only as an
+identifier and is never dereferenced. It must be ASCII and have exactly one
+of these case-sensitive prefixes:
+
+```text
+http://arxiv.org/abs/<identifier>
+https://arxiv.org/abs/<identifier>
+```
+
+The authority is exact lowercase `arxiv.org`, with no userinfo, port, query,
+or fragment. The path is exact `/abs/<identifier>` with one nonempty final
+identifier, no percent encoding, backslash, double slash, or dot segment.
+The extracted complete versioned identifier is ASCII, at most 64 bytes, must
+match the same new/legacy base grammar above, and must always end in a legal
+`v[1-9][0-9]*`. HTTP and HTTPS response prefixes normalize to the same
+`(base_id, version)` identity; provider outbound remains HTTPS-only.
+
+The bounded feed must have exactly one Atom entry and no error entry. Matching
+is exhaustive:
+
+| Request | Response | Result |
+|---|---|---|
+| `base_id vN` | same `base_id vN` | accept |
+| `base_id vN` | same base with another version, or no version | reject |
+| versionless `base_id` | same base with any legal `vN` | accept |
+| versionless `base_id` | same base without a version | reject |
+| any request | different `base_id` | reject |
+
+Title key must also equal the held bibliography title key and Atom
+`published` must supply a legal four-digit year. Title, year, LLM output,
+provider rank, or caller state can never replace base/version matching.
+Successful `metadata.arxiv_id` stores the response's complete normalized
+versioned identifier, including `vN`; it does not store a versionless request
+form.
+
+**Title.** Input must be valid scalar UTF-8 of at most 4,096 bytes. Code applies
+NFKC; maps every Unicode White_Space character and every Unicode General
+Category `P*` punctuation character to ASCII space; collapses consecutive
+spaces; trims; and applies full Unicode casefold. It performs no fuzzy,
+token-similarity, deaccenting, stemming, year-based, LLM, or caller-selected
+match. The resulting match key must be nonempty, at most 1,024 Unicode scalar
+values, and at most 4,096 UTF-8 bytes. Provider titles use the identical
+algorithm.
+
+The stored projected title is not the casefolded match key. It is the provider
+title after NFKC, Unicode White_Space collapse to ASCII space, trim, scalar
+validation, and the same 1,024-scalar/4,096-byte limits, but before punctuation
+mapping and casefold. A control character, DEL, empty result, or over-limit
+display title rejects.
+
+For OpenAlex, `meta.count` must be a true integer `0..200` and must equal the
+bounded `results` array length, proving that the one response contains the
+reported candidate set. Exactly one result title must equal the request title
+match key. Zero matches, two matches, `meta.count > 200`, a count/length
+mismatch, or any inability to prove unique mechanical identity is ambiguous
+and non-`verified`. DOI, arXiv ID, year, an LLM, rank, score, caller flag, or
+persisted choice cannot break a title tie.
+
+For every route, year is a true integer, never a boolean, in `1000..2999`.
+Consumed required values that are missing, duplicated, wrong-type, malformed,
+or ambiguous reject. The code-owned bounded authority projection is the
+existing citation entry with exact outer keys `cite_key`, `route_class`,
+`endpoint_class`, `request_sha256`, `response_sha256`, `outbound_count`,
+`status`, and `metadata`, plus exact nested metadata keys `title`, `doi`,
+`arxiv_id`, `year`, and `source`. This combined projection binds title, DOI,
+arXiv ID, year, source, route/endpoint class, and both wire digests without a
+report-root or manifest change. Crossref projects the normalized DOI and null
+arXiv ID; arXiv projects the normalized arXiv ID and null DOI; OpenAlex
+projects both identifiers as null.
+
+Raw responses exist only in bounded memory. The projection and digests are
+built from the same captured bytes, then the raw request/response is
+discarded. A stored projection and synchronized stored hashes cannot replace
+strict parsing of the current epoch's held transport capture. Prompt,
+reasoning, secret, credential, complete provider envelope, and unused
+provider fields are never persisted.
+
+##### 18.13.2.4 Private relevance request and response wire
+
+Relevance uses a new private `Stage23RelevanceTransport`, never
+`LLMClient.chat()` or a generic verifier. A registry-issued held transport
+spec is built only from the fully replayed canonical configuration. It binds
+exact provider ID, primary model, raw base URL, parsed HTTPS origin, endpoint
+path, wire-policy ID, timeout/cap policy, and one held credential handle.
+Fallback models/URLs, extra caller headers, proxy bridges, alternate wire
+APIs, and provider SDKs are forbidden.
+
+The raw base URL is not trimmed, deduplicated, repaired, or guessed. It must
+parse as lowercase `https` plus authority and an optional path prefix. It
+rejects non-HTTPS, userinfo, query, fragment, trailing slash, empty segment,
+double slash, backslash, dot segment, percent-encoded slash/backslash/dot
+segment, or a path already ending in or containing `/chat/completions`.
+Origin is parsed scheme plus authority. Endpoint path is the validated
+existing path prefix plus exact `/chat/completions`:
+
+```text
+https://host    -> origin https://host, path /chat/completions
+https://host/v1 -> origin https://host, path /v1/chat/completions
+```
+
+Failure to construct exactly one provider/model/origin/path/spec is a
+structured system/configuration failure, not relevance `missing`, `failed`,
+or `unavailable`.
+
+The held credential is a raw ASCII token of 1..4,096 bytes, every byte in
+`0x21..0x7e`. Whitespace, CTL, CR, LF, DEL, OWS, Unicode, and header injection
+are impossible under that grammar. Code alone constructs
+`Authorization: Bearer <token>`. The complete actual request head remains at
+most 16,384 bytes. Credential absence, invalidity, or head overflow is a
+structured system/configuration failure. Credential bytes never enter a
+digest, log, exception, diagnostic, report, or artifact. A retry uses the
+same held credential identity and exact bytes.
+
+The code-owned paper projection is built only from replayed upstream
+authority and has exact key order:
+
+```json
+{
+  "schema_version": 1,
+  "paper_sha256": "<sha256>",
+  "abstract_claim_ids": ["<claim-id>"],
+  "abstract_sentences": ["<rerendered sentence>"]
+}
+```
+
+Paper path/hash/size remains separately bound by the exact held Stage 22
+FileRef in the user payload. `abstract_claim_ids` equals the complete Stage 19
+abstract `ordered_claim_ids` in exact order. Its count is nonzero and no
+greater than the independently replayed scientific claim registry's record
+count for `target_section=abstract`. IDs are duplicate-free, belong to that
+registry section and generation, and satisfy the replayed Stage 19 selection.
+For every ID, code independently rerenders the registry claim from held facts;
+`abstract_sentences` has identical length/order and contains those exact
+nonempty strings. The complete canonical projection is at most 16,384 UTF-8
+bytes. Nothing is truncated. Missing, duplicate, foreign, reordered,
+rerender-mismatched, empty, or oversized projection data is a structured
+system failure. No complete paper, preamble, free prose, caller title,
+caller abstract, or Markdown title/abstract extractor is used.
+
+The user content is canonical UTF-8 JSON with exact key order
+`schema_version`, `task`, `paper`, `claim_projection`, `cited_keys`, and
+`metadata`. `schema_version` is true integer `1`; task is exact
+`stage23_paper_relevance`; `paper` is the exact Stage 22 paper
+path/hash/size FileRef; `claim_projection` is the object above; `cited_keys`
+is the exact sorted report closure; and `metadata` is the citation projection
+array in the same order. The canonical serializer emits no BOM, insignificant
+space, or trailing newline. The system message is exactly:
+
+```text
+Score each ordered citation for relevance to the bounded governed abstract claims. Return only the required JSON object.
+```
+
+The OpenAI-compatible request is one `POST` and sends headers in exact on-wire
+order:
+
+```text
+Host: <endpoint authority>
+User-Agent: AutoResearchClaw-Stage23/1
+Accept: application/json
+Accept-Encoding: identity
+Content-Type: application/json; charset=utf-8
+Content-Length: <canonical decimal entity length>
+Authorization: Bearer <held token>
+Connection: close
+```
+
+The non-secret request transcript omits only the Authorization line. The
+entity is canonical UTF-8 JSON, at most 131,072 bytes, with exact root order
+`model`, `messages`, `temperature`, `max_tokens`, `response_format`, and
+`stream`. `model` is the held primary model. `messages` has exactly two
+objects, each with exact key order `role`, `content`: the first is role
+`system` with the fixed system message; the second is role `user` with the
+canonical user JSON string. Temperature is the true integer `0`; `max_tokens`
+is the true integer `2048`;
+`response_format` is exact `{"type":"json_object"}`; `stream` is false.
+
+The relevance response entity cap is 262,144 bytes. Status must be 200 and
+media type must be `application/json` with charset absent or UTF-8. The
+bounded raw provider envelope is duplicate-safe strict JSON under the common
+JSON limits. Standard unrelated bounded envelope fields such as ID, object,
+created, and usage may be ignored. The consumed projection requires the
+returned model to equal the requested model, exactly one choice, assistant
+role, one string content, finish reason exact `stop`, and no tool call.
+Assistant content is strict JSON with exact root key `scores`; each array item
+has exact keys `cite_key` and `score`. The array has exact cited-key
+order/closure. Score is a JSON string matching `[0-9]\.[0-9]{6}`, parsed as
+Decimal, canonical in `0.000000..1.000000`; JSON numbers, booleans, NaN, and
+Infinity reject.
+
+Only a first-attempt DNS, connect, reset, timeout, or TLS I/O failure before
+any response status/header/body byte is a retryable pure transport failure.
+Certificate, hostname, configuration, type, credential, endpoint, or policy
+failure is a structured system failure. Any error after any response material
+is relevance `failed`, including status-only, redirect, 429/5xx, wrong media
+type, invalid head, partial/truncated/overflow entity, provider-envelope
+failure, empty content, or score-schema/semantic failure. A legal second
+outbound uses identical provider, model, origin, target, ordered non-secret
+headers, entity bytes, request digest, timeout/cap policy, and held credential
+identity. It cannot lead to a third outbound.
+
+##### 18.13.2.5 Relevance states and system-failure boundary
+
+`missing` is produced if and only if the structured relevance LLM handle is
+exactly `llm is None` before semantic request construction. It is never
+selected by a model response, empty response, malformed response, config
+string, caller flag, persisted artifact, transport error, or missing/invalid
+credential. If `llm` is non-null, Stage 23 begins exactly one semantic
+operation and its report state can only be `complete`, `failed`, or
+`unavailable`.
+
+Canonical configuration that cannot uniquely construct provider, model,
+origin, endpoint, held credential, or transport spec; a wrong type; or any
+policy/system validation failure is outside the four-state relevance union.
+It returns exact Stage 23 `FAILED`, outer `decision="retry"`, empty artifacts
+and evidence refs, manifest-first cleanup where applicable, and zero Stage 23
+authority publication. It is not relevance `missing`, `failed`, or
+`unavailable`, and cannot degrade.
+
+The four persisted report states are mutually exclusive and exhaustive:
+
+| Status | Semantic calls | Outbound attempts | Request SHA | Response SHA | Retry fingerprint | Scores | Error class |
+|---|---:|---:|---|---|---|---|---|
+| `complete` | 1 | 1 or 2 | non-null | non-null | null for 1; request SHA for 2 | exact complete ordered closure | null |
+| `failed` | 1 | 1 or 2 | non-null | non-null | null for 1; request SHA for 2 | `[]` | `relevance_semantic_failure` |
+| `unavailable` | 1 | 1 or 2 | non-null | null | null for 1; request SHA for 2 | `[]` | `pure_transport_exhausted` |
+| `missing` | 0 | 0 | null | null | null | `[]` | `relevance_missing` |
+
+`incomplete` is not a fifth persisted status; it denotes only an invalid or
+unfinished in-memory operation and fails Stage 23. In particular, this legal
+sequence:
+
+```text
+attempt 1 -> pure transport failure before any response material
+attempt 2 -> identical request -> malformed/schema-invalid/semantic-invalid response
+```
+
+is exact `failed`, `semantic_calls=1`, `outbound_attempts=2`,
+`retry_fingerprint=request_sha256`, empty scores, and
+`error_class=relevance_semantic_failure`. It is not `unavailable`, cannot
+retry again, and follows the existing claim-scope outcome matrix:
+`research_release` fails; `pipeline_validation` and `exploratory` degrade.
 
 #### 18.13.3 Exact verification report schema v2
 
@@ -3661,6 +4126,8 @@ for one citation is:
     "status": "complete",
     "semantic_calls": 1,
     "outbound_attempts": 1,
+    "request_sha256": "<sha256>",
+    "response_sha256": "<sha256>",
     "retry_fingerprint": null,
     "scores": [
       {
@@ -3701,10 +4168,10 @@ Every `citations` entry has exactly `cite_key`, `route_class`,
 `status`, and `metadata`; array order equals `cited_keys`. Route is exact
 `crossref-doi`, `arxiv-id`, or `openalex-title`, and endpoint class is exact
 `crossref`, `arxiv`, or `openalex` under the fixed precedence rule.
-`request_sha256` binds the exact code-owned outbound request bytes;
-`response_sha256` binds the exact response bytes consumed by the strict
-parser. Both are lowercase SHA-256 and are independently recomputed from held
-in-memory transport captures before those captures are discarded.
+`request_sha256` binds the exact canonical non-secret request transcript and
+`response_sha256` binds the exact canonical bounded response transcript under
+Section 18.13.2.1. Both are lowercase SHA-256 and are independently recomputed
+from held in-memory transport captures before those captures are discarded.
 `outbound_count` is the true integer `1` for every publishable metadata result
 and cross-matches transport telemetry; a publishable metadata result has exact
 status `verified`.
@@ -3717,30 +4184,36 @@ route.
 Metadata is evidence of bibliographic identity, not evidence that a paper
 supports a manuscript claim.
 
-`relevance` has exactly `status`, `semantic_calls`, `outbound_attempts`,
-`retry_fingerprint`, `scores`, and `error_class`. For `complete`, status is
-exact `complete`, semantic calls is true integer `1`, outbound attempts is
-`1` or `2`, scores has exact cited-key closure/order, and error class is null.
-Each score has exactly `cite_key` and `score`; score is a six-place canonical
-decimal string in `[0.000000,1.000000]`. `retry_fingerprint` is null for one
-outbound and the lowercase SHA-256 of the identical request bytes for two.
+The only report-schema delta made by B5-D1E is nested: `relevance` changes from
+six to exactly eight keys in canonical order `status`, `semantic_calls`,
+`outbound_attempts`, `request_sha256`, `response_sha256`,
+`retry_fingerprint`, `scores`, and `error_class`. Report schema version remains
+true integer `2` and the exact 13 root keys above do not change.
+
+For `complete`, semantic calls is true integer `1`, outbound attempts is `1`
+or `2`, both request and response SHA are non-null lowercase SHA-256, scores
+has exact cited-key closure/order, and error class is null. Each score has
+exactly `cite_key` and `score`; score is a six-place canonical decimal string
+in `[0.000000,1.000000]`. `retry_fingerprint` is null for one outbound and
+equals `request_sha256` for two.
 
 For exhausted pure transport, status is exact `unavailable`, semantic calls
-is true integer `1`, outbound attempts is `1` or `2`, scores is the empty
-array, and `error_class` is exact `pure_transport_exhausted`.
-`retry_fingerprint` is null after one non-retryable-at-runtime transport
-attempt, or the exact request SHA-256 after two identical attempts. No raw
-provider body, prompt, secret, URL query credential, traceback, or unbounded
-diagnostic is persisted.
+is true integer `1`, outbound attempts is `1` or `2`, request SHA is non-null,
+response SHA is null, scores is empty, and error class is exact
+`pure_transport_exhausted`. Retry fingerprint is null for one outbound and
+equals request SHA for two.
 
-For the exact missing branch, status is `missing`, semantic calls and outbound
-attempts are true integer `0`, retry fingerprint is null, scores is empty, and
-error class is exact `relevance_missing`. For a response-level semantic or
-schema failure, status is `failed`, semantic calls and outbound attempts are
-true integer `1`, retry fingerprint is null, scores is empty, and error class
-is exact `relevance_semantic_failure`. No missing, unavailable, or failed
-branch fabricates a score. Low relevance is represented only by a complete
-score array containing at least one value below `0.500000`.
+For exact `missing`, semantic calls and outbound attempts are true integer
+zero; request SHA, response SHA, and retry fingerprint are null; scores is
+empty; and error class is exact `relevance_missing`. For a response-level
+semantic/schema failure, status is `failed`, semantic calls is true integer
+`1`, outbound attempts is `1` or `2`, both digests are non-null, scores is
+empty, error class is exact `relevance_semantic_failure`, and retry
+fingerprint is null for one outbound or request SHA for two. No missing,
+unavailable, or failed branch fabricates a score. Low relevance is represented
+only by a complete score array containing at least one value below `0.500000`.
+No raw provider body, prompt, secret, URL query credential, traceback, or
+unbounded diagnostic is persisted.
 
 `outcome` is exact `passed` or `degraded` and is mechanically derived from
 `claim_scope`, upstream quality, existence closure, and relevance under
@@ -3748,7 +4221,8 @@ Section 18.13.5. The report persists no raw response, raw request, prompt, API
 key, credential, reasoning, chain-of-thought, or provider body. Only exact
 request/response digests and the bounded parsed metadata are retained.
 `generated` is copied exactly from the fully replayed Stage 22 manifest;
-Stage 23 makes zero clock calls.
+Stage 23 makes zero authority wall-clock calls; bounded transport deadlines
+use only an unpersisted monotonic clock as frozen in Section 18.13.2.1.
 
 #### 18.13.4 Exact Stage 23 manifest schema v2 and four-file tuples
 
@@ -3982,15 +4456,18 @@ The matrix is exhaustive and code-owned:
 | any result not exact `verified`, or cited closure invalid | any/not called | any | either | exact `FAILED`, manifest-first cleanup, empty tuples |
 | all exact `verified` | complete and every score `>=0.500000` | any | `passed` | `DONE`, `outcome=passed`, exact four-tuples |
 | all exact `verified` | complete and every score `>=0.500000` | any | `degraded` | `DONE`, `outcome=degraded`, exact four-tuples |
-| all exact `verified` | missing, unavailable, failed, incomplete, or any score `<0.500000` | `research_release` | either | exact `FAILED`, manifest-first cleanup, empty tuples |
-| all exact `verified` | missing, unavailable, failed, incomplete, or any score `<0.500000` | `pipeline_validation` | either | `DONE`, `outcome=degraded`, exact four-tuples |
-| all exact `verified` | missing, unavailable, failed, incomplete, or any score `<0.500000` | `exploratory` | either | `DONE`, `outcome=degraded`, exact four-tuples |
+| all exact `verified` | missing, unavailable, failed, or any score `<0.500000` | `research_release` | either | exact `FAILED`, manifest-first cleanup, empty tuples |
+| all exact `verified` | missing, unavailable, failed, or any score `<0.500000` | `pipeline_validation` | either | `DONE`, `outcome=degraded`, exact four-tuples |
+| all exact `verified` | missing, unavailable, failed, or any score `<0.500000` | `exploratory` | either | `DONE`, `outcome=degraded`, exact four-tuples |
 | provider/relevance call-bound, retry-class, fallback, cache, or route violation | any | any | either | exact `FAILED`, cleanup, empty tuples |
 | publication, source fixpoint, namespace, tuple, immediate, or terminal postcondition fails | irrelevant | any | either | exact `FAILED`, cleanup, empty tuples |
 
 Existence verification is mandatory for every scope. Relevance is
 claim-scope-sensitive exactly as shown: any adverse relevance state fails
 `research_release` and degrades only `pipeline_validation` or `exploratory`.
+`incomplete` is not a matrix state and cannot reach a `DONE` row; an invalid
+or unfinished in-memory relevance operation fails Stage 23 through the
+publication/postcondition failure row with cleanup and empty tuples.
 A low score is paper-level relevance evidence; it neither deletes the
 citation nor decides scientific support. Pure-transport exhaustion records
 absence of relevance evidence, not a fabricated score. Upstream `degraded`
@@ -4127,11 +4604,33 @@ interleavings:
 | Stage 22 tuple | substitute `paper.tex` for `code/`; omit `code/`; use `code` or another wrong directory slash/prefix; reorder, omit, or duplicate any tuple member; or return `DONE` before validators | immediate/terminal reject; exact empty failure tuples |
 | Stage 23 cited closure | 0, 33, duplicate, missing, unplanned, Markdown/LaTeX mismatch, or shadow bibliography key | fail before provider/output I/O |
 | Provider route | violate DOI -> Crossref, else arXiv ID -> arXiv, else title -> OpenAlex precedence; choose alternate provider, fallback, retry, cache, batch substitution, redirect, or second outbound | call-bound/route failure; cleanup; empty tuples |
-| Provider evidence | change or omit endpoint/route class, request SHA-256, response SHA-256, or recompute a digest over bytes not consumed by the strict parser | report/manifest replay rejects; raw request/response remains unpersisted |
-| Relevance retry | retry after response bytes/HTTP status, change request fingerprint, make second semantic call, third outbound, fallback, cache, or repair | `FAILED`; not degraded; cleanup |
-| Relevance semantics | missing/failed/low relevance, duplicate/extra/missing key, wrong order, malformed/nonfinite/out-of-range score | no retry/repair; `research_release` fails, `pipeline_validation`/`exploratory` degrade |
+| Provider request wire | change method/origin/path/query parameter spelling/order, `%HH` case, `%20` to `+`, DOI `%2F`, Host/header order/value, body, proxy, port, or endpoint prefix without changing a body-only digest | canonical non-secret request transcript changes or strict route rejects; no outbound substitution |
+| Provider response wire | redirect, 206, 429, 5xx, wrong media/charset, nonidentity compression, TE+CL, bad length, chunk extension/trailer, truncation, body cap+1, response-head 16,385th byte, or line cap+1 | non-`verified`; zero fallback/retry; bounded canonical response digest; raw bytes discarded |
+| Provider JSON | duplicate key at any depth, extra consumed key, missing/wrong-type consumed field, depth/container/string overflow, NaN/Infinity, or boolean used as integer | strict bounded parser rejects; citation non-`verified` |
+| Provider XML | DTD, entity, XInclude, external read, fifth/no element namespace, namespace rebinding, forged non-Atom authority field, depth/element/text overflow | strict parser rejects; OpenSearch/arXiv extensions never become authority |
+| DOI identity | provider title is similar or exact but returned normalized DOI differs; title-only result substitutes for DOI | reject; DOI exact match is mandatory |
+| arXiv response URI | dereference Atom ID; use non-arXiv host, uppercase host, userinfo, port, query, fragment, PDF path, percent encoding, backslash, double slash, dot segment, no version, over-64-byte identifier, or non-HTTP(S) scheme | reject; only exact bounded HTTP/HTTPS `arxiv.org/abs/<versioned-id>` identifier strings normalize; outbound remains HTTPS |
+| arXiv version identity | explicit request `base vN` receives another/no version; versionless request receives no version; any request receives another base; title/year/LLM/rank/caller substitutes for ID | reject; versionless request accepts only same-base legal versioned response, explicit request requires exact base/version, and projected ID retains response `vN` |
+| OpenAlex ambiguity | zero exact-title candidates, multiple exact candidates, `meta.count > 200`, count/results mismatch, rank/year/DOI/LLM/caller tie-break | reject as non-verified; no second page or provider |
+| Provider projection | admit complete provider envelope, raw body, unused field, prompt, reasoning, secret, or credential into authority | exact combined citation/metadata projection rejects; sensitive/raw material is never published |
+| Provider evidence | change or omit endpoint/route class, canonical request SHA-256, canonical response SHA-256, or hash reserialized/decoded bytes rather than the captured transcript | report/manifest replay rejects; raw request/response remains unpersisted |
+| Stored evidence forgery | synchronously rewrite parsed projection, route, counters, request/response hashes, report, and manifest without the current held transport capture | independent current-epoch capture/parse/digest rebuild rejects; stored values are not transport authority |
+| Relevance first-response failure | first outbound returns malformed/empty, duplicate/extra/missing field, wrong order/model/choice/role/finish, nonfinite/out-of-range/numeric/bool score, status/header/partial body, redirect, 429, or 5xx | exact `failed` with semantic=1/outbound=1, non-null digests, null retry fingerprint, no retry/repair |
+| Relevance second-response failure | first outbound pure-fails before response; identical second receives malformed/schema-invalid/semantic-invalid response or any response material followed by failure | exact `failed` with semantic=1/outbound=2, retry fingerprint=request SHA, empty scores; no third outbound |
+| Relevance successful retry | first outbound pure-fails before response; identical second returns exact complete closure | exact `complete` with semantic=1/outbound=2 and retry fingerprint=request SHA |
+| Relevance exhausted transport | first and second identical outbounds both pure-fail before any response material | exact `unavailable` with semantic=1/outbound=2, response SHA null, retry fingerprint=request SHA |
+| Relevance partial response | any status/header/body byte precedes timeout/reset/truncation, including invalid/conflicting head | response SHA non-null; exact `failed`; zero further retry |
+| Relevance missing | `llm is None` before semantic request construction | exact `missing` with semantic/outbound 0/0, all digests/fingerprint null, empty scores |
+| Relevance missing impersonation | non-null LLM returns empty/malformed content, caller/config/persisted flag says missing, or credential/provider/spec is absent/invalid | response case is `failed`; config/system case is Stage 23 `FAILED` outside the relevance union; never `missing` |
+| Relevance configuration | ambiguous/non-HTTPS/bad-prefix endpoint, wrong-type provider/model/spec, missing/illegal credential, oversized request head, or paper-projection replay/rerender/cap failure | exact Stage 23 `FAILED`, decision retry, empty tuples, zero authority publication; never degraded |
+| Relevance abstract projection | omit, duplicate, reorder, import foreign ID, alter rerendered sentence, include full paper/free prose/caller abstract, truncate, or exceed 16,384 bytes | structured system failure before semantic outbound; no authority publication |
+| Relevance request identity | change provider/model/origin/path/header/body/timeout, credential identity, or request SHA on retry; use body-only fingerprint | call-bound failure; no second semantic call or authority publication |
+| Relevance hidden behavior | SDK/generic `LLMClient.chat`, ClaimVerifier, hidden retry, model/endpoint fallback, cache, semantic repair, second semantic call, third outbound, or aggregate outbound 35 | exact Stage 23 `FAILED`; not degraded; cleanup |
+| Relevance state schema | use old six-key object, omit/extra/reorder digest keys, uppercase/wrong-length digest, `failed(2)` with null fingerprint, response material with null response SHA, or persist `incomplete` | exact eight-key union replay rejects |
+| Relevance numeric semantics | JSON numeric score, boolean, duplicate key, NaN/Inf, more/fewer than six decimals, out-of-range Decimal, wrong cited key/order, or fabricated score in adverse state | strict rejection; no retry/repair; claim-scope outcome matrix applies |
+| Secret/raw leakage | persist or log Authorization/token, raw request/response, canonical transcript, prompt, complete provider envelope, reasoning, traceback, or unbounded diagnostic | fail closed; no publishable Stage 23 authority |
 | Outcome crossing | publish passed with adverse relevance or degraded upstream; degrade `research_release`; degrade a non-verified citation; mismatch claim scope/report/manifest/degraded flag | exact claim-scope matrix rejects |
-| Stage 23 schema | use a withdrawn 23-key root set, two-key FileRef, wrong 26-key set, old output role/order, non-null fixed logical name, or omit claim scope/policy/upstream quality binding | exact schema and output replay rejects |
+| Stage 23 schema | change report v2 exact 13 roots, use old six-key relevance, use a withdrawn 23-key manifest root set, two-key FileRef, wrong 26-key set, old output role/order, non-null fixed logical name, or omit claim scope/policy/upstream quality binding | exact schema and output replay rejects |
 | Manifest tuple | retain withdrawn root names; wrong role/logical_name/path/hash/size/count/order; add `kind`; include manifest in outputs; or add manifest self path/hash | exact-key/replay rejection; no self-hash cycle |
 | Executor | producer mutates provisional status/decision/degraded flag/context/tuple; hook converts `DONE`; circular context/result; public return before terminal validation | withdraw and clean; exact `status=FAILED`, outer `decision="retry"`, empty tuples |
 | Generic-v1 | legal generic input with stale structured v2 formal names | unchanged generic schemas, bytes, calls, retries, cleanup, and result behavior |
@@ -4170,8 +4669,9 @@ Once a valid `1111` domain-v2 dispatch enters the structured path, every later
 error is `FAILED`; generic fallback is forbidden.
 
 Structured Stage 21-23 implementation is outside the
-B5-D1A/B5-D1B-R1/B5-D1D docs-only slices. Stage 24/25, independent reconstruction, E9,
-`release_check`, release gates, and fresh F0 are deferred to B5-D2 or later.
+B5-D1A/B5-D1B-R1/B5-D1D/B5-D1E docs-only slices. Stage 24/25, independent
+reconstruction, E9, `release_check`, release gates, and fresh F0 are deferred
+to B5-D2 or later.
 None of these design slices changes release authority. Fresh F0 requires separate
 explicit authorization.
 
@@ -4197,8 +4697,12 @@ structured Stage 21 deterministic archive authority. B5-D1B-R1 freezes the
 structured Stage 22 export and Stage 23 citation-verification authority.
 B5-D1D normalizes the trusted-local filesystem boundary across Stages 17-23
 without changing the frozen Stage 22 manifest v2, nested `code/` tree, Stage
-23 provider/outcome contracts, or capability. Separate Stage 21-23
-implementation slices must keep `1110`. B5-D2 or later
+23 provider/outcome contracts, or capability. B5-D1E freezes the exact
+Stage 23 metadata-provider wires, identity normalization, bounded projections,
+private relevance request/response transport, four-state nested relevance
+schema, and system-failure boundary without changing report schema v2's 13
+roots, manifest v2's 26 roots, the outcome matrix, or capability. Separate
+Stage 21-23 implementation slices must keep `1110`. B5-D2 or later
 separately freezes and implements Stage 24/25, independent reconstruction,
 `pipeline_validation`, `research_release`, `release_check`, release gates, and
 full release integration; every implementation and pre-activation commit
