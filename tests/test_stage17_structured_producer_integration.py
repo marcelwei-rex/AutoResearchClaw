@@ -21,6 +21,7 @@ from researchclaw.pipeline import scientific_claim_authority as authority
 from researchclaw.pipeline import executor as pipeline_executor
 from researchclaw.pipeline import structured_scientific_claim_capabilities as capability
 from researchclaw.pipeline.canonical_experiment_evidence import (
+    CanonicalProjectArtifact,
     canonical_authority_json_text,
 )
 from researchclaw.pipeline.release_graph_lock import ReleaseGraphLock
@@ -168,6 +169,15 @@ class _SelectionLLM:
         )
 
 
+_BIBLIOGRAPHY_BYTES = (
+    b"@article{Smith2024,\n"
+    b"  title = {Fixture reference},\n"
+    b"  author = {Smith, A.},\n"
+    b"  year = {2024}\n"
+    b"}\n"
+)
+
+
 def _citation_inputs() -> tuple[bytes, bytes]:
     allowlist = canonical_authority_json_text(
         {
@@ -176,7 +186,7 @@ def _citation_inputs() -> tuple[bytes, bytes]:
             "shortlist_path": "stage-05/shortlist.jsonl",
             "shortlist_sha256": "1" * 64,
             "references_path": "stage-04/references.bib",
-            "references_sha256": "2" * 64,
+            "references_sha256": hashlib.sha256(_BIBLIOGRAPHY_BYTES).hexdigest(),
             "cards_manifest_path": "stage-06/cards_manifest.json",
             "cards_manifest_sha256": "3" * 64,
             "eligible_keys": ["Smith2024"],
@@ -242,8 +252,17 @@ def active_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "build_canonical_fact_sheet",
         lambda _value: cfs,
     )
+    project_content = b"def main():\n    print('fixture')\n\n\nif __name__ == '__main__':\n    main()\n"
     evidence = _evidence(
-        structured_results=MappingProxyType({"primary": Decimal("1.25")})
+        structured_results=MappingProxyType({"primary": Decimal("1.25")}),
+        project_artifacts=(
+            CanonicalProjectArtifact(
+                logical_name="main.py",
+                source_path="stage-10/main.py",
+                sha256=hashlib.sha256(project_content).hexdigest(),
+                content=project_content,
+            ),
+        ),
     )
     binding = build_scientific_claim_generation_binding(evidence)
     plan, allowlist = _citation_inputs()
@@ -251,9 +270,20 @@ def active_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     stage_dir = run_dir / "stage-17"
     (run_dir / "stage-16").mkdir(parents=True)
     (run_dir / "stage-06").mkdir()
+    (run_dir / "stage-04").mkdir()
+    (run_dir / "stage-13").mkdir()
     stage_dir.mkdir()
     (run_dir / "stage-16" / "citation_plan.json").write_bytes(plan)
     (run_dir / "stage-06" / "citation_allowlist.json").write_bytes(allowlist)
+    (run_dir / "stage-04" / "references.bib").write_bytes(_BIBLIOGRAPHY_BYTES)
+    (run_dir / evidence.manifest_path).write_text(
+        canonical_authority_json_text(evidence.manifest),
+        encoding="utf-8",
+    )
+    (run_dir / evidence.selected_result_manifest_path).write_text(
+        canonical_authority_json_text(evidence.selected_result),
+        encoding="utf-8",
+    )
 
     with ReleaseGraphLock.acquire(run_dir, "b3b-fixture", mode="write") as lease:
         with monkeypatch.context() as capture_patch:

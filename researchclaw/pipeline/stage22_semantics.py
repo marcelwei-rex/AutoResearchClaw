@@ -9,8 +9,9 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
+from researchclaw.config import RCConfig
 from researchclaw.pipeline.canonical_experiment_evidence import (
     canonical_authority_json_text,
 )
@@ -34,6 +35,19 @@ class Stage22DeterministicOutputs:
     template_files: tuple[tuple[str, str], ...]
 
 
+@dataclass(frozen=True)
+class Stage22SemanticInputs:
+    """Authority bytes required by both generic and structured Stage 22."""
+
+    evidence: Any
+    canonical_config: RCConfig
+    paper_path: str
+    paper_sha256: str
+    paper_content: bytes
+    bibliography_content: bytes
+    quality_outcome: str
+
+
 def build_stage22_deterministic_outputs(
     bundle: Stage22InputBundle,
     *,
@@ -41,14 +55,38 @@ def build_stage22_deterministic_outputs(
 ) -> Stage22DeterministicOutputs:
     """Rebuild every non-compiler Stage 22 output from captured authority."""
 
-    paper = bundle.stage20_inputs.revised_paper.text()
+    return build_stage22_outputs_from_inputs(
+        Stage22SemanticInputs(
+            evidence=bundle.evidence,
+            canonical_config=bundle.canonical_config,
+            paper_path=bundle.stage20_inputs.revised_paper.path,
+            paper_sha256=bundle.stage20_inputs.revised_paper.sha256,
+            paper_content=bundle.stage20_inputs.revised_paper.content,
+            bibliography_content=bundle.stage19_inputs.bibliography.content,
+            quality_outcome=bundle.stage21_inputs.quality_gate_outcome,
+        ),
+        generated=generated,
+    )
+
+
+def build_stage22_outputs_from_inputs(
+    inputs: Stage22SemanticInputs,
+    *,
+    generated: str,
+) -> Stage22DeterministicOutputs:
+    """Pure deterministic projection from already replayed authority bytes."""
+
+    try:
+        paper = inputs.paper_content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise Stage22SemanticError("canonical Stage 19 paper is not UTF-8") from exc
     if not paper.strip():
         raise Stage22SemanticError("canonical Stage 19 paper is empty")
-    if bundle.stage21_inputs.quality_gate_outcome == "degraded":
+    if inputs.quality_outcome == "degraded":
         paper = _insert_degradation_notice(paper)
     paper = _remove_unavailable_markdown_figures(paper)
 
-    bibliography = bundle.stage19_inputs.bibliography.content
+    bibliography = inputs.bibliography_content
     try:
         bibliography_text = bibliography.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -56,7 +94,7 @@ def build_stage22_deterministic_outputs(
     valid_keys = set(re.findall(r"@\w+\{([^,]+),", bibliography_text))
     latex_markdown = _convert_citations_to_latex(paper, valid_keys)
 
-    template = get_template(bundle.canonical_config.export.target_conference)
+    template = get_template(inputs.canonical_config.export.target_conference)
     tex_source = latex_markdown
     if template.name in ML_CHECKLIST_TEMPLATES:
         from researchclaw.pipeline._helpers import _generate_neurips_checklist
@@ -70,16 +108,16 @@ def build_stage22_deterministic_outputs(
         tex_source,
         template,
         title=_extract_title(tex_source),
-        authors=bundle.canonical_config.export.authors,
-        bib_file=bundle.canonical_config.export.bib_file,
+        authors=inputs.canonical_config.export.authors,
+        bib_file=inputs.canonical_config.export.bib_file,
     )
     with tempfile.TemporaryDirectory(prefix="researchclaw-stage22-render-") as root:
         tex_text, _removed = remove_missing_figures(tex_text, Path(root))
     tex_bytes = tex_text.encode("utf-8")
 
     registry = VerifiedRegistry.from_experiment(
-        thaw_canonical_summary(bundle.evidence),
-        metric_direction=bundle.canonical_config.experiment.metric_direction,
+        thaw_canonical_summary(inputs.evidence),
+        metric_direction=inputs.canonical_config.experiment.metric_direction,
     )
     verification = verify_paper(tex_text, registry)
     if verification.severity == "REJECT":
@@ -112,7 +150,7 @@ def build_stage22_deterministic_outputs(
             {
                 "schema_version": 1,
                 "policy": "no_numeric_rewrite",
-                "source_paper_sha256": bundle.stage20_inputs.revised_paper.sha256,
+                "source_paper_sha256": inputs.paper_sha256,
                 "numbers_replaced": 0,
                 "generated": generated,
             }
@@ -122,8 +160,8 @@ def build_stage22_deterministic_outputs(
     direct_files["canonical_source.json"] = canonical_authority_json_text(
         {
             "schema_version": 2,
-            "source_paper_path": bundle.stage20_inputs.revised_paper.path,
-            "source_paper_sha256": bundle.stage20_inputs.revised_paper.sha256,
+            "source_paper_path": inputs.paper_path,
+            "source_paper_sha256": inputs.paper_sha256,
             "markdown_path": "stage-22/paper_final.md",
             "markdown_sha256": hashlib.sha256(markdown_bytes).hexdigest(),
             "latex_path": "stage-22/paper.tex",
@@ -137,7 +175,7 @@ def build_stage22_deterministic_outputs(
     )
     return Stage22DeterministicOutputs(
         direct_files=direct_files,
-        code_files=_build_code_package(bundle, paper),
+        code_files=_build_code_package_from_inputs(inputs.evidence, paper),
         template_name=template.name,
         template_files=template_files,
     )
@@ -229,9 +267,13 @@ def _parse_compile_status(content: bytes, *, generated: str) -> dict[str, object
 
 
 def _build_code_package(bundle: Stage22InputBundle, paper: str) -> dict[str, bytes]:
+    return _build_code_package_from_inputs(bundle.evidence, paper)
+
+
+def _build_code_package_from_inputs(evidence: Any, paper: str) -> dict[str, bytes]:
     project = {
         artifact.logical_name: artifact.content
-        for artifact in bundle.evidence.project_artifacts
+        for artifact in evidence.project_artifacts
     }
     if not project or "main.py" not in project:
         raise Stage22SemanticError("canonical selected project is incomplete")
@@ -239,7 +281,7 @@ def _build_code_package(bundle: Stage22InputBundle, paper: str) -> dict[str, byt
     project_list = "\n".join(f"- `{name}`" for name in sorted(project))
     domain_capture = any(
         artifact.source_path.startswith("stage-10/evaluator-capture-v1/")
-        for artifact in bundle.evidence.project_artifacts
+        for artifact in evidence.project_artifacts
     )
     run_command = (
         "`python main.py --vendor-root trojnet --data-root data "

@@ -1266,6 +1266,74 @@ def _execute_structured_stage21_private(
         )
 
 
+def _execute_structured_stage22_private(
+    release_lock,
+    pre_admission_context,
+) -> StageResult:
+    """Run the private 1110 Stage 22 contract without generic hooks."""
+
+    from researchclaw.pipeline import stage22_structured_publication as stage22
+
+    attempt = None
+    try:
+        attempt = stage22.transition_stage22_pre_admission_context(
+            release_lock,
+            pre_admission_context,
+        )
+        provisional = stage22.produce_structured_stage22(
+            release_lock,
+            attempt,
+        )
+        stage22.validate_structured_stage22_immediate_postcondition(
+            release_lock,
+            provisional,
+            artifacts=provisional.artifacts,
+            evidence_refs=provisional.evidence_refs,
+            context=attempt,
+        )
+        # Structured Stage 22 intentionally invokes no PRM, HITL, edit,
+        # prompt, semantic-repair, or repair hook between postconditions.
+        stage22.validate_structured_stage22_terminal_postcondition(
+            release_lock,
+            provisional,
+            artifacts=provisional.artifacts,
+            evidence_refs=provisional.evidence_refs,
+            context=attempt,
+        )
+        result = StageResult(
+            stage=Stage.EXPORT_PUBLISH,
+            status=StageStatus.DONE,
+            artifacts=stage22.STRUCTURED_STAGE22_ARTIFACTS,
+            evidence_refs=stage22.STRUCTURED_STAGE22_EVIDENCE_REFS,
+        )
+        stage22.clear_structured_stage22_context(release_lock, attempt)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        cleanup_errors = ()
+        if attempt is not None:
+            try:
+                cleanup_errors = stage22.fail_structured_stage22_attempt(
+                    release_lock,
+                    attempt,
+                )
+            except Exception as cleanup_exc:  # noqa: BLE001
+                cleanup_errors = (str(cleanup_exc),)
+        cleanup_suffix = (
+            "; structured Stage 22 cleanup also failed: "
+            + "; ".join(cleanup_errors)
+            if cleanup_errors
+            else ""
+        )
+        return StageResult(
+            stage=Stage.EXPORT_PUBLISH,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error=f"Structured Stage 22 failed: {exc}{cleanup_suffix}",
+            decision="retry",
+        )
+
+
 _STAGE_EXECUTORS: dict[Stage, Callable[..., StageResult]] = {
     Stage.TOPIC_INIT: _execute_topic_init,
     Stage.PROBLEM_DECOMPOSE: _execute_problem_decompose,
