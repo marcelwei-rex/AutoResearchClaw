@@ -3912,6 +3912,73 @@ path, wire-policy ID, timeout/cap policy, and one held credential handle.
 Fallback models/URLs, extra caller headers, proxy bridges, alternate wire
 APIs, and provider SDKs are forbidden.
 
+The exact structured Stage 23 relevance provider-admission map is:
+
+| Canonical provider ID | Exact Stage 23 wire-policy ID | Admission |
+|---|---|---|
+| `openai` | `stage23-openai-chat-completions-bearer-v1` | allowed |
+| `openrouter` | `stage23-openai-chat-completions-bearer-v1` | allowed |
+| `deepseek` | `stage23-openai-chat-completions-bearer-v1` | allowed |
+| `novita` | `stage23-openai-chat-completions-bearer-v1` | allowed |
+| `minimax` | `stage23-openai-chat-completions-bearer-v1` | allowed |
+| `openai-compatible` | `stage23-openai-chat-completions-bearer-v1` | allowed |
+| `anthropic` | none | structured system/configuration failure |
+| `kimi-anthropic` | none | structured system/configuration failure |
+| `ollama` | none | structured system/configuration failure |
+| `acp` | none | structured system/configuration failure |
+| `claude-cli` | none | structured system/configuration failure |
+| `codex-cli` | none | structured system/configuration failure |
+| any unknown provider | none | structured system/configuration failure |
+
+This closed map applies only to private structured Stage 23. It does not
+remove, add, reinterpret, or otherwise change any generic-v1 provider
+capability. Exact `wire_api=chat_completions` is mandatory for every allowed
+provider. Exact `wire_api=responses` and every other non-`chat_completions`
+wire are structured system/configuration failures; no spelling
+normalization, compatibility alias, adapter, or alternate wire may admit
+them.
+
+Provider admission is rebuilt only from these fields of the fully replayed
+canonical configuration: `provider`, `base_url`, `wire_api`,
+`primary_model`, `fallback_models`, and the MetaClaw bridge state. The
+admitted values additionally require:
+
+- exact `wire_api=chat_completions`;
+- `fallback_models` is the exact empty tuple;
+- the MetaClaw bridge is disabled;
+- canonical `base_url` is nonempty and is used exactly as stored, without a
+  provider preset, default, fallback, repair, or inferred value;
+- `primary_model` is 1..256 bytes of visible ASCII `0x21..0x7e`; and
+- there are no extra headers, fallback URL, or proxy bridge.
+
+`llm is None` remains the sole `missing` admission and is classified during
+pre-admission before any Stage 23 pathname or provider I/O. When `llm` is
+non-null, it must be the active `LLMClient` created and registered for the
+current pipeline run by the code-owned factory. The active registration binds
+the same run, writer owner, writer epoch, canonical provider, canonical client
+configuration, and live client identity. A fake, copy, caller-created,
+unregistered, wrong-run, wrong-owner, wrong-epoch, inactive, or wrong-type
+client is a structured system/configuration failure. The active client must
+have no Anthropic adapter, fallback chain, fallback URL, extra header,
+MetaClaw bridge, proxy bridge, or alternate transport.
+
+For a non-null admitted client, its held `base_url`, `primary_model`, and
+`wire_api` must exactly equal the fully replayed canonical values before any
+endpoint parsing or request construction. Stage 23 reads the credential
+exactly once from that active client's held memory while constructing the
+registry-issued transport spec. It never rereads an environment variable,
+canonical-config secret field, caller secret, provider preset, or fallback
+credential. The resulting credential handle and exact bytes remain bound to
+the same live client registration through any legal retry.
+
+For a non-null handle, the complete
+provider/configuration/client/credential transport-spec admission occurs
+during pre-admission, before any Stage 23 pathname observation, namespace
+acquisition, metadata-provider I/O, or relevance-provider I/O. A failure
+returns exact Stage 23 `FAILED`, outer `decision="retry"`, empty artifacts and
+evidence refs, and zero Stage 23 pathname, provider, or authority I/O. It is
+never relevance `missing`, `failed`, or `unavailable`.
+
 The raw base URL is not trimmed, deduplicated, repaired, or guessed. It must
 parse as lowercase `https` plus authority and an optional path prefix. It
 rejects non-HTTPS, userinfo, query, fragment, trailing slash, empty segment,
@@ -4498,9 +4565,39 @@ Stage23PreAdmissionContext(pre_admission)
   -> cleared
 ```
 
-For the unavailable-relevance degraded branch,
-`relevance_complete` names completion of the bounded relevance operation, not
-availability of scores.
+Every legal member of the exact four-state relevance union takes the same
+phase transition:
+
+```text
+metadata_verified -> relevance_complete
+```
+
+This includes `complete`, `failed`, `unavailable`, and the zero-semantic-call
+`missing` branch. `relevance_complete` means only that the bounded operation
+has ended and its result is one valid union member. It does not imply that a
+request was constructed, an outbound occurred, scores are available, or the
+relevance result is successful.
+
+After the code-owned claim-scope outcome matrix is derived, a publishable
+branch takes:
+
+```text
+relevance_complete -> payloads_published
+```
+
+This includes degraded `pipeline_validation` and `exploratory` results for
+`missing`, `failed`, `unavailable`, or a complete low score. A non-publishable
+branch takes:
+
+```text
+relevance_complete -> failed_cleanup -> cleared
+```
+
+This includes the same adverse states under `research_release`. It returns
+exact Stage 23 `FAILED`, outer `decision="retry"`, and empty artifacts and
+evidence refs. A system/configuration failure and an `incomplete` in-memory
+operation are outside the four-state union and never enter
+`relevance_complete`; they fail and clear without publishing authority.
 
 1. **Dispatch and pre-admission.** Apply the `1110` mechanical boundary and
    validate the upstream-only single-use context. Fully capture/replay current
@@ -4622,6 +4719,12 @@ interleavings:
 | Relevance partial response | any status/header/body byte precedes timeout/reset/truncation, including invalid/conflicting head | response SHA non-null; exact `failed`; zero further retry |
 | Relevance missing | `llm is None` before semantic request construction | exact `missing` with semantic/outbound 0/0, all digests/fingerprint null, empty scores |
 | Relevance missing impersonation | non-null LLM returns empty/malformed content, caller/config/persisted flag says missing, or credential/provider/spec is absent/invalid | response case is `failed`; config/system case is Stage 23 `FAILED` outside the relevance union; never `missing` |
+| Relevance provider admission | use `openai`, `openrouter`, `deepseek`, `novita`, `minimax`, or `openai-compatible` with the exact admitted canonical fields and wire policy | admit only exact `stage23-openai-chat-completions-bearer-v1`; generic-v1 provider behavior remains unchanged |
+| Relevance provider rejection | use `anthropic`, `kimi-anthropic`, `ollama`, `acp`, `claude-cli`, `codex-cli`, an unknown provider, `wire_api=responses`, or any non-`chat_completions` wire | structured system/configuration failure before any Stage 23 pathname/provider I/O; FAILED/retry/empty tuples; zero authority |
+| Relevance canonical admission | use nonempty canonical base URL, exact `chat_completions`, one visible-ASCII 1..256-byte primary model, empty fallback tuple, and disabled MetaClaw bridge | construct exactly one held transport spec from replayed canonical values; no preset/default/fallback inference |
+| Relevance canonical admission drift | preset-filled/empty/repaired base URL; normalized wire alias; nonempty fallback models; enabled MetaClaw bridge; extra headers; fallback URL; proxy bridge; empty, non-ASCII, control-containing, or over-256-byte primary model | structured system/configuration failure before Stage 23 pathname/provider I/O; no degrading or alternate route |
+| Relevance client identity | non-null active client is factory-created, registered, same-run/owner/epoch, live, and exact-match for canonical provider/base URL/model/wire | admit; read its held credential exactly once into the same registered transport spec |
+| Relevance client forgery | fake, copied, caller-created, unregistered, wrong-run/owner/epoch, inactive, wrong-type, config-mismatched, Anthropic-adapted, fallback-enabled, bridged, or proxy client | structured system/configuration failure before Stage 23 pathname/provider I/O; never `missing`; no env/config/caller secret reread |
 | Relevance configuration | ambiguous/non-HTTPS/bad-prefix endpoint, wrong-type provider/model/spec, missing/illegal credential, oversized request head, or paper-projection replay/rerender/cap failure | exact Stage 23 `FAILED`, decision retry, empty tuples, zero authority publication; never degraded |
 | Relevance abstract projection | omit, duplicate, reorder, import foreign ID, alter rerendered sentence, include full paper/free prose/caller abstract, truncate, or exceed 16,384 bytes | structured system failure before semantic outbound; no authority publication |
 | Relevance request identity | change provider/model/origin/path/header/body/timeout, credential identity, or request SHA on retry; use body-only fingerprint | call-bound failure; no second semantic call or authority publication |
@@ -4630,6 +4733,9 @@ interleavings:
 | Relevance numeric semantics | JSON numeric score, boolean, duplicate key, NaN/Inf, more/fewer than six decimals, out-of-range Decimal, wrong cited key/order, or fabricated score in adverse state | strict rejection; no retry/repair; claim-scope outcome matrix applies |
 | Secret/raw leakage | persist or log Authorization/token, raw request/response, canonical transcript, prompt, complete provider envelope, reasoning, traceback, or unbounded diagnostic | fail closed; no publishable Stage 23 authority |
 | Outcome crossing | publish passed with adverse relevance or degraded upstream; degrade `research_release`; degrade a non-verified citation; mismatch claim scope/report/manifest/degraded flag | exact claim-scope matrix rejects |
+| Relevance phase union | route `complete`, `failed`, `unavailable`, or zero-call `missing` through any phase other than `metadata_verified -> relevance_complete` | lifecycle rejects; `relevance_complete` records only a completed legal union member |
+| Relevance phase publication | publishable complete/high or pipeline-validation/exploratory adverse result bypasses `relevance_complete`, or uses a phase specific to missing/failed/unavailable | reject; every publishable union member uses `relevance_complete -> payloads_published` |
+| Relevance phase failure | research-release adverse result reaches payload creation, or system/configuration failure or `incomplete` enters `relevance_complete` | reject and withdraw; legal non-publishable union uses `relevance_complete -> failed_cleanup -> cleared`; system/incomplete never enters the union phase |
 | Stage 23 schema | change report v2 exact 13 roots, use old six-key relevance, use a withdrawn 23-key manifest root set, two-key FileRef, wrong 26-key set, old output role/order, non-null fixed logical name, or omit claim scope/policy/upstream quality binding | exact schema and output replay rejects |
 | Manifest tuple | retain withdrawn root names; wrong role/logical_name/path/hash/size/count/order; add `kind`; include manifest in outputs; or add manifest self path/hash | exact-key/replay rejection; no self-hash cycle |
 | Executor | producer mutates provisional status/decision/degraded flag/context/tuple; hook converts `DONE`; circular context/result; public return before terminal validation | withdraw and clean; exact `status=FAILED`, outer `decision="retry"`, empty tuples |
