@@ -454,6 +454,25 @@ class RenderedScientificClaim:
 
 
 @dataclass(frozen=True)
+class RenderedScientificClaimSlot:
+    """Ephemeral identity and UTF-8 extent for one renderer slot."""
+
+    slot_ordinal: int
+    fact_kind: str
+    fact_id: str
+    byte_start: int
+    byte_end: int
+
+
+@dataclass(frozen=True)
+class RenderedScientificClaimWithSlots:
+    """One renderer result and its same-pass ephemeral slot projection."""
+
+    rendered: RenderedScientificClaim
+    slots: tuple[RenderedScientificClaimSlot, ...]
+
+
+@dataclass(frozen=True)
 class ScientificClaimAuthorityRegistry:
     """Immutable B2 fact and claim registries for one generation."""
 
@@ -973,7 +992,37 @@ def render_scientific_claim(
         raise ScientificClaimAuthorityError(
             "renderer references an unknown fact"
         ) from exc
-    return _render_template(template, slot_facts)
+    return _render_template_with_slots(template, slot_facts).rendered
+
+
+def render_scientific_claim_with_slots(
+    template_id: str,
+    renderer_slot_fact_ids: Sequence[str],
+    *,
+    registry: ScientificClaimAuthorityRegistry,
+    binding: ScientificClaimGenerationBinding,
+) -> RenderedScientificClaimWithSlots:
+    """Render one claim and expose same-pass ephemeral UTF-8 slot extents."""
+
+    validate_scientific_claim_registry(registry, binding=binding)
+    template = _template_for_id(template_id)
+    if isinstance(renderer_slot_fact_ids, (str, bytes)) or not isinstance(
+        renderer_slot_fact_ids, Sequence
+    ):
+        raise ScientificClaimAuthorityError(
+            "renderer slot fact IDs must be an ordered sequence"
+        )
+    fact_by_id = {fact.fact_id: fact for fact in registry.facts}
+    try:
+        slot_facts = tuple(
+            fact_by_id[_sha256(fact_id, "renderer slot fact ID")]
+            for fact_id in renderer_slot_fact_ids
+        )
+    except KeyError as exc:
+        raise ScientificClaimAuthorityError(
+            "renderer references an unknown fact"
+        ) from exc
+    return _render_template_with_slots(template, slot_facts)
 
 
 def validate_scientific_claim_selection(
@@ -1212,9 +1261,16 @@ def _render_template(
     template: _RendererTemplateSpec,
     slot_facts: Sequence[EvidenceFact],
 ) -> RenderedScientificClaim:
+    return _render_template_with_slots(template, slot_facts).rendered
+
+
+def _render_template_with_slots(
+    template: _RendererTemplateSpec,
+    slot_facts: Sequence[EvidenceFact],
+) -> RenderedScientificClaimWithSlots:
     if len(slot_facts) != len(template.slot_fact_kinds):
         raise ScientificClaimAuthorityError("renderer template arity mismatch")
-    values: list[str] = []
+    values: list[tuple[EvidenceFact, str]] = []
     spec_by_kind = {
         spec.fact_kind: spec for spec in _EVIDENCE_FACT_REGISTRY
     }
@@ -1234,20 +1290,36 @@ def _render_template(
                     "primary metric has no code-owned display label"
                 )
             value = labels[value]
-        values.append(value)
+        values.append((fact, value))
 
-    pieces: list[str] = [template.literal_parts[0]]
-    for value, literal in zip(
+    content = bytearray(template.literal_parts[0].encode("utf-8"))
+    slots: list[RenderedScientificClaimSlot] = []
+    for ordinal, ((fact, value), literal) in enumerate(zip(
         values, template.literal_parts[1:], strict=True
-    ):
-        pieces.extend((value, literal))
-    sentence = "".join(pieces)
+    )):
+        start = len(content)
+        content.extend(value.encode("utf-8"))
+        end = len(content)
+        slots.append(
+            RenderedScientificClaimSlot(
+                slot_ordinal=ordinal,
+                fact_kind=fact.fact_kind,
+                fact_id=fact.fact_id,
+                byte_start=start,
+                byte_end=end,
+            )
+        )
+        content.extend(literal.encode("utf-8"))
+    exact = bytes(content)
+    sentence = exact.decode("utf-8")
     _validate_rendered_sentence(sentence)
-    content = sentence.encode("utf-8")
-    return RenderedScientificClaim(
-        sentence=sentence,
-        content=content,
-        sha256=hashlib.sha256(content).hexdigest(),
+    return RenderedScientificClaimWithSlots(
+        rendered=RenderedScientificClaim(
+            sentence=sentence,
+            content=exact,
+            sha256=hashlib.sha256(exact).hexdigest(),
+        ),
+        slots=tuple(slots),
     )
 
 

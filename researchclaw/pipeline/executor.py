@@ -1451,6 +1451,114 @@ def _execute_structured_stage23_with_pre_admission_private(
     )
 
 
+def _execute_structured_stage24_private(
+    release_lock,
+    pre_admission_context,
+) -> StageResult:
+    """Run the private exact-1110 Stage 24 contract without generic hooks."""
+
+    from researchclaw.pipeline import stage24_structured_publication as stage24
+
+    attempt = None
+    try:
+        attempt = stage24.transition_stage24_pre_admission_context(
+            release_lock,
+            pre_admission_context,
+        )
+        provisional = stage24.produce_structured_stage24(
+            release_lock,
+            attempt,
+        )
+        stage24.validate_structured_stage24_immediate_postcondition(
+            release_lock,
+            provisional,
+            artifacts=provisional.artifacts,
+            evidence_refs=provisional.evidence_refs,
+            context=attempt,
+        )
+        # No PRM, HITL, edit, prompt, repair, or fallback hook is legal here.
+        stage24.validate_structured_stage24_terminal_postcondition(
+            release_lock,
+            provisional,
+            artifacts=provisional.artifacts,
+            evidence_refs=provisional.evidence_refs,
+            context=attempt,
+        )
+        result = StageResult(
+            stage=Stage.TRUTH_AUDIT,
+            status=StageStatus.DONE,
+            artifacts=stage24.STRUCTURED_STAGE24_ARTIFACTS,
+            evidence_refs=stage24.STRUCTURED_STAGE24_EVIDENCE_REFS,
+            decision="structured-scientific-claim-v1",
+            degraded=provisional.degraded,
+        )
+        stage24.clear_structured_stage24_context(release_lock, attempt)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        cleanup_errors = ()
+        if attempt is not None:
+            try:
+                cleanup_errors = stage24.fail_structured_stage24_attempt(
+                    release_lock,
+                    attempt,
+                )
+            except Exception as cleanup_exc:  # noqa: BLE001
+                cleanup_errors = (str(cleanup_exc),)
+        cleanup_suffix = (
+            "; structured Stage 24 cleanup also failed: "
+            + "; ".join(cleanup_errors)
+            if cleanup_errors
+            else ""
+        )
+        return StageResult(
+            stage=Stage.TRUTH_AUDIT,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error=f"Structured Stage 24 failed: {exc}{cleanup_suffix}",
+            decision="retry",
+        )
+
+
+def _execute_structured_stage24_with_pre_admission_private(
+    release_lock,
+    *,
+    clients,
+    canonical_stage_dir: bool = True,
+) -> StageResult:
+    """Include pre-admission failures in the exact Stage 24 failure tuple."""
+
+    from researchclaw.pipeline import stage24_structured_publication as stage24
+
+    if canonical_stage_dir is not True:
+        return StageResult(
+            stage=Stage.TRUTH_AUDIT,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error="Structured Stage 24 failed before attempt",
+            decision="retry",
+        )
+    try:
+        pre = stage24.issue_stage24_pre_admission_context(
+            release_lock,
+            clients=clients,
+        )
+    except Exception:  # noqa: BLE001
+        return StageResult(
+            stage=Stage.TRUTH_AUDIT,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error="Structured Stage 24 failed before attempt",
+            decision="retry",
+        )
+    return _execute_structured_stage24_private(
+        release_lock,
+        pre,
+    )
+
+
 _STAGE_EXECUTORS: dict[Stage, Callable[..., StageResult]] = {
     Stage.TOPIC_INIT: _execute_topic_init,
     Stage.PROBLEM_DECOMPOSE: _execute_problem_decompose,
