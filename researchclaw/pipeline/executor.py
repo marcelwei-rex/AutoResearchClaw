@@ -1559,6 +1559,106 @@ def _execute_structured_stage24_with_pre_admission_private(
     )
 
 
+def _execute_structured_stage25_private(
+    release_lock,
+    pre_admission_context,
+) -> StageResult:
+    """Run the private exact-1110 Stage 25 contract without generic hooks."""
+
+    from researchclaw.pipeline import stage25_structured_publication as stage25
+
+    attempt = None
+    try:
+        attempt = stage25.transition_stage25_pre_admission_context(
+            release_lock,
+            pre_admission_context,
+        )
+        provisional = stage25.produce_structured_stage25(
+            release_lock,
+            attempt,
+        )
+        stage25.validate_structured_stage25_immediate_postcondition(
+            release_lock,
+            provisional,
+            artifacts=provisional.artifacts,
+            evidence_refs=provisional.evidence_refs,
+            context=attempt,
+        )
+        # No PRM, HITL, edit, prompt, repair, or fallback hook is legal here.
+        stage25.validate_structured_stage25_terminal_postcondition(
+            release_lock,
+            provisional,
+            artifacts=provisional.artifacts,
+            evidence_refs=provisional.evidence_refs,
+            context=attempt,
+        )
+        result = StageResult(
+            stage=Stage.DEAI_AUDIT,
+            status=StageStatus.DONE,
+            artifacts=stage25.STRUCTURED_STAGE25_ARTIFACTS,
+            evidence_refs=stage25.STRUCTURED_STAGE25_EVIDENCE_REFS,
+            decision="structured-scientific-claim-v1",
+        )
+        stage25.clear_structured_stage25_context(release_lock, attempt)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        cleanup_errors = ()
+        if attempt is not None:
+            try:
+                cleanup_errors = stage25.fail_structured_stage25_attempt(
+                    release_lock,
+                    attempt,
+                )
+            except Exception as cleanup_exc:  # noqa: BLE001
+                cleanup_errors = (str(cleanup_exc),)
+        cleanup_suffix = (
+            "; structured Stage 25 cleanup also failed: "
+            + "; ".join(cleanup_errors)
+            if cleanup_errors
+            else ""
+        )
+        return StageResult(
+            stage=Stage.DEAI_AUDIT,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error=f"Structured Stage 25 failed: {exc}{cleanup_suffix}",
+            decision="retry",
+        )
+
+
+def _execute_structured_stage25_with_pre_admission_private(
+    release_lock,
+    *,
+    canonical_stage_dir: bool = True,
+) -> StageResult:
+    """Include pre-admission failures in the exact Stage 25 failure tuple."""
+
+    from researchclaw.pipeline import stage25_structured_publication as stage25
+
+    if canonical_stage_dir is not True:
+        return StageResult(
+            stage=Stage.DEAI_AUDIT,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error="Structured Stage 25 failed before attempt",
+            decision="retry",
+        )
+    try:
+        pre = stage25.issue_stage25_pre_admission_context(release_lock)
+    except Exception:  # noqa: BLE001
+        return StageResult(
+            stage=Stage.DEAI_AUDIT,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            evidence_refs=(),
+            error="Structured Stage 25 failed before attempt",
+            decision="retry",
+        )
+    return _execute_structured_stage25_private(release_lock, pre)
+
+
 _STAGE_EXECUTORS: dict[Stage, Callable[..., StageResult]] = {
     Stage.TOPIC_INIT: _execute_topic_init,
     Stage.PROBLEM_DECOMPOSE: _execute_problem_decompose,

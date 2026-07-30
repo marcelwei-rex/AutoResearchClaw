@@ -405,6 +405,26 @@ class ProvisionalStage24Result:
     context: Stage24AttemptContext
 
 
+@dataclass
+class CurrentStructuredStage24Capture:
+    """Held, independently replayed current Stage 24 authority for Stage 25."""
+
+    _record: _AttemptRecord
+    manifest_value: Mapping[str, object]
+    manifest: BoundArtifact
+    outputs: tuple[BoundArtifact, ...]
+    paper: BoundArtifact
+    stage22_manifest: BoundArtifact
+    stage23_manifest: BoundArtifact
+
+    @property
+    def identity_tuple(self) -> tuple[object, ...]:
+        return _capture_final_state(self._record)
+
+    def close(self) -> None:
+        _close_attempt(self._record)
+
+
 _PRE_CONTEXTS: weakref.WeakKeyDictionary[
     Stage24PreAdmissionContext, _PreRecord
 ] = weakref.WeakKeyDictionary()
@@ -455,6 +475,155 @@ def issue_stage24_pre_admission_context(
     finalizer = weakref.finalize(context, capture.close)
     _PRE_CONTEXTS[context] = _PreRecord(token, owner, capture, finalizer)
     return context
+
+
+def capture_current_structured_stage24(
+    lease: ReleaseGraphLock,
+) -> CurrentStructuredStage24Capture:
+    """Capture and independently replay current Stage 24 through held fds."""
+
+    writer = require_active_writer_epoch(lease.run_dir, lease)
+    _require_private_capability()
+    initial = _capture_upstream(writer, clients={})
+    namespace: BoundOutputNamespace | None = None
+    held_directories: dict[str, tuple[int, tuple[int, int]]] = {}
+    held_files: dict[str, _HeldFile] = {}
+    manifest: _HeldFile | None = None
+    try:
+        namespace = writer.open_stage_namespace(_STAGE_NAME)
+        require_namespace_owned_by_epoch(namespace, writer, _STAGE_NAME)
+        if set(namespace.direct_entries()) != {
+            *_DIRECT_NAMES,
+            *_DIRECTORIES,
+            _MANIFEST_NAME,
+        }:
+            raise StructuredStage24PublicationError(
+                "current Stage 24 exact namespace mismatch"
+            )
+        for directory in _DIRECTORIES:
+            descriptor = os.open(
+                directory,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=namespace._stage_fd,
+            )
+            info = os.fstat(descriptor)
+            named = os.stat(
+                directory,
+                dir_fd=namespace._stage_fd,
+                follow_symlinks=False,
+            )
+            identity = (info.st_dev, info.st_ino)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or identity != (named.st_dev, named.st_ino)
+            ):
+                os.close(descriptor)
+                raise StructuredStage24PublicationError(
+                    f"current Stage 24 directory mismatch: {directory}"
+                )
+            held_directories[directory] = (descriptor, identity)
+        for name in _DIRECT_NAMES:
+            held_files[name] = _hold_existing_stage24_file(
+                namespace._stage_fd,
+                name,
+                logical_path=f"stage-24/{name}",
+            )
+        for directory in _DIRECTORIES:
+            descriptor, _identity = held_directories[directory]
+            for name in sorted(os.listdir(descriptor)):
+                if not name.endswith(".json"):
+                    raise StructuredStage24PublicationError(
+                        "current Stage 24 assessment name mismatch"
+                    )
+                key = f"{directory}/{name}"
+                held_files[key] = _hold_existing_stage24_file(
+                    descriptor,
+                    name,
+                    logical_path=f"stage-24/{key}",
+                )
+        manifest = _hold_existing_stage24_file(
+            namespace._stage_fd,
+            _MANIFEST_NAME,
+            logical_path=f"stage-24/{_MANIFEST_NAME}",
+        )
+        record = _AttemptRecord(
+            object(),
+            writer._require_active(),
+            initial,
+            namespace,
+            phase="current_replay",
+            held_directories=held_directories,
+            held_files=held_files,
+            manifest=manifest,
+        )
+        value = authority.strict_json_object(
+            manifest.expected_bytes,
+            label="current Stage 24 truth manifest",
+        )
+        record.outcome = value["outcome"]
+        _verify_complete_publication(record)
+        _verify_source_snapshot(initial)
+        snapshot = _capture_final_state(record)
+        if _capture_final_state(record) != snapshot:
+            raise StructuredStage24PublicationError(
+                "current Stage 24 second capture mismatch"
+            )
+        record.final_snapshot = snapshot
+        output_by_path = {
+            item.logical_path: BoundArtifact(
+                item.logical_path,
+                hashlib.sha256(item.expected_bytes).hexdigest(),
+                item.expected_bytes,
+            )
+            for item in held_files.values()
+        }
+        source = initial.source_map
+        return CurrentStructuredStage24Capture(
+            record,
+            value,
+            BoundArtifact(
+                f"stage-24/{_MANIFEST_NAME}",
+                hashlib.sha256(manifest.expected_bytes).hexdigest(),
+                manifest.expected_bytes,
+            ),
+            tuple(output_by_path[row["path"]] for row in value["outputs"]),
+            source["stage-23/paper_final_verified.md"],
+            source["stage-22/stage22_export_manifest.json"],
+            source["stage-23/stage23_verification_manifest.json"],
+        )
+    except Exception:
+        if namespace is not None:
+            record = _AttemptRecord(
+                object(),
+                writer._require_active(),
+                initial,
+                namespace,
+                held_directories=held_directories,
+                held_files=held_files,
+                manifest=manifest,
+            )
+            _close_attempt(record)
+        else:
+            initial.close()
+        raise
+
+
+def verify_current_structured_stage24(
+    capture: CurrentStructuredStage24Capture,
+) -> None:
+    if type(capture) is not CurrentStructuredStage24Capture:
+        raise StructuredStage24PublicationError(
+            "current Stage 24 capture type mismatch"
+        )
+    _verify_complete_publication(capture._record)
+    _verify_source_snapshot(capture._record.initial)
+    if _capture_final_state(capture._record) != capture._record.final_snapshot:
+        raise StructuredStage24PublicationError(
+            "current Stage 24 capture changed"
+        )
 
 
 def transition_stage24_pre_admission_context(
@@ -3102,6 +3271,50 @@ def _hold_run_file(writer: ReleaseGraphLock, path: str) -> _HeldFile:
     finally:
         for item in reversed(opened):
             os.close(item)
+
+
+def _hold_existing_stage24_file(
+    parent_fd: int,
+    name: str,
+    *,
+    logical_path: str,
+) -> _HeldFile:
+    if "/" in name or name in {"", ".", ".."}:
+        raise StructuredStage24PublicationError(
+            "unsafe current Stage 24 leaf name"
+        )
+    descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | os.O_NONBLOCK
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        info = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        identity = (info.st_dev, info.st_ino)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or identity != (named.st_dev, named.st_ino)
+        ):
+            raise StructuredStage24PublicationError(
+                f"current Stage 24 file mismatch: {logical_path}"
+            )
+        content = _read_descriptor(descriptor)
+        return _HeldFile(
+            parent_fd,
+            name,
+            descriptor,
+            identity,
+            logical_path,
+            content,
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
 
 
 def _create_held_file(
