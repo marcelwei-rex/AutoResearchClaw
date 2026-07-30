@@ -3111,7 +3111,7 @@ commit candidate until those producer checks pass.
   "quality_outcome": "passed",
   "degradation_signal": null,
   "bibliography_source": {
-    "path": "stage-4/references.bib",
+    "path": "stage-04/references.bib",
     "sha256": "<sha256>",
     "size": 1
   },
@@ -6207,6 +6207,60 @@ exactly these `group_role`s in order:
 12. `stage25_publication`;
 13. `release_control`.
 
+##### 18.17.2.1 Exact code-owned entry-role vocabulary
+
+One immutable code-owned `CaptureGroupRoleSpecV1` table is the sole vocabulary,
+path-resolver, repeatability, and ordering authority for all 13 groups. The
+producer capture, independent reconstruction, private pre-activation verifier,
+and public release consumer MUST import and consume the same table object.
+They MUST NOT copy, flatten, locally restate, or reconstruct the table.
+Caller objects, config, stored manifests, directory enumeration, and persisted
+handoffs provide only bytes to validate; none may select a group, role, path
+set, repeatability flag, ordinal, or count.
+
+The table has exactly the following group rows and expansion rules. `R` means
+repeatable; every other role is mandatory and non-repeatable unless an explicit
+branch below says otherwise. A fixed arrow binds exactly one path. A closure
+arrow is one code-owned resolver over independently replayed upstream bytes,
+never a caller or stored-manifest choice.
+
+| Group | Exact entry-role sequence and unique path resolver |
+|---|---|
+| `canonical_experiment_generation` | `canonical_experiment_evidence -> canonical_experiment_evidence.json`; `experiment_contract ->` the strict replay result's exact `experiment_contract_path` (exact `stage-09/experiment_contract.yaml` for the current legal domain-v2 branch); `run_config ->` the strict replay result's exact `run_config_path`. These are the only three entries. The held `run_config` bytes are the sole active semantic-config source. Generation binding and CFS are independently rebuilt values, not file entries. Config-namespace controls validate this exact path, bytes, hash, and schema and do not create another role. |
+| `stage15_critique` | `stage15_critique -> stage-15/critique.json`; `stage15_critique_manifest -> stage-15/stage15_critique_manifest.json`. These exact existing `Stage24InputEntry.role` tokens are reused in this order; generic `stage04_18_source` is forbidden here. |
+| `stage16_and_cfs_sources` | One role only: `stage04_18_source` (R). Its resolver is the complete set of pre-Stage-17 regular source files required to independently rebuild canonical evidence, CFS, Stage 4/6 citation/card authority, and the Stage 16 citation plan, minus the three group-1 owner paths, both Stage 15 paths, and both Stage 18 paths. It contains the canonical candidate manifest, selected-result manifest, selected-execution artifact, mandatory domain-v2 execution-policy artifact, every file referenced by the canonical/candidate/selected-result strict objects, canonical evidence `artifacts` and `project_artifacts`, and the complete Stage 9-14 selected execution, journal, evidence, package, candidate, refinement, and compatibility closure. The resolver validates every exact candidate collection, live `stage-14` first and then `stage-14_vN` in numeric `N` order, and every complete candidate-owned tree before selecting the winner; a stored selected-candidate reference cannot prune that closure. It also contains exactly the citation-plan replay sources `stage-04/candidates.jsonl`, `stage-04/cite_key_registry.json`, `stage-04/references.bib`, `stage-05/shortlist.jsonl`, `stage-05/screening_report.json`, `stage-06/citation_allowlist.json`, `stage-06/cards_manifest.json`, every manifest-declared card JSON/Markdown file, `stage-16/citation_policy_effective.json`, and `stage-16/citation_plan.json`. Active-config controls `active_config_snapshot.json`, `config_snapshot_history.jsonl`, and `checkpoint.json`, plus every replay-required non-owner `config.yaml` or `config.resumed-YYYYMMDD-HHMMSS.yaml`, also enter this closure; the group-1 selected `run_config` owner path is excluded. An absent optional config control uses only its already-frozen absence semantics and creates no file role. After resolver validation and ownership subtraction, all emitted entries are sorted by normalized NFC run-relative UTF-8 path bytes, never discovery or stored-selection order. |
+| `stage17_publication` | `facts -> stage-17/scientific_evidence_facts.json`; `claim_registry -> stage-17/scientific_claim_registry.json`; `claim_selection -> stage-17/scientific_claim_selection.json`; `paper_draft -> stage-17/paper_draft.md`; `paper_structure_report -> stage-17/paper_structure_report.json`; `experiment_fact_closure_report -> stage-17/experiment_fact_closure_report.json`; `citation_closure_report -> stage-17/citation_closure_report.json`; `stage17_manifest -> stage-17/scientific_claim_authority_manifest.json`. |
+| `stage18_review` | `reviews -> stage-18/reviews.md`; `review_structure_report -> stage-18/review_structure_report.json`. Both are mandatory, in this order, with no manifest or absence branch. |
+| `stage19_publication` | `claim_selection -> stage-19/scientific_claim_selection.json`; `paper_revised -> stage-19/scientific_claim_paper_revised.md`; `paper_structure_report -> stage-19/scientific_claim_paper_structure_report.json`; `experiment_fact_closure_report -> stage-19/scientific_claim_experiment_fact_closure_report.json`; `citation_closure_report -> stage-19/scientific_claim_citation_closure_report.json`; `stage19_manifest -> stage-19/scientific_claim_authority_manifest.json`. |
+| `stage20_publication` | `quality_report -> stage-20/quality_report.json`; `fabrication_flags -> stage-20/fabrication_flags.json`; `stage20_manifest -> stage-20/quality_gate_manifest.json`; then `degradation_signal -> degradation_signal.json` only for `degraded`. For `passed`, that last role is absent and the existing ordered absence witness is mandatory. |
+| `stage21_publication` | `archive -> stage-21/archive.md`; `stage21_manifest -> stage-21/bundle_index.json`. |
+| `stage22_publication` | Expand independently replayed manifest output rows in their frozen order: the eight fixed roles `paper_markdown`, `paper_latex_markdown`, `bibliography`, `paper_latex`, `compile_status`, `paper_verification`, `sanitization_report`, `canonical_source`; optional `paper_pdf`; `template_file` (R) in manifest logical-name order; `project_file` (R) in manifest logical-name order; and exactly two `code_support_file` entries for `stage-22/code/README.md` then `stage-22/code/requirements.txt`. A synthetic or prefix-closed directory is emitted once, prefix-before-descendants, with the independent CaptureGroup-only role `stage22_output_directory` (R); it never inherits a descendant file role and never enters a Stage 22 manifest/output row. Recursive file leaves retain their exact manifest output role. Expand trees in frozen output-row order and direct children in NFC UTF-8 bytewise order. Append `stage22_manifest -> stage-22/stage22_export_manifest.json` last. |
+| `stage23_publication` | `verification_report -> stage-23/verification_report.json`; `verified_bibliography -> stage-23/references_verified.bib`; `verified_paper -> stage-23/paper_final_verified.md`; `stage23_manifest -> stage-23/stage23_verification_manifest.json`. |
+| `stage24_publication` | Six direct files first: `obligation_inventory -> stage-24/obligation_inventory.json`; `claims -> stage-24/claims.json`; `citations -> stage-24/citations.json`; `citation_support -> stage-24/citation_support.json`; `critique_resolution -> stage-24/critique_resolution.json`; `truth_audit -> stage-24/truth_audit.json`. Then mandatory non-repeatable `citation_assessment_directory -> stage-24/citation-assessments`, followed by `citation_assessment` leaves (R); mandatory `generic_support_assessment_directory -> stage-24/generic-support-assessments`, followed by `generic_support_assessment` leaves (R); mandatory `resolution_assessment_directory -> stage-24/resolution-assessments`, followed by `resolution_assessment` leaves (R). Leaves retain the existing full-ID/path order; an independently replayed zero count requires the corresponding empty directory and zero leaves. Append `stage24_manifest -> stage-24/stage24_truth_manifest.json` last. Directory roles never substitute for leaf roles or vice versa. |
+| `stage25_publication` | `deai_audit -> stage-25/deai_audit.json`; `stage25_manifest -> stage-25/stage25_deai_manifest.json`. |
+| `release_control` | Exact empty marker: `root_entry_count=0`, `recursive_leaf_count=0`, `entries=()`. Its six typed values remain only in `release_control_roles`; every directory and file entry inside `deliverables_payload_closure` has exact role `deliverables_payload_closure`. |
+
+Every role has exactly one fixed-path resolver or one closed dynamic resolver.
+A repeatable role may emit only the ordered paths returned by its resolver.
+Fixed roles reject zero or multiple entries; dynamic roles reject any missing,
+extra, duplicate, reordered, or resolver-external path. All 13 groups apply
+global path uniqueness before capture: one normalized path has exactly one
+owner. A second enumeration by another group or role, a same-group duplicate,
+`(role,path)` duplicate, different digest for the same path, case-fold
+collision, NFC collision, platform alias, slash or component alias, or
+percent/backslash spelling fails closed. There is no first-wins behavior, set
+collapse, post-hoc subtraction, or silent deduplication. The group-3 set
+difference above is the normative ownership partition applied by its resolver,
+not an instruction to capture duplicates and remove them later.
+
+All fixed and dynamic leaves must be regular, same-filesystem, single-link
+held files. Every directory must be a held real same-filesystem directory.
+Missing or extra namespace entries, symlinks, hardlinks, FIFOs, sockets,
+devices, other special objects, cross-device objects, path/name identity
+drift, and unexpected empty directories reject. Stage 22 and deliverables
+recursive closure retain their existing prefix, direct-child slice, and
+declared-root semantics; this table adds only the exact entry-role mapping.
+
 Each `CaptureGroupV1` has exactly `group_ordinal`, `group_role`,
 `root_entry_count`, `recursive_leaf_count`, `entries`. `entries` is an exact
 tagged union. A file entry has exactly `ordinal`, `entry_kind`, `role`, `path`,
@@ -6232,7 +6286,9 @@ has exact `root_entry_count=0`, `recursive_leaf_count=0`, `entries=()`;
 its six typed contents live only in the separate `release_control_roles`
 field, preventing the same bytes from being captured twice.
 
-The fixed publication counts are Stage 17 exact 8 (seven outputs then manifest),
+The fixed publication counts and entry-role expansion are derived only from
+the `CaptureGroupRoleSpecV1` table above. Stage 17 is exact 8 (seven outputs
+then manifest),
 Stage 19 exact 6 (five outputs then manifest), Stage 20 exact 3 for passed or
 4 for degraded with the root signal after the manifest, Stage 21 exact 2
 (`archive.md`, `bundle_index.json`), and Stage 23 exact 4 (report,
@@ -6243,8 +6299,9 @@ order, expanded to all direct output files, every prefix-closed directory
 entry, and every canonical recursive leaf, followed by the manifest last.
 Root/directory/leaf counts are independently rebuilt from that closure; the
 manifest's 23 root keys are not an output count. Stage 24/25 counts and
-ordering are Sections 18.15-18.16. The canonical-generation,
-Stage 15/16/18, and recursive groups use their frozen source-role order.
+ordering are Sections 18.15-18.16 plus the exact directory/leaf expansion
+above. The canonical-generation, Stage 15/16/18, and recursive groups use only
+the table's frozen source-role order.
 
 `release_control_role_count` is the true integer `6`.
 `release_control_roles` has exactly, in order:
@@ -6296,9 +6353,15 @@ source object. Duplicate, missing, extra, reordered, or divergent witnesses
 fail. Every witness has exact fields
 `role`, `parent_device`, `parent_inode`, `name`.
 `conditional_absence_count == len(conditional_absences)`.
-`capture_identity_sha256` hashes the canonical encoding of fields 1-18,
-excluding entry `content` but including every ordinal, role, path, digest,
-size, device/inode/link identity, and absence witness.
+`capture_identity_sha256` is lowercase SHA-256 of the exact Section 3 canonical
+JSON bytes for an ordered projection of handoff fields 1-18. The projection
+recursively omits only each file entry's `content` field and retains every
+other field, including every ordinal, role, path, digest, size,
+device/inode/link identity, count, state, reference, and absence witness.
+Arrays retain their frozen order, object encoding follows Section 3, UTF-8 is
+exact, and the encoded projection has exactly one trailing LF. Field 19
+`capture_identity_sha256` itself and opaque fields 20-22 are excluded, so the
+digest has no self-cycle.
 `owner_token`, `read_epoch`, held fds, and `held_identity_set` are opaque and
 nonserializable and do not enter that digest. The digest is not an authority
 oracle and cannot substitute for Snapshot B or terminal held-byte replay.
@@ -6387,6 +6450,25 @@ path/role; cleanup collision; manifest-last failure; both executor
 postconditions; consumer handoff forgery/copy/expiry; live-read fallback; valid
 blocked versus invalid failure; and every existing release gate still failing
 under its prior negative fixture.
+
+The CaptureGroup matrix MUST additionally mutate every group role token,
+role order, repeatability flag, fixed-path resolver, dynamic closure, root
+count, recursive count, and entry ordinal independently. It MUST cover
+producer/reconstructor table skew, a consumer-local copied table, flattening to
+`path -> bytes`, caller/config/stored-manifest role injection, fixed-path
+substitution, dynamic omission/addition/duplication/reordering, role-correct
+path-wrong and path-correct role-wrong pairs, case/NFC/platform aliases,
+symlink/hardlink/cross-device/special objects, and group-1/group-3 overlap
+without first-wins or deduplication. It MUST also cover a Stage 22 directory
+given a descendant role instead of `stage22_output_directory`, duplicate or
+misordered shared prefixes, mixed direct-child slices, Stage 24 directory/leaf
+role substitution, empty/nonempty assessment-count mismatch and assessment-ID
+reordering, and deliverables role injection or recursive aliasing. Identity
+tests MUST reject projections that include file `content`, include field 19 or
+opaque fields 20-22, alter array order, or omit/add the one trailing LF. The
+legacy alias `stage-4/references.bib` is always rejected; the only canonical
+path is `stage-04/references.bib`. Exact `1110` private verification remains
+forced non-PASS, while public/direct exact `1110` rejects mechanically.
 
 The B5-D2A implementation scope is exactly:
 
