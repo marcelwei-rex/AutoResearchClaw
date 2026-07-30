@@ -6227,8 +6227,8 @@ never a caller or stored-manifest choice.
 | Group | Exact entry-role sequence and unique path resolver |
 |---|---|
 | `canonical_experiment_generation` | `canonical_experiment_evidence -> canonical_experiment_evidence.json`; `experiment_contract ->` the strict replay result's exact `experiment_contract_path` (exact `stage-09/experiment_contract.yaml` for the current legal domain-v2 branch); `run_config ->` the strict replay result's exact `run_config_path`. These are the only three entries. The held `run_config` bytes are the sole active semantic-config source. Generation binding and CFS are independently rebuilt values, not file entries. Config-namespace controls validate this exact path, bytes, hash, and schema and do not create another role. |
-| `stage15_critique` | `stage15_critique -> stage-15/critique.json`; `stage15_critique_manifest -> stage-15/stage15_critique_manifest.json`. These exact existing `Stage24InputEntry.role` tokens are reused in this order; generic `stage04_18_source` is forbidden here. |
-| `stage16_and_cfs_sources` | One role only: `stage04_18_source` (R). Its resolver is the complete set of pre-Stage-17 regular source files required to independently rebuild canonical evidence, CFS, Stage 4/6 citation/card authority, and the Stage 16 citation plan, minus the three group-1 owner paths, both Stage 15 paths, and both Stage 18 paths. It contains the canonical candidate manifest, selected-result manifest, selected-execution artifact, mandatory domain-v2 execution-policy artifact, every file referenced by the canonical/candidate/selected-result strict objects, canonical evidence `artifacts` and `project_artifacts`, and the complete Stage 9-14 selected execution, journal, evidence, package, candidate, refinement, and compatibility closure. The resolver validates every exact candidate collection, live `stage-14` first and then `stage-14_vN` in numeric `N` order, and every complete candidate-owned tree before selecting the winner; a stored selected-candidate reference cannot prune that closure. It also contains exactly the citation-plan replay sources `stage-04/candidates.jsonl`, `stage-04/cite_key_registry.json`, `stage-04/references.bib`, `stage-05/shortlist.jsonl`, `stage-05/screening_report.json`, `stage-06/citation_allowlist.json`, `stage-06/cards_manifest.json`, every manifest-declared card JSON/Markdown file, `stage-16/citation_policy_effective.json`, and `stage-16/citation_plan.json`. Active-config controls `active_config_snapshot.json`, `config_snapshot_history.jsonl`, and `checkpoint.json`, plus every replay-required non-owner `config.yaml` or `config.resumed-YYYYMMDD-HHMMSS.yaml`, also enter this closure; the group-1 selected `run_config` owner path is excluded. An absent optional config control uses only its already-frozen absence semantics and creates no file role. After resolver validation and ownership subtraction, all emitted entries are sorted by normalized NFC run-relative UTF-8 path bytes, never discovery or stored-selection order. |
+| `stage15_critique` | All roles are fixed and non-repeatable. Exact order is `stage15_decision_text -> stage-15/decision.md`; `stage15_decision_structured -> stage-15/decision_structured.json`; then, only for `external_final`, `stage15_external_review_directory -> stage-15/external-review`, `stage15_external_structured_review -> stage-15/external-review/structured.json`, and conditional `stage15_external_prose_review -> stage-15/external-review/review.md`; then `stage15_critique -> stage-15/critique.json`; `stage15_critique_manifest -> stage-15/stage15_critique_manifest.json`. The last two exact existing `Stage24InputEntry.role` tokens are reused once each; the five source/directory tokens are CaptureGroup-only and do not alter the Stage 15 writer, persisted schema, or Stage 24 input role vocabulary. Generic `stage04_18_source` is forbidden for every G2-owned path. |
+| `stage16_and_cfs_sources` | One role only: `stage04_18_source` (R). Its resolver is the complete set of pre-Stage-17 regular source files required to independently rebuild canonical evidence, CFS, Stage 4/6 citation/card authority, and the Stage 16 citation plan, minus the three group-1 owner paths, every path owned by the code-owned G2 Stage 15 resolver for the held branch, and both Stage 18 paths. It contains the canonical candidate manifest, selected-result manifest, selected-execution artifact, mandatory domain-v2 execution-policy artifact, every file referenced by the canonical/candidate/selected-result strict objects, canonical evidence `artifacts` and `project_artifacts`, and the complete Stage 9-14 selected execution, journal, evidence, package, candidate, refinement, and compatibility closure. The resolver validates every exact candidate collection, live `stage-14` first and then `stage-14_vN` in numeric `N` order, and every complete candidate-owned tree before selecting the winner; a stored selected-candidate reference cannot prune that closure. It also contains exactly the citation-plan replay sources `stage-04/candidates.jsonl`, `stage-04/cite_key_registry.json`, `stage-04/references.bib`, `stage-05/shortlist.jsonl`, `stage-05/screening_report.json`, `stage-06/citation_allowlist.json`, `stage-06/cards_manifest.json`, every manifest-declared card JSON/Markdown file, `stage-16/citation_policy_effective.json`, and `stage-16/citation_plan.json`. Active-config controls `active_config_snapshot.json`, `config_snapshot_history.jsonl`, and `checkpoint.json`, plus every replay-required non-owner `config.yaml` or `config.resumed-YYYYMMDD-HHMMSS.yaml`, also enter this closure; the group-1 selected `run_config` owner path is excluded. An absent optional config control uses only its already-frozen absence semantics and creates no file role. After resolver validation and ownership subtraction, all emitted entries are sorted by normalized NFC run-relative UTF-8 path bytes, never discovery or stored-selection order. |
 | `stage17_publication` | `facts -> stage-17/scientific_evidence_facts.json`; `claim_registry -> stage-17/scientific_claim_registry.json`; `claim_selection -> stage-17/scientific_claim_selection.json`; `paper_draft -> stage-17/paper_draft.md`; `paper_structure_report -> stage-17/paper_structure_report.json`; `experiment_fact_closure_report -> stage-17/experiment_fact_closure_report.json`; `citation_closure_report -> stage-17/citation_closure_report.json`; `stage17_manifest -> stage-17/scientific_claim_authority_manifest.json`. |
 | `stage18_review` | `reviews -> stage-18/reviews.md`; `review_structure_report -> stage-18/review_structure_report.json`. Both are mandatory, in this order, with no manifest or absence branch. |
 | `stage19_publication` | `claim_selection -> stage-19/scientific_claim_selection.json`; `paper_revised -> stage-19/scientific_claim_paper_revised.md`; `paper_structure_report -> stage-19/scientific_claim_paper_structure_report.json`; `experiment_fact_closure_report -> stage-19/scientific_claim_experiment_fact_closure_report.json`; `citation_closure_report -> stage-19/scientific_claim_citation_closure_report.json`; `stage19_manifest -> stage-19/scientific_claim_authority_manifest.json`. |
@@ -6239,6 +6239,35 @@ never a caller or stored-manifest choice.
 | `stage24_publication` | Six direct files first: `obligation_inventory -> stage-24/obligation_inventory.json`; `claims -> stage-24/claims.json`; `citations -> stage-24/citations.json`; `citation_support -> stage-24/citation_support.json`; `critique_resolution -> stage-24/critique_resolution.json`; `truth_audit -> stage-24/truth_audit.json`. Then mandatory non-repeatable `citation_assessment_directory -> stage-24/citation-assessments`, followed by `citation_assessment` leaves (R); mandatory `generic_support_assessment_directory -> stage-24/generic-support-assessments`, followed by `generic_support_assessment` leaves (R); mandatory `resolution_assessment_directory -> stage-24/resolution-assessments`, followed by `resolution_assessment` leaves (R). Leaves retain the existing full-ID/path order; an independently replayed zero count requires the corresponding empty directory and zero leaves. Append `stage24_manifest -> stage-24/stage24_truth_manifest.json` last. Directory roles never substitute for leaf roles or vice versa. |
 | `stage25_publication` | `deai_audit -> stage-25/deai_audit.json`; `stage25_manifest -> stage-25/stage25_deai_manifest.json`. |
 | `release_control` | Exact empty marker: `root_entry_count=0`, `recursive_leaf_count=0`, `entries=()`. Its six typed values remain only in `release_control_roles`; every directory and file entry inside `deliverables_payload_closure` has exact role `deliverables_payload_closure`. |
+
+The G2 branch discriminator is the strict duplicate-safe parse of the already
+held `stage-15/critique.json` bytes. Neither its manifest nor caller, config,
+path presence, or a stored binding may select the branch. The held critique
+state and independently held namespace closure MUST agree, and the expected
+critique manifest is rebuilt from held sources before the stored manifest is
+compared. The exact branches are:
+
+| Held final state | Exact emitted G2 role order | Exact G2 conditional absence |
+|---|---|---|
+| `model_final` or `none_final` | `stage15_decision_text`, `stage15_decision_structured`, `stage15_critique`, `stage15_critique_manifest` | one `stage15_external_review_directory` witness against the held `stage-15` parent and name `external-review` |
+| `external_final`, `external_prose=null` | `stage15_decision_text`, `stage15_decision_structured`, `stage15_external_review_directory`, `stage15_external_structured_review`, `stage15_critique`, `stage15_critique_manifest` | one `stage15_external_prose_review` witness against the held `stage-15/external-review` parent and name `review.md` |
+| `external_final`, held `external_prose` non-null | `stage15_decision_text`, `stage15_decision_structured`, `stage15_external_review_directory`, `stage15_external_structured_review`, `stage15_external_prose_review`, `stage15_critique`, `stage15_critique_manifest` | none |
+
+`external_pending`, an unknown state, a missing final critique or manifest, or
+any disagreement among held critique state, held directory closure, replayed
+decision/external targets, and rebuilt manifest is not a final capture branch
+and fails closed. `none_final` remains unable to satisfy the existing reviewer
+isolation release gate. The external directory is a directory entry; its
+structured review and optional prose are `recursive_file` entries whose
+`parent_path` is exact `stage-15/external-review`. The structured review is
+mandatory for `external_final`; prose presence is selected only by the held
+critique's strict `external_prose` null/non-null value. Missing, extra,
+duplicate, or reordered roles or paths; an extra external entry; a branch-
+inconsistent directory or file; or any alias/case/NFC collision rejects before
+reconstruction. Absence is established from the held parent at Snapshot A and
+replayed at Snapshot B and terminal replay, never by a later path lookup. Every
+present G2 path has G2 as its unique owner; G3 performs the code-owned ownership
+partition before capture and MUST NOT capture then subtract or deduplicate it.
 
 Every role has exactly one fixed-path resolver or one closed dynamic resolver.
 A repeatable role may emit only the ordered paths returned by its resolver.
@@ -6273,13 +6302,81 @@ respectively. A directory entry has exactly `ordinal`, `entry_kind`, `role`,
 true nonnegative integers; file `content` is bytes. `root_entry_count` equals
 the number of root file plus directory entries; `recursive_leaf_count` equals
 the number of `recursive_file` entries; and `len(entries)` is their sum.
-Directory `leaf_start` and `leaf_count` identify one contiguous canonical leaf
-slice containing only that directory's direct `recursive_file` children and
-cross-check each child's `parent_path`; nested directories have their own
-directory entry and direct-child slice. Group and entry order are authority
-and MUST NOT be collapsed to a set or re-sorted after capture. Directory
-device/inode/link identity enters Snapshot A/B, terminal replay, and capture
-identity even though it has no content digest.
+Directory `leaf_start` is the zero-based ordinal in the filtered
+`recursive_file` subsequence of the containing `CaptureGroupV1.entries` (or of
+the containing `ReleaseControlRoleV1.entries` for a deliverables tree), never
+the absolute `entries` index. `leaf_count` counts only that directory's direct
+regular-file children, never nested descendants. The half-open slice
+`[leaf_start, leaf_start + leaf_count)` contains exactly those direct
+`recursive_file` children and cross-checks every child's `parent_path`.
+Zero direct files use the insertion ordinal after all earlier directory
+buckets and have `leaf_count=0`; nested directories have their own directory
+entry and direct-child slice. A directory entry gains no `parent_path` field:
+its structural parent is uniquely derived from the canonical immediate prefix
+in the expansion table. Group and entry order are authority and MUST NOT be
+collapsed to a set or re-sorted after capture. Directory device/inode/link
+identity enters Snapshot A/B, terminal replay, and capture identity even though
+it has no content digest.
+
+One immutable code-owned `RecursiveTreeExpansionV1` primitive/table object is
+the shared tree component of `CaptureGroupRoleSpecV1`. Producer capture,
+independent reconstruction, private pre-activation verification, and public
+release consumption MUST import and consume that same object. They MUST NOT
+copy its table, run a local DFS, apply a local sort, or infer expansion from
+stored rows. From held same-filesystem identities, the primitive first builds
+one canonical child table. Each directory's complete direct-child list is NFC
+normalized and strictly ordered by the single child basename's UTF-8 bytes;
+duplicate, case-fold/NFC/platform, slash/component, file-directory-prefix, or
+inode aliases reject before sorting or expansion. Enumeration verifies this
+table and is not path, branch, or role authority.
+
+Global `entries` are a sequence of frozen outer root units. A root file unit
+emits one `file` entry. A directory unit is atomic and emits two segments:
+
+1. segment D emits the root directory and every nested directory in
+   directory-only preorder, so every parent prefix precedes all descendants;
+2. segment L visits directories in that same preorder and emits, for each
+   directory, the regular-file projection of its complete sorted direct-child
+   list as one contiguous `recursive_file` bucket.
+
+The full direct-child order is retained and verified in the shared table;
+segments D and L are its type projections and are not ordinary mixed-node DFS.
+Different directory units never interleave. Stage 22 outer units follow frozen
+manifest output-row order: a direct file remains at its row position, while a
+tree is placed once at its first descendant output row and later rows in that
+tree merge into the same unit without another directory or leaf emission.
+Recursive leaves retain their independently replayed Stage 22 output role, and
+the Stage 22 manifest remains last. Deliverables outer units follow declared
+manifest-root order, and every directory/file entry retains exact role
+`deliverables_payload_closure`.
+
+Normative mixed-tree example: held directory `H` has direct children, in NFC
+UTF-8 bytewise order, `a.txt`, `b/`, `c.txt`; `H/b` has `child.txt`. The shared
+child table is `H=[a.txt(file), b(directory), c.txt(file)]`,
+`H/b=[child.txt(file)]`. Exact absolute `entries` ordinals and directory
+metadata are:
+
+| Absolute ordinal | Entry | `leaf_start` | `leaf_count` | `parent_path` |
+|---:|---|---:|---:|---|
+| 0 | `directory H` | 0 | 2 | not a directory field |
+| 1 | `directory H/b` | 2 | 1 | not a directory field |
+| 2 | `recursive_file H/a.txt` | n/a | n/a | `H` |
+| 3 | `recursive_file H/c.txt` | n/a | n/a | `H` |
+| 4 | `recursive_file H/b/child.txt` | n/a | n/a | `H/b` |
+
+The filtered recursive-file ordinals are `0,1,2`: `H` owns slice `[0,2)`
+(`a.txt`,`c.txt`) and `H/b` owns `[2,3)` (`child.txt`). Here
+`root_entry_count=2`, `recursive_leaf_count=3`, and `len(entries)=5`. A
+directory-only child is legal only when its descendant closure eventually
+contains a regular leaf; its own zero-length direct-file slice uses the
+insertion rule above. A truly empty Stage 22 or deliverables directory rejects.
+Multiple nested directories follow directory-only preorder and receive
+nonoverlapping, possibly adjacent or zero-length, direct-file slices. Missing
+or extra entries; symlinks (never followed); regular-file `nlink != 1` or
+repeated regular-file inode aliases;
+FIFO, socket, device, or other special objects; cross-device directory or file;
+alias/case/NFC/prefix collision; or any Snapshot A/B/terminal expansion-table
+or ordered-entry drift fails closed.
 
 The thirteenth `release_control` capture group is the ordered group marker and
 has exact `root_entry_count=0`, `recursive_leaf_count=0`, `entries=()`;
