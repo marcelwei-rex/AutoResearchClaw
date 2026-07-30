@@ -8,8 +8,9 @@ structured Stage 21 archival, B5-D1B-R1 docs-only authority for structured
 Stage 22 export and Stage 23 citation verification, B5-D1D project-wide
 trusted-local filesystem normalization, and B5-D1E exact Stage 23
 provider/relevance wire contracts. B5-D2 freezes the structured Stage 24/25
-schemas, while B5-D2A freezes Route A for Stage 24 ephemeral renderer-slot
-numeric authority. Together they freeze complete
+schemas, B5-D2A freezes Route A for Stage 24 ephemeral renderer-slot numeric
+authority, and B5-D2B freezes the final deterministic declarative-support set
+`D`. Together they freeze complete
 held-fd independent reconstruction, release dispatch/lifecycle, and activation
 layers. B5-D1E changes only the Stage 23 report's nested relevance object; it
 does not change a report or manifest root schema.
@@ -5211,6 +5212,114 @@ array is nonempty. Each such sentence creates exactly one generic input in
 ID-and-order subsequence of `U`; omission, addition, duplicate, reorder, or
 `G > 128` fails.
 
+##### 18.15.3.1.1 B5-D2B deterministic declarative-support set D
+
+`D` is the complete ordered set, in unchanged complete obligation-inventory
+order, of `declarative_sentence` obligations in the final held Stage 23 paper
+that close exactly one-to-one, by equal complete sentence span, with a
+code-owned renderer occurrence independently replayed from the Stage 19
+selected `ScientificClaimRecord` set. It is not a text classifier, evidence
+kind, waiver, or new claim class. A renderer occurrence exists only for a
+claim actually selected by Stage 19. An unselected optional claim produces no
+occurrence and no phantom `D` member. A selected optional Results-scope claim
+and a mandatory selected Discussion claim may enter `D \ U`.
+
+The ephemeral occurrence identity binds all of the following as one
+indivisible replay tuple:
+
+```text
+generation binding and CFS identity
+Stage 17 registry canonical bytes and SHA-256
+claim_id
+renderer_template_id
+ordered renderer_slot_fact_ids
+governed section identity
+Stage 19 selection ordinal
+complete rendered sentence bytes, SHA-256, and Stage 19 absolute span
+complete Stage 22 transform replay and resulting absolute span
+final held Stage 23 paper identity, complete sentence bytes, SHA-256, and span
+```
+
+The Stage 22 transform is the complete deterministic transform, not a net
+offset supplied by a caller or ledger. Every insertion/deletion and its order
+is replayed from held upstream; overlap with a renderer sentence, ambiguous
+shift, mixed generation, incomplete transform, or a Stage 23 byte mutation
+fails the Stage 24 attempt. Stage 23 verification does not mint an occurrence:
+it only supplies the final held paper whose bytes and identity must exactly
+close the replayed result.
+
+For `D` construction, a `D`-candidate occurrence is a replayed selected
+renderer occurrence whose final complete sentence span lies in a governed
+section for which the unchanged obligation policy emits
+`declarative_sentence`. Abstract, Limitations, Conclusion, and every other
+occurrence outside that selected-section policy are still replayed for
+whole-paper closure but are outside `D` and do not require a declarative
+match. Each `D`-candidate occurrence's final complete
+`[sentence_byte_start,sentence_byte_end)` MUST equal the complete span of
+exactly one `declarative_sentence` obligation, and that obligation's
+`source_sha256` MUST equal SHA-256 of those exact held bytes. Every
+`D`-candidate occurrence and every resulting `D` obligation is consumed
+exactly once in both directions. Zero, duplicate, repeated, reordered,
+overlapping, or multiply consumed matches fail the complete attempt. Matching
+by `str.find`, `bytes.find`, substring, sentence value, display label, prose,
+normalized text, or any other locator is forbidden.
+
+`U` and `G` are independently rebuilt by the pre-existing eligible-child and
+actual-evidence rules above as if `D` did not exist. Membership in `D` is
+never evidence and never a source of `U`/`G` membership. No `D` marker,
+renderer-occurrence identity, or deterministic-`D` support projection appears
+in a generic assessment input, prompt, context, record, evidence row, or
+provider call. Thus an obligation in `D ∩ U` is present in `U` and its
+existing generic input only because it independently satisfies the existing
+`U` predicate; `D` has not fed it into that set. Ledger precedence is then
+exact:
+
+| Declarative state | Provider/record path | Existing `claims.json` row |
+|---|---|---|
+| `D \ U` | excluded from `U`, `G`, and generic provider calls | `support_required=true`, `status=supported`, `support_record_id=null` |
+| `D ∩ U`, also in `G` | exactly one existing generic assessment; `D` supplies no authority | `support_required=true`; generic verdict decides `supported|unsupported`; existing assessment ID is retained |
+| `D ∩ U`, not in `G` | no generic record; `D` cannot replace missing actual evidence | `support_required=true`, `status=unsupported`, `support_record_id=null` |
+| not in `D`, in `G` | exactly the existing generic assessment | `support_required=true`; generic verdict decides `supported|unsupported`; existing assessment ID is retained |
+| not in `D`, in `U` but not `G` | no generic record | `support_required=true`, `status=unsupported`, `support_record_id=null` |
+| not in `D` or `U` | no deterministic or generic authority | `support_required=true`, `status=unsupported`, `support_record_id=null` |
+
+This table is the only declarative ledger branch. In particular,
+`not_required` remains impossible for a `declarative_sentence`, removal of
+evidence never changes one to `not_required`, and there is no raw-prose or raw
+CFS fallback. `D ∩ U` is not double-authorized: the existing `U -> G` path
+alone determines the declarative sentence status. Numeric, citation, and
+comparative child obligations retain their independent ledger rows and
+closure. A `D \ U` parent being supported never hides or changes an
+unsupported child; any unsupported child still makes `unsupported_count`
+nonzero and truth closure fail.
+
+`D` adds no semantic call and does not change `C`, `U`, `G`, `R`,
+`S=C+G+R <= 268`, any role count, or the `536` outbound-attempt bound. It
+adds no persisted field, policy, schema, artifact, `FileRef`, manifest root,
+evidence kind, source authority, status value, claim class, renderer grammar,
+or release edge. `claims.json` remains exact `claim_ledger_v1`; the Stage 24
+and Stage 25 manifest root counts remain exactly `29` and `26`.
+
+The added projection does not change the authority DAG:
+
+```text
+held generation/CFS
+  -> held Stage 17 registry/renderer
+  -> held Stage 19 selection and renderer replay
+  -> complete held Stage 22 transform
+  -> final held Stage 23 paper
+final held Stage 23 paper -> unchanged obligation inventory
+renderer replay + obligation inventory -> ephemeral occurrences -> D
+obligation inventory + structurally eligible children -> U
+U + supported numeric rows + supported citation verdict rows -> G
+D + independently derived U/G -> independently expected claims ledger
+expected ledger -> compare stored claims.json -> existing Stage 24 manifest
+```
+
+There is no `claims.json`, manifest, assessment-record, caller, or provider
+edge back into occurrences, `D`, `U`, or `G`; no persisted ledger self-claim
+can create support. There is no reverse edge or manifest self-hash cycle.
+
 The exact role map order is `citation_assessment`,
 `generic_support_assessment`, `resolution_assessment`. A zero-count role has
 exactly `state="not_required", assessment_count=0`, registers no active
@@ -5633,9 +5742,16 @@ synchronize a receipt.
 Independent replay never calls a provider. It rebuilds role counts and map,
 non-secret client binding, input, exact system and user bytes, request digest,
 decision canonical bytes and content digest, ordinal/retry relation, and
-strictly parses every record. The response transcript digest, whose raw bytes
-are intentionally absent, cannot self-prove semantic validity and is
-provenance only. Every other mismatch fails.
+strictly parses every record. It also independently rebuilds `D` from the
+held generation/CFS, Stage 17 registry bytes, Stage 19 selection and renderer,
+complete Stage 22 transform, and final held Stage 23 paper; replays the
+bidirectional single-consumption closure; and re-derives every declarative
+ledger row using the table in Section 18.15.3.1.1. Persisted
+`obligation_inventory.json`, `claims.json`, assessment records, manifests, or
+caller state cannot report or choose `D`; the stored claims ledger is only an
+object to compare with independently expected bytes. The response transcript
+digest, whose raw bytes are intentionally absent, cannot self-prove semantic
+validity and is provenance only. Every other mismatch fails.
 
 There is no persistent diagnostic schema. Structured Stage 24 permits only a
 bounded in-memory, code-owned `error_class` and sanitized message, never raw
@@ -5646,8 +5762,9 @@ never read by replay/release, and cannot coexist with a successful namespace.
 ##### 18.15.3.5 Exact failure ordering
 
 1. Complete held upstream replay, Snapshot A, generation/CFS/source fixpoint;
-   rebuild obligation inventory, `C`, `U`, `R`, and all bounds. Overflow
-   yields zero Stage 24 provider I/O.
+   rebuild obligation inventory, the ephemeral renderer occurrences, `D`,
+   bidirectional single-consumption, `C`, `U`, `R`, and all bounds. Overflow
+   or any `D` closure failure yields zero Stage 24 provider I/O.
 2. Validate all three model projections, non-secret configs/bindings,
    writer/critic isolation, exact prompts/envelopes/caps, and sign zero roles
    as `not_required`, all before namespace/credential/provider I/O.
@@ -6298,6 +6415,61 @@ zero/multiple slot or obligation matches, overlap, and repeated consumption;
 no raw fallback for a selected code-owned non-value numeric slot; and the
 existing `identifier_metadata` comparison regression.
 
+The final B5-D2B minimum implementation surface is exact:
+
+- `stage24_structured_publication.py`: extend the existing ephemeral renderer
+  occurrence with the complete sentence bytes/hash, Stage 19 span, complete
+  Stage 22 transform result/final span, and the frozen identity tuple in
+  Section 18.15.3.1.1; construct `D`; enforce bidirectional
+  single-consumption; apply the frozen declarative ledger precedence; exclude
+  only `D \ U` from generic calls; and independently rebuild `D` during replay;
+- `stage24_structured_authority.py`: modify only if an independently justified
+  pure validator is required for the same in-memory closure; it MUST add no
+  field, schema, artifact, source, status, or authority;
+- tests only for the real lifecycle and adversarial contract below.
+
+`scientific_claim_authority.py` remains limited to the already-authorized
+B5-D2A Route A renderer-slot primitive and MUST NOT expand for B5-D2B. No other
+production, test-support, executor, transport, script, release-gate, provider,
+API, F0, resume, or capability surface is in scope.
+
+B5-D2B tests MUST include a real held lifecycle in which a selected optional
+Results-scope sentence and a mandatory selected Discussion sentence are each
+in `D \ U`, each ledger row is
+`support_required=true,status=supported,support_record_id=null`, and
+`unsupported_count=0`. They MUST also prove that non-renderer evidence-free
+declarative prose remains `unsupported`; deleting evidence never changes a
+declarative row to `not_required`; `D ∩ U` status is controlled only by the
+existing `U -> G` branch; and any unsupported numeric, citation, or
+comparative child retains its own row, increments `unsupported_count`, and
+fails truth closure even when its `D \ U` parent is supported.
+
+The dedicated B5-D2B adversarial matrix is:
+
+| Area | Mutation | Required result |
+|---|---|---|
+| Real success | selected optional Results plus mandatory Discussion have no eligible child evidence | both are exact `D \ U` supported/null; zero generic calls for them; `unsupported_count=0` |
+| Non-renderer prose | evidence-free declarative sentence has no replayed selected renderer occurrence | `support_required=true,status=unsupported,support_record_id=null`; never `not_required` or raw fallback |
+| Evidence deletion | remove or make unsupported the only admissible evidence authority/row without mutating the paper bytes | recompute actual evidence: a non-`D` sentence may leave `U/G` and remains unsupported; a `D ∩ U` sentence with an unsupported citation verdict remains in structurally derived `U` but leaves `G` and is unsupported; never `not_required` |
+| `D/U` overlap | a `D` sentence independently satisfies `U`, with supported or unsupported generic verdict, or loses actual evidence before `G` | existing generic verdict alone controls when in `G`; without `G` it is unsupported; deterministic `D` never rescues or double-authorizes |
+| Child failure | parent is supported through `D \ U`, but a contained numeric, citation, or comparative child is unsupported | child row and failure remain visible; `unsupported_count>0`; truth closure fails |
+| Duplicate/reuse | duplicate sentence bytes, duplicate occurrence, duplicate obligation, zero/multiple match, repeated consumption, overlap, or cross-section reuse | bidirectional single-consumption fails before provider I/O |
+| Locator substitution | `str.find`, `bytes.find`, substring/value/label/prose/normalized-text matching, or stored-span locator replaces identity/cursor replay | fail closed; no `D` or generic fallback |
+| Stage 19 selection | after Stage 19 authority is bound, mutate/reorder `ordered_claim_ids`; consume occurrences/obligations in an order different from independently replayed `ordered_claim_ids`; delete a selected optional claim; leave an unselected optional claim in a ledger; or change section/selection ordinal | exact replay or one-to-one closure fails; a legal bound Stage 19 exact permutation remains valid; an unselected optional claim creates no phantom `D` |
+| Generation/source | mix generation/CFS, registry bytes/hash, claim ID, template ID, or ordered slot fact IDs | fail closed before provider I/O |
+| Stage 22 transform | insertion/deletion causes a legal deterministic span shift; transform is omitted/reordered/overlaps a sentence/uses a net caller offset | exact full replay accepts only the legal shifted identity; every incomplete, ambiguous, or overlapping transform fails |
+| Stage 23 paper | mutate, duplicate, reorder, delete, or synchronously rehash final sentence/paper bytes | held replay and full-span identity reject |
+| Stored ledger | forge `claims.json`/counts/manifest to self-report `D`, supported, or `not_required` | independent upstream replay derives expected `D` and ledger bytes and rejects |
+| Frozen boundary | add a `D` field, policy/schema/artifact/`FileRef`/manifest root/evidence kind/source/status/claim class, alter `generic-v1`, call bounds, roots, gates, or capability | exact-schema/boundary rejection |
+
+If implementation of `D` leaves any new foundational authority, persistent
+schema, source, grammar, or status-branch gap in a real successful lifecycle,
+the implementation/review MUST stop outside the Stage 24 runtime and
+persisted schemas and report `STOP_COMPLEXITY_THRESHOLD_EXCEEDED`; this token
+is not a claim status, Stage outcome, or persisted field. The B5 route then
+pauses. No B5-D2C or further automatic foundational-semantics revision is
+authorized.
+
 The private Stage 24 assessment transport adds this mandatory adversarial
 matrix:
 
@@ -6505,6 +6677,28 @@ B5-D2 is ready for a narrow docs-only commit only when:
   primary-key/condition/CFS-mean binding; duplicate sentence/value/metric,
   reorder, optional deletion, Stage 22 transform, and paper mutation all fail
   closed without a persistent projection or raw fallback;
+- B5-D2B independently rebuilds complete-sentence renderer occurrences and
+  `D` from held generation/CFS, Stage 17 registry bytes, Stage 19 selection,
+  complete Stage 22 transform, final held Stage 23 paper, and unchanged
+  obligation inventory order; bidirectional single-consumption is exact;
+  unselected optional claims create no phantom `D`; and persisted
+  `claims.json` never reports or proves membership;
+- B5-D2B declarative precedence is exactly the six-row table in Section
+  18.15.3.1.1: only `D \ U` is deterministic supported/null, `D ∩ U` remains
+  exclusively controlled by existing `U -> G`, non-`D` evidence-free rows
+  remain unsupported, and no supported parent hides any unsupported numeric,
+  citation, or comparative child;
+- the B5-D2B implementation and adversarial surface in Section 18.19 is
+  complete; it changes no persistent schema, source, grammar, status branch,
+  evidence kind, root count, call bound, generic behavior, release gate, or
+  capability; any newly exposed foundational gap is reported outside the
+  runtime and persisted schemas as exact
+  `STOP_COMPLEXITY_THRESHOLD_EXCEEDED`, pauses B5, and does not authorize
+  B5-D2C;
+- the no-cycle DAG is one-way from held upstream and obligation inventory into
+  ephemeral occurrences/`D` and independent `U/G`, then into the expected
+  ledger; stored claims and manifests are only downstream comparison objects
+  and have no reverse authority edge;
 - no Stage 17, Stage 19, Stage 20, Stage 21, Stage 22, Stage 23, Stage 24, or
   Stage 25 manifest example has a self-hash cycle;
 - the task-added tracked diff contains only this document and production,
