@@ -8,7 +8,8 @@ structured Stage 21 archival, B5-D1B-R1 docs-only authority for structured
 Stage 22 export and Stage 23 citation verification, B5-D1D project-wide
 trusted-local filesystem normalization, and B5-D1E exact Stage 23
 provider/relevance wire contracts. B5-D2 freezes the structured Stage 24/25
-schemas, complete
+schemas, while B5-D2A freezes Route A for Stage 24 ephemeral renderer-slot
+numeric authority. Together they freeze complete
 held-fd independent reconstruction, release dispatch/lifecycle, and activation
 layers. B5-D1E changes only the Stage 23 report's nested relevance object; it
 does not change a report or manifest root schema.
@@ -4823,6 +4824,120 @@ binding. Any ambiguity, duplicate match, non-exact value, missing sealed
 unit/label, or raw-only match is `unsupported` and therefore fails Stage 24;
 it never degrades.
 
+##### 18.15.1.1 B5-D2A Route A: ephemeral renderer-slot projection
+
+For a `ScientificClaimRecord` selected by the replayed Stage 19 descendant
+selection, Stage 24 MUST use Route A if and only if the record is exactly
+replayable from the existing Stage 17 registry and its existing code-owned
+renderer. No persisted sentence, claim, label, prose, numeric value, or caller
+choice may create or select this route.
+
+The renderer implementation MUST have one pure, code-owned render primitive
+that constructs the sentence and its ordered slot projection in the same
+pass. The projection contains, in held memory only, the exact sentence UTF-8
+bytes and, for every ordered renderer slot, its slot ordinal, fact kind, fact
+ID, and sentence-relative half-open UTF-8 byte span. The existing renderer
+MUST consume the sentence result from that same primitive. Renderer replay
+MUST prove that existing rendered sentence bytes and hash, `claim_id`, claim
+registry canonical bytes and hash, and Stage 17 publication bytes are
+unchanged. Searching the completed sentence for a slot value is forbidden,
+even when the value currently appears only once.
+
+Stage 22 and Stage 23 independent held-byte replay MUST succeed before this
+projection is constructed. The sole occurrence surface is the held Stage 23
+`paper_final_verified.md`. Stage 24 MUST parse its governed sections under the
+existing manuscript structure contract, then consume occurrences in governed
+section order and each section's replayed Stage 19 `ordered_claim_ids` order.
+The transform-aware construction MUST first rebuild the complete Stage 19
+paper with the existing exact framing: the governed heading, its leading LF,
+the ordered renderer sentences separated by the `_join_rendered_sentences`
+single ASCII SP, and the trailing LF LF. Every `NONE` connector itself emits
+zero bytes. While emitting those bytes it mechanically advances one byte
+cursor and translates sentence-relative slot spans into Stage 19 paper spans,
+without `str.find`, `bytes.find`, a global string or value search, or a
+label/prose locator.
+
+Those Stage 19 spans are not final offsets. The same in-memory construction
+MUST replay the existing Stage 22 deterministic transform over the complete
+paper and carry each renderer span through the exact ordered insertions and
+deletions. An edit that overlaps or changes a renderer-owned span fails.
+The transform result MUST equal the complete held Stage 23 verified paper
+byte-for-byte before any projected span is used. Thus the legal Abstract
+degraded-notice suffix and unavailable-figure deletions are consumed only as
+the exact independently rebuilt Stage 22 transform, never as an arbitrary
+suffix or skipped region, and all later-section offsets include their exact
+shift. Stage 23 MUST remain an exact copy of the held Stage 22 Markdown.
+Selection cardinality, each renderer occurrence/slot cursor, complete
+Stage 22 paper bytes, section structure, and final endpoint MUST all close.
+An unexpected paper mutation or inability to replay and consume the final
+verified paper sequentially fails closed.
+
+A `numeric_role=claim_numeric` obligation receives this code-owned numeric
+binding if and only if its held-paper `[byte_start, byte_end)` is exactly equal
+to one and only one `primary_metric_value` slot span in one consumed occurrence,
+and that obligation and slot are each consumed exactly once. Zero or multiple
+obligations for a slot, zero or multiple slots for an obligation, overlap,
+cross-record matching, repeated consumption, or any selected code-owned
+non-value numeric slot is `unsupported`; none may fall through to the raw
+CFS/label route.
+
+Only after that one-to-one span equality succeeds may Stage 24 use the same
+`ScientificClaimRecord` to resolve its `primary_metric_key`,
+`primary_condition`, and `primary_metric_value` facts. It then selects exactly
+the CFS `view="results"` record for that primary condition and metric key at
+the canonical condition-aggregate `mean` pointer and requires exact canonical
+Decimal value equality. It MUST NOT first locate a CFS record by numeric value
+or display label. The display label is a consistency check only: the sealed
+Stage 9 `metric_display_labels[primary_metric_key]` MUST exist and equal the
+unique code-owned renderer label for that metric key, with no duplicate
+code-owned label mapping. Label or prose bytes never locate an occurrence.
+
+Duplicate exact sentences, the same value in multiple slots or metrics,
+`condition == value`, Stage 19 reorder, and optional-claim deletion are
+resolved only by the tuple:
+
+```text
+held Stage 23 paper identity
+governed section identity
+Stage 19 selection ordinal
+claim_id
+renderer_template_id
+slot ordinal
+slot fact_id
+exact absolute slot span
+```
+
+Generation binding, CFS identity, registry canonical bytes/hash, claim ID and
+rendered bytes, Stage 19 selection, Stage 22 transform, Stage 23 paper
+hash/held identity, slot fact IDs, and the CFS condition/key/mean
+pointer/value MUST all independently replay and close. Mixed generation,
+paper drift, occurrence ambiguity, slot ambiguity, or identity divergence is
+`FAILED`, never degradation.
+
+This projection exists only in memory during the held Stage 24 attempt. It
+adds no artifact, `FileRef`, manifest root or field, persisted span or hash,
+obligation field, claim field, schema, renderer grammar, or source authority,
+and it writes nothing back to Stage 17-23. The authority DAG remains:
+
+```text
+generation + CFS
+  -> Stage 17 registry/renderer
+  -> Stage 19 descendant selection and paper
+  -> Stage 20-21 held replay
+  -> Stage 22 deterministic transform
+  -> Stage 23 verified paper
+  -> Stage 24 ephemeral occurrence/slot projection
+  -> existing Stage 24 payloads and manifest
+```
+
+There is no reverse edge and no manifest self-hash cycle. Non-code-owned
+manuscript prose retains the existing raw CFS/label path. Route A MUST NOT add
+`AUPRC of` or any other open English grammar. If implementation requires a
+persistent field/schema/source authority, changes Stage 17-23 bytes or
+renderer grammar, or cannot consume the final held verified section by the
+ordered cursor contract, it MUST stop with
+`STOP_COMPLEXITY_THRESHOLD_EXCEEDED`.
+
 #### 18.15.2 Exact namespace, common shapes, and payload schemas
 
 The successful structured Stage 24 namespace contains exactly ten coarse
@@ -6156,6 +6271,33 @@ postconditions; consumer handoff forgery/copy/expiry; live-read fallback; valid
 blocked versus invalid failure; and every existing release gate still failing
 under its prior negative fixture.
 
+The B5-D2A implementation scope is exactly:
+
+- `scientific_claim_authority.py`: extract the same-source pure render and
+  ordered slot-span primitive; make the existing renderer consume it; prove
+  rendered sentence/hash, claim ID, registry canonical bytes/hash, and Stage
+  17 publication parity;
+- `stage24_structured_publication.py`: after existing held Stage 22/23 replay,
+  build the ephemeral occurrence projection and the one-to-one numeric
+  obligation mapping from replayed Stage 19 section selections;
+- tests only for the Route A lifecycle, parity, value-flow, identity, and
+  ambiguity contract below.
+
+It MUST NOT expand Stage 24 grammar or schema. `generic-v1`, every persisted
+Stage 17-23 schema, the Stage 24 manifest's exact 29 roots, the Stage 25
+manifest's exact 26 roots, release gates, and capability exact `1110` remain
+unchanged.
+
+Route A tests MUST include a real held lifecycle using the real sealed AUPRC
+mapping; all-registry renderer/claim-ID/registry-byte parity; Stage 19 reorder;
+optional result-scope deletion; duplicate exact sentences in another section
+or non-code-owned prose; one canonical value in multiple slots or metrics;
+`condition == value`; mixed generation; Stage 22 degraded-notice insertion and
+unavailable-figure deletion that move final offsets; Stage 23 paper mutation;
+zero/multiple slot or obligation matches, overlap, and repeated consumption;
+no raw fallback for a selected code-owned non-value numeric slot; and the
+existing `identifier_metadata` comparison regression.
+
 The private Stage 24 assessment transport adds this mandatory adversarial
 matrix:
 
@@ -6357,6 +6499,12 @@ B5-D2 is ready for a narrow docs-only commit only when:
   remains a null-record, code-owned byte-grammar/Decimal predicate with the
   complete four-value rank map, and introduces no assessment, FileRef,
   policy, artifact, manifest field, or authority edge;
+- B5-D2A Route A consumes renderer occurrences only by held Stage 23 section,
+  Stage 19 selection ordinal, and ordered slot identity; exact one-to-one
+  `claim_numeric`/`primary_metric_value` span equality precedes same-record
+  primary-key/condition/CFS-mean binding; duplicate sentence/value/metric,
+  reorder, optional deletion, Stage 22 transform, and paper mutation all fail
+  closed without a persistent projection or raw fallback;
 - no Stage 17, Stage 19, Stage 20, Stage 21, Stage 22, Stage 23, Stage 24, or
   Stage 25 manifest example has a self-hash cycle;
 - the task-added tracked diff contains only this document and production,
