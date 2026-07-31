@@ -6690,6 +6690,39 @@ activation readiness additionally requires reviewed implementation under
 exact `1110`, independent fail-open verification, unchanged generic behavior,
 and a separately authorized implementation-free `1110 -> 1111` declaration.
 
+#### 18.19.1 `STOP_B5A6_ROUTE` disposition closure
+
+The `STOP_B5A6_ROUTE` decision is accepted as of 2026-07-31. It terminates the
+current B5-A6 independent-reconstruction and release-integration implementation
+route without reverting the previously committed B5-A1 through B5-A5 work or
+the existing Stage 17 through Stage 25 authorities. It does not declare the
+Section 18.17 reconstruction contract implemented, verified, mergeable, or
+release-ready.
+
+The uncommitted B5-A6 scaffolding was archived outside the repository as
+`b5-a6-scaffolding-2b009eae6dbfdf65625de54db0d03d30983746cf.patch`, with
+SHA-256
+`4062dca18ffea88e503f41a8e47baee1b113db1028d104e66c2861d5cf350f83`,
+then removed from the worktree. The tracked reconstruction module was restored
+to baseline `2b009eae6dbfdf65625de54db0d03d30983746cf`; the new untracked
+B5-A6 test scaffolding was removed. The external patch is audit evidence only.
+It is not implementation, test, review, activation, or release evidence.
+
+Capability remains exact `1110`. Structured independent reconstruction,
+structured release integration, public/direct structured entry, Global
+Activation, exact `1111`, API execution, resume, and Fresh F0 remain frozen.
+The stopped writer is not resumed; no further pure-seam extraction, B5-A6R, or
+Kimi counter-audit is authorized by this closure.
+
+Any future reconsideration requires a separately named and explicitly
+authorized architecture rebaseline. It must start from current code rather
+than revive the archived scaffolding, and must freeze an exact file allowlist,
+credible per-file LOC bounds, producer/reconstructor zero-drift parity
+matrices, terminal release lifecycle, and hard stop conditions before any
+implementation authorization. A docs/design approval would not authorize
+implementation, tests, stage, commit, push, activation, API use, resume, or
+Fresh F0.
+
 ## 19. Generic and release boundary
 
 `generic-v1` Stage 18 through Stage 25 schemas, bytes, artifact names,
