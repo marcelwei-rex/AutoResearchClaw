@@ -27,7 +27,10 @@ from researchclaw.literature.screening import (
 from researchclaw.pipeline import runner as rc_runner
 from researchclaw.pipeline.citation_release_audit import _replay_screening_admission
 from researchclaw.pipeline.executor import StageResult
-from researchclaw.pipeline.stage_impls._literature import _execute_literature_screen
+from researchclaw.pipeline.stage_impls._literature import (
+    _execute_literature_screen,
+    _screen_candidate_batch,
+)
 from researchclaw.pipeline.stages import STAGE_SEQUENCE, Stage, StageStatus
 
 
@@ -261,6 +264,161 @@ def test_stage5_repairs_one_malformed_batch_once(tmp_path: Path) -> None:
     assert len(llm.calls) == 2
     assert "PREVIOUS RESPONSE VIOLATED" in llm.calls[1]
     assert f"at most {MAX_SCREEN_REASON_CHARS} Unicode" in llm.calls[0]
+
+
+def test_stage5_threshold_repair_identifies_each_conflict_and_invariant(
+    tmp_path: Path,
+) -> None:
+    rows = [_candidate(1), _candidate(2)]
+    ids = _write_candidates(tmp_path, rows)
+    sealed_rows = list(
+        parse_screening_candidates(
+            (tmp_path / "stage-04" / "candidates.jsonl").read_text()
+        )
+    )
+    contradictory = json.loads(_response("screen-batch-001", ids))
+    contradictory["decisions"][0].update(
+        {"decision": "keep", "relevance_score": 0.49, "quality_score": 0.8}
+    )
+    contradictory["decisions"][1].update(
+        {"decision": "keep", "relevance_score": 0.9, "quality_score": 0.59}
+    )
+    llm = _SequenceLLM(
+        [json.dumps(contradictory), _response("screen-batch-001", ids)]
+    )
+
+    decisions = _screen_candidate_batch(
+        llm=llm,  # type: ignore[arg-type]
+        prompts=None,
+        run_dir=tmp_path,
+        config=_config(),  # type: ignore[arg-type]
+        batch_id="screen-batch-001",
+        rows=sealed_rows,
+        minimum_quality_score=0.6,
+    )
+
+    assert len(decisions) == len(ids)
+    assert len(llm.calls) == 2
+    repair = llm.calls[1]
+    for expected in (
+        ids[0],
+        'actual decision="keep"',
+        "actual relevance_score=0.49",
+        "actual quality_score=0.80",
+        ids[1],
+        "actual relevance_score=0.90",
+        "actual quality_score=0.59",
+        "current relevance threshold=0.50",
+        "current quality threshold=0.60",
+        "keep iff relevance_score >= relevance_threshold AND quality_score >= "
+        "quality_threshold; reject otherwise",
+        "Regenerate the complete batch once",
+    ):
+        assert expected in repair
+
+
+def test_stage5_repair_identifies_reject_above_both_thresholds(
+    tmp_path: Path,
+) -> None:
+    ids = _write_candidates(tmp_path, [_candidate(1)])
+    rows = list(
+        parse_screening_candidates(
+            (tmp_path / "stage-04" / "candidates.jsonl").read_text()
+        )
+    )
+    contradictory = json.loads(_response("screen-batch-001", ids))
+    contradictory["decisions"][0]["decision"] = "reject"
+    llm = _SequenceLLM(
+        [json.dumps(contradictory), _response("screen-batch-001", ids)]
+    )
+
+    _screen_candidate_batch(
+        llm=llm,  # type: ignore[arg-type]
+        prompts=None,
+        run_dir=tmp_path,
+        config=_config(),  # type: ignore[arg-type]
+        batch_id="screen-batch-001",
+        rows=rows,
+        minimum_quality_score=0.6,
+    )
+
+    assert len(llm.calls) == 2
+    repair = llm.calls[1]
+    assert ids[0] in repair
+    assert 'actual decision="reject"' in repair
+    assert "actual relevance_score=0.90" in repair
+    assert "actual quality_score=0.80" in repair
+    assert (
+        "keep iff relevance_score >= relevance_threshold AND quality_score >= "
+        "quality_threshold; reject otherwise"
+    ) in repair
+
+
+@pytest.mark.parametrize(
+    ("field", "malformed"),
+    [
+        ("source_identity", ["not", "a", "string"]),
+        ("source_identity", {"not": "a string"}),
+        ("decision", ["not", "a", "string"]),
+        ("decision", {"not": "a string"}),
+    ],
+)
+def test_stage5_malformed_identity_or_decision_repairs_once_then_fails_closed(
+    tmp_path: Path, field: str, malformed: object
+) -> None:
+    ids = _write_candidates(tmp_path, [_candidate(1)])
+    rows = list(
+        parse_screening_candidates(
+            (tmp_path / "stage-04" / "candidates.jsonl").read_text()
+        )
+    )
+    payload = json.loads(_response("screen-batch-001", ids))
+    payload["decisions"][0][field] = malformed
+    response = json.dumps(payload)
+    llm = _SequenceLLM([response, response])
+
+    with pytest.raises(
+        ScreeningContractError, match="initial_error=.*repair_error="
+    ):
+        _screen_candidate_batch(
+            llm=llm,  # type: ignore[arg-type]
+            prompts=None,
+            run_dir=tmp_path,
+            config=_config(),  # type: ignore[arg-type]
+            batch_id="screen-batch-001",
+            rows=rows,
+            minimum_quality_score=0.6,
+        )
+
+    assert len(llm.calls) == 2
+
+
+def test_stage5_threshold_repair_is_once_only_and_remains_fail_closed(
+    tmp_path: Path,
+) -> None:
+    ids = _write_candidates(tmp_path, [_candidate(1)])
+    rows = list(
+        parse_screening_candidates(
+            (tmp_path / "stage-04" / "candidates.jsonl").read_text()
+        )
+    )
+    contradictory = json.loads(_response("screen-batch-001", ids))
+    contradictory["decisions"][0]["quality_score"] = 0.59
+    response = json.dumps(contradictory)
+    llm = _SequenceLLM([response, response])
+
+    with pytest.raises(ScreeningContractError, match="repair_error=.*contradicts"):
+        _screen_candidate_batch(
+            llm=llm,  # type: ignore[arg-type]
+            prompts=None,
+            run_dir=tmp_path,
+            config=_config(),  # type: ignore[arg-type]
+            batch_id="screen-batch-001",
+            rows=rows,
+            minimum_quality_score=0.6,
+        )
+
+    assert len(llm.calls) == 2
 
 
 def test_pipeline_validation_can_continue_only_verified_batches_degraded(

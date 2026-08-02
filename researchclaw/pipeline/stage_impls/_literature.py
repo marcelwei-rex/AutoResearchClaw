@@ -1079,11 +1079,18 @@ def _screen_candidate_batch(
             expected_source_ids=expected_ids,
             minimum_quality_score=minimum_quality_score,
         )
-    except ScreeningContractError as initial_error:
+    except (ScreeningContractError, TypeError) as initial_error:
+        initial_error = ScreeningContractError(str(initial_error))
+        conflict_feedback = _screening_threshold_conflict_feedback(
+            response.content,
+            expected_source_ids=expected_ids,
+            minimum_quality_score=minimum_quality_score,
+        )
         repair_prompt = (
             user_prompt
             + "\n\nTHE PREVIOUS RESPONSE VIOLATED THE CONTRACT:\n"
             + str(initial_error)
+            + conflict_feedback
             + "\nRegenerate the complete batch once. Do not omit any ID."
         )
         repaired = _chat_with_prompt(
@@ -1101,10 +1108,61 @@ def _screen_candidate_batch(
                 expected_source_ids=expected_ids,
                 minimum_quality_score=minimum_quality_score,
             )
-        except ScreeningContractError as repair_error:
+        except (ScreeningContractError, TypeError) as repair_error:
+            repair_error = ScreeningContractError(str(repair_error))
             raise ScreeningContractError(
                 f"initial_error={initial_error}; repair_error={repair_error}"
             ) from repair_error
+
+
+def _screening_threshold_conflict_feedback(
+    response_text: str,
+    *,
+    expected_source_ids: list[str],
+    minimum_quality_score: float,
+) -> str:
+    """Describe threshold contradictions without altering the response."""
+    try:
+        payload = json.loads(response_text)
+        raw_decisions = payload["decisions"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return ""
+    expected = set(expected_source_ids)
+    conflicts: list[str] = []
+    for raw in raw_decisions if isinstance(raw_decisions, list) else ():
+        source_identity = raw.get("source_identity") if isinstance(raw, dict) else None
+        if not isinstance(source_identity, str) or source_identity not in expected:
+            continue
+        decision = raw.get("decision")
+        relevance = raw.get("relevance_score")
+        quality = raw.get("quality_score")
+        if (
+            not isinstance(decision, str)
+            or decision not in {"keep", "reject"}
+            or isinstance(relevance, bool)
+            or not isinstance(relevance, (int, float))
+            or isinstance(quality, bool)
+            or not isinstance(quality, (int, float))
+        ):
+            continue
+        qualifies = relevance >= MIN_RELEVANCE_SCORE and quality >= minimum_quality_score
+        if (decision == "keep") == qualifies:
+            continue
+        conflicts.append(
+            f'- source_identity={json.dumps(raw["source_identity"])}, '
+            f'actual decision={json.dumps(decision)}, '
+            f"actual relevance_score={relevance:.2f}, "
+            f"actual quality_score={quality:.2f}"
+        )
+    if not conflicts:
+        return ""
+    invariant = (
+        f"current relevance threshold={MIN_RELEVANCE_SCORE:.2f}; "
+        f"current quality threshold={minimum_quality_score:.2f}; "
+        "keep iff relevance_score >= relevance_threshold AND quality_score >= "
+        "quality_threshold; reject otherwise."
+    )
+    return "\nConflicting decisions:\n" + "\n".join(conflicts) + "\n" + invariant
 
 
 def _deduplicate_screened_candidates(
