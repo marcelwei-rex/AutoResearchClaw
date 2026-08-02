@@ -32,6 +32,7 @@ from researchclaw.literature.citation_policy import (
     replay_config_snapshot_namespace,
 )
 from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
+from researchclaw.pipeline import release_capture_profile as _profile
 from researchclaw.pipeline.canonical_experiment_evidence import (
     CONFIG_SEMANTIC_POLICY_VERSION,
     parse_selected_candidate_manifest,
@@ -48,6 +49,10 @@ CAPTURE_DIRECTORY = "evaluator-capture-v1"
 CAPTURE_MANIFEST = "capture-manifest.json"
 DOMAIN_SEAL_SCHEMA_VERSION = 3
 DOMAIN_SEAL_POLICY_VERSION = 2
+@dataclass(frozen=True)
+class CapturedEvaluatorMember:
+    role: str; path: str; sha256: str
+    size: int; content: bytes
 
 
 @dataclass(frozen=True)
@@ -592,6 +597,108 @@ def _replay_published_capture(
         raise Stage10EvaluatorCaptureError("capture manifest replay mismatch")
 
 
+def resolve_captured_evaluator_membership(
+    *,
+    package_manifest_bytes: bytes,
+    execution_policy_bytes: bytes,
+    capture_entries: tuple[tuple[str, bytes], ...],
+) -> tuple[CapturedEvaluatorMember, ...]:
+    """Resolve evaluator members from captured bytes without live authority."""
+
+    if (type(package_manifest_bytes) is not bytes
+            or type(execution_policy_bytes) is not bytes
+            or type(capture_entries) is not tuple):
+        raise Stage10EvaluatorCaptureError("captured evaluator inputs are invalid")
+    capture_tree: dict[str, bytes] = {}
+    paths: list[str] = []
+    for entry in capture_entries:
+        if (type(entry) is not tuple or len(entry) != 2
+                or type(entry[0]) is not str or type(entry[1]) is not bytes):
+            raise Stage10EvaluatorCaptureError("capture entry identity mismatch")
+        path, content = entry
+        paths.append(path)
+        capture_tree[path] = content
+    try:
+        if _profile.canonical_order(tuple(paths)) != tuple(paths):
+            raise Stage10EvaluatorCaptureError("capture entries are not canonical")
+    except _profile.ReleaseProfileError as exc:
+        raise Stage10EvaluatorCaptureError("capture entry identity mismatch") from exc
+
+    package = _parse_captured_package_manifest(package_manifest_bytes)
+    package_paths = tuple(item["capture_path"] for item in package["files"])
+    try:
+        if _profile.canonical_order(package_paths) != package_paths:
+            raise Stage10EvaluatorCaptureError("package capture paths are not canonical")
+    except _profile.ReleaseProfileError as exc:
+        raise Stage10EvaluatorCaptureError("package capture path identity mismatch") from exc
+    if (hashlib.sha256(execution_policy_bytes).hexdigest()
+            != package["execution_policy_sha256"]):
+        raise Stage10EvaluatorCaptureError("captured execution policy hash mismatch")
+    try:
+        capture_manifest_bytes = capture_tree.pop(CAPTURE_MANIFEST)
+    except KeyError as exc:
+        raise Stage10EvaluatorCaptureError("capture manifest is missing") from exc
+    capture_manifest = _parse_capture_manifest(capture_manifest_bytes)
+    expected_package_ref = _file_ref(
+        DOMAIN_EVALUATOR_PACKAGE_MANIFEST_SNAPSHOT_PATH, package_manifest_bytes)
+    expected_execution_ref = _file_ref(
+        DOMAIN_EVALUATOR_EXECUTION_POLICY_SNAPSHOT_PATH, execution_policy_bytes)
+    if capture_manifest["package_manifest"] != expected_package_ref:
+        raise Stage10EvaluatorCaptureError("capture package manifest binding mismatch")
+    if capture_manifest["execution_policy"] != expected_execution_ref:
+        raise Stage10EvaluatorCaptureError("capture execution policy binding mismatch")
+    if capture_manifest["evaluator_schema"] != package["evaluator_schema"]:
+        raise Stage10EvaluatorCaptureError("capture evaluator schema mismatch")
+
+    expected_files: dict[str, bytes] = {}
+    expected_rows: list[dict[str, Any]] = []
+    source_rows: list[dict[str, Any]] = []
+    members: list[CapturedEvaluatorMember] = []
+    for package_item in package["files"]:
+        capture_path = package_item["capture_path"]
+        try:
+            content = capture_tree[capture_path]
+        except KeyError as exc:
+            raise Stage10EvaluatorCaptureError(
+                f"captured evaluator file is missing: {capture_path}"
+            ) from exc
+        if (
+            len(content) != package_item["size"]
+            or hashlib.sha256(content).hexdigest() != package_item["sha256"]
+        ):
+            raise Stage10EvaluatorCaptureError(
+                f"captured evaluator file bytes mismatch: {capture_path}"
+            )
+        expected_files[capture_path] = content
+        package_entry = dict(package_item)
+        expected_rows.append({
+            "role": package_item["role"], "path": capture_path,
+            "sha256": package_item["sha256"], "size": package_item["size"],
+            "package_entry_sha256": hashlib.sha256(
+                _canonical_json_bytes(package_entry)
+            ).hexdigest(),
+        })
+        source_rows.append({
+            "source_root": package_item["source_root"],
+            "source_path": package_item["source_path"],
+            "role": package_item["role"], "sha256": package_item["sha256"],
+            "size": package_item["size"],
+        })
+        members.append(CapturedEvaluatorMember(
+            package_item["role"], capture_path, package_item["sha256"],
+            package_item["size"], content))
+    if capture_tree != expected_files:
+        raise Stage10EvaluatorCaptureError("capture contains an undeclared entry")
+    if capture_manifest["files"] != expected_rows:
+        raise Stage10EvaluatorCaptureError("capture file manifest mismatch")
+    expected_namespace_sha = hashlib.sha256(
+        _canonical_json_bytes(source_rows)
+    ).hexdigest()
+    if capture_manifest["source_namespace_sha256"] != expected_namespace_sha:
+        raise Stage10EvaluatorCaptureError("capture source namespace hash mismatch")
+    return tuple(members)
+
+
 def _replay_candidate_from_captured_authority(
     *,
     capture_tree: dict[str, bytes],
@@ -627,59 +734,13 @@ def _replay_candidate_from_captured_authority(
     if capture_manifest["evaluator_schema"] != seal["evaluator_schema"]:
         raise Stage10EvaluatorCaptureError("capture evaluator schema mismatch")
 
-    expected_files: dict[str, bytes] = {}
-    expected_rows: list[dict[str, Any]] = []
-    source_rows: list[dict[str, Any]] = []
-    for package_item in package["files"]:
-        capture_path = package_item["capture_path"]
-        try:
-            content = capture_tree[capture_path]
-        except KeyError as exc:
-            raise Stage10EvaluatorCaptureError(
-                f"captured evaluator file is missing: {capture_path}"
-            ) from exc
-        if len(content) != package_item["size"] or hashlib.sha256(content).hexdigest() != package_item["sha256"]:
-            raise Stage10EvaluatorCaptureError(
-                f"captured evaluator file bytes mismatch: {capture_path}"
-            )
-        expected_files[capture_path] = content
-        package_entry = {
-            "source_root": package_item["source_root"],
-            "source_path": package_item["source_path"],
-            "capture_path": capture_path,
-            "role": package_item["role"],
-            "sha256": package_item["sha256"],
-            "size": package_item["size"],
-        }
-        expected_rows.append(
-            {
-                "role": package_item["role"],
-                "path": capture_path,
-                "sha256": package_item["sha256"],
-                "size": package_item["size"],
-                "package_entry_sha256": hashlib.sha256(
-                    _canonical_json_bytes(package_entry)
-                ).hexdigest(),
-            }
-        )
-        source_rows.append(
-            {
-                "source_root": package_item["source_root"],
-                "source_path": package_item["source_path"],
-                "role": package_item["role"],
-                "sha256": package_item["sha256"],
-                "size": package_item["size"],
-            }
-        )
-    if capture_tree != expected_files:
-        raise Stage10EvaluatorCaptureError("capture contains an undeclared entry")
-    if capture_manifest["files"] != expected_rows:
-        raise Stage10EvaluatorCaptureError("capture file manifest mismatch")
-    expected_namespace_sha = hashlib.sha256(
-        _canonical_json_bytes(source_rows)
-    ).hexdigest()
-    if capture_manifest["source_namespace_sha256"] != expected_namespace_sha:
-        raise Stage10EvaluatorCaptureError("capture source namespace hash mismatch")
+    resolve_captured_evaluator_membership(
+        package_manifest_bytes=package_manifest_bytes,
+        execution_policy_bytes=execution_policy_bytes,
+        capture_entries=tuple(sorted(
+            ((CAPTURE_MANIFEST, capture_manifest_bytes), *capture_tree.items())
+        )),
+    )
 
 
 def _capture_manifest_bytes(

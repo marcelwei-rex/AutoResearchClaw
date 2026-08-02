@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import inspect
@@ -8,6 +9,7 @@ import signal
 import shutil
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -680,3 +682,265 @@ def test_stage12_has_no_live_package_or_fixture_consumer() -> None:
     assert "domain_evaluators" not in source
     assert "validation_fixtures" not in source
     assert "TRUSTED_SOURCE_BASE" not in source
+
+
+def _r1_stage10_case():
+    plan = metric_authority.build_domain_evaluator_capture_plan(
+        metric_authority.select_metric_authority(TOPIC, "sandbox")
+    )
+    authority = plan.selection.evaluator_authority or {}
+    manifest = {
+        "schema_version": 1,
+        "capture_policy_version": 1,
+        "package_manifest": {
+            "path": metric_authority.DOMAIN_EVALUATOR_PACKAGE_MANIFEST_SNAPSHOT_PATH,
+            "sha256": hashlib.sha256(plan.package_manifest_bytes).hexdigest(),
+            "size": len(plan.package_manifest_bytes),
+        },
+        "execution_policy": {
+            "path": metric_authority.DOMAIN_EVALUATOR_EXECUTION_POLICY_SNAPSHOT_PATH,
+            "sha256": hashlib.sha256(plan.execution_policy_bytes).hexdigest(),
+            "size": len(plan.execution_policy_bytes),
+        },
+        "evaluator_schema": authority["evaluator_schema"],
+        "source_namespace_sha256": plan.source_namespace_sha256,
+        "files": list(plan.files),
+    }
+    manifest_bytes = (json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ) + "\n").encode()
+    entries = dict(plan.contents)
+    entries[stage10_evaluator_capture.CAPTURE_MANIFEST] = manifest_bytes
+    return plan, tuple(sorted(entries.items()))
+
+
+def _r1_stage10_resolve(plan, entries):
+    api = getattr(
+        stage10_evaluator_capture, "resolve_captured_evaluator_membership", None
+    )
+    assert callable(api), "missing resolve_captured_evaluator_membership"
+    return api(
+        package_manifest_bytes=plan.package_manifest_bytes,
+        execution_policy_bytes=plan.execution_policy_bytes,
+        capture_entries=entries,
+    )
+
+
+def test_r1_07_17_shared_membership_preserves_nested_frozen_order() -> None:
+    plan, entries = _r1_stage10_case()
+    before = (plan.package_manifest_bytes, plan.execution_policy_bytes, entries)
+    first = _r1_stage10_resolve(plan, entries)
+    second = _r1_stage10_resolve(plan, entries)
+    assert type(first) is tuple and first == second and first is not second
+    paths = tuple(member.path for member in first)
+    assert "data/c1355/c1355_ht1.bench" in paths
+    assert "vendor/train.py" in paths
+    assert paths == tuple(item["capture_path"] for item in json.loads(
+        plan.package_manifest_bytes
+    )["files"])
+    rows = json.loads(plan.package_manifest_bytes)["files"]
+    actual = dict(entries)
+    member_type = getattr(stage10_evaluator_capture, "CapturedEvaluatorMember")
+    assert all(type(member) is member_type for member in first)
+    assert member_type.__dataclass_params__.frozen
+    assert tuple(field.name for field in member_type.__dataclass_fields__.values()) == (
+        "role", "path", "sha256", "size", "content")
+    assert tuple((item.role, item.path, item.sha256, item.size, item.content)
+        for item in first) == tuple((row["role"], row["capture_path"], row["sha256"],
+        row["size"], actual[row["capture_path"]]) for row in rows)
+    with pytest.raises((AttributeError, TypeError)):
+        first[0].path = "flat.py"
+    assert (plan.package_manifest_bytes, plan.execution_policy_bytes, entries) == before
+
+
+@pytest.mark.parametrize("attack", ("missing", "extra", "bytes"))
+def test_r1_09_10_actual_capture_closure_and_bytes_reject(attack: str) -> None:
+    plan, entries = _r1_stage10_case()
+    tree = dict(entries)
+    target = next(path for path in tree if path != "capture-manifest.json")
+    if attack == "missing":
+        tree.pop(target)
+    elif attack == "extra":
+        tree["vendor/evil.py"] = b"evil\n"
+    else:
+        tree[target] += b"drift"
+    with pytest.raises(Stage10EvaluatorCaptureError):
+        _r1_stage10_resolve(plan, tuple(sorted(tree.items())))
+
+
+@pytest.mark.parametrize(
+    "attack", ("role", "path", "sha256", "size", "entry_sha", "order",
+               "row_add", "row_delete", "source_sha", "package_ref_path",
+               "package_ref_sha256", "package_ref_size", "execution_ref_path",
+               "execution_ref_sha256", "execution_ref_size", "schema")
+)
+def test_r1_11_12_13_capture_manifest_is_comparison_only(attack: str) -> None:
+    plan, entries = _r1_stage10_case()
+    tree = dict(entries)
+    manifest = json.loads(tree["capture-manifest.json"])
+    if attack in {"role", "path", "sha256", "size", "entry_sha"}:
+        field = {"entry_sha": "package_entry_sha256"}.get(attack, attack)
+        manifest["files"][0][field] = (
+            manifest["files"][0][field] + "x"
+            if isinstance(manifest["files"][0][field], str)
+            else manifest["files"][0][field] + 1
+        )
+    elif attack == "order":
+        manifest["files"][:2] = reversed(manifest["files"][:2])
+    elif attack == "row_add":
+        manifest["files"].append(dict(manifest["files"][-1], path="vendor/evil.py"))
+        manifest["files"].sort(key=lambda row: row["path"])
+    elif attack == "row_delete":
+        manifest["files"].pop()
+    elif attack == "source_sha":
+        manifest["source_namespace_sha256"] = "0" * 64
+    elif attack.startswith(("package_ref_", "execution_ref_")):
+        owner, field = attack.rsplit("_", 1)
+        ref = manifest[{"package_ref": "package_manifest", "execution_ref": "execution_policy"}[owner]]
+        ref[field] = {"path": "wrong.json", "sha256": "0" * 64, "size": ref["size"] + 1}[field]
+    else:
+        manifest["evaluator_schema"] += "-forged"
+    tree["capture-manifest.json"] = (json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ) + "\n").encode()
+    with pytest.raises(Stage10EvaluatorCaptureError):
+        _r1_stage10_resolve(plan, tuple(sorted(tree.items())))
+
+
+@pytest.mark.parametrize("attack", ("missing", "duplicate", "unsafe", "prefix"))
+def test_r1_08_package_member_identity_rejects(attack: str) -> None:
+    plan, entries = _r1_stage10_case()
+    package = json.loads(plan.package_manifest_bytes)
+    if attack == "missing":
+        package["files"].pop()
+    else:
+        package["files"][1]["capture_path"] = {
+            "duplicate": package["files"][0]["capture_path"],
+            "unsafe": "../evil.py",
+            "prefix": package["files"][0]["capture_path"] + "/child.py",
+        }[attack]
+    forged = (json.dumps(package, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if attack in {"missing", "prefix"}:
+        tree = dict(entries)
+        manifest = json.loads(tree["capture-manifest.json"])
+        if attack == "prefix":
+            old, new = json.loads(plan.package_manifest_bytes)["files"][1]["capture_path"], package["files"][1]["capture_path"]
+            tree[new] = tree.pop(old)
+            row = next(item for item in manifest["files"] if item["path"] == old)
+            row["path"] = new
+            row["package_entry_sha256"] = hashlib.sha256((json.dumps(
+                package["files"][1], sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest()
+        manifest["package_manifest"].update(
+            sha256=hashlib.sha256(forged).hexdigest(), size=len(forged))
+        manifest["files"].sort(key=lambda item: item["path"])
+        tree["capture-manifest.json"] = (json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        entries = tuple(sorted(tree.items()))
+        package_paths = tuple(item["capture_path"] for item in package["files"])
+        row_paths = tuple(item["path"] for item in manifest["files"])
+        actual_paths = set(tree) - {"capture-manifest.json"}
+        assert manifest["package_manifest"]["sha256"] == hashlib.sha256(forged).hexdigest()
+        assert manifest["package_manifest"]["size"] == len(forged)
+        if attack == "prefix":
+            assert set(package_paths) == actual_paths == set(row_paths) and row_paths == tuple(sorted(row_paths))
+            assert any(right.startswith(left + "/") for left in package_paths for right in package_paths)
+        else:
+            removed = json.loads(plan.package_manifest_bytes)["files"][-1]["capture_path"]
+            assert removed not in package_paths and removed in actual_paths and removed in row_paths
+    plan = SimpleNamespace(
+        package_manifest_bytes=forged,
+        execution_policy_bytes=plan.execution_policy_bytes,
+    )
+    with pytest.raises(Stage10EvaluatorCaptureError):
+        _r1_stage10_resolve(plan, entries)
+
+
+def test_r1_14_producer_replay_delegates_shared_membership_helper() -> None:
+    source = inspect.getsource(
+        stage10_evaluator_capture._replay_candidate_from_captured_authority
+    )
+    calls = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "resolve_captured_evaluator_membership"]
+    assert len(calls) == 1
+
+
+def test_r1_10_capture_bytes_reject_after_outer_metadata_can_rebind() -> None:
+    plan, entries = _r1_stage10_case()
+    tree = dict(entries)
+    target = next(path for path in tree if path != "capture-manifest.json")
+    tree[target] += b"coherent outer record drift"
+    with pytest.raises(Stage10EvaluatorCaptureError):
+        _r1_stage10_resolve(plan, tuple(sorted(tree.items())))
+
+
+def _r1_producer_replay_inputs():
+    plan, entries = _r1_stage10_case()
+    tree = dict(entries)
+    ref = lambda path, content: {"path": path,
+        "sha256": hashlib.sha256(content).hexdigest(), "size": len(content)}
+    authority = plan.selection.evaluator_authority or {}
+    contract = {"schema_version": 3, "metric_authority": plan.selection.contract_identity(),
+        "evaluator_authority": {"evaluator_schema": authority["evaluator_schema"]}}
+    seal = {"metric_authority": contract["metric_authority"],
+        "evaluator_schema": authority["evaluator_schema"],
+        "package_manifest": ref(metric_authority.DOMAIN_EVALUATOR_PACKAGE_MANIFEST_SNAPSHOT_PATH, plan.package_manifest_bytes),
+        "execution_policy": ref(metric_authority.DOMAIN_EVALUATOR_EXECUTION_POLICY_SNAPSHOT_PATH, plan.execution_policy_bytes),
+        "capture_manifest": ref("stage-10/evaluator-capture-v1/capture-manifest.json", tree["capture-manifest.json"])}
+    return plan, tree, seal, contract
+
+
+@pytest.mark.parametrize("attack", ("contract", "metric", "package", "execution", "capture",
+    "capture_package", "capture_execution", "capture_schema", "package_execution"))
+def test_r1_14_producer_prebindings_precede_shared_helper(
+    monkeypatch: pytest.MonkeyPatch, attack: str
+) -> None:
+    api = getattr(stage10_evaluator_capture, "resolve_captured_evaluator_membership", None)
+    assert callable(api), "missing resolve_captured_evaluator_membership"
+    plan, tree, seal, contract = _r1_producer_replay_inputs()
+    package_bytes = plan.package_manifest_bytes
+    calls = []
+    def counting(**kwargs):
+        calls.append(kwargs)
+        return api(**kwargs)
+    monkeypatch.setattr(stage10_evaluator_capture, "resolve_captured_evaluator_membership", counting)
+    if attack == "contract": contract["schema_version"] = 2
+    elif attack == "metric": seal["metric_authority"] = {}
+    elif attack in {"package", "execution", "capture"}:
+        seal[{"package": "package_manifest", "execution": "execution_policy",
+            "capture": "capture_manifest"}[attack]]["sha256"] = "0" * 64
+    elif attack.startswith("capture_"):
+        manifest = json.loads(tree["capture-manifest.json"])
+        field = attack.removeprefix("capture_")
+        if field == "schema": manifest["evaluator_schema"] += "-wrong"
+        else: manifest[{"package": "package_manifest", "execution": "execution_policy"}[field]]["sha256"] = "0" * 64
+        tree["capture-manifest.json"] = (json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        seal["capture_manifest"].update(sha256=hashlib.sha256(
+            tree["capture-manifest.json"]).hexdigest(), size=len(tree["capture-manifest.json"]))
+    else:
+        package = json.loads(package_bytes); package["execution_policy_sha256"] = "0" * 64
+        package_bytes = (json.dumps(package, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        seal["package_manifest"].update(sha256=hashlib.sha256(package_bytes).hexdigest(), size=len(package_bytes))
+    with pytest.raises(Stage10EvaluatorCaptureError):
+        stage10_evaluator_capture._replay_candidate_from_captured_authority(
+            capture_tree=tree, seal=seal, contract=contract,
+            package_manifest_bytes=package_bytes,
+            execution_policy_bytes=plan.execution_policy_bytes)
+    assert calls == []
+
+
+def test_r1_14_producer_calls_shared_helper_once_after_prebindings(monkeypatch) -> None:
+    api = getattr(stage10_evaluator_capture, "resolve_captured_evaluator_membership", None)
+    assert callable(api), "missing resolve_captured_evaluator_membership"
+    plan, tree, seal, contract = _r1_producer_replay_inputs()
+    calls = []
+    def counting(**kwargs):
+        calls.append(kwargs)
+        return api(**kwargs)
+    monkeypatch.setattr(stage10_evaluator_capture, "resolve_captured_evaluator_membership", counting)
+    stage10_evaluator_capture._replay_candidate_from_captured_authority(
+        capture_tree=tree, seal=seal, contract=contract,
+        package_manifest_bytes=plan.package_manifest_bytes,
+        execution_policy_bytes=plan.execution_policy_bytes)
+    assert len(calls) == 1
