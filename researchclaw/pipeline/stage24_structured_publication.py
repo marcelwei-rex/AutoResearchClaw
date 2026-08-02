@@ -2010,7 +2010,7 @@ def _numeric_support(
         if (item.byte_start, item.byte_end) in renderer_slot_spans:
             result[item.obligation_id] = {"status": "unsupported"}
             continue
-        sentence = _containing_sentence(obligations, item)
+        sentence = authority.containing_sentence(obligations, item)
         label = generic_stage24._metric_label_binding(
             bundle.paper.content[sentence.byte_start : sentence.byte_end],
             sentence_start=sentence.byte_start,
@@ -2059,62 +2059,40 @@ def _citation_spec(
     *,
     binding: transport.UnderlyingClientBinding,
 ) -> _AssessmentSpec:
-    identity = {
-        "schema_version": 2,
-        "policy_version": "citation_assessment_v2",
-        "assessment_role": "citation_assessment",
-        "client_binding_sha256": binding.client_binding_sha256,
-        "canonical_manifest_sha256": item.canonical_manifest_sha256,
-        "paper_sha256": item.paper_sha256,
-        "obligation_id": item.obligation_id,
-        "byte_start": item.byte_start,
-        "byte_end": item.byte_end,
-        "source_sha256": item.source_sha256,
-        "instance_id": item.instance_id,
-        "cite_key": item.cite_key,
-        "stage23_verification_record_sha256": (
-            item.stage23_verification_record_sha256
+    plan = authority.derive_citation_assessment_plan(
+        authority.CitationAssessmentPlanInput(
+            canonical_manifest_sha256=item.canonical_manifest_sha256,
+            paper_sha256=item.paper_sha256,
+            obligation_id=item.obligation_id,
+            byte_start=item.byte_start,
+            byte_end=item.byte_end,
+            source_sha256=item.source_sha256,
+            instance_id=item.instance_id,
+            cite_key=item.cite_key,
+            stage23_verification_record_sha256=(
+                item.stage23_verification_record_sha256
+            ),
+            evidence_records=tuple(asdict(row) for row in item.evidence_records),
+            paper=bundle.paper.content,
+            obligations=tuple(obligations),
+            evidence_cards=tuple(bundle.evidence_cards),
         ),
-        "evidence_records": [asdict(row) for row in item.evidence_records],
-        "critic_model": binding.model,
-    }
-    assessment_id = authority.global_identity_sha256(identity)
-    obligation = next(
-        row for row in obligations if row.obligation_id == item.obligation_id
+        client_binding_sha256=binding.client_binding_sha256,
+        critic_model=binding.model,
     )
-    container = _containing_sentence(obligations, obligation)
-    cards = generic_stage24._cards_by_key(bundle)
-    card = cards[item.cite_key][0]
-    excerpts = {
-        row["excerpt_id"]: row
-        for row in card["evidence_excerpts"]
-        if isinstance(row, Mapping)
-    }
-    context = {
-        "manuscript_context": bundle.paper.content[
-            container.byte_start : container.byte_end
-        ].decode("utf-8", errors="strict"),
-        "retained_excerpts": [
-            {
-                "excerpt_id": record.excerpt_id,
-                "excerpt_text": excerpts[record.excerpt_id]["excerpt_text"],
-            }
-            for record in item.evidence_records
-        ],
-    }
     transport.build_assessment_request(
-        role="citation_assessment",
+        role=plan.role,
         binding=binding,
-        assessment_input=identity,
-        bound_context=context,
+        assessment_input=plan.identity,
+        bound_context=plan.bound_context,
     )
     return _AssessmentSpec(
-        "citation_assessment",
-        identity,
-        assessment_id,
-        context,
-        item.obligation_id,
-        None,
+        plan.role,
+        plan.identity,
+        plan.assessment_id,
+        plan.bound_context,
+        plan.obligation_id,
+        plan.finding_content_sha256,
     )
 
 
@@ -2127,46 +2105,32 @@ def _resolution_specs(
     findings = () if critique is None else critique["findings"]
     result: list[_AssessmentSpec] = []
     for finding in findings:
-        if finding["severity"] not in {"P0", "P1"}:
+        plan = authority.derive_resolution_assessment_plan(
+            authority.ResolutionAssessmentPlanInput(
+                critique_sha256=bundle.critique.sha256,
+                raw_paper_sha256=bundle.paper.sha256,
+                finding=finding,
+                paper=bundle.paper.content,
+            ),
+            client_binding_sha256=binding.client_binding_sha256,
+            critic_model=binding.model,
+        )
+        if plan is None:
             continue
-        content = {
-            key: finding[key]
-            for key in (
-                "id",
-                "severity",
-                "category",
-                "question",
-                "finding",
-                "falsification_criterion",
-            )
-        }
-        finding_hash = authority.global_identity_sha256(content)
-        identity = {
-            "schema_version": 2,
-            "policy_version": "resolution_assessment_v2",
-            "assessment_role": "resolution_assessment",
-            "client_binding_sha256": binding.client_binding_sha256,
-            "critique_sha256": bundle.critique.sha256,
-            "finding_content_sha256": finding_hash,
-            "raw_paper_sha256": bundle.paper.sha256,
-            "critic_model": binding.model,
-        }
-        assessment_id = authority.global_identity_sha256(identity)
-        context = {"finding": content, "paper": bundle.paper.text()}
         transport.build_assessment_request(
-            role="resolution_assessment",
+            role=plan.role,
             binding=binding,
-            assessment_input=identity,
-            bound_context=context,
+            assessment_input=plan.identity,
+            bound_context=plan.bound_context,
         )
         result.append(
             _AssessmentSpec(
-                "resolution_assessment",
-                identity,
-                assessment_id,
-                context,
-                None,
-                finding_hash,
+                plan.role,
+                plan.identity,
+                plan.assessment_id,
+                plan.bound_context,
+                plan.obligation_id,
+                plan.finding_content_sha256,
             )
         )
     if len(result) > 12:
@@ -2185,99 +2149,41 @@ def _derive_generic_specs(
     result: list[_AssessmentSpec] = []
     binding = capture.role_bindings["generic_support_assessment"]
     for sentence in capture.generic_universe:
-        evidence_rows: list[dict[str, object]] = []
-        for child in capture.obligations:
-            if (
-                child.byte_start < sentence.byte_start
-                or child.byte_end > sentence.byte_end
-            ):
-                continue
-            numeric = capture.numeric.get(child.obligation_id)
-            if numeric is not None and numeric["status"] == "supported":
-                numeric_binding = copy.deepcopy(numeric["authority"])
-                evidence_rows.append(
-                    {
-                        "evidence_kind": "numeric_support",
-                        "authority": numeric_binding,
-                        "semantic_pointer": numeric_binding[
-                            "semantic_pointer"
-                        ],
-                        "semantic_value_sha256": numeric_binding[
-                            "semantic_value_sha256"
-                        ],
-                    }
-                )
-            citation = citation_records.get(child.obligation_id)
-            if citation is not None and citation["verdict"] == "supported":
-                assessment_id = citation["assessment_id"]
-                content = citation_bytes[f"{assessment_id}.json"]
-                evidence_rows.append(
-                    {
-                        "evidence_kind": "citation_support",
-                        "authority": {
-                            "authority_kind": "file",
-                            "file": {
-                                "path": (
-                                    "stage-24/citation-assessments/"
-                                    f"{assessment_id}.json"
-                                ),
-                                "sha256": hashlib.sha256(content).hexdigest(),
-                                "size": len(content),
-                            },
-                        },
-                        "semantic_pointer": "/verdict",
-                        "semantic_value_sha256": hashlib.sha256(
-                            b"supported"
-                        ).hexdigest(),
-                    }
-                )
-        unique = {
-            authority.global_canonical_json_bytes(row): row
-            for row in evidence_rows
-        }
-        rows = [
-            unique[key]
-            for key in sorted(unique)
-        ]
-        if not rows:
-            continue
-        identity = {
-            "schema_version": 3,
-            "policy_version": "generic_support_structured_v3",
-            "assessment_role": "generic_support_assessment",
-            "client_binding_sha256": binding.client_binding_sha256,
-            "canonical_manifest_sha256": (
-                capture.generic_bundle.canonical_manifest.sha256
+        plan = authority.derive_generic_assessment_plan(
+            authority.GenericAssessmentPlanInput(
+                canonical_manifest_sha256=(
+                    capture.generic_bundle.canonical_manifest.sha256
+                ),
+                paper_sha256=capture.generic_bundle.paper.sha256,
+                obligation_id=sentence.obligation_id,
+                byte_start=sentence.byte_start,
+                byte_end=sentence.byte_end,
+                source_sha256=sentence.source_sha256,
+                paper=capture.generic_bundle.paper.content,
+                obligations=capture.obligations,
+                numeric_support=capture.numeric,
+                citation_records=citation_records,
+                citation_record_bytes=citation_bytes,
             ),
-            "paper_sha256": capture.generic_bundle.paper.sha256,
-            "obligation_id": sentence.obligation_id,
-            "byte_start": sentence.byte_start,
-            "byte_end": sentence.byte_end,
-            "source_sha256": sentence.source_sha256,
-            "evidence_records": rows,
-            "critic_model": binding.model,
-        }
-        assessment_id = authority.global_identity_sha256(identity)
-        context = {
-            "manuscript_sentence": capture.generic_bundle.paper.content[
-                sentence.byte_start : sentence.byte_end
-            ].decode("utf-8", errors="strict"),
-            "evidence_records": copy.deepcopy(rows),
-        }
+            client_binding_sha256=binding.client_binding_sha256,
+            critic_model=binding.model,
+        )
+        if plan is None:
+            continue
         transport.build_assessment_request(
-            role="generic_support_assessment",
+            role=plan.role,
             binding=binding,
-            assessment_input=identity,
-            bound_context=context,
+            assessment_input=plan.identity,
+            bound_context=plan.bound_context,
         )
         result.append(
             _AssessmentSpec(
-                "generic_support_assessment",
-                identity,
-                assessment_id,
-                context,
-                sentence.obligation_id,
-                None,
+                plan.role,
+                plan.identity,
+                plan.assessment_id,
+                plan.bound_context,
+                plan.obligation_id,
+                plan.finding_content_sha256,
             )
         )
     return tuple(result)
@@ -3677,31 +3583,6 @@ def _model_projection(config) -> dict[str, str]:
             "writer and Stage 24 critics are not isolated"
         )
     return values
-
-
-def _containing_sentence(
-    obligations: Sequence[ClaimObligation],
-    child: ClaimObligation,
-) -> ClaimObligation:
-    candidates = tuple(
-        item
-        for item in obligations
-        if item.kind in {"comparative_sentence", "declarative_sentence"}
-        and item.byte_start <= child.byte_start
-        and item.byte_end >= child.byte_end
-    )
-    if not candidates:
-        return child
-    return min(
-        candidates,
-        key=lambda item: (
-            item.byte_end - item.byte_start,
-            item.byte_start,
-            item.byte_end,
-            authority.KIND_RANK[item.kind],
-            item.obligation_id,
-        ),
-    )
 
 
 def _strict_object(content: bytes, label: str) -> dict[str, object]:

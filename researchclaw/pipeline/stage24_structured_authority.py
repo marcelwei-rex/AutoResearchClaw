@@ -7,7 +7,7 @@ specified by ``SCIENTIFIC_CLAIM_AUTHORITY_DESIGN.md`` section 18.15.
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -141,6 +141,272 @@ def global_canonical_json_bytes(value: object) -> bytes:
 
 def global_identity_sha256(value: object) -> str:
     return hashlib.sha256(global_canonical_json_bytes(value)).hexdigest()
+
+
+@dataclass(frozen=True)
+class AssessmentPlanItem:
+    role: str
+    identity: Mapping[str, object]
+    assessment_id: str
+    bound_context: Mapping[str, object]
+    obligation_id: str | None
+    finding_content_sha256: str | None
+
+
+@dataclass(frozen=True)
+class CitationAssessmentPlanInput:
+    canonical_manifest_sha256: str
+    paper_sha256: str
+    obligation_id: str
+    byte_start: int
+    byte_end: int
+    source_sha256: str
+    instance_id: str
+    cite_key: str
+    stage23_verification_record_sha256: str
+    evidence_records: tuple[Mapping[str, object], ...]
+    paper: bytes
+    obligations: tuple[ClaimObligation, ...]
+    evidence_cards: tuple[Mapping[str, object], ...]
+
+
+@dataclass(frozen=True)
+class GenericAssessmentPlanInput:
+    canonical_manifest_sha256: str
+    paper_sha256: str
+    obligation_id: str
+    byte_start: int
+    byte_end: int
+    source_sha256: str
+    paper: bytes
+    obligations: tuple[ClaimObligation, ...]
+    numeric_support: Mapping[str, Mapping[str, object]]
+    citation_records: Mapping[str, Mapping[str, object]]
+    citation_record_bytes: Mapping[str, bytes]
+
+
+@dataclass(frozen=True)
+class ResolutionAssessmentPlanInput:
+    critique_sha256: str
+    raw_paper_sha256: str
+    finding: Mapping[str, object]
+    paper: bytes
+
+
+def derive_citation_assessment_plan(
+    inputs: CitationAssessmentPlanInput,
+    *,
+    client_binding_sha256: str,
+    critic_model: str,
+) -> AssessmentPlanItem:
+    target = next(
+        row for row in inputs.obligations if row.obligation_id == inputs.obligation_id
+    )
+    container = containing_sentence(inputs.obligations, target)
+    if type(inputs.cite_key) is not str or not inputs.cite_key:
+        raise StructuredStage24AuthorityError("citation card cite_key closure mismatch")
+    cards: dict[str, Mapping[str, object]] = {}
+    for row in inputs.evidence_cards:
+        key = row.get("cite_key")
+        if type(key) is not str or not key or key in cards:
+            raise StructuredStage24AuthorityError(
+                "citation card cite_key closure mismatch"
+            )
+        cards[key] = row
+    if inputs.cite_key not in cards:
+        raise StructuredStage24AuthorityError("citation card cite_key closure mismatch")
+    excerpts = {
+        row["excerpt_id"]: row
+        for row in cards[inputs.cite_key]["evidence_excerpts"]
+        if isinstance(row, Mapping)
+    }
+    evidence = [_detached_mapping(row) for row in inputs.evidence_records]
+    identity = {
+        "schema_version": 2,
+        "policy_version": "citation_assessment_v2",
+        "assessment_role": "citation_assessment",
+        "client_binding_sha256": client_binding_sha256,
+        "canonical_manifest_sha256": inputs.canonical_manifest_sha256,
+        "paper_sha256": inputs.paper_sha256,
+        "obligation_id": inputs.obligation_id,
+        "byte_start": inputs.byte_start,
+        "byte_end": inputs.byte_end,
+        "source_sha256": inputs.source_sha256,
+        "instance_id": inputs.instance_id,
+        "cite_key": inputs.cite_key,
+        "stage23_verification_record_sha256": (
+            inputs.stage23_verification_record_sha256
+        ),
+        "evidence_records": evidence,
+        "critic_model": critic_model,
+    }
+    context = {
+        "manuscript_context": inputs.paper[
+            container.byte_start : container.byte_end
+        ].decode("utf-8", errors="strict"),
+        "retained_excerpts": [
+            {
+                "excerpt_id": row["excerpt_id"],
+                "excerpt_text": excerpts[row["excerpt_id"]]["excerpt_text"],
+            }
+            for row in inputs.evidence_records
+        ],
+    }
+    return AssessmentPlanItem(
+        "citation_assessment",
+        identity,
+        global_identity_sha256(identity),
+        context,
+        inputs.obligation_id,
+        None,
+    )
+
+
+def derive_generic_assessment_plan(
+    inputs: GenericAssessmentPlanInput,
+    *,
+    client_binding_sha256: str,
+    critic_model: str,
+) -> AssessmentPlanItem | None:
+    evidence_rows: list[dict[str, object]] = []
+    for child in inputs.obligations:
+        if child.byte_start < inputs.byte_start or child.byte_end > inputs.byte_end:
+            continue
+        numeric = inputs.numeric_support.get(child.obligation_id)
+        if numeric is not None and numeric["status"] == "supported":
+            binding = _detached_mapping(numeric["authority"])  # type: ignore[arg-type]
+            evidence_rows.append(
+                {
+                    "evidence_kind": "numeric_support",
+                    "authority": binding,
+                    "semantic_pointer": binding["semantic_pointer"],
+                    "semantic_value_sha256": binding["semantic_value_sha256"],
+                }
+            )
+        citation = inputs.citation_records.get(child.obligation_id)
+        if citation is not None and citation["verdict"] == "supported":
+            assessment_id = citation["assessment_id"]
+            content = inputs.citation_record_bytes[f"{assessment_id}.json"]
+            evidence_rows.append(
+                {
+                    "evidence_kind": "citation_support",
+                    "authority": {
+                        "authority_kind": "file",
+                        "file": {
+                            "path": "stage-24/citation-assessments/"
+                            f"{assessment_id}.json",
+                            "sha256": hashlib.sha256(content).hexdigest(),
+                            "size": len(content),
+                        },
+                    },
+                    "semantic_pointer": "/verdict",
+                    "semantic_value_sha256": hashlib.sha256(b"supported").hexdigest(),
+                }
+            )
+    unique = {
+        global_canonical_json_bytes(row): _detached_mapping(row)
+        for row in evidence_rows
+    }
+    rows = [unique[key] for key in sorted(unique)]
+    if not rows:
+        return None
+    identity_rows = [_detached_mapping(row) for row in rows]
+    identity = {
+        "schema_version": 3,
+        "policy_version": "generic_support_structured_v3",
+        "assessment_role": "generic_support_assessment",
+        "client_binding_sha256": client_binding_sha256,
+        "canonical_manifest_sha256": inputs.canonical_manifest_sha256,
+        "paper_sha256": inputs.paper_sha256,
+        "obligation_id": inputs.obligation_id,
+        "byte_start": inputs.byte_start,
+        "byte_end": inputs.byte_end,
+        "source_sha256": inputs.source_sha256,
+        "evidence_records": identity_rows,
+        "critic_model": critic_model,
+    }
+    context = {
+        "manuscript_sentence": inputs.paper[
+            inputs.byte_start : inputs.byte_end
+        ].decode(
+            "utf-8", errors="strict"
+        ),
+        "evidence_records": [_detached_mapping(row) for row in rows],
+    }
+    return AssessmentPlanItem(
+        "generic_support_assessment",
+        identity,
+        global_identity_sha256(identity),
+        context,
+        inputs.obligation_id,
+        None,
+    )
+
+
+def derive_resolution_assessment_plan(
+    inputs: ResolutionAssessmentPlanInput,
+    *,
+    client_binding_sha256: str,
+    critic_model: str,
+) -> AssessmentPlanItem | None:
+    if inputs.finding["severity"] not in {"P0", "P1"}:
+        return None
+    content = {
+        key: _plain(inputs.finding[key])
+        for key in (
+            "id",
+            "severity",
+            "category",
+            "question",
+            "finding",
+            "falsification_criterion",
+        )
+    }
+    finding_hash = global_identity_sha256(content)
+    identity = {
+        "schema_version": 2,
+        "policy_version": "resolution_assessment_v2",
+        "assessment_role": "resolution_assessment",
+        "client_binding_sha256": client_binding_sha256,
+        "critique_sha256": inputs.critique_sha256,
+        "finding_content_sha256": finding_hash,
+        "raw_paper_sha256": inputs.raw_paper_sha256,
+        "critic_model": critic_model,
+    }
+    context = {
+        "finding": _detached_mapping(content),
+        "paper": inputs.paper.decode("utf-8", errors="strict"),
+    }
+    return AssessmentPlanItem(
+        "resolution_assessment",
+        identity,
+        global_identity_sha256(identity),
+        context,
+        None,
+        finding_hash,
+    )
+
+
+def containing_sentence(
+    obligations: Sequence[ClaimObligation], child: ClaimObligation
+) -> ClaimObligation:
+    candidates = tuple(
+        item
+        for item in obligations
+        if item.kind in {"comparative_sentence", "declarative_sentence"}
+        and item.byte_start <= child.byte_start
+        and item.byte_end >= child.byte_end
+    )
+    return child if not candidates else min(
+        candidates,
+        key=lambda item: (
+            item.byte_end - item.byte_start,
+            item.byte_start,
+            item.byte_end,
+            KIND_RANK[item.kind],
+            item.obligation_id,
+        ),
+    )
 
 
 def strict_json_object(content: bytes, *, label: str) -> dict[str, Any]:
@@ -872,3 +1138,10 @@ def _plain(value: object) -> object:
     if isinstance(value, (tuple, list)):
         return [_plain(item) for item in value]
     return value
+
+
+def _detached_mapping(value: Mapping[str, object]) -> dict[str, object]:
+    detached = _plain(value)
+    if type(detached) is not dict:
+        raise StructuredStage24AuthorityError("plan input is not a JSON object")
+    return detached

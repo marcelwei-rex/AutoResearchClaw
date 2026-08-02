@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import ast
 import hashlib
 import json
 from dataclasses import replace
@@ -1137,6 +1138,161 @@ def _complete_stage24_upstream(
     )
     _publish_stage15_none(capture, monkeypatch)
     assert publish_stage23(capture).status is StageStatus.DONE
+
+
+def test_stage24_success_namespace_matches_literal_golden_bytes(
+    active_capture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from researchclaw.pipeline import stage20_structured_publication as stage20
+
+    monkeypatch.setattr(
+        stage20,
+        "_utcnow_iso",
+        lambda: "2026-07-28T00:00:00+00:00",
+    )
+    _complete_stage24_upstream(active_capture, monkeypatch)
+    monkeypatch.setattr(
+        transport.Stage24AssessmentTransport,
+        "exchange",
+        lambda _client, request: _assessment_http(request),
+    )
+    clients = {role: _client_factory for role in transport.ROLE_ORDER}
+    pre = publication.issue_stage24_pre_admission_context(
+        active_capture.lease,
+        clients=clients,
+    )
+    success = executor._execute_structured_stage24_private(
+        active_capture.lease,
+        pre,
+    )
+    assert success.status is StageStatus.DONE, success.error
+    stage24 = active_capture.run_dir / "stage-24"
+    actual = {
+        path.relative_to(stage24).as_posix(): (
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+            path.stat().st_size,
+        )
+        for path in sorted(stage24.rglob("*"))
+        if path.is_file()
+    }
+    golden = {
+        "citation-assessments/8a48a69a7072bb20ba71bad55d186a6e2995fa85dcc76902758645e5be85a01e.json": (
+            "3eb26a5549d9a5de601521ef1a5bf376d77c807564b56614de6847981dd7070a",
+            1124,
+        ),
+        "citation_support.json": (
+            "9c961dd8dfe0a139b54a13caed6a34094705db220b7b1dcc7b952c884b94873a",
+            496,
+        ),
+        "citations.json": (
+            "a1148a677f994b5848652faaf1616b732c2112ef428ec9463d9e71d396cedf50",
+            379,
+        ),
+        "claims.json": (
+            "c0c88b149d81324462981a40423c75c07c4906045871eec20783c04e57ca9150",
+            2542,
+        ),
+        "critique_resolution.json": (
+            "7154e968d410244588c7f2a72cddd46e3736519cac7cc95f9ffd0e59cd506abc",
+            265,
+        ),
+        "generic-support-assessments/0dadefa7a930a67d5ad8877b4486adb8c3f767ddbc47df67fca9da2554936aa5.json": (
+            "55aa8f92f80cb7d8c11d8233a2db0d4097764829f9678e6c394890943cd2d831",
+            1138,
+        ),
+        "obligation_inventory.json": (
+            "b3e42e2f81fb944380d550a44f5c8ee12494bb16a58effa5ffbde266877f3fc5",
+            4454,
+        ),
+        "stage24_truth_manifest.json": (
+            "82a0e5a6f4b33a95cb0a58d680acab2f582cbf3ed4a9d256b1a2416aa93b7532",
+            4493,
+        ),
+        "truth_audit.json": (
+            "91d006e52aa829e4ac3a984d872759f131774ef44af3ae2aa45ed668e664d1db",
+            895,
+        ),
+    }
+    assert actual == golden
+    assert tuple(
+        path.relative_to(stage24).as_posix()
+        for path in sorted(stage24.rglob("*"))
+        if path.is_dir()
+    ) == (
+        "citation-assessments",
+        "generic-support-assessments",
+        "resolution-assessments",
+    )
+
+
+def test_assessment_spec_builders_delegate_shared_plans_and_keep_gates() -> None:
+    tree = ast.parse(inspect.getsource(publication))
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    expected = {
+        "_citation_spec": "derive_citation_assessment_plan",
+        "_derive_generic_specs": "derive_generic_assessment_plan",
+        "_resolution_specs": "derive_resolution_assessment_plan",
+    }
+    for function_name, shared_name in expected.items():
+        calls = [
+            node
+            for node in ast.walk(functions[function_name])
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        ]
+        assert sum(call.func.attr == shared_name for call in calls) == 1
+        assert sum(call.func.attr == "build_assessment_request" for call in calls) == 1
+        shared_call = next(call for call in calls if call.func.attr == shared_name)
+        critic = next(
+            keyword.value
+            for keyword in shared_call.keywords
+            if keyword.arg == "critic_model"
+        )
+        assert isinstance(critic, ast.Attribute)
+        assert isinstance(critic.value, ast.Name)
+        assert (critic.value.id, critic.attr) == ("binding", "model")
+    assert "_containing_sentence" not in functions
+    citation_source = inspect.getsource(publication._citation_spec)
+    generic_source = inspect.getsource(publication._derive_generic_specs)
+    assert "manuscript_context" not in citation_source
+    assert "retained_excerpts" not in citation_source
+    assert "evidence_kind" not in generic_source
+
+
+def test_resolution_count_fails_after_thirteenth_request_gate(monkeypatch) -> None:
+    findings = tuple(
+        {
+            "id": f"f-{index}",
+            "severity": "P1",
+            "category": "evidence",
+            "question": "Q?",
+            "finding": "F.",
+            "falsification_criterion": "C.",
+        }
+        for index in range(13)
+    )
+    bundle = SimpleNamespace(
+        critique_publication=SimpleNamespace(critique={"findings": findings}),
+        critique=SimpleNamespace(sha256="d" * 64),
+        paper=SimpleNamespace(sha256="e" * 64, content=b"Paper."),
+    )
+    binding = SimpleNamespace(client_binding_sha256="c" * 64, model="critic-r")
+    gates = []
+    monkeypatch.setattr(
+        transport,
+        "build_assessment_request",
+        lambda **kwargs: gates.append(kwargs),
+    )
+    with pytest.raises(
+        publication.StructuredStage24PublicationError,
+        match="Stage 24 resolution count exceeds 12",
+    ):
+        publication._resolution_specs(bundle, binding=binding)
+    assert len(gates) == 13
 
 
 def test_private_stage24_real_success_and_mutation_cleanup(
