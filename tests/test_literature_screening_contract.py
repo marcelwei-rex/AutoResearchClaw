@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from researchclaw.adapters import AdapterBundle
+from researchclaw.config import RCConfig
 from researchclaw.literature.citation_identity import seal_citation_collection
 from researchclaw.literature.screening import (
     MAX_SCREEN_CANDIDATES,
@@ -23,9 +24,11 @@ from researchclaw.literature.screening import (
     parse_screening_response,
     sha256_text,
 )
-from researchclaw.pipeline.stage_impls._literature import _execute_literature_screen
+from researchclaw.pipeline import runner as rc_runner
 from researchclaw.pipeline.citation_release_audit import _replay_screening_admission
-from researchclaw.pipeline.stages import StageStatus
+from researchclaw.pipeline.executor import StageResult
+from researchclaw.pipeline.stage_impls._literature import _execute_literature_screen
+from researchclaw.pipeline.stages import STAGE_SEQUENCE, Stage, StageStatus
 
 
 class _SequenceLLM:
@@ -89,12 +92,34 @@ def _response(
     )
 
 
-def _config(claim_scope: str = "pipeline_validation") -> SimpleNamespace:
+def _run02_threshold_contradiction_responses(source_ids: list[str]) -> list[str]:
+    responses: list[str] = []
+    for batch_index in range(7):
+        start = batch_index * SCREEN_BATCH_SIZE
+        responses.append(
+            _response(
+                f"screen-batch-{batch_index + 1:03d}",
+                source_ids[start:start + SCREEN_BATCH_SIZE],
+            )
+        )
+    batch8_ids = source_ids[7 * SCREEN_BATCH_SIZE:8 * SCREEN_BATCH_SIZE]
+    contradictory = json.loads(_response("screen-batch-008", batch8_ids))
+    contradictory["decisions"][0]["quality_score"] = 0.4
+    response = json.dumps(contradictory)
+    return [*responses, response, response]
+
+
+def _config(
+    claim_scope: str = "pipeline_validation",
+    *,
+    graceful_degradation: bool = True,
+) -> SimpleNamespace:
     return SimpleNamespace(
         research=SimpleNamespace(
             topic="hardware runtime detection",
             domains=("hardware security",),
             quality_threshold=6.0,
+            graceful_degradation=graceful_degradation,
         ),
         experiment=SimpleNamespace(claim_scope=claim_scope),
     )
@@ -273,6 +298,126 @@ def test_pipeline_validation_can_continue_only_verified_batches_degraded(
     assert report["unscreened_candidate_ids"] == second_ids
     assert report["screening_complete"] is False
     assert report["degraded"] is True
+
+
+def test_run02_threshold_contradiction_fails_when_degradation_disabled(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run-02"
+    candidates = [
+        _candidate(index) for index in range(1, MAX_SCREEN_CANDIDATES + 1)
+    ]
+    ids = _write_candidates(run_dir, candidates)
+    llm = _SequenceLLM(_run02_threshold_contradiction_responses(ids))
+    stage_dir = run_dir / "stage-05"
+    stage_dir.mkdir()
+
+    result = _execute_literature_screen(
+        stage_dir,
+        run_dir,
+        _config("pipeline_validation", graceful_degradation=False),  # type: ignore[arg-type]
+        AdapterBundle(),
+        llm=llm,  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert result.decision == "retry"
+    assert "screening is incomplete" in (result.error or "")
+    assert len(llm.calls) == 9
+    assert not (stage_dir / "shortlist.jsonl").exists()
+    assert (stage_dir / "screening_partial.jsonl").exists()
+    report = json.loads((stage_dir / "screening_report.json").read_text())
+    assert report["screening_complete"] is False
+    assert report["degraded"] is True
+    assert report["screened_candidate_ids"] == ids[:7 * SCREEN_BATCH_SIZE]
+    assert report["unscreened_candidate_ids"] == ids[7 * SCREEN_BATCH_SIZE:]
+    assert report["failed_batches"] == [
+        {
+            "batch_id": "screen-batch-008",
+            "error": (
+                "initial_error=screening decision contradicts configured score "
+                "thresholds; repair_error=screening decision contradicts "
+                "configured score thresholds"
+            ),
+        }
+    ]
+
+
+def test_run02_stage5_failure_terminalizes_runner_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_evidence_migration_complete: None,
+) -> None:
+    run_dir = tmp_path / "run-02-integrated"
+    candidates = [
+        _candidate(index) for index in range(1, MAX_SCREEN_CANDIDATES + 1)
+    ]
+    ids = _write_candidates(run_dir, candidates)
+    llm = _SequenceLLM(_run02_threshold_contradiction_responses(ids))
+    config = RCConfig.from_dict(
+        {
+            "project": {"name": "run-02-stage05-acceptance", "mode": "docs-first"},
+            "research": {
+                "topic": "hardware runtime detection",
+                "domains": ["hardware security"],
+                "quality_threshold": 6.0,
+                "graceful_degradation": False,
+            },
+            "experiment": {"claim_scope": "pipeline_validation"},
+            "llm": {
+                "provider": "openai-compatible",
+                "base_url": "http://localhost:1234/v1",
+                "api_key_env": "RC_TEST_KEY",
+                "api_key": "fixture-only",
+            },
+            "runtime": {"timezone": "UTC"},
+            "notifications": {"channel": "local"},
+            "knowledge_base": {"root": str(tmp_path / "kb")},
+        },
+        project_root=tmp_path,
+        check_paths=False,
+    )
+    adapters = AdapterBundle()
+    seen: list[Stage] = []
+
+    def execute(stage: Stage, **_kwargs: object) -> StageResult:
+        seen.append(stage)
+        if stage is Stage.LITERATURE_SCREEN:
+            stage_dir = run_dir / "stage-05"
+            stage_dir.mkdir()
+            return _execute_literature_screen(
+                stage_dir, run_dir, config, adapters, llm=llm  # type: ignore[arg-type]
+            )
+        return StageResult(
+            stage=stage, status=StageStatus.DONE, artifacts=("out.md",)
+        )
+
+    monkeypatch.setattr(rc_runner, "execute_stage", execute)
+    results = rc_runner.execute_pipeline(
+        run_dir=run_dir,
+        run_id="run-02-stage05-acceptance",
+        config=config,
+        adapters=adapters,
+    )
+
+    assert seen == list(STAGE_SEQUENCE[:5])
+    assert results[-1].stage is Stage.LITERATURE_SCREEN
+    assert results[-1].status is StageStatus.FAILED
+    checkpoint = json.loads((run_dir / "checkpoint.json").read_text())
+    assert checkpoint["last_completed_stage"] == int(Stage.LITERATURE_COLLECT)
+    attempts = [
+        json.loads(line)
+        for line in (run_dir / "attempts" / "attempt_log.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert attempts[-1]["stage"] == int(Stage.LITERATURE_SCREEN)
+    assert attempts[-1]["status"] == StageStatus.FAILED.value
+    assert attempts[-1]["decision"] == "retry"
+    summary = json.loads((run_dir / "pipeline_summary.json").read_text())
+    assert summary["final_stage"] == int(Stage.LITERATURE_SCREEN)
+    assert summary["final_status"] == StageStatus.FAILED.value
+    assert summary["stages_failed"] == 1
 
 
 def test_research_release_rejects_any_failed_batch(tmp_path: Path) -> None:

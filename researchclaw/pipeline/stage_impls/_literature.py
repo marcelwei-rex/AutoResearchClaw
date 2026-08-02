@@ -870,7 +870,10 @@ def _execute_literature_screen(
     )
 
     claim_scope = config.experiment.claim_scope
-    allows_degraded_screening = claim_scope == "pipeline_validation"
+    allows_degraded_screening = (
+        claim_scope == "pipeline_validation"
+        and getattr(config.research, "graceful_degradation", True)
+    )
     selected_rows: list[dict[str, Any]] = []
     screened_ids: list[str] = []
     unscreened_ids: list[str] = []
