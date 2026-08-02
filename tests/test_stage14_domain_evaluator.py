@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from decimal import Decimal
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import shutil
@@ -48,6 +49,60 @@ _DOMAIN_METRICS = (
     "recall",
     "top_k_precision",
 )
+
+
+@pytest.mark.parametrize(
+    ("path", "role", "expected"),
+    [
+        ("evaluator/evaluator_main.py", "evaluator", "main.py"),
+        ("verifier/verifier_main.py", "verifier", "verifier_main.py"),
+        ("vendor/models/deep/model.py", "vendor", "trojnet/models/deep/model.py"),
+        (
+            "policy/execution-policy-v1.json",
+            "policy",
+            "execution-policy-v1.json",
+        ),
+        ("data/c1355/nested/sample.bench", "data", "data/c1355/nested/sample.bench"),
+    ],
+)
+def test_domain_project_logical_name_mapping(
+    path: str, role: object, expected: str
+) -> None:
+    from researchclaw.pipeline.stage14_domain_evaluator import (
+        domain_project_logical_name,
+    )
+
+    assert domain_project_logical_name(path, role) == expected
+
+
+@pytest.mark.parametrize(
+    ("path", "role"),
+    [
+        ("evaluator/evaluator_main.py", "unknown"),
+        ("data/c1355/sample.bench", "vendor"),
+        ("evaluator/unknown.py", "evaluator"),
+    ],
+)
+def test_domain_project_logical_name_rejects_unsupported_pairs(
+    path: str, role: object
+) -> None:
+    from researchclaw.pipeline.stage14_domain_evaluator import (
+        Stage14DomainEvaluatorError,
+        domain_project_logical_name,
+    )
+
+    with pytest.raises(Stage14DomainEvaluatorError) as exc_info:
+        domain_project_logical_name(path, role)
+    assert str(exc_info.value) == (
+        f"unsupported domain evaluator release project entry: {path}"
+    )
+
+
+def test_domain_project_logical_name_is_the_only_producer_mapping_source() -> None:
+    assert not hasattr(stage14_domain_evaluator, "_domain_project_logical_name")
+    source = inspect.getsource(stage14_domain_evaluator._domain_project_artifacts)
+    assert "domain_project_logical_name(path, item[\"role\"])" in source
+    assert "_domain_project_logical_name" not in source
 
 
 def _domain_observation_payload() -> dict[str, object]:

@@ -1638,7 +1638,7 @@ def _domain_project_artifacts(
             raise Stage14DomainEvaluatorError(
                 f"Stage 10 capture project file binding mismatch: {path}"
             )
-        logical_name = _domain_project_logical_name(path, item["role"])
+        logical_name = domain_project_logical_name(path, item["role"])
         artifacts.append(
             CanonicalProjectArtifact(
                 logical_name=logical_name,
@@ -1655,7 +1655,7 @@ def _domain_project_artifacts(
     return tuple(sorted(artifacts, key=lambda artifact: artifact.logical_name))
 
 
-def _domain_project_logical_name(path: str, role: object) -> str:
+def domain_project_logical_name(path: str, role: object) -> str:
     if role == "evaluator" and path == "evaluator/evaluator_main.py":
         return "main.py"
     if role == "verifier" and path == "verifier/verifier_main.py":
