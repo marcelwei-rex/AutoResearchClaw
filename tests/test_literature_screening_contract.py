@@ -17,6 +17,7 @@ from researchclaw.literature.screening import (
     MAX_SCREEN_REASON_CHARS,
     SCREEN_BATCH_SIZE,
     SCREENING_POLICY_VERSION,
+    SCREENING_SCHEMA_VERSION,
     ScreeningContractError,
     build_screening_report,
     parse_screening_candidates,
@@ -25,7 +26,8 @@ from researchclaw.literature.screening import (
     sha256_text,
 )
 from researchclaw.pipeline import runner as rc_runner
-from researchclaw.pipeline.citation_release_audit import _replay_screening_admission
+from researchclaw.pipeline import citation_release_audit
+from researchclaw.pipeline.citation_release_audit import CitationAuditError
 from researchclaw.pipeline.executor import StageResult
 from researchclaw.pipeline.stage_impls._literature import (
     _execute_literature_screen,
@@ -79,12 +81,11 @@ def _response(
     keep = keep_ids if keep_ids is not None else set(source_ids)
     return json.dumps(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "batch_id": batch_id,
             "decisions": [
                 {
                     "source_identity": source_id,
-                    "decision": "keep" if source_id in keep else "reject",
                     "relevance_score": 0.9 if source_id in keep else 0.1,
                     "quality_score": 0.8 if source_id in keep else 0.2,
                     "reason": "directly relevant" if source_id in keep else "off topic",
@@ -95,7 +96,7 @@ def _response(
     )
 
 
-def _run02_threshold_contradiction_responses(source_ids: list[str]) -> list[str]:
+def _legacy_decision_field_responses(source_ids: list[str]) -> list[str]:
     responses: list[str] = []
     for batch_index in range(7):
         start = batch_index * SCREEN_BATCH_SIZE
@@ -106,9 +107,9 @@ def _run02_threshold_contradiction_responses(source_ids: list[str]) -> list[str]
             )
         )
     batch8_ids = source_ids[7 * SCREEN_BATCH_SIZE:8 * SCREEN_BATCH_SIZE]
-    contradictory = json.loads(_response("screen-batch-008", batch8_ids))
-    contradictory["decisions"][0]["quality_score"] = 0.4
-    response = json.dumps(contradictory)
+    legacy = json.loads(_response("screen-batch-008", batch8_ids))
+    legacy["decisions"][0]["decision"] = "keep"
+    response = json.dumps(legacy)
     return [*responses, response, response]
 
 
@@ -158,7 +159,7 @@ def test_screening_response_requires_exact_candidate_id_closure() -> None:
 
 def test_screening_response_rejects_duplicate_json_key() -> None:
     text = (
-        '{"schema_version":1,"schema_version":1,'
+        '{"schema_version":2,"schema_version":2,'
         '"batch_id":"screen-batch-001","decisions":[]}'
     )
     with pytest.raises(ScreeningContractError, match="duplicate JSON key"):
@@ -180,16 +181,51 @@ def test_screening_response_rejects_boolean_score() -> None:
         )
 
 
-def test_screening_response_rejects_decision_score_contradiction() -> None:
+def test_screening_response_rejects_model_decision_field() -> None:
     payload = json.loads(_response("screen-batch-001", ["doi:10.1000/a"]))
-    payload["decisions"][0]["quality_score"] = 0.4
-    with pytest.raises(ScreeningContractError, match="contradicts"):
+    payload["decisions"][0]["decision"] = "keep"
+    with pytest.raises(ScreeningContractError, match="fields mismatch"):
         parse_screening_response(
             json.dumps(payload),
             expected_batch_id="screen-batch-001",
             expected_source_ids=["doi:10.1000/a"],
             minimum_quality_score=0.6,
         )
+
+
+def test_screening_response_rejects_schema_v1() -> None:
+    payload = json.loads(_response("screen-batch-001", ["doi:10.1000/a"]))
+    payload["schema_version"] = 1
+    with pytest.raises(ScreeningContractError, match="unsupported.*schema_version"):
+        parse_screening_response(
+            json.dumps(payload),
+            expected_batch_id="screen-batch-001",
+            expected_source_ids=["doi:10.1000/a"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("relevance", "quality", "expected"),
+    [(0.50, 0.60, "keep"), (0.4999, 0.60, "reject"), (0.50, 0.5999, "reject")],
+)
+def test_screening_response_v2_derives_decision_at_frozen_boundaries(
+    relevance: float, quality: float, expected: str
+) -> None:
+    payload = json.loads(_response("screen-batch-001", ["doi:10.1000/a"]))
+    row = payload["decisions"][0]
+    row["relevance_score"] = relevance
+    row["quality_score"] = quality
+    assert set(payload) == {"schema_version", "batch_id", "decisions"}
+    assert set(row) == {
+        "source_identity", "relevance_score", "quality_score", "reason"
+    }
+    parsed = parse_screening_response(
+        json.dumps(payload),
+        expected_batch_id="screen-batch-001",
+        expected_source_ids=["doi:10.1000/a"],
+        minimum_quality_score=0.6,
+    )
+    assert parsed[0].decision == expected
 
 
 @pytest.mark.parametrize(("reason_length", "accepted"), [(160, True), (161, False)])
@@ -264,94 +300,9 @@ def test_stage5_repairs_one_malformed_batch_once(tmp_path: Path) -> None:
     assert len(llm.calls) == 2
     assert "PREVIOUS RESPONSE VIOLATED" in llm.calls[1]
     assert f"at most {MAX_SCREEN_REASON_CHARS} Unicode" in llm.calls[0]
-
-
-def test_stage5_threshold_repair_identifies_each_conflict_and_invariant(
-    tmp_path: Path,
-) -> None:
-    rows = [_candidate(1), _candidate(2)]
-    ids = _write_candidates(tmp_path, rows)
-    sealed_rows = list(
-        parse_screening_candidates(
-            (tmp_path / "stage-04" / "candidates.jsonl").read_text()
-        )
-    )
-    contradictory = json.loads(_response("screen-batch-001", ids))
-    contradictory["decisions"][0].update(
-        {"decision": "keep", "relevance_score": 0.49, "quality_score": 0.8}
-    )
-    contradictory["decisions"][1].update(
-        {"decision": "keep", "relevance_score": 0.9, "quality_score": 0.59}
-    )
-    llm = _SequenceLLM(
-        [json.dumps(contradictory), _response("screen-batch-001", ids)]
-    )
-
-    decisions = _screen_candidate_batch(
-        llm=llm,  # type: ignore[arg-type]
-        prompts=None,
-        run_dir=tmp_path,
-        config=_config(),  # type: ignore[arg-type]
-        batch_id="screen-batch-001",
-        rows=sealed_rows,
-        minimum_quality_score=0.6,
-    )
-
-    assert len(decisions) == len(ids)
-    assert len(llm.calls) == 2
-    repair = llm.calls[1]
-    for expected in (
-        ids[0],
-        'actual decision="keep"',
-        "actual relevance_score=0.49",
-        "actual quality_score=0.80",
-        ids[1],
-        "actual relevance_score=0.90",
-        "actual quality_score=0.59",
-        "current relevance threshold=0.50",
-        "current quality threshold=0.60",
-        "keep iff relevance_score >= relevance_threshold AND quality_score >= "
-        "quality_threshold; reject otherwise",
-        "Regenerate the complete batch once",
-    ):
-        assert expected in repair
-
-
-def test_stage5_repair_identifies_reject_above_both_thresholds(
-    tmp_path: Path,
-) -> None:
-    ids = _write_candidates(tmp_path, [_candidate(1)])
-    rows = list(
-        parse_screening_candidates(
-            (tmp_path / "stage-04" / "candidates.jsonl").read_text()
-        )
-    )
-    contradictory = json.loads(_response("screen-batch-001", ids))
-    contradictory["decisions"][0]["decision"] = "reject"
-    llm = _SequenceLLM(
-        [json.dumps(contradictory), _response("screen-batch-001", ids)]
-    )
-
-    _screen_candidate_batch(
-        llm=llm,  # type: ignore[arg-type]
-        prompts=None,
-        run_dir=tmp_path,
-        config=_config(),  # type: ignore[arg-type]
-        batch_id="screen-batch-001",
-        rows=rows,
-        minimum_quality_score=0.6,
-    )
-
-    assert len(llm.calls) == 2
-    repair = llm.calls[1]
-    assert ids[0] in repair
-    assert 'actual decision="reject"' in repair
-    assert "actual relevance_score=0.90" in repair
-    assert "actual quality_score=0.80" in repair
-    assert (
-        "keep iff relevance_score >= relevance_threshold AND quality_score >= "
-        "quality_threshold; reject otherwise"
-    ) in repair
+    assert '"schema_version":2' in llm.calls[0]
+    assert "Do not output decision" in llm.calls[0]
+    assert not (stage_dir / "screening_failure_evidence.jsonl").exists()
 
 
 @pytest.mark.parametrize(
@@ -359,11 +310,9 @@ def test_stage5_repair_identifies_reject_above_both_thresholds(
     [
         ("source_identity", ["not", "a", "string"]),
         ("source_identity", {"not": "a string"}),
-        ("decision", ["not", "a", "string"]),
-        ("decision", {"not": "a string"}),
     ],
 )
-def test_stage5_malformed_identity_or_decision_repairs_once_then_fails_closed(
+def test_stage5_malformed_identity_repairs_once_then_fails_closed(
     tmp_path: Path, field: str, malformed: object
 ) -> None:
     ids = _write_candidates(tmp_path, [_candidate(1)])
@@ -393,7 +342,7 @@ def test_stage5_malformed_identity_or_decision_repairs_once_then_fails_closed(
     assert len(llm.calls) == 2
 
 
-def test_stage5_threshold_repair_is_once_only_and_remains_fail_closed(
+def test_stage5_extra_decision_repair_is_once_only_and_remains_fail_closed(
     tmp_path: Path,
 ) -> None:
     ids = _write_candidates(tmp_path, [_candidate(1)])
@@ -402,12 +351,12 @@ def test_stage5_threshold_repair_is_once_only_and_remains_fail_closed(
             (tmp_path / "stage-04" / "candidates.jsonl").read_text()
         )
     )
-    contradictory = json.loads(_response("screen-batch-001", ids))
-    contradictory["decisions"][0]["quality_score"] = 0.59
-    response = json.dumps(contradictory)
+    legacy = json.loads(_response("screen-batch-001", ids))
+    legacy["decisions"][0]["decision"] = "keep"
+    response = json.dumps(legacy)
     llm = _SequenceLLM([response, response])
 
-    with pytest.raises(ScreeningContractError, match="repair_error=.*contradicts"):
+    with pytest.raises(ScreeningContractError, match="repair_error=.*fields mismatch"):
         _screen_candidate_batch(
             llm=llm,  # type: ignore[arg-type]
             prompts=None,
@@ -419,6 +368,101 @@ def test_stage5_threshold_repair_is_once_only_and_remains_fail_closed(
         )
 
     assert len(llm.calls) == 2
+
+
+def test_stage5_terminal_repair_failure_writes_exact_safe_evidence(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    ids = _write_candidates(run_dir, [_candidate(1)])
+    legacy = json.loads(_response("screen-batch-001", ids))
+    legacy["decisions"][0]["decision"] = "keep"
+    response = json.dumps(legacy)
+    llm = _SequenceLLM([response, response])
+    llm.client_metadata = {"api_key": "SECRET_SENTINEL"}
+    stage_dir = run_dir / "stage-05"
+    stage_dir.mkdir()
+    evidence_path = stage_dir / "screening_failure_evidence.jsonl"
+    evidence_path.write_text("stale\n", encoding="utf-8")
+
+    result = _execute_literature_screen(
+        stage_dir,
+        run_dir,
+        _config(graceful_degradation=False),  # type: ignore[arg-type]
+        AdapterBundle(),
+        llm=llm,  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert len(llm.calls) == 2
+    lines = evidence_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    evidence = json.loads(lines[0])
+    assert set(evidence) == {
+        "evidence_schema_version", "batch_id", "initial_response",
+        "initial_error", "repair_prompt", "repair_response", "repair_error",
+    }
+    assert evidence["evidence_schema_version"] == 1
+    assert evidence["batch_id"] == "screen-batch-001"
+    assert evidence["initial_response"] == response
+    assert evidence["repair_response"] == response
+    assert evidence["repair_prompt"] == llm.calls[1]
+    assert "SECRET_SENTINEL" not in lines[0]
+    assert "screening_failure_evidence.jsonl" in result.artifacts
+    assert "stage-05/screening_failure_evidence.jsonl" in result.evidence_refs
+
+
+def test_stage5_success_clears_stale_failure_evidence(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    ids = _write_candidates(run_dir, [_candidate(1)])
+    stage_dir = run_dir / "stage-05"
+    stage_dir.mkdir()
+    evidence_path = stage_dir / "screening_failure_evidence.jsonl"
+    evidence_path.write_text("stale\n", encoding="utf-8")
+
+    result = _execute_literature_screen(
+        stage_dir,
+        run_dir,
+        _config(),  # type: ignore[arg-type]
+        AdapterBundle(),
+        llm=_SequenceLLM([_response("screen-batch-001", ids)]),  # type: ignore[arg-type]
+    )
+
+    assert result.status is StageStatus.DONE
+    assert not evidence_path.exists()
+    assert "screening_failure_evidence.jsonl" not in result.artifacts
+
+
+def test_stage5_degraded_failures_append_evidence_in_batch_order(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    ids = _write_candidates(
+        run_dir, [_candidate(index) for index in range(1, SCREEN_BATCH_SIZE + 2)]
+    )
+    responses: list[str] = []
+    for batch_number, batch_ids in enumerate(
+        (ids[:SCREEN_BATCH_SIZE], ids[SCREEN_BATCH_SIZE:]), start=1
+    ):
+        legacy = json.loads(_response(f"screen-batch-{batch_number:03d}", batch_ids))
+        legacy["decisions"][0]["decision"] = "keep"
+        response = json.dumps(legacy)
+        responses.extend([response, response])
+    stage_dir = run_dir / "stage-05"
+    stage_dir.mkdir()
+
+    _execute_literature_screen(
+        stage_dir, run_dir, _config(), AdapterBundle(),  # type: ignore[arg-type]
+        llm=_SequenceLLM(responses),  # type: ignore[arg-type]
+    )
+
+    evidence = [
+        json.loads(line)
+        for line in (stage_dir / "screening_failure_evidence.jsonl").read_text().splitlines()
+    ]
+    assert [row["batch_id"] for row in evidence] == [
+        "screen-batch-001", "screen-batch-002"
+    ]
 
 
 def test_pipeline_validation_can_continue_only_verified_batches_degraded(
@@ -458,7 +502,7 @@ def test_pipeline_validation_can_continue_only_verified_batches_degraded(
     assert report["degraded"] is True
 
 
-def test_run02_threshold_contradiction_fails_when_degradation_disabled(
+def test_legacy_decision_field_fails_when_degradation_disabled(
     tmp_path: Path,
 ) -> None:
     run_dir = tmp_path / "run-02"
@@ -466,7 +510,7 @@ def test_run02_threshold_contradiction_fails_when_degradation_disabled(
         _candidate(index) for index in range(1, MAX_SCREEN_CANDIDATES + 1)
     ]
     ids = _write_candidates(run_dir, candidates)
-    llm = _SequenceLLM(_run02_threshold_contradiction_responses(ids))
+    llm = _SequenceLLM(_legacy_decision_field_responses(ids))
     stage_dir = run_dir / "stage-05"
     stage_dir.mkdir()
 
@@ -493,15 +537,15 @@ def test_run02_threshold_contradiction_fails_when_degradation_disabled(
         {
             "batch_id": "screen-batch-008",
             "error": (
-                "initial_error=screening decision contradicts configured score "
-                "thresholds; repair_error=screening decision contradicts "
-                "configured score thresholds"
+                "initial_error=screening decision fields mismatch: missing=[], "
+                "extra=['decision']; repair_error=screening decision fields "
+                "mismatch: missing=[], extra=['decision']"
             ),
         }
     ]
 
 
-def test_run02_stage5_failure_terminalizes_runner_metadata(
+def test_legacy_decision_failure_terminalizes_runner_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     canonical_evidence_migration_complete: None,
@@ -511,7 +555,7 @@ def test_run02_stage5_failure_terminalizes_runner_metadata(
         _candidate(index) for index in range(1, MAX_SCREEN_CANDIDATES + 1)
     ]
     ids = _write_candidates(run_dir, candidates)
-    llm = _SequenceLLM(_run02_threshold_contradiction_responses(ids))
+    llm = _SequenceLLM(_legacy_decision_field_responses(ids))
     config = RCConfig.from_dict(
         {
             "project": {"name": "run-02-stage05-acceptance", "mode": "docs-first"},
@@ -745,6 +789,7 @@ def test_stage5_failure_clears_stale_owned_artifacts(tmp_path: Path) -> None:
         "screening_partial.jsonl",
         "screening_report.json",
         "screen_meta.json",
+        "screening_failure_evidence.jsonl",
     ):
         (stage_dir / artifact_name).write_text("stale", encoding="utf-8")
 
@@ -763,6 +808,7 @@ def test_stage5_failure_clears_stale_owned_artifacts(tmp_path: Path) -> None:
         "screening_partial.jsonl",
         "screening_report.json",
         "screen_meta.json",
+        "screening_failure_evidence.jsonl",
     ):
         assert not (stage_dir / artifact_name).exists()
 
@@ -987,13 +1033,14 @@ def test_stage5_caps_model_screening_without_backfill(tmp_path: Path) -> None:
     assert admitted_ids[143] in llm.calls[17]
     assert admitted_ids[144] not in llm.calls[17]
     assert admitted_ids[144] in llm.calls[18]
-    candidates = parse_screening_candidates(
-        (run_dir / "stage-04" / "candidates.jsonl").read_text(encoding="utf-8")
-    )
-    _replay_screening_admission(_config(), candidates, report)  # type: ignore[arg-type]
-
-
-def test_screening_report_rejects_previous_policy_version() -> None:
+@pytest.mark.parametrize(
+    ("field", "invalid", "error"),
+    [("screening_policy_version", 2, "screening_policy_version"),
+     ("decision_authority", "model_declared", "decision_authority")],
+)
+def test_screening_report_rejects_previous_authority(
+    field: str, invalid: object, error: str
+) -> None:
     candidates_text = '{"source_identity":"doi:10.1000/a"}\n'
     report = build_screening_report(
         candidates_sha256=sha256_text(candidates_text),
@@ -1015,8 +1062,10 @@ def test_screening_report_rejects_previous_policy_version() -> None:
         degradation_codes=[],
     )
     assert report["screening_policy_version"] == SCREENING_POLICY_VERSION
-    report["screening_policy_version"] = 1
-    with pytest.raises(ScreeningContractError, match="screening_policy_version"):
+    assert report["schema_version"] == SCREENING_SCHEMA_VERSION == 2
+    assert report["decision_authority"] == "code_derived_from_scores"
+    report[field] = invalid
+    with pytest.raises(ScreeningContractError, match=error):
         parse_screening_report(
             json.dumps(report),
             candidates_text_sha256=sha256_text(candidates_text),
@@ -1028,6 +1077,51 @@ def test_screening_report_rejects_previous_policy_version() -> None:
             expected_claim_scope="pipeline_validation",
             expected_candidate_ids=["doi:10.1000/a"],
             expected_selected_ids=["doi:10.1000/a"],
+        )
+
+
+def test_public_citation_audit_rejects_policy_v2_report_and_shortlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "run"
+    ids = _write_candidates(run_dir, [_candidate(1)])
+    stage4 = run_dir / "stage-04"
+    candidates_text = (stage4 / "candidates.jsonl").read_text()
+    registry_text = (stage4 / "cite_key_registry.json").read_text()
+    references_text = (stage4 / "references.bib").read_text()
+    shortlist = json.loads(candidates_text)
+    shortlist.update(
+        screening_policy_version=2, relevance_score=0.9,
+        quality_score=0.8, keep_reason="legacy",
+    )
+    shortlist_text = json.dumps(shortlist) + "\n"
+    report = build_screening_report(
+        candidates_sha256=sha256_text(candidates_text),
+        registry_sha256=sha256_text(registry_text),
+        references_sha256=sha256_text(references_text),
+        screening_output_path="stage-05/shortlist.jsonl",
+        screening_output_sha256=sha256_text(shortlist_text),
+        minimum_quality_score=0.6, claim_scope="pipeline_validation",
+        candidate_ids=ids, prefilter_rejected_ids=[], screened_ids=ids,
+        selected_ids=ids, semantic_duplicate_ids=[], unscreened_ids=[],
+        batch_count=1, failed_batches=[], degraded=False, degradation_codes=[],
+    )
+    report["screening_policy_version"] = 2
+    stage5 = run_dir / "stage-05"
+    stage5.mkdir()
+    (stage5 / "shortlist.jsonl").write_text(shortlist_text)
+    (stage5 / "screening_report.json").write_text(json.dumps(report))
+    config = _config()
+    config.experiment.dataset_origin = "public"
+    monkeypatch.setattr(citation_release_audit, "_load_active_config", lambda _: config)
+
+    with pytest.raises(CitationAuditError, match="screening_policy_version"):
+        citation_release_audit.audit_citation_evidence(
+            run_dir,
+            contract_path=run_dir / "stage-09" / "experiment_contract.yaml",
+            contract=SimpleNamespace(
+                claim_scope="pipeline_validation", dataset_origin="public"
+            ),  # type: ignore[arg-type]
         )
 
 

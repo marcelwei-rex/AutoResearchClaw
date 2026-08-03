@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 
-SCREENING_SCHEMA_VERSION = 1
-SCREENING_POLICY_VERSION = 2
+SCREENING_SCHEMA_VERSION = 2
+SCREENING_POLICY_VERSION = 3
 SCREEN_BATCH_SIZE = 8
 MAX_SCREEN_REASON_CHARS = 160
 MAX_SCREEN_CANDIDATES = 150
@@ -67,7 +67,6 @@ def parse_screening_response(
             raw,
             {
                 "source_identity",
-                "decision",
                 "relevance_score",
                 "quality_score",
                 "reason",
@@ -80,24 +79,18 @@ def parse_screening_response(
                 f"duplicate screening decision for {source_identity}"
             )
         seen.add(source_identity)
-        decision = raw["decision"]
-        if decision not in {"keep", "reject"}:
-            raise ScreeningContractError("decision must be keep or reject")
         relevance_score = _score(raw, "relevance_score")
         quality_score = _score(raw, "quality_score")
-        qualifies = (
-            relevance_score >= minimum_relevance_score
-            and quality_score >= minimum_quality_score
-        )
-        if (decision == "keep") != qualifies:
-            raise ScreeningContractError(
-                "screening decision contradicts configured score thresholds"
-            )
         reason = _required_string(raw, "reason")
         if len(reason) > MAX_SCREEN_REASON_CHARS:
             raise ScreeningContractError(
                 f"reason exceeds {MAX_SCREEN_REASON_CHARS} Unicode code points"
             )
+        qualifies = (
+            relevance_score >= minimum_relevance_score
+            and quality_score >= minimum_quality_score
+        )
+        decision = "keep" if qualifies else "reject"
         decisions.append(
             ScreeningDecision(
                 source_identity=source_identity,
@@ -202,6 +195,7 @@ def build_screening_report(
     report = {
         "schema_version": SCREENING_SCHEMA_VERSION,
         "screening_policy_version": SCREENING_POLICY_VERSION,
+        "decision_authority": "code_derived_from_scores",
         "candidates_path": "stage-04/candidates.jsonl",
         "candidates_sha256": candidates_sha256,
         "registry_path": "stage-04/cite_key_registry.json",
@@ -262,6 +256,7 @@ def parse_screening_report(
         {
             "schema_version",
             "screening_policy_version",
+            "decision_authority",
             "candidates_path",
             "candidates_sha256",
             "registry_path",
@@ -293,6 +288,8 @@ def parse_screening_report(
         raise ScreeningContractError("unsupported screening report schema_version")
     if payload["screening_policy_version"] != SCREENING_POLICY_VERSION:
         raise ScreeningContractError("unsupported screening_policy_version")
+    if payload["decision_authority"] != "code_derived_from_scores":
+        raise ScreeningContractError("unsupported screening decision_authority")
     if payload["candidates_path"] != "stage-04/candidates.jsonl":
         raise ScreeningContractError("noncanonical screening candidates_path")
     if payload["registry_path"] != "stage-04/cite_key_registry.json":

@@ -769,6 +769,7 @@ def _execute_literature_screen(
             "screening_partial.jsonl",
             "screening_report.json",
             "screen_meta.json",
+            "screening_failure_evidence.jsonl",
         ):
             (stage_dir / artifact_name).unlink(missing_ok=True)
     except OSError as exc:
@@ -904,6 +905,9 @@ def _execute_literature_screen(
                     batch_id=batch_id,
                     rows=batch_rows,
                     minimum_quality_score=minimum_quality_score,
+                    failure_evidence_path=(
+                        stage_dir / "screening_failure_evidence.jsonl"
+                    ),
                 )
             except (RuntimeError, ScreeningContractError) as exc:
                 failed_batches.append(
@@ -980,7 +984,10 @@ def _execute_literature_screen(
     # stage fails without leaving a success-named artifact that resume can use.
     (stage_dir / output_name).write_text(shortlist_text, encoding="utf-8")
 
-    artifacts = (output_name, "screening_report.json")
+    artifact_names = [output_name, "screening_report.json"]
+    if (stage_dir / "screening_failure_evidence.jsonl").is_file():
+        artifact_names.append("screening_failure_evidence.jsonl")
+    artifacts = tuple(artifact_names)
     evidence_refs = tuple(f"stage-05/{name}" for name in artifacts)
     if failure_error:
         return StageResult(
@@ -1009,6 +1016,7 @@ def _screen_candidate_batch(
     batch_id: str,
     rows: list[dict[str, Any]],
     minimum_quality_score: float,
+    failure_evidence_path: Path | None = None,
 ) -> tuple[ScreeningDecision, ...]:
     prompt_rows = []
     for row in rows:
@@ -1039,16 +1047,18 @@ def _screen_candidate_batch(
     contract = (
         "\n\nSTAGE 5 BATCH OUTPUT CONTRACT (OVERRIDES ANY EARLIER RETURN SCHEMA):\n"
         f"- batch_id must be exactly {batch_id}.\n"
-        "- Return exactly one decision for every source_identity below.\n"
+        "- Return exactly one screening row for every source_identity below.\n"
         "- Do not return or modify candidate metadata.\n"
-        "- decision is exactly keep or reject. Scores are numbers in [0,1].\n"
+        "- Each row contains exactly source_identity, relevance_score, "
+        "quality_score, and reason. Scores are numbers in [0,1].\n"
+        "- Do not output decision; code derives it from the frozen thresholds.\n"
         f"- reason is a nonempty screening explanation of at most "
         f"{MAX_SCREEN_REASON_CHARS} Unicode code points.\n"
         f"- keep requires relevance_score >= {MIN_RELEVANCE_SCORE:.2f} and "
         f"quality_score >= {minimum_quality_score:.2f}; reject otherwise.\n"
         "- Return ONLY this JSON object shape:\n"
-        '{"schema_version":1,"batch_id":"...","decisions":['
-        '{"source_identity":"...","decision":"keep|reject",'
+        '{"schema_version":2,"batch_id":"...","decisions":['
+        '{"source_identity":"...",'
         '"relevance_score":0.0,"quality_score":0.0,"reason":"..."}]}\n'
         f"EXPECTED SOURCE IDENTITIES: {json.dumps(expected_ids)}\n"
     )
@@ -1081,16 +1091,10 @@ def _screen_candidate_batch(
         )
     except (ScreeningContractError, TypeError) as initial_error:
         initial_error = ScreeningContractError(str(initial_error))
-        conflict_feedback = _screening_threshold_conflict_feedback(
-            response.content,
-            expected_source_ids=expected_ids,
-            minimum_quality_score=minimum_quality_score,
-        )
         repair_prompt = (
             user_prompt
             + "\n\nTHE PREVIOUS RESPONSE VIOLATED THE CONTRACT:\n"
             + str(initial_error)
-            + conflict_feedback
             + "\nRegenerate the complete batch once. Do not omit any ID."
         )
         repaired = _chat_with_prompt(
@@ -1110,59 +1114,33 @@ def _screen_candidate_batch(
             )
         except (ScreeningContractError, TypeError) as repair_error:
             repair_error = ScreeningContractError(str(repair_error))
+            if (
+                failure_evidence_path is not None
+                and isinstance(response.content, str)
+                and isinstance(repaired.content, str)
+            ):
+                evidence = {
+                    "evidence_schema_version": 1,
+                    "batch_id": batch_id,
+                    "initial_response": response.content,
+                    "initial_error": str(initial_error),
+                    "repair_prompt": repair_prompt,
+                    "repair_response": repaired.content,
+                    "repair_error": str(repair_error),
+                }
+                with failure_evidence_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            evidence,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
             raise ScreeningContractError(
                 f"initial_error={initial_error}; repair_error={repair_error}"
             ) from repair_error
-
-
-def _screening_threshold_conflict_feedback(
-    response_text: str,
-    *,
-    expected_source_ids: list[str],
-    minimum_quality_score: float,
-) -> str:
-    """Describe threshold contradictions without altering the response."""
-    try:
-        payload = json.loads(response_text)
-        raw_decisions = payload["decisions"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return ""
-    expected = set(expected_source_ids)
-    conflicts: list[str] = []
-    for raw in raw_decisions if isinstance(raw_decisions, list) else ():
-        source_identity = raw.get("source_identity") if isinstance(raw, dict) else None
-        if not isinstance(source_identity, str) or source_identity not in expected:
-            continue
-        decision = raw.get("decision")
-        relevance = raw.get("relevance_score")
-        quality = raw.get("quality_score")
-        if (
-            not isinstance(decision, str)
-            or decision not in {"keep", "reject"}
-            or isinstance(relevance, bool)
-            or not isinstance(relevance, (int, float))
-            or isinstance(quality, bool)
-            or not isinstance(quality, (int, float))
-        ):
-            continue
-        qualifies = relevance >= MIN_RELEVANCE_SCORE and quality >= minimum_quality_score
-        if (decision == "keep") == qualifies:
-            continue
-        conflicts.append(
-            f'- source_identity={json.dumps(raw["source_identity"])}, '
-            f'actual decision={json.dumps(decision)}, '
-            f"actual relevance_score={relevance:.2f}, "
-            f"actual quality_score={quality:.2f}"
-        )
-    if not conflicts:
-        return ""
-    invariant = (
-        f"current relevance threshold={MIN_RELEVANCE_SCORE:.2f}; "
-        f"current quality threshold={minimum_quality_score:.2f}; "
-        "keep iff relevance_score >= relevance_threshold AND quality_score >= "
-        "quality_threshold; reject otherwise."
-    )
-    return "\nConflicting decisions:\n" + "\n".join(conflicts) + "\n" + invariant
 
 
 def _deduplicate_screened_candidates(
