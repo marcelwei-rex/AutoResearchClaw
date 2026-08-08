@@ -692,6 +692,7 @@ def execute_pipeline(
                                 config=config,
                                 adapters=adapters,
                                 from_stage=rollback_target,
+                                to_stage=to_stage,
                                 auto_approve_gates=auto_approve_gates,
                                 stop_on_gate=stop_on_gate,
                                 skip_noncritical=skip_noncritical,
