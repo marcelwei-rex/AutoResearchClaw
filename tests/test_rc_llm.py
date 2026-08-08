@@ -38,14 +38,12 @@ def _make_client(
     primary_model: str = "gpt-5.2",
     fallback_models: list[str] | None = None,
     wire_api: str = "chat_completions",
-    thinking_mode: str = "",
     timeout_sec: int = 120,
 ) -> LLMClient:
     config = LLMConfig(
         base_url="https://api.example.com/v1",
         api_key=api_key,
         wire_api=wire_api,
-        thinking_mode=thinking_mode,
         primary_model=primary_model,
         fallback_models=fallback_models or ["gpt-5.1", "gpt-4.1", "gpt-4o"],
         timeout_sec=timeout_sec,
@@ -82,7 +80,6 @@ def test_llm_config_defaults():
     assert config.primary_model == "gpt-4o"
     assert config.max_tokens == 4096
     assert config.temperature == 0.7
-    assert config.thinking_mode == ""
 
 
 def test_llm_config_custom_values():
@@ -148,57 +145,6 @@ def test_build_request_body_structure_via_raw_call(monkeypatch: pytest.MonkeyPat
     assert body["model"] == "gpt-4o"
     assert body["messages"] == [{"role": "user", "content": "hello"}]
     assert body["temperature"] == 0.2
-    assert "thinking" not in body
-
-
-def test_chat_completions_request_includes_explicit_thinking_mode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-
-    def fake_urlopen(req: urllib.request.Request, timeout: int) -> _DummyHTTPResponse:
-        captured["request"] = req
-        return _DummyHTTPResponse(
-            {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
-        )
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    client = _make_client(
-        primary_model="deepseek-v4-flash",
-        fallback_models=[],
-        thinking_mode="disabled",
-    )
-
-    response = client._raw_call(
-        "deepseek-v4-flash",
-        [{"role": "user", "content": "hello"}],
-        4096,
-        0.7,
-        False,
-    )
-
-    request = captured["request"]
-    assert isinstance(request, urllib.request.Request)
-    assert isinstance(request.data, bytes)
-    body = json.loads(request.data.decode("utf-8"))
-    assert body["thinking"] == {"type": "disabled"}
-    assert response.content == "ok"
-
-
-def test_responses_wire_rejects_chat_completions_thinking_mode() -> None:
-    client = _make_client(wire_api="responses", thinking_mode="disabled")
-
-    with pytest.raises(
-        ValueError,
-        match="thinking_mode requires chat_completions wire API",
-    ):
-        client._raw_call(
-            "gpt-4.1",
-            [{"role": "user", "content": "hello"}],
-            123,
-            0.2,
-            False,
-        )
 
 
 def test_build_request_uses_max_completion_tokens_for_new_models(
@@ -271,7 +217,6 @@ def test_from_rc_config_builds_expected_llm_config():
             api_key="inline-key",
             api_key_env="OPENAI_API_KEY",
             wire_api="responses",
-            thinking_mode="",
             primary_model="o3",
             fallback_models=("o3-mini", "gpt-4o"),
             timeout_sec=901,
@@ -283,66 +228,11 @@ def test_from_rc_config_builds_expected_llm_config():
     assert client.config.base_url == "https://proxy.example/v1"
     assert client.config.api_key == "inline-key"
     assert client.config.wire_api == "responses"
-    assert client.config.thinking_mode == ""
     assert client.config.primary_model == "o3"
     assert client.config.fallback_models == ["o3-mini", "gpt-4o"]
     assert client.config.timeout_sec == 901
     assert client.config.max_retries == 4
     assert client.config.retry_base_delay == 3.5
-
-
-def test_from_rc_config_propagates_explicit_thinking_mode() -> None:
-    rc_config = SimpleNamespace(
-        llm=SimpleNamespace(
-            base_url="https://api.deepseek.com",
-            api_key="inline-key",
-            api_key_env="DEEPSEEK_API_KEY",
-            wire_api="chat_completions",
-            thinking_mode="disabled",
-            primary_model="deepseek-v4-flash",
-            fallback_models=(),
-            timeout_sec=901,
-            max_retries=4,
-            retry_base_delay=3.5,
-        )
-    )
-
-    client = LLMClient.from_rc_config(rc_config)
-
-    assert client.config.thinking_mode == "disabled"
-
-
-def test_chat_rejects_empty_visible_content_without_promoting_reasoning() -> None:
-    client = LLMClient(
-        LLMConfig(
-            base_url="https://api.deepseek.com",
-            api_key="test-key",
-            primary_model="deepseek-v4-flash",
-            fallback_models=[],
-        )
-    )
-
-    def fake_call(*args: Any, **kwargs: Any) -> LLMResponse:
-        return LLMResponse(
-            content="",
-            model="deepseek-v4-flash",
-            finish_reason="length",
-            raw={
-                "choices": [
-                    {
-                        "message": {
-                            "content": "",
-                            "reasoning_content": "hidden reasoning",
-                        }
-                    }
-                ]
-            },
-        )
-
-    client._call_with_retry = fake_call  # type: ignore[method-assign]
-
-    with pytest.raises(RuntimeError, match="empty visible response content"):
-        client.chat([{"role": "user", "content": "hello"}])
 
 
 def test_create_llm_client_dispatches_to_claude_cli_provider():

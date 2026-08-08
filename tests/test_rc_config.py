@@ -284,44 +284,6 @@ def test_validate_config_accepts_llm_wire_api_responses(tmp_path: Path):
     assert result.ok is True
 
 
-def test_validate_config_accepts_llm_thinking_mode_disabled(tmp_path: Path):
-    data = _valid_config_data()
-    data["llm"]["thinking_mode"] = "disabled"
-
-    result = validate_config(data, project_root=tmp_path, check_paths=False)
-
-    assert result.ok is True
-
-
-@pytest.mark.parametrize("value", ["off", "reasoning", True, 1])
-def test_validate_config_rejects_invalid_llm_thinking_mode(
-    tmp_path: Path, value: object
-) -> None:
-    data = _valid_config_data()
-    data["llm"]["thinking_mode"] = value
-
-    result = validate_config(data, project_root=tmp_path, check_paths=False)
-
-    assert result.ok is False
-    assert f"Invalid llm.thinking_mode: {value}" in result.errors
-
-
-def test_validate_config_rejects_thinking_mode_for_responses_wire(
-    tmp_path: Path,
-) -> None:
-    data = _valid_config_data()
-    data["llm"]["wire_api"] = "responses"
-    data["llm"]["thinking_mode"] = "disabled"
-
-    result = validate_config(data, project_root=tmp_path, check_paths=False)
-
-    assert result.ok is False
-    assert (
-        "llm.thinking_mode requires llm.wire_api=chat_completions"
-        in result.errors
-    )
-
-
 @pytest.mark.parametrize("provider", ["claude-cli", "codex-cli"])
 def test_validate_config_accepts_local_cli_provider_without_url_or_key_env(
     tmp_path: Path, provider: str
@@ -428,15 +390,6 @@ def test_rcconfig_from_dict_parses_llm_wire_api(tmp_path: Path):
     config = RCConfig.from_dict(data, project_root=tmp_path, check_paths=False)
 
     assert config.llm.wire_api == "responses"
-
-
-def test_rcconfig_from_dict_parses_llm_thinking_mode(tmp_path: Path):
-    data = _valid_config_data()
-    data["llm"]["thinking_mode"] = "disabled"
-
-    config = RCConfig.from_dict(data, project_root=tmp_path, check_paths=False)
-
-    assert config.llm.thinking_mode == "disabled"
 
 
 def test_rcconfig_from_dict_parses_partial_run_and_q1_gate_controls(

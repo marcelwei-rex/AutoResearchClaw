@@ -21,8 +21,6 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
-from researchclaw.llm.budget_ledger import BudgetUnverifiable, current_transport_ledger
-
 logger = logging.getLogger(__name__)
 
 # Models that require max_completion_tokens instead of max_tokens
@@ -76,7 +74,6 @@ class LLMConfig:
     base_url: str
     api_key: str
     wire_api: str = "chat_completions"
-    thinking_mode: str = ""
     primary_model: str = "gpt-4o"
     fallback_models: list[str] = field(
         default_factory=lambda: ["gpt-4.1", "gpt-4o-mini"]
@@ -98,10 +95,6 @@ class LLMClient:
     """Stateless OpenAI-compatible chat completion client."""
 
     def __init__(self, config: LLMConfig) -> None:
-        if config.thinking_mode not in {"", "enabled", "disabled"}:
-            raise ValueError(
-                "thinking_mode must be empty, 'enabled', or 'disabled'"
-            )
         self.config = config
         self._model_chain = [config.primary_model] + list(config.fallback_models)
         self._anthropic = None  # Will be set by from_rc_config if needed
@@ -166,7 +159,6 @@ class LLMClient:
             base_url=base_url,
             api_key=api_key,
             wire_api=getattr(rc_config.llm, "wire_api", "chat_completions"),
-            thinking_mode=getattr(rc_config.llm, "thinking_mode", ""),
             primary_model=rc_config.llm.primary_model or "gpt-4o",
             fallback_models=list(rc_config.llm.fallback_models or []),
             fallback_url=fallback_url,
@@ -228,10 +220,6 @@ class LLMClient:
         for m in models:
             try:
                 resp = self._call_with_retry(m, messages, max_tok, temp, json_mode)
-                if not isinstance(resp.content, str) or not resp.content.strip():
-                    raise ValueError(
-                        "empty visible response content; hidden reasoning is not output"
-                    )
                 if strip_thinking:
                     from researchclaw.utils.thinking_tags import strip_thinking_tags
 
@@ -246,8 +234,6 @@ class LLMClient:
                         raw=resp.raw,
                     )
                 return resp
-            except BudgetUnverifiable:
-                raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Model %s failed: %s. Trying next.", m, exc)
                 last_error = exc
@@ -419,8 +405,6 @@ class LLMClient:
 
         # Use Anthropic adapter if configured
         if self._anthropic:
-            if current_transport_ledger() is not None:
-                raise BudgetUnverifiable("STOP_BUDGET_UNVERIFIABLE: unsupported transport")
             if (
                 exact_temperature
                 and any(model.startswith(prefix) for prefix in ("claude-3-7", "claude-4"))
@@ -449,10 +433,6 @@ class LLMClient:
             _wire_is_responses = (
                 self._normalize_wire_api(self.config.wire_api) == "responses"
             )
-            if self.config.thinking_mode and _wire_is_responses:
-                raise ValueError(
-                    "thinking_mode requires chat_completions wire API"
-                )
             _json_hint = (
                 "You MUST respond with valid JSON only. "
                 "Do not include any text outside the JSON object."
@@ -482,9 +462,6 @@ class LLMClient:
                     )
                 else:
                     body["max_tokens"] = max_tokens
-
-                if self.config.thinking_mode:
-                    body["thinking"] = {"type": self.config.thinking_mode}
 
             if json_mode:
                 # Many OpenAI-compatible providers don't support the
@@ -538,7 +515,10 @@ class LLMClient:
             req = urllib.request.Request(url, data=payload, headers=headers)
 
             try:
-                data = self._transport_call(req, payload, model, max_tokens)
+                with urllib.request.urlopen(
+                    req, timeout=self.config.timeout_sec
+                ) as resp:
+                    data = json.loads(resp.read())
             except (urllib.error.URLError, OSError) as exc:
                 # MetaClaw bridge: fallback to direct LLM if proxy unreachable
                 if allow_endpoint_fallback and self.config.fallback_url:
@@ -557,7 +537,10 @@ class LLMClient:
                     fallback_req = urllib.request.Request(
                         fallback_url, data=payload, headers=fallback_headers
                     )
-                    data = self._transport_call(fallback_req, payload, model, max_tokens)
+                    with urllib.request.urlopen(
+                        fallback_req, timeout=self.config.timeout_sec
+                    ) as resp:
+                        data = json.loads(resp.read())
                 else:
                     raise
 
@@ -588,34 +571,6 @@ class LLMClient:
         if self._normalize_wire_api(self.config.wire_api) == "responses":
             return self._parse_responses_response(data, model)
         return self._parse_chat_completions_response(data, model)
-
-    def _transport_call(self, request: urllib.request.Request, payload: bytes, model: str, max_tokens: int) -> dict[str, Any]:
-        ledger = current_transport_ledger()
-        wire = json.loads(payload) if ledger else {}
-        reserved_output = int(wire.get("max_output_tokens", wire.get("max_completion_tokens", wire.get("max_tokens", max_tokens))))
-        attempt = ledger.begin(model, payload, reserved_output) if ledger else None
-        try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_sec) as response:
-                raw = response.read()
-        except (urllib.error.URLError, OSError, http.client.HTTPException):
-            if ledger and attempt: ledger.transport_error(attempt, model)
-            raise
-        try:
-            data = json.loads(raw)
-        except (TypeError, ValueError) as exc:
-            if ledger and attempt: ledger.response(attempt, model, None, None)
-            raise exc
-        if ledger and attempt:
-            usage = data.get("usage") if isinstance(data, dict) else None
-            responses_wire = self._normalize_wire_api(self.config.wire_api) == "responses"
-            input_key, output_key = ("input_tokens", "output_tokens") if responses_wire else ("prompt_tokens", "completion_tokens")
-            details = usage.get("input_tokens_details" if responses_wire else "prompt_tokens_details", {}) if isinstance(usage, dict) else {}
-            nested_cache = details.get("cached_tokens", 0) if isinstance(details, dict) else 0
-            top_cache = usage.get("prompt_cache_hit_tokens") if isinstance(usage, dict) else None
-            if top_cache is not None and nested_cache not in (0, top_cache):
-                ledger.response(attempt, model, None, None)
-            ledger.response(attempt, data.get("model") if isinstance(data, dict) else None, usage.get(input_key) if isinstance(usage, dict) else None, usage.get(output_key) if isinstance(usage, dict) else None, top_cache if top_cache is not None else nested_cache)
-        return data
 
     def _build_responses_body(
         self,

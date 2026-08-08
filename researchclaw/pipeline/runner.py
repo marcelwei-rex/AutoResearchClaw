@@ -16,7 +16,6 @@ from typing import Any
 
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
-from researchclaw.llm.budget_ledger import BudgetUnverifiable, TransportBudgetLedger, transport_budgeted
 from researchclaw.evolution import (
     EvolutionStore,
     extract_lessons,
@@ -236,21 +235,18 @@ def _build_pipeline_summary(
         "stages_failed": sum(
             1 for item in results if item.status == StageStatus.FAILED
         ),
-        "degraded": any(
-            r.status is StageStatus.DONE and r.decision == "degraded" for r in results
-        ),
+        "degraded": any(r.decision == "degraded" for r in results),
         "from_stage": int(from_stage),
         "final_stage": int(results[-1].stage) if results else int(from_stage),
         "final_status": results[-1].status.value if results else "no_stages",
-        "final_terminal_action": results[-1].terminal_action if results else "stop",
         "generated": _utcnow_iso(),
         "content_metrics": _collect_content_metrics(run_dir),
     }
     if results:
         if results[-1].error:
             summary["final_error"] = results[-1].error
-        if results[-1].persisted_decision:
-            summary["final_decision"] = results[-1].persisted_decision
+        if results[-1].decision:
+            summary["final_decision"] = results[-1].decision
     return summary
 
 
@@ -409,7 +405,6 @@ def _run_experiment_repair(run_dir: Path, config: RCConfig, run_id: str) -> None
     raise PermissionError("legacy experiment repair is disabled by canonical policy")
 
 
-@transport_budgeted
 def execute_pipeline(
     *,
     run_dir: Path,
@@ -483,6 +478,8 @@ def execute_pipeline(
             ))
         except Exception:
             logger.debug("Event log initialisation skipped")
+
+    cost_budget = getattr(config.experiment.cli_agent, "max_budget_usd", 0.0) or 0.0
 
     for stage in STAGE_SEQUENCE:
         started = _should_start(stage, from_stage, started)
@@ -559,6 +556,17 @@ def execute_pipeline(
                 event_log.append(create_event(
                     EventType.STAGE_START, run_id=run_id, stage=stage.name,
                 ))
+            except Exception:
+                pass
+
+        # ── Cost budget check ──
+        if cost_budget > 0:
+            try:
+                from researchclaw.cost_tracker import get_global_tracker
+                if not get_global_tracker().check_budget(cost_budget):
+                    logger.warning("Cost budget $%.2f exceeded — pausing pipeline", cost_budget)
+                    print(f"{prefix} BUDGET EXCEEDED ($%.2f) — stopping" % cost_budget)
+                    break
             except Exception:
                 pass
 
@@ -738,15 +746,26 @@ def execute_pipeline(
                     stage=stage_num,
                     stage_name=stage.name,
                     status=result.status.value,
-                    terminal_action=result.terminal_action,
-                    decision=result.persisted_decision or "",
+                    decision=result.decision or "",
                     error=result.error,
                     elapsed_sec=elapsed,
                     artifacts=result.artifacts,
                 )
-                _cumulative = TransportBudgetLedger(run_dir, config.llm).cumulative_cost()
-                _prev = _ra.last_cumulative_cost(run_dir)
-                _delta = max(0.0, round(_cumulative - _prev, 6))
+                # get_global_tracker().total_cost_usd is CUMULATIVE. Writing that
+                # as each row's cost_usd and later summing rows double-counts.
+                # Write the per-stage DELTA as cost_usd, and record the running
+                # total separately as cumulative_usd.
+                _cumulative = None
+                try:
+                    from researchclaw.cost_tracker import get_global_tracker
+
+                    _cumulative = float(get_global_tracker().total_cost_usd)
+                except Exception:  # noqa: BLE001
+                    pass
+                _delta = None
+                if _cumulative is not None:
+                    _prev = _ra.last_cumulative_cost(run_dir)
+                    _delta = max(0.0, round(_cumulative - _prev, 6))
                 _ra.append_cost_entry(
                     run_dir,
                     stage=stage_num,
@@ -757,10 +776,8 @@ def execute_pipeline(
                     cumulative_usd=_cumulative,
                     elapsed_sec=elapsed,
                 )
-            except BudgetUnverifiable:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                raise RuntimeError("Attempt/cost log append failed") from exc
+            except Exception:  # noqa: BLE001
+                logger.warning("Attempt/cost log append failed", exc_info=True)
 
         # ── Event log: stage end ──
         if event_log:
@@ -896,13 +913,17 @@ def execute_pipeline(
                 raise RuntimeError("Stage 15 exhaustion escaped terminalization")
 
         # --- HITL: Handle abort decision ---
-        if result.status is StageStatus.DONE and result.decision == "abort":
+        if result.decision == "abort":
             logger.info("[%s] Pipeline aborted by user at stage %s", run_id, stage.name)
             print(f"[{run_id}] Pipeline aborted by user at {stage.name}")
             break
 
-        if result.status == StageStatus.FAILED and skip_noncritical and stage in NONCRITICAL_STAGES:
-            logger.warning("Noncritical stage %s failed; skip requested but terminal failure stops", stage.name)
+        if result.status == StageStatus.FAILED:
+            if skip_noncritical and stage in NONCRITICAL_STAGES:
+                logger.warning("Noncritical stage %s failed - skipping", stage.name)
+            else:
+                break
+
         if result.status == StageStatus.PAUSED:
             logger.warning(
                 "[%s] Pipeline paused at %s: %s",
@@ -910,6 +931,7 @@ def execute_pipeline(
                 stage.name,
                 result.error or result.decision,
             )
+            break
 
         # --- HITL: Handle rejected stage (from HITL review) ---
         if result.status == StageStatus.REJECTED:
@@ -918,8 +940,9 @@ def execute_pipeline(
                 run_id, stage.name,
             )
             print(f"[{run_id}] Stage {stage.name} rejected — pipeline stopped")
+            break
 
-        if result.terminal_action != "advance":
+        if result.status == StageStatus.BLOCKED_APPROVAL and stop_on_gate:
             break
 
     if _internal_rollback:
@@ -1043,7 +1066,7 @@ def execute_pipeline(
         hitl_session = getattr(adapters, "hitl", None)
         if hitl_session is not None:
             has_abort = any(
-                r.status is StageStatus.DONE and r.decision == "abort" for r in results
+                r.decision == "abort" for r in results
             )
             has_failure = any(
                 r.status == StageStatus.FAILED for r in results
@@ -1374,9 +1397,6 @@ def _package_deliverables(
             if _sm.get("stages_failed") not in (0, None):
                 not_release_ready = True
                 release_blockers.append("stages_failed")
-            if _sm.get("stages_blocked") not in (0, None):
-                not_release_ready = True
-                release_blockers.append("stages_blocked")
             if _sm.get("final_stage") != int(_FINAL_STG) or _sm.get("final_status") != "done":
                 not_release_ready = True
                 release_blockers.append("incomplete_run")

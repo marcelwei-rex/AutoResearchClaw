@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import math
@@ -18,14 +17,9 @@ from researchclaw.experiment_runtime.contract import (
     ContractValidationError,
     ExperimentContract,
     contract_sha256,
-    derive_execution_spec,
-    execution_spec_bytes,
     find_stage09_contract,
     load_contract,
     sha256_file,
-)
-from researchclaw.experiment_runtime.metric_authority import (
-    config_allows_domain_evaluator_capture,
 )
 from researchclaw.experiment_runtime.scaffold import (
     PluginValidationError,
@@ -55,12 +49,8 @@ from researchclaw.pipeline._helpers import (
 )
 from researchclaw.pipeline.canonical_experiment_evidence import (
     CONFIG_SEMANTIC_POLICY_VERSION,
-    CanonicalExperimentEvidenceError,
-    SANDBOX_GENERIC_EVALUATOR_SCHEMA,
     SEAL_POLICY_VERSION,
     STAGE10_SEAL_SCHEMA_VERSION,
-    _validate_sandbox_generic_evaluator_result,
-    generic_result_prompt_contract,
     semantic_config_sha256,
     validate_selected_candidate_manifest,
 )
@@ -263,16 +253,10 @@ def _seal_selected_candidate_impl(
     manifest_files: dict[str, dict[str, str]] = {}
     scaffold_files: dict[str, dict[str, str]] = {}
     plugin_files: dict[str, dict[str, str]] = {}
-    contract = load_contract(contract_path, allow_domain_evaluator_capture=config_allows_domain_evaluator_capture(config))
-    generic_model_owned = (
-        contract.metric_authority.get("domain_id") == "generic_sandbox"
-    )
+    contract = load_contract(contract_path)
     canonical_scaffold = (
-        (
-            contract.claim_scope == "pipeline_validation"
-            or not config.experiment.allow_legacy_experiment_path
-        )
-        and not generic_model_owned
+        contract.claim_scope == "pipeline_validation"
+        or not config.experiment.allow_legacy_experiment_path
     )
     scaffold_owned_files = {"main.py"} if canonical_scaffold else set()
     for src in sorted(exp_dir.glob("*.py")):
@@ -330,8 +314,6 @@ def _seal_selected_candidate_impl(
         "scaffold_files": scaffold_files,
         "plugin_files": plugin_files,
     }
-    if generic_model_owned:
-        manifest["evaluator_schema"] = SANDBOX_GENERIC_EVALUATOR_SCHEMA
     manifest_path = stage_dir / "selected_candidate_manifest.json"
     manifest_tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
     manifest_tmp_path.write_text(
@@ -347,7 +329,6 @@ def _run_stage10_smoke_gate(
     stage_dir: Path,
     exp_dir: Path,
     config: RCConfig,
-    structured_out: list[Any] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Run a quarantined executable smoke check for the generated project."""
     if config.experiment.mode not in ("sandbox", "docker"):
@@ -379,8 +360,6 @@ def _run_stage10_smoke_gate(
             },
         )
         structured = _latest_sandbox_results_json(sandbox)
-        if structured_out is not None:
-            structured_out.append(structured)
         metrics = {
             k: float(v)
             for k, v in (result.metrics or {}).items()
@@ -725,408 +704,6 @@ def _execute_pipeline_validation_plugin_generation(
     )
 
 
-def _generate_generic_main_py(
-    llm: LLMClient,
-    prompts: PromptManager,
-    *,
-    contract: ExperimentContract,
-    spec: dict[str, Any],
-    journal: list[dict[str, Any]],
-) -> str:
-    """Generate the model-owned generic-sandbox ``main.py`` via the LLM.
-
-    ADJ-E9-01: the prompt consumes only the contract-derived execution spec;
-    paper-plan prose and research-topic narrative never enter the prompt.
-    One bounded repair on syntactically invalid output.  Hard LLM failures
-    and persistent invalid output raise — there is no silent fallback.
-    Every attempt is recorded in *journal* with request/response hashes.
-    """
-    system = prompts.system("code_generation")
-    result_contract = generic_result_prompt_contract()
-    user = (
-        "Generate exactly one self-contained Python file named main.py for a "
-        "model-owned generic sandbox experiment.\n\n"
-        "The file MUST run under `python main.py` and write results.json.\n"
-        f"{result_contract}"
-        "results.json MUST bind claim_scope / dataset_origin / dataset_name / "
-        "primary_metric key+direction EXACTLY to the execution-spec values "
-        "below, and MUST carry the spec's seeds and conditions verbatim. "
-        "metrics MUST be flat: the top-level metrics object maps each allowed "
-        "metric key directly to a plain number, and every per_seed entry "
-        "carries its own flat metrics object; never nest metrics under "
-        "conditions.\n"
-        "Honor the spec's runtime_restrictions and budget_cap_sec.\n"
-        f"Execution spec (authoritative; spec_hash {spec['spec_hash']}):\n"
-        f"```json\n{json.dumps(spec, indent=2, sort_keys=True)}\n```\n"
-        "Do not use any paper plan, research topic, or prior-stage narrative "
-        "as execution specification or scientific evidence; the paper plan is "
-        "narrative-only.\n"
-        "Return the complete main.py in a single ```python fenced block."
-    )
-    model = getattr(getattr(llm, "config", None), "primary_model", None)
-
-    def _attempt(kind: str, user_text: str) -> str | None:
-        entry: dict[str, Any] = {
-            "attempt": len(journal) + 1,
-            "kind": kind,
-            "model": str(model) if model else None,
-            "system_sha256": hashlib.sha256(system.encode("utf-8")).hexdigest(),
-            "user_sha256": hashlib.sha256(user_text.encode("utf-8")).hexdigest(),
-            "response_sha256": None,
-            "call_role": "initial" if kind == "initial" else "repair",
-            "trigger": None if kind == "initial" else "syntax_validation",
-        }
-        try:
-            resp = _chat_with_prompt(llm, system, user_text, max_tokens=8192)
-        except Exception as exc:  # noqa: BLE001
-            entry.update(outcome="error", error=str(exc))
-            journal.append(entry)
-            raise RuntimeError(
-                f"Stage 10 generic LLM call failed: {exc}"
-            ) from exc
-        code = _extract_code_block(resp.content).strip()
-        entry["response_sha256"] = hashlib.sha256(
-            resp.content.encode("utf-8")
-        ).hexdigest()
-        try:
-            compile(code, "main.py", "exec")
-        except SyntaxError as exc:
-            entry.update(outcome="invalid", error=f"SyntaxError: {exc}")
-            journal.append(entry)
-            return None
-        entry.update(outcome="ok", error=None)
-        journal.append(entry)
-        return code
-
-    code = _attempt("initial", user)
-    if code is not None:
-        return code
-    repair_user = (
-        "The main.py you generated is not valid Python. Return the corrected "
-        "complete main.py in a single ```python fenced block.\n\n"
-        f"Original request:\n{user}"
-    )
-    code = _attempt("repair", repair_user)
-    if code is None:
-        raise RuntimeError(
-            "Stage 10 generic LLM generation produced invalid Python after "
-            "one bounded repair"
-        )
-    return code
-
-
-def _generic_binding_diagnostic(structured: object, contract: ExperimentContract) -> str | None:
-    """ADJ-E7-01: validator diagnostic when the smoke result breaks binding."""
-    try:
-        _validate_sandbox_generic_evaluator_result(structured, contract)
-    except CanonicalExperimentEvidenceError as exc:
-        return str(exc)
-    assert isinstance(structured, dict)
-    spec = derive_execution_spec(contract)
-    expected = {
-        "entry_point": "main.py", "evaluator_owner": "model",
-        "seeds": spec["seeds"], "conditions": spec["conditions"],
-    }
-    mismatches = [key for key, value in expected.items() if structured[key] != value]
-    if mismatches:
-        return "Stage 10 generic model binding mismatch: " + ", ".join(mismatches)
-    return None
-
-
-_RUNTIME_REPAIR_EXCLUSIONS = (
-    "MemoryError",
-    "ModuleNotFoundError",
-    "ImportError",
-    "PermissionError",
-    "OSError",
-    "URLError",
-    "socket.",
-)
-
-
-def _runtime_crash_evidence(
-    stage_dir: Path, smoke_blockers: list[str]
-) -> dict[str, str] | None:
-    """ADJ-E9-01: evidence for a repairable candidate-Python crash.
-
-    Repairable means: smoke failed with returncode=1 and the stderr tail is a
-    Python traceback free of environmental markers.  Timeouts, OOM, import /
-    permission / OS errors and non-traceback exits (e.g. rc!=1 sandbox
-    denials) are not candidate bugs and are not repaired.
-    """
-    if any(b.startswith("Stage 10 smoke timed out") for b in smoke_blockers):
-        return None
-    if "Stage 10 smoke failed with returncode=1" not in smoke_blockers:
-        return None
-    try:
-        report = json.loads(
-            (stage_dir / "smoke" / "smoke_report.json").read_text(encoding="utf-8")
-        )
-    except (OSError, UnicodeDecodeError, ValueError):
-        return None
-    if not isinstance(report, dict):
-        return None
-    if report.get("timed_out") or report.get("returncode") != 1:
-        return None
-    stderr_tail = str(report.get("stderr_tail") or "")
-    if "Traceback (most recent call last)" not in stderr_tail:
-        return None
-    if any(marker in stderr_tail for marker in _RUNTIME_REPAIR_EXCLUSIONS):
-        return None
-    return {"trigger": "candidate_python_traceback_rc1", "stderr_tail": stderr_tail}
-
-
-def _repair_generic_main_py_binding(
-    llm: LLMClient, prompts: PromptManager, *, contract: ExperimentContract,
-    model: str | None, journal: list[dict[str, Any]], diagnostics: list[str], previous_code: str,
-    kind: str = "provenance_repair", trigger: str | None = None,
-) -> str:
-    """One bounded smoke-time repair carrying every diagnostic verbatim."""
-    system = prompts.system("code_generation")
-    result_contract = generic_result_prompt_contract()
-    spec = derive_execution_spec(contract)
-    exact_binding = json.dumps({key: spec[key] for key in ("seeds", "conditions")}, sort_keys=True)
-    diagnostic_text = "; ".join(diagnostics)
-    if kind == "runtime_repair":
-        user = (
-            "The main.py you generated crashed at runtime with a Python traceback. "
-            f'Crash evidence (stderr tail): "{diagnostic_text}". Fix the candidate bug so '
-            "`python main.py` runs to completion and writes a contract-bound results.json. "
-            f"{result_contract}"
-            f"The authoritative seeds and conditions are exactly {exact_binding}. "
-            "results.json MUST bind claim_scope / dataset_origin / dataset_name "
-            f'to "{contract.claim_scope}" / "{contract.dataset_origin}" / "{contract.dataset_name}". The top-level '
-            "metrics object and every per_seed metrics object MUST be flat (metric key -> plain number) and include "
-            'the primary metric key. Return the '
-            "corrected complete main.py in a single ```python fenced block.\n\nCurrent main.py:\n"
-            f"```python\n{previous_code}\n```"
-        )
-    else:
-        user = (
-            "The main.py you generated runs, but its results.json failed the Stage 10 smoke contract checks "
-            f'with these diagnostics: "{diagnostic_text}". {result_contract}The authoritative seeds and conditions are exactly {exact_binding}. results.json MUST bind claim_scope / dataset_origin / dataset_name '
-            f'to "{contract.claim_scope}" / "{contract.dataset_origin}" / "{contract.dataset_name}". The top-level '
-            "metrics object and every per_seed metrics object MUST be flat (metric key -> plain number) and include "
-            'the primary metric key. Return the '
-            "corrected complete main.py in a single ```python fenced block.\n\nCurrent main.py:\n"
-            f"```python\n{previous_code}\n```"
-        )
-    entry: dict[str, Any] = {"attempt": len(journal) + 1, "kind": kind, "call_role": "repair", "trigger": trigger or "smoke_contract_validation", "diagnostics": list(diagnostics), "model": model, "system_sha256": hashlib.sha256(system.encode("utf-8")).hexdigest(), "user_sha256": hashlib.sha256(user.encode("utf-8")).hexdigest(), "response_sha256": None, "code_sha256_before": hashlib.sha256(previous_code.encode("utf-8")).hexdigest()}
-    try:
-        resp = _chat_with_prompt(llm, system, user, max_tokens=8192)
-    except Exception as exc:  # noqa: BLE001
-        entry.update(outcome="error", error=str(exc))
-        journal.append(entry)
-        raise RuntimeError(f"Stage 10 generic LLM call failed: {exc}") from exc
-    code = _extract_code_block(resp.content).strip()
-    entry["response_sha256"] = hashlib.sha256(resp.content.encode("utf-8")).hexdigest()
-    entry["code_sha256_after"] = hashlib.sha256(code.encode("utf-8")).hexdigest()
-    try:
-        compile(code, "main.py", "exec")
-    except SyntaxError as exc:
-        entry.update(outcome="invalid", error=f"SyntaxError: {exc}")
-        journal.append(entry)
-        raise RuntimeError(f"Stage 10 generic {kind} produced invalid Python: {exc}") from exc
-    entry.update(outcome="ok", error=None)
-    journal.append(entry)
-    return code
-
-
-def _execute_generic_sandbox_full_generation(
-    stage_dir: Path,
-    run_dir: Path,
-    config: RCConfig,
-    *,
-    contract: ExperimentContract,
-    contract_path: Path,
-    exp_plan: str,
-    metric: str,
-    llm: LLMClient | None,
-    prompts: PromptManager | None,
-) -> StageResult:
-    """Generate (via LLM) and seal a model-owned experiment for generic_sandbox.
-
-    No silent fallback: a missing LLM client, LLM failure, or unusable LLM
-    output fails the stage.
-    """
-    _ = run_dir, exp_plan  # ADJ-E9-01: plan prose no longer feeds codegen.
-    exp_dir = stage_dir / "experiment"
-    exp_dir.mkdir(parents=True, exist_ok=True)
-    artifacts: list[str] = ["experiment/"]
-    journal: list[dict[str, Any]] = []
-    blockers: list[str] = []
-    model = getattr(getattr(llm, "config", None), "primary_model", None)
-    model_name = str(model) if model else None
-
-    if llm is None:
-        blockers.append(
-            "Stage 10 generic_sandbox channel requires an LLM client"
-        )
-    else:
-        try:
-            (exp_dir / "main.py").write_text(
-                _generate_generic_main_py(
-                    llm,
-                    prompts or PromptManager(),
-                    contract=contract,
-                    spec=derive_execution_spec(contract),
-                    journal=journal,
-                ),
-                encoding="utf-8",
-            )
-        except Exception as exc:  # noqa: BLE001
-            blockers.append(str(exc))
-    (stage_dir / "generic_llm_journal.json").write_text(
-        json.dumps(
-            {"model": model_name, "attempts": journal, "generated": _utcnow_iso()},
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    artifacts.append("generic_llm_journal.json")
-
-    sealed: tuple[str, str] | None = None
-    if not blockers:
-        (stage_dir / "generic_full.json").write_text(
-            json.dumps(
-                {
-                    "mode": "generic_full_v1",
-                    "claim_scope": contract.claim_scope,
-                    "evaluator_schema": SANDBOX_GENERIC_EVALUATOR_SCHEMA,
-                    "generator": {"source": "llm", "model": model_name},
-                    "generated": _utcnow_iso(),
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        artifacts.append("generic_full.json")
-        structured_box: list[Any] = []
-        smoke_blockers, smoke_artifacts = _run_stage10_smoke_gate(
-            stage_dir, exp_dir, config, structured_out=structured_box
-        )
-        artifacts.extend(smoke_artifacts)
-
-        # ADJ-E7-01/ADJ-E8-01/ADJ-E9-01: unify smoke-time contract diagnostics
-        # (metric, provenance, validator schema) into one bounded repair; a
-        # candidate-Python crash (rc=1 traceback) gets one bounded runtime
-        # repair; environmental failures (timeout/OOM/denial) fail directly.
-        def _smoke_diagnostics(blk: list[str]) -> list[str]:
-            metric = [b for b in blk if b.startswith("Stage 10 smoke did not produce finite primary metric")]
-            repairable = metric + [b for b in blk if b == _DATASET_ORIGIN_BLOCKER]
-            if len(blk) != len(repairable) or not structured_box:
-                return []
-            binding = _generic_binding_diagnostic(structured_box[0], contract)
-            return repairable + ([binding] if binding is not None else [])
-
-        diagnostics = _smoke_diagnostics(smoke_blockers)
-        crash = _runtime_crash_evidence(stage_dir, smoke_blockers)
-        repairs_used = sum(1 for e in journal if e.get("kind") != "initial")
-        deferred: list[str] = []
-        repair_kind = "provenance_repair"
-        if crash is not None and repairs_used < 2:
-            # The crash subsumes every smoke blocker (rc/metric/origin are all
-            # consequences of the crash); defer them all to the runtime repair.
-            deferred = list(smoke_blockers)
-            repair_kind = "runtime_repair"
-        elif diagnostics and repairs_used < 2:
-            deferred = diagnostics
-        for blocker in smoke_blockers:
-            if blocker not in deferred:
-                _add_stage10_blocker(blockers, blocker)
-        if deferred:
-            try:
-                previous_code = (exp_dir / "main.py").read_text(encoding="utf-8")
-                smoke_dir = stage_dir / "smoke"
-                (smoke_dir / "main_prerepair.py").write_text(
-                    previous_code, encoding="utf-8"
-                )
-                prereport = smoke_dir / "smoke_report.json"
-                for prepath in (prereport, smoke_dir / "smoke_results.json"):
-                    if prepath.exists():
-                        prepath.with_name(f"{prepath.stem}_prerepair.json").write_text(
-                            prepath.read_text(encoding="utf-8"), encoding="utf-8"
-                        )
-                repaired = _repair_generic_main_py_binding(
-                    llm, prompts or PromptManager(), contract=contract, model=model_name,
-                    journal=journal,
-                    diagnostics=(
-                        [crash["stderr_tail"]]
-                        if repair_kind == "runtime_repair" and crash is not None
-                        else deferred
-                    ),
-                    previous_code=previous_code,
-                    kind=repair_kind,
-                    trigger=(
-                        crash["trigger"]
-                        if repair_kind == "runtime_repair" and crash is not None
-                        else None
-                    ),
-                )
-                (exp_dir / "main.py").write_text(repaired, encoding="utf-8")
-            except Exception as exc:  # noqa: BLE001
-                _add_stage10_blocker(blockers, str(exc))
-                deferred = []
-            else:
-                journal_text = json.dumps({"model": model_name, "attempts": journal, "generated": _utcnow_iso()}, indent=2)
-                (stage_dir / "generic_llm_journal.json").write_text(journal_text, encoding="utf-8")
-                structured_box.clear()
-                re_blockers, re_artifacts = _run_stage10_smoke_gate(
-                    stage_dir, exp_dir, config, structured_out=structured_box
-                )
-                artifacts.extend(a for a in re_artifacts if a not in artifacts)
-                for blocker in re_blockers:
-                    _add_stage10_blocker(blockers, blocker)
-                deferred = _smoke_diagnostics(re_blockers)
-            if deferred:
-                _add_stage10_blocker(blockers, "Stage 10 generic smoke-time contract diagnostics after one bounded repair: " + "; ".join(deferred))
-
-        (stage_dir / "experiment_spec.md").write_text(
-            f"# Experiment Specification\n\n## Topic\n{config.research.topic}\n\n"
-            "## Runtime Mode\n`generic_full_v1` — the model owns `main.py` end "
-            "to end (LLM-generated data generation, scoring, and `results.json` "
-            "in the `sandbox_generic_v1` grammar); one bounded repair, no "
-            "silent fallback.\n\n"
-            "## Entry Point\n`main.py` — model-owned evaluator (LLM-generated)\n\n"
-            "## Outputs\n- `results.json` is written by the model-owned "
-            "`main.py`\n"
-            f"- Primary metric key: `{metric}`\n\n## Generated\n{_utcnow_iso()}\n",
-            encoding="utf-8",
-        )
-        artifacts.append("experiment_spec.md")
-
-        if not blockers:
-            try:
-                sealed = _seal_selected_candidate(stage_dir, exp_dir, contract_path, config)
-            except Exception as exc:  # noqa: BLE001
-                blockers.append(f"Stage 10 sealing failed: {exc}")
-
-    if blockers:
-        (stage_dir / "stage10_blockers.json").write_text(
-            json.dumps(
-                {"status": "failed", "blockers": blockers, "generated": _utcnow_iso()},
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        artifacts.append("stage10_blockers.json")
-        return StageResult(
-            stage=Stage.CODE_GENERATION,
-            status=StageStatus.FAILED,
-            artifacts=tuple(artifacts),
-            evidence_refs=tuple(f"stage-10/{a}" for a in artifacts),
-            error="; ".join(blockers),
-        )
-
-    artifacts.extend(sealed or ())
-    return StageResult(
-        stage=Stage.CODE_GENERATION,
-        status=StageStatus.DONE,
-        artifacts=tuple(artifacts),
-        evidence_refs=tuple(f"stage-10/{a}" for a in artifacts),
-    )
-
-
 def _execute_collider_plan_generation(
     stage_dir: Path,
     run_dir: Path,
@@ -1386,30 +963,6 @@ def _execute_code_generation_under_lock(
             evidence_refs=(),
             error=error,
         )
-    if contract.metric_authority.get("domain_id") == "generic_sandbox":
-        spec_path = contract_path.with_name("execution_spec.json")
-        try:
-            raw_spec = spec_path.read_bytes()
-            published_spec = json.loads(raw_spec)
-        except (OSError, json.JSONDecodeError) as exc:
-            return StageResult(
-                stage=Stage.CODE_GENERATION,
-                status=StageStatus.FAILED,
-                artifacts=(),
-                evidence_refs=(),
-                error=f"Stage 10 execution spec replay failed: {exc}",
-            )
-        if (
-            published_spec != derive_execution_spec(contract)
-            or raw_spec != execution_spec_bytes(contract)
-        ):
-            return StageResult(
-                stage=Stage.CODE_GENERATION,
-                status=StageStatus.FAILED,
-                artifacts=(),
-                evidence_refs=(),
-                error="Stage 10 execution spec replay mismatch",
-            )
     if contract.schema_version == 3:
         try:
             capture_artifact, manifest_artifact = publish_domain_evaluator_candidate(
@@ -1445,18 +998,6 @@ def _execute_code_generation_under_lock(
         contract.claim_scope == "pipeline_validation"
         or not config.experiment.allow_legacy_experiment_path
     ):
-        if contract.metric_authority.get("domain_id") == "generic_sandbox":
-            return _execute_generic_sandbox_full_generation(
-                stage_dir,
-                run_dir,
-                config,
-                contract=contract,
-                contract_path=contract_path,
-                exp_plan=exp_plan,
-                metric=metric,
-                llm=llm,
-                prompts=_pm,
-            )
         return _execute_pipeline_validation_plugin_generation(
             stage_dir,
             run_dir,

@@ -248,18 +248,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         new_research = dataclasses.replace(config.research, topic=topic)
         config = dataclasses.replace(config, research=new_research)
 
-    run_id = _generate_run_id(config.research.topic)
-    run_dir = Path(output or f"artifacts/{run_id}")
-    from researchclaw.llm.budget_ledger import TransportBudgetLedger
-    transport_ledger = TransportBudgetLedger(run_dir, config.llm)
-
     # --- LLM Preflight ---
     if not skip_preflight:
         from researchclaw.llm import create_llm_client
 
         client = create_llm_client(config)
         print("Preflight check...", end=" ", flush=True)
-        ok, msg = transport_ledger.call(client.preflight)
+        ok, msg = client.preflight()
         if ok:
             print(msg)
         else:
@@ -268,7 +263,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         if config.paper_revision.sectional_enabled:
             print("Sectional critic preflight...", end=" ", flush=True)
             try:
-                ok, msg = transport_ledger.call(client.preflight, model=config.paper_revision.critic_model)
+                ok, msg = client.preflight(model=config.paper_revision.critic_model)
             except TypeError:
                 ok = False
                 msg = "configured LLM transport cannot probe an explicit critic model"
@@ -277,6 +272,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             else:
                 print(f"FAILED — {msg}", file=sys.stderr)
                 return 1
+
+    run_id = _generate_run_id(config.research.topic)
+    run_dir = Path(output or f"artifacts/{run_id}")
 
     # BUG-119 / BUG-216: When --resume or --from-stage is used without
     # --output, search for the most recent existing run directory that
@@ -481,7 +479,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         stop_on_gate=stop_on_gate,
         skip_noncritical=skip_noncritical,
         kb_root=kb_root_path,
-        _transport_ledger=transport_ledger,
     )
 
     done = sum(1 for r in results if r.status.value == "done")

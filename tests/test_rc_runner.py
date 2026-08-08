@@ -248,14 +248,13 @@ def test_execute_pipeline_stops_on_failed_stage(
     run_dir: Path,
     rc_config: RCConfig,
     adapters: AdapterBundle,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     fail_stage = Stage.SEARCH_STRATEGY
 
     def mock_execute_stage(stage: Stage, **kwargs) -> StageResult:
         _ = kwargs
         if stage == fail_stage:
-            return StageResult(stage, StageStatus.FAILED, (), "forced failure", "abort")
+            return _failed(stage, "forced failure")
         return _done(stage)
 
     monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
@@ -268,22 +267,6 @@ def test_execute_pipeline_stops_on_failed_stage(
     assert results[-1].stage == fail_stage
     assert results[-1].status == StageStatus.FAILED
     assert len(results) == int(fail_stage)
-    summary = json.loads((run_dir / "pipeline_summary.json").read_text())
-    assert summary["final_terminal_action"] == "stop"
-    assert summary["final_decision"] == "abort"
-    assert "Pipeline aborted by user" not in capsys.readouterr().out
-    attempt = json.loads((run_dir / "attempts/attempt_log.jsonl").read_text().splitlines()[-1])
-    assert (attempt["status"], attempt["decision"]) == ("failed", "abort")
-
-
-def test_execute_pipeline_honors_done_abort(
-    monkeypatch, run_dir, rc_config, adapters, capsys,
-) -> None:
-    monkeypatch.setattr(rc_runner, "execute_stage", lambda stage, **_: StageResult(
-        stage, StageStatus.DONE, (), decision="abort"))
-    results = rc_runner.execute_pipeline(
-        run_dir=run_dir, run_id="run-abort", config=rc_config, adapters=adapters)
-    assert (len(results), "Pipeline aborted by user" in capsys.readouterr().out) == (1, True)
 
 
 def test_execute_pipeline_stops_on_paused_stage(
@@ -458,7 +441,7 @@ def test_execute_pipeline_does_not_consume_raw_refinement_trajectory(
     assert not (run_dir / "trajectory_signal.json").exists()
 
 
-def test_execute_pipeline_stops_after_gate_even_when_stop_on_gate_disabled(
+def test_execute_pipeline_continues_after_gate_when_stop_on_gate_disabled(
     monkeypatch: pytest.MonkeyPatch,
     run_dir: Path,
     rc_config: RCConfig,
@@ -480,11 +463,8 @@ def test_execute_pipeline_stops_after_gate_even_when_stop_on_gate_disabled(
         adapters=adapters,
         stop_on_gate=False,
     )
-    assert len(results) == int(gate_stage)
-    assert results[-1].status is StageStatus.BLOCKED_APPROVAL
-    summary = json.loads((run_dir / "pipeline_summary.json").read_text())
-    assert (summary["final_status"], summary["final_terminal_action"]) == ("blocked_approval", "block")
-    assert summary["final_decision"] == "block"
+    assert len(results) == 25
+    assert any(item.status == StageStatus.BLOCKED_APPROVAL for item in results)
 
 
 def test_execute_pipeline_writes_pipeline_summary_json(
@@ -540,10 +520,10 @@ def test_pipeline_summary_has_expected_fields_and_values(
     )
     assert summary["stages_paused"] == 0
     assert summary["stages_blocked"] == 1
-    assert summary["stages_failed"] == 0
+    assert summary["stages_failed"] == 1
     assert summary["from_stage"] == 1
-    assert summary["final_stage"] == int(Stage.LITERATURE_SCREEN)
-    assert summary["final_status"] == "blocked_approval"
+    assert summary["final_stage"] == int(Stage.HYPOTHESIS_GEN)
+    assert summary["final_status"] == "failed"
     assert "generated" in summary
 
 
@@ -682,33 +662,6 @@ def test_build_pipeline_summary_core_fields(
     assert summary["run_id"] == "run-core"
     assert summary["final_status"] == expected_status
     assert summary["final_stage"] == expected_final_stage
-
-
-@pytest.mark.parametrize("status", [StageStatus.PENDING, StageStatus.RUNNING,
-                                    StageStatus.APPROVED, StageStatus.RETRYING])
-def test_execute_pipeline_stops_on_every_unexpected_nonadvance_status(
-    monkeypatch, run_dir, rc_config, adapters, status) -> None:
-    calls = []
-    monkeypatch.setattr(rc_runner, "execute_stage", lambda stage, **_:
-                        calls.append(stage) or StageResult(stage, status, ()))
-    results = rc_runner.execute_pipeline(
-        run_dir=run_dir, run_id=f"run-{status.value}", config=rc_config,
-        adapters=adapters, to_stage=Stage.PROBLEM_DECOMPOSE)
-    assert (calls, len(results), results[0].terminal_action) == (
-        [Stage.TOPIC_INIT], 1, "stop")
-    attempt = json.loads((run_dir / "attempts/attempt_log.jsonl").read_text())
-    assert (attempt["status"], attempt["terminal_action"]) == (status.value, "stop")
-
-
-def test_failed_noncritical_stage_cannot_advance_when_skip_requested(
-    monkeypatch, run_dir, rc_config, adapters) -> None:
-    monkeypatch.setattr(rc_runner, "execute_stage", lambda stage, **_: _failed(stage))
-    results = rc_runner.execute_pipeline(
-        run_dir=run_dir, run_id="run-skip-failed", config=rc_config,
-        adapters=adapters, from_stage=Stage.KNOWLEDGE_ARCHIVE,
-        to_stage=Stage.EXPORT_PUBLISH, skip_noncritical=True)
-    assert [(r.stage, r.status) for r in results] == [
-        (Stage.KNOWLEDGE_ARCHIVE, StageStatus.FAILED)]
 
 
 def test_pipeline_prints_stage_progress(
@@ -1658,10 +1611,6 @@ def test_package_deliverables_collects_all_artifacts(
     run_dir: Path, rc_config: RCConfig
 ) -> None:
     _setup_stage_artifacts(run_dir)
-    (run_dir / "pipeline_summary.json").write_text(json.dumps({
-        "degraded": False, "stages_failed": 0, "stages_blocked": 1,
-        "final_stage": 25, "final_status": "done",
-    }))
     dest = rc_runner._package_deliverables(run_dir, "run-pkg-test", rc_config)
     assert dest is not None
     assert dest == run_dir / "deliverables"
@@ -1674,7 +1623,6 @@ def test_package_deliverables_collects_all_artifacts(
     manifest = json.loads((dest / "manifest.json").read_text())
     assert manifest["run_id"] == "run-pkg-test"
     assert "paper_final.md" in manifest["files"]
-    assert (manifest["release_ready"], "stages_blocked" in manifest["release_blockers"]) == (False, True)
 
 
 def test_package_deliverables_prefers_verified_versions(

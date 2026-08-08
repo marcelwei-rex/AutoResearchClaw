@@ -2004,8 +2004,6 @@ def test_attempt_log_append_only(tmp_path: Path) -> None:
     assert e1["attempt"] == 1 and e2["attempt"] == 2
     lines = (tmp_path / "attempts" / "attempt_log.jsonl").read_text().strip().splitlines()
     assert len(lines) == 2  # the failed attempt is preserved
-    assert (e1["terminal_action"], e2["terminal_action"]) == ("stop", "advance")
-    with pytest.raises(ValueError): ra.append_attempt(tmp_path, run_id="r", stage=12, stage_name="EXPERIMENT_RUN", status="failed", terminal_action="advance")
 
 
 def test_citation_instance_extraction() -> None:
