@@ -1778,6 +1778,7 @@ def _execute_stage_under_release_scope(
         )
 
     from researchclaw.experiment_runtime.metric_authority import (
+        config_allows_domain_evaluator_capture,
         select_metric_authority,
     )
     from researchclaw.pipeline.release_graph_lock import (
@@ -1796,7 +1797,9 @@ def _execute_stage_under_release_scope(
             _cleanup_stage9_outputs(stage9_namespace)
             stage9_namespace.assert_canonical()
             selection = select_metric_authority(
-                config.research.topic, config.experiment.mode
+                config.research.topic,
+                config.experiment.mode,
+                allow_domain_evaluator_capture=config_allows_domain_evaluator_capture(config),
             )
         except Exception:
             stage9_namespace.close()

@@ -367,12 +367,18 @@ def append_attempt(
     stage: int,
     stage_name: str,
     status: str,
+    terminal_action: str | None = None,
     decision: str = "",
     error: str | None = None,
     elapsed_sec: float | None = None,
     artifacts: tuple[str, ...] = (),
     kind: str = "stage_execution",
 ) -> dict[str, Any]:
+    expected_action = {
+        "done": "advance", "paused": "pause", "blocked_approval": "block",
+    }.get(status, "stop")
+    if terminal_action is not None and terminal_action != expected_action:
+        raise ValueError("terminal_action is inconsistent with status")
     log_path = run_dir / "attempts" / "attempt_log.jsonl"
     prior = 0
     if log_path.is_file():
@@ -397,6 +403,7 @@ def append_attempt(
         "attempt": prior + 1,
         "attempt_id": f"stage{stage:02d}-a{prior + 1}",
         "status": status,
+        "terminal_action": terminal_action or expected_action,
         "decision": decision,
         "error": (error or "")[:2000] or None,
         "elapsed_sec": round(elapsed_sec, 2) if elapsed_sec is not None else None,

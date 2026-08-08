@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from researchclaw.pipeline.bound_output_namespace import BoundOutputNamespace
 from researchclaw.experiment_runtime.metric_authority import (
     MetricAuthorityError,
     MetricAuthoritySelection,
+    config_allows_domain_evaluator_capture,
     publish_metric_authority_snapshots,
     select_metric_authority,
 )
@@ -187,11 +189,87 @@ def contract_sha256(
     return hashlib.sha256(_read_contract_bytes(path, namespace=namespace)).hexdigest()
 
 
+def derive_execution_spec(contract: ExperimentContract) -> dict[str, Any]:
+    """ADJ-E9-01: deterministic execution spec derived solely from the contract.
+
+    The paper plan is narrative-only; the generic codegen channel consumes
+    this hash-pinned spec instead of plan prose.  ``spec_hash`` is taken over
+    the spec body without the ``spec_hash`` field itself.
+    """
+    contract_hash = hashlib.sha256(
+        json.dumps(contract.to_dict(), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    spec: dict[str, Any] = {
+        "schema_version": 1,
+        "execution_domain": contract.metric_authority.get("domain_id"),
+        "claim_scope": contract.claim_scope,
+        "dataset_origin": contract.dataset_origin,
+        "dataset_name": contract.dataset_name,
+        "primary_metric": {
+            "key": contract.primary_metric.get("key"),
+            "direction": contract.primary_metric.get("direction"),
+        },
+        "allowed_metric_keys": sorted(contract.metric_units),
+        "conditions": ["model_under_test"],
+        "seeds": [int(contract_hash[o : o + 4], 16) % 1000 + 1 for o in (0, 8, 16)],
+        "runtime_restrictions": [
+            "network:none",
+            "stdlib+numpy only",
+            "no subprocess",
+            "no dynamic imports",
+            "only writes results.json",
+            "deterministic under fixed seeds",
+        ],
+        "budget_cap_sec": contract.smoke_budget_sec,
+        "paper_plan_role": (
+            "narrative_only__not_execution_spec__not_scientific_evidence"
+        ),
+        "contract_hash": contract_hash,
+    }
+    spec["spec_hash"] = hashlib.sha256(
+        json.dumps(spec, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return spec
+
+
+def execution_spec_bytes(contract: ExperimentContract) -> bytes:
+    """Canonical bytes for the Stage 9/10 execution authority."""
+    return (
+        json.dumps(derive_execution_spec(contract), indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def derive_execution_spec_diagnostics(
+    diagnostics: list[dict[str, object]],
+) -> dict[str, Any]:
+    """Build independently hashed, non-authoritative Stage 9 diagnostics."""
+    value: dict[str, Any] = {
+        "schema_version": 1,
+        "diagnostics": list(diagnostics),
+    }
+    value["diagnostics_hash"] = hashlib.sha256(
+        json.dumps(value, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return value
+
+
+def execution_spec_diagnostics_bytes(
+    diagnostics: list[dict[str, object]],
+) -> bytes:
+    return (
+        json.dumps(
+            derive_execution_spec_diagnostics(diagnostics), indent=2, sort_keys=True
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
 def validate_contract_dict(
     data: dict[str, Any],
     *,
     authority_selection: MetricAuthoritySelection | None = None,
     replay_trusted_authority: bool = True,
+    allow_domain_evaluator_capture: bool = True,
 ) -> ExperimentContract:
     errors: list[str] = []
 
@@ -398,7 +476,9 @@ def validate_contract_dict(
         try:
             experiment_mode = metric_authority.get("experiment_mode")
             selected = authority_selection or select_metric_authority(
-                topic, experiment_mode
+                topic,
+                experiment_mode,
+                allow_domain_evaluator_capture=allow_domain_evaluator_capture,
             )
             if metric_authority != selected.contract_identity():
                 errors.append("metric_authority does not match trusted selector result")
@@ -478,14 +558,12 @@ def validate_contract_structure_dict(data: dict[str, Any]) -> ExperimentContract
     return validate_contract_dict(data, replay_trusted_authority=False)
 
 
-def load_contract(
-    path: Path, *, namespace: BoundOutputNamespace | None = None
-) -> ExperimentContract:
+def load_contract(path: Path, *, namespace: BoundOutputNamespace | None = None, allow_domain_evaluator_capture: bool = True) -> ExperimentContract:
     try:
         content = _read_contract_bytes(path, namespace=namespace)
     except OSError as exc:
         raise ContractValidationError(f"cannot read contract: {exc}") from exc
-    return load_contract_bytes(content)
+    return load_contract_bytes(content, allow_domain_evaluator_capture=allow_domain_evaluator_capture)
 
 
 def parse_contract_bytes(content: bytes) -> dict[str, Any]:
@@ -504,12 +582,14 @@ def load_contract_bytes(
     content: bytes,
     *,
     authority_selection: MetricAuthoritySelection | None = None,
+    allow_domain_evaluator_capture: bool = True,
 ) -> ExperimentContract:
     """Strictly load captured contract bytes without reopening their path."""
 
     return validate_contract_dict(
         parse_contract_bytes(content),
         authority_selection=authority_selection,
+        allow_domain_evaluator_capture=allow_domain_evaluator_capture,
     )
 
 
@@ -561,7 +641,9 @@ def derive_contract(
     experiment_mode = str(getattr(experiment, "mode", "") or "")
     try:
         authority = authority_selection or select_metric_authority(
-            topic, experiment_mode
+            topic,
+            experiment_mode,
+            allow_domain_evaluator_capture=config_allows_domain_evaluator_capture(config),
         )
         if stage_dir is not None:
             publish_metric_authority_snapshots(

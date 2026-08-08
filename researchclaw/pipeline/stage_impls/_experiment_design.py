@@ -17,7 +17,10 @@ from researchclaw.experiment_runtime.contract import (
     ContractValidationError,
     contract_sha256,
     derive_contract,
+    derive_execution_spec,
     dump_contract,
+    execution_spec_bytes,
+    execution_spec_diagnostics_bytes,
     load_contract_bytes,
 )
 from researchclaw.experiment_runtime.metric_authority import (
@@ -25,6 +28,7 @@ from researchclaw.experiment_runtime.metric_authority import (
     MetricAuthorityError,
     MetricAuthoritySelection,
     build_domain_evaluator_capture_plan,
+    config_allows_domain_evaluator_capture,
     derive_domain_evaluator_experiment_plan,
     select_metric_authority,
 )
@@ -57,6 +61,8 @@ _STAGE9_OWNED_OUTPUTS = (
     "exp_plan.yaml",
     "experiment_contract.sha256",
     "experiment_contract.yaml",
+    "execution_spec.json",
+    "execution_spec_diagnostics.json",
     "metric_authority.json",
     "metric_authority_index.json",
     "plan_meta.json",
@@ -66,6 +72,7 @@ _STAGE9_OWNED_OUTPUTS = (
 _STAGE9_AUTHORITY_OUTPUTS = (
     "experiment_contract.yaml",
     "experiment_contract.sha256",
+    "execution_spec.json",
     "domain_selector_policy.json",
     "domain_profile.json",
     "metric_authority_index.json",
@@ -217,7 +224,9 @@ def _execute_experiment_design_in_namespace(
         namespace.assert_canonical()
         if authority_selection is None:
             authority_selection = select_metric_authority(
-                config.research.topic, config.experiment.mode
+                config.research.topic,
+                config.experiment.mode,
+                allow_domain_evaluator_capture=config_allows_domain_evaluator_capture(config),
             )
         result = _execute_experiment_design_bound(
             stage_dir,
@@ -586,6 +595,7 @@ def _execute_experiment_design_bound(
         )
     # ── BA: BenchmarkAgent — intelligent dataset/baseline selection ──────
     _benchmark_plan = None
+    _spec_diagnostics: list[dict[str, object]] = []
     # BUG-40: Skip BenchmarkAgent for non-ML domains — it has no relevant
     # benchmarks for physics/chemistry/mathematics/etc. and would inject
     # wrong datasets (e.g., CIFAR-10 for PDE topics).
@@ -662,7 +672,11 @@ def _execute_experiment_design_bound(
                 })
 
             # Inject BenchmarkAgent selections into experiment plan
-            if isinstance(plan, dict) and _benchmark_plan.selected_benchmarks:
+            if (
+                isinstance(plan, dict)
+                and _benchmark_plan.selected_benchmarks
+                and _benchmark_plan.validation_passed
+            ):
                 plan["datasets"] = [
                     b.get("name", "Unknown") for b in _benchmark_plan.selected_benchmarks
                 ]
@@ -676,6 +690,23 @@ def _execute_experiment_design_bound(
                 ] + _baselines_from_plan
                 # Deduplicate baselines
                 plan["baselines"] = list(dict.fromkeys(plan["baselines"]))
+            if (
+                _benchmark_plan.selected_benchmarks
+                and not _benchmark_plan.validation_passed
+            ):
+                # ADJ-E9-01: fail-closed — an unvalidated BenchmarkAgent
+                # product is rejected and the rejection is recorded
+                # structurally for the execution-spec artifact.
+                _spec_diagnostics.append(
+                    {
+                        "type": "benchmark_agent_product_rejected",
+                        "validation_passed": False,
+                        "selected_benchmarks": [
+                            str(b.get("name", "Unknown"))
+                            for b in _benchmark_plan.selected_benchmarks
+                        ],
+                    }
+                )
 
             logger.info(
                 "BenchmarkAgent: %d benchmarks, %d baselines selected (%d LLM calls, %.1fs)",
@@ -848,6 +879,14 @@ def _execute_experiment_design_bound(
             namespace=namespace,
         )
         namespace.write_text_atomic("experiment_contract.sha256", contract_sha + "\n")
+        if contract.metric_authority.get("domain_id") == "generic_sandbox":
+            namespace.write_bytes_atomic(
+                "execution_spec.json", execution_spec_bytes(contract)
+            )
+            namespace.write_bytes_atomic(
+                "execution_spec_diagnostics.json",
+                execution_spec_diagnostics_bytes(_spec_diagnostics),
+            )
     except (ContractValidationError, MetricAuthorityError) as exc:
         error = f"Experiment contract invalid: {exc}"
         logger.error("Stage 9: %s", error)
@@ -876,11 +915,21 @@ def _execute_experiment_design_bound(
             "exp_plan.yaml",
             "experiment_contract.yaml",
             "experiment_contract.sha256",
+            *(
+                ("execution_spec.json", "execution_spec_diagnostics.json")
+                if contract.metric_authority.get("domain_id") == "generic_sandbox"
+                else ()
+            ),
             *authority_artifacts,
         ),
         evidence_refs=(
             "stage-09/exp_plan.yaml",
             "stage-09/experiment_contract.yaml",
+            *(
+                ("stage-09/execution_spec.json",)
+                if contract.metric_authority.get("domain_id") == "generic_sandbox"
+                else ()
+            ),
         ),
     )
 
@@ -901,7 +950,9 @@ def _validate_stage9_publication(
 
     contract_path = namespace.stage_dir / "experiment_contract.yaml"
     replayed_selection = select_metric_authority(
-        config.research.topic, config.experiment.mode
+        config.research.topic,
+        config.experiment.mode,
+        allow_domain_evaluator_capture=config_allows_domain_evaluator_capture(config),
     )
     contract = load_contract_bytes(
         namespace.read_bytes("experiment_contract.yaml"),
@@ -932,4 +983,17 @@ def _validate_stage9_publication(
             raise ContractValidationError(
                 "fixed domain evaluator experiment plan mismatch"
             )
+    elif contract.metric_authority.get("domain_id") == "generic_sandbox":
+        expected = derive_execution_spec(contract)
+        try:
+            raw_spec = namespace.read_bytes("execution_spec.json")
+            published = json.loads(raw_spec)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ContractValidationError(
+                f"execution spec semantic replay failed: {exc}"
+            ) from exc
+        if published != expected:
+            raise ContractValidationError("execution spec semantic replay mismatch")
+        if raw_spec != execution_spec_bytes(contract):
+            raise ContractValidationError("execution spec byte replay mismatch")
     namespace.assert_canonical()

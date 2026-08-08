@@ -1,6 +1,7 @@
 # pyright: reportPrivateUsage=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownVariableType=false, reportUnusedCallResult=false, reportAttributeAccessIssue=false, reportUnknownLambdaType=false
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
@@ -22,7 +23,9 @@ import yaml
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import PaperRevisionConfig, RCConfig
 from researchclaw.experiment_runtime.contract import (
+    ContractValidationError,
     derive_contract,
+    derive_execution_spec,
     dump_contract,
     load_contract,
     sha256_file,
@@ -837,10 +840,29 @@ def test_write_stage_meta_writes_expected_json(run_dir: Path) -> None:
     assert payload["run_id"] == "run-abc"
     assert payload["status"] == "done"
     assert payload["decision"] == "proceed"
+    assert payload["terminal_action"] == "advance"
     assert payload["output_artifacts"] == ["goal.md"]
     assert payload["evidence_refs"] == ["stage-01/goal.md"]
     assert payload["next_stage"] == 2
     assert re.match(r"\d{4}-\d{2}-\d{2}T", payload["ts"])
+
+
+@pytest.mark.parametrize(("status", "decision", "expected_decision", "terminal_action"),
+    [
+        (StageStatus.FAILED, "proceed", None, "stop"),
+        (StageStatus.PAUSED, "proceed", None, "pause"),
+        (StageStatus.BLOCKED_APPROVAL, "proceed", None, "block"),
+        (StageStatus.PAUSED, "resume", "resume", "pause"),
+        (StageStatus.BLOCKED_APPROVAL, "block", "block", "block"),
+    ],
+)
+def test_write_stage_meta_projects_terminal_authority(
+    run_dir: Path, status: StageStatus, decision: str, expected_decision: str | None, terminal_action: str) -> None:
+    stage_dir = run_dir / "stage-02"; stage_dir.mkdir()
+    result = rc_executor.StageResult(Stage.PROBLEM_DECOMPOSE, status, (), decision=decision)
+    rc_executor._write_stage_meta(stage_dir, Stage.PROBLEM_DECOMPOSE, "run-terminal", result)
+    payload = json.loads((stage_dir / "decision.json").read_text(encoding="utf-8"))
+    assert (payload["decision"], payload["terminal_action"]) == (expected_decision, terminal_action)
 
 
 def test_write_stage_meta_keeps_paused_stage_as_next_stage(run_dir: Path) -> None:
@@ -2287,6 +2309,19 @@ class TestExperimentDesignGuard:
     ) -> None:
         run_dir, _stage_dir = _prepare_stage9_run(tmp_path)
         llm = FakeLLMClient(json.dumps(_valid_stage9_plan()))
+        config = _governed_stage9_config(rc_config)
+        config = replace(
+            config,
+            research=replace(
+                config.research,
+                topic="structural health monitoring for smart buildings",
+            ),
+            experiment=replace(
+                config.experiment,
+                metric_key="accuracy",
+                metric_direction="maximize",
+            ),
+        )
         monkeypatch.setattr(
             rc_executor, "_create_configured_llm", lambda _config: llm
         )
@@ -2295,7 +2330,7 @@ class TestExperimentDesignGuard:
             Stage.EXPERIMENT_DESIGN,
             run_dir=run_dir,
             run_id="stage9-generic-deferred-llm",
-            config=_governed_stage9_config(rc_config),
+            config=config,
             adapters=adapters,
             auto_approve_gates=True,
         )
@@ -2304,6 +2339,27 @@ class TestExperimentDesignGuard:
         assert len(llm.calls) >= 1
         contract = load_contract(run_dir / "stage-09/experiment_contract.yaml")
         assert contract.schema_version == 2
+        stage9 = run_dir / "stage-09"
+        spec = json.loads((stage9 / "execution_spec.json").read_text())
+        assert spec == derive_execution_spec(contract)
+        diagnostics = json.loads(
+            (stage9 / "execution_spec_diagnostics.json").read_text()
+        )
+        body = {k: v for k, v in diagnostics.items() if k != "diagnostics_hash"}
+        assert diagnostics["schema_version"] == 1
+        assert diagnostics["diagnostics_hash"] == hashlib.sha256(
+            json.dumps(body, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        assert "execution_spec.json" in result.artifacts
+        assert "stage-09/execution_spec.json" in result.evidence_refs
+        from researchclaw.pipeline.stage_impls import _experiment_design as module
+
+        (stage9 / "execution_spec.json").write_bytes(
+            (stage9 / "execution_spec.json").read_bytes() + b" "
+        )
+        with BoundOutputNamespace.open(run_dir, stage9, "stage-09") as namespace:
+            with pytest.raises(ContractValidationError, match="byte replay"):
+                module._validate_stage9_publication(namespace, run_dir, config)
 
     def test_domain_evaluator_stage9_rejects_late_plan_mutation(
         self,

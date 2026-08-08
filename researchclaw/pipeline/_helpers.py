@@ -43,6 +43,22 @@ class StageResult:
     evidence_refs: tuple[str, ...] = ()
     degraded: bool = False
 
+    @property
+    def terminal_action(self) -> str:
+        """Control action derived only from status; unknown states fail closed."""
+        return {
+            StageStatus.DONE: "advance",
+            StageStatus.PAUSED: "pause",
+            StageStatus.BLOCKED_APPROVAL: "block",
+        }.get(self.status, "stop")
+
+    @property
+    def persisted_decision(self) -> str | None:
+        """Project an unsafe default away without changing business semantics."""
+        if self.status is not StageStatus.DONE and self.decision == "proceed":
+            return None
+        return self.decision
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -283,7 +299,8 @@ def _write_stage_meta(
         "stage_id": f"{int(stage):02d}-{stage.name.lower()}",
         "run_id": run_id,
         "status": result.status.value,
-        "decision": result.decision,
+        "decision": result.persisted_decision,
+        "terminal_action": result.terminal_action,
         "output_artifacts": list(result.artifacts),
         "evidence_refs": list(result.evidence_refs),
         "error": result.error,

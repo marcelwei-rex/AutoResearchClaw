@@ -31,6 +31,7 @@ from researchclaw.experiment_runtime.contract import (
 from researchclaw.experiment_runtime.scaffold import render_main_py, scaffold_sha256
 from researchclaw.experiment_runtime.metric_authority import (
     MetricAuthorityError,
+    config_allows_domain_evaluator_capture,
     replay_metric_authority,
 )
 from researchclaw.literature.citation_policy import (
@@ -56,6 +57,26 @@ CANDIDATE_SCHEMA_VERSION = 1
 CANONICAL_MANIFEST_SCHEMA_VERSION = 1
 INVOCATION_JOURNAL_SCHEMA_VERSION = 1
 EVALUATOR_DECIMAL_PRECISION = 50
+SANDBOX_GENERIC_EVALUATOR_SCHEMA = "sandbox_generic_v1"
+
+
+def generic_result_prompt_contract() -> str:
+    """Return the single prompt grammar paired with the authoritative validator."""
+    return (
+        "Generic results contract (shared verbatim across every call):\n"
+        "results.json MUST have exactly these top-level keys: schema_version, claim_scope, dataset_origin, "
+        "dataset_name, entry_point, primary_metric, metrics, seeds, conditions, per_seed, runtime_sec, "
+        "evaluator_owner. schema_version is int and equals 1; entry_point=\"main.py\"; metrics is an object; "
+        "seeds is a nonempty list of fixed ints; conditions is a nonempty string list; runtime_sec is a "
+        "nonnegative number; evaluator_owner=\"model\". primary_metric has exactly {key, value, direction}; "
+        "every per_seed row has exactly keys {seed, status, metrics, error}; status is only \"ok\", \"failed\", "
+        "or \"negative\". status=\"ok\" requires flat metrics and error=null; "
+        "failed/negative requires metrics=null and a nonempty error. At least one per_seed entry must have "
+        "status=\"ok\". Seeds are fixed integers and rows follow seed order. Every aggregate metrics value MUST "
+        "equal the exact mean over ok rows, and primary_metric.value MUST equal metrics[primary_metric.key]. "
+        "Seeds and conditions MUST match the authoritative execution spec verbatim; metrics keys MUST be allowed "
+        "by that spec; primary_metric key and direction MUST match that spec.\n"
+    )
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _TOKEN_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -426,11 +447,20 @@ def _authority_json_value(value: object) -> str:
     )
 
 
+def expected_stage12_evaluator_schema(contract: ExperimentContract) -> str:
+    """Return the evaluator evidence schema selected for the contract domain."""
+    if contract.metric_authority.get("domain_id") == "generic_sandbox":
+        return SANDBOX_GENERIC_EVALUATOR_SCHEMA
+    return "hpc_anomaly_detection_v1"
+
+
 def _validate_evaluator_result(
     value: object,
     contract: ExperimentContract,
     evaluator_schema: str,
 ) -> dict[str, list[int | float | Decimal]]:
+    if evaluator_schema == SANDBOX_GENERIC_EVALUATOR_SCHEMA:
+        return _validate_sandbox_generic_evaluator_result(value, contract)
     if evaluator_schema != "hpc_anomaly_detection_v1":
         raise CanonicalExperimentEvidenceError("unsupported evaluator schema")
     if not isinstance(value, dict):
@@ -516,6 +546,133 @@ def _hpc_metric_map(
     return result
 
 
+_GENERIC_METRIC_RANGES: dict[str, tuple[Decimal, Decimal | None]] = {
+    "accuracy": (Decimal(0), Decimal(1)),
+    "latency_ms": (Decimal(0), None),
+    "sample_count": (Decimal(0), None),
+}
+
+
+def _validate_sandbox_generic_evaluator_result(
+    value: object,
+    contract: ExperimentContract,
+) -> dict[str, list[int | float | Decimal]]:
+    if not isinstance(value, dict):
+        raise CanonicalExperimentEvidenceError("generic evaluator result must be an object")
+    _exact_keys(
+        value,
+        {
+            "schema_version", "claim_scope", "dataset_origin", "dataset_name",
+            "entry_point", "primary_metric", "metrics", "seeds", "conditions",
+            "per_seed", "runtime_sec", "evaluator_owner",
+        },
+        "generic evaluator result",
+    )
+    _require_equal(value, "schema_version", 1)
+    if (
+        value["claim_scope"] != contract.claim_scope
+        or value["dataset_origin"] != contract.dataset_origin
+        or value["dataset_name"] != contract.dataset_name
+    ):
+        raise CanonicalExperimentEvidenceError("generic evaluator contract binding mismatch")
+    _safe_relative_path(value["entry_point"], "entry_point")
+    if value["evaluator_owner"] not in {"scaffold", "model"}:
+        raise CanonicalExperimentEvidenceError("generic evaluator owner mismatch")
+    seeds = value["seeds"]
+    if not isinstance(seeds, list) or not seeds:
+        raise CanonicalExperimentEvidenceError("generic evaluator seeds must be nonempty")
+    for seed in seeds:
+        _strict_int(seed, "generic evaluator seed")
+    conditions = value["conditions"]
+    if not isinstance(conditions, list) or not conditions:
+        raise CanonicalExperimentEvidenceError("generic evaluator conditions must be nonempty")
+    for condition in conditions:
+        _required_string(condition, "generic evaluator condition")
+    runtime_sec = _finite_json_number(value["runtime_sec"], "runtime_sec")
+    if runtime_sec < 0:
+        raise CanonicalExperimentEvidenceError("runtime_sec must be nonnegative")
+
+    registry_keys = set(contract.metric_units)
+    metrics = _generic_metric_map(
+        value["metrics"], registry_keys, "generic aggregate metrics", exact=False
+    )
+    per_seed = value["per_seed"]
+    if not isinstance(per_seed, list) or len(per_seed) != len(seeds):
+        raise CanonicalExperimentEvidenceError("generic per_seed must match the seeds list")
+    ok_metrics: list[dict[str, int | float | Decimal]] = []
+    for expected_seed, item in zip(seeds, per_seed, strict=True):
+        if not isinstance(item, dict):
+            raise CanonicalExperimentEvidenceError("generic per_seed entry must be an object")
+        _exact_keys(item, {"seed", "status", "metrics", "error"}, "generic per_seed entry")
+        if _strict_int(item["seed"], "generic seed") != expected_seed:
+            raise CanonicalExperimentEvidenceError("generic per_seed order mismatch")
+        status = item["status"]
+        if status == "ok":
+            if item["error"] is not None:
+                raise CanonicalExperimentEvidenceError("ok generic run must not carry an error")
+            ok_metrics.append(
+                _generic_metric_map(
+                    item["metrics"], set(metrics), "generic per-seed metrics", exact=True
+                )
+            )
+        elif status in {"failed", "negative"}:
+            if item["metrics"] is not None:
+                raise CanonicalExperimentEvidenceError("non-ok generic run must not carry metrics")
+            _required_string(item["error"], "generic run error")
+        else:
+            raise CanonicalExperimentEvidenceError("invalid generic run status")
+    if not ok_metrics:
+        raise CanonicalExperimentEvidenceError("generic evaluator requires at least one ok run")
+    for key in sorted(metrics):
+        expected = _decimal_mean(item[key] for item in ok_metrics)
+        if Decimal(canonical_decimal(metrics[key])) != Decimal(canonical_decimal(expected)):
+            raise CanonicalExperimentEvidenceError(f"generic aggregate metric mismatch: {key}")
+
+    primary = value["primary_metric"]
+    if not isinstance(primary, dict):
+        raise CanonicalExperimentEvidenceError("generic primary_metric must be an object")
+    _exact_keys(primary, {"key", "value", "direction"}, "generic primary_metric")
+    metric_key = _required_string(contract.primary_metric.get("key"), "contract primary metric")
+    direction = contract.primary_metric.get("direction")
+    if primary["key"] != metric_key or primary["direction"] != direction:
+        raise CanonicalExperimentEvidenceError("generic primary metric policy mismatch")
+    if metric_key not in metrics:
+        raise CanonicalExperimentEvidenceError("generic primary metric key is absent from metrics")
+    if Decimal(canonical_decimal(primary["value"])) != Decimal(canonical_decimal(metrics[metric_key])):
+        raise CanonicalExperimentEvidenceError("generic primary metric value mismatch")
+    return {metric_key: [metrics[metric_key]]}
+
+
+def _generic_metric_map(
+    value: object,
+    allowed_keys: set[str],
+    label: str,
+    *,
+    exact: bool,
+) -> dict[str, int | float | Decimal]:
+    if not isinstance(value, dict) or not value:
+        raise CanonicalExperimentEvidenceError(f"{label} must be a nonempty object")
+    unknown = sorted(set(value) - allowed_keys)
+    if unknown:
+        raise CanonicalExperimentEvidenceError(
+            f"{label} keys outside the evaluator registry: {unknown}"
+        )
+    if exact and set(value) != allowed_keys:
+        raise CanonicalExperimentEvidenceError(
+            f"{label} keys differ from the aggregate metric keys"
+        )
+    result: dict[str, int | float | Decimal] = {}
+    for key in sorted(value):
+        number = _finite_json_number(value[key], f"{label}.{key}")
+        bounds = _GENERIC_METRIC_RANGES.get(key)
+        if bounds is not None:
+            lower, upper = bounds
+            if number < lower or (upper is not None and number > upper):
+                raise CanonicalExperimentEvidenceError(f"{label}.{key} is out of range")
+        result[key] = value[key]
+    return result
+
+
 def _finite_json_number(value: object, field: str) -> Decimal:
     if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
         raise CanonicalExperimentEvidenceError(f"{field} must be a JSON number")
@@ -553,15 +710,23 @@ def parse_selected_candidate_manifest(text: str) -> dict[str, Any]:
 
 
 def _parse_scaffold_candidate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
+    authority = payload.get("metric_authority")
+    generic_model_owned = (
+        isinstance(authority, dict)
+        and authority.get("domain_id") == "generic_sandbox"
+    )
+    expected_keys = {
+        "schema_version", "seal_policy_version", "producer_input_type",
+        "contract_path", "contract_sha256", "run_config_path",
+        "run_config_sha256", "config_semantic_policy_version",
+        "config_semantic_sha256", "scaffold_sha256", "entry_point",
+        "metric_authority", "files", "scaffold_files", "plugin_files",
+    }
+    if generic_model_owned:
+        expected_keys = expected_keys | {"evaluator_schema"}
     _exact_keys(
         payload,
-        {
-            "schema_version", "seal_policy_version", "producer_input_type",
-            "contract_path", "contract_sha256", "run_config_path",
-            "run_config_sha256", "config_semantic_policy_version",
-            "config_semantic_sha256", "scaffold_sha256", "entry_point",
-            "metric_authority", "files", "scaffold_files", "plugin_files",
-        },
+        expected_keys,
         "selected candidate manifest",
     )
     _require_equal(payload, "schema_version", STAGE10_SEAL_SCHEMA_VERSION)
@@ -580,6 +745,8 @@ def _parse_scaffold_candidate_manifest(payload: dict[str, Any]) -> dict[str, Any
         CONFIG_SEMANTIC_POLICY_VERSION,
     )
     _metric_authority_identity(payload["metric_authority"])
+    if generic_model_owned and payload["evaluator_schema"] != SANDBOX_GENERIC_EVALUATOR_SCHEMA:
+        raise CanonicalExperimentEvidenceError("generic seal evaluator schema mismatch")
     if payload["entry_point"] != "main.py":
         raise CanonicalExperimentEvidenceError("entry_point must be main.py")
     files = _file_map(payload["files"], "files", owner=None, nonempty=True)
@@ -657,7 +824,10 @@ def validate_selected_candidate_manifest(
         raise CanonicalExperimentEvidenceError("canonical experiment contract is missing")
     try:
         contract_relative = contract_path.relative_to(run_dir).as_posix()
-        contract = load_contract(contract_path)
+        contract = load_contract(
+            contract_path,
+            allow_domain_evaluator_capture=config_allows_domain_evaluator_capture(config),
+        )
     except (ValueError, ContractValidationError) as exc:
         raise CanonicalExperimentEvidenceError(f"canonical contract is invalid: {exc}") from exc
     if payload["contract_path"] != contract_relative:
@@ -674,6 +844,7 @@ def validate_selected_candidate_manifest(
             metric_units=contract.metric_units,
             metric_display_labels=contract.metric_display_labels,
             evaluator_authority=contract.evaluator_authority,
+            allow_domain_evaluator_capture=config_allows_domain_evaluator_capture(config),
         )
     except MetricAuthorityError as exc:
         raise CanonicalExperimentEvidenceError(
@@ -705,8 +876,11 @@ def validate_selected_candidate_manifest(
         if sha256_file(selected_dir / name) != metadata["sha256"]:
             raise CanonicalExperimentEvidenceError(f"selected candidate hash mismatch: {name}")
     canonical_scaffold = (
-        contract.claim_scope == "pipeline_validation"
-        or not config.experiment.allow_legacy_experiment_path
+        (
+            contract.claim_scope == "pipeline_validation"
+            or not config.experiment.allow_legacy_experiment_path
+        )
+        and contract.metric_authority.get("domain_id") != "generic_sandbox"
     )
     expected_scaffold = {"main.py"} if canonical_scaffold else set()
     if set(payload["scaffold_files"]) != expected_scaffold:
@@ -1630,7 +1804,10 @@ def _derive_selected_result(
     if contract_path is None:
         raise CanonicalExperimentEvidenceError("canonical experiment contract is missing")
     try:
-        contract = load_contract(contract_path)
+        contract = load_contract(
+            contract_path,
+            allow_domain_evaluator_capture=config_allows_domain_evaluator_capture(config),
+        )
     except ContractValidationError as exc:
         raise CanonicalExperimentEvidenceError(f"canonical contract is invalid: {exc}") from exc
     metric_key = _required_string(contract.primary_metric.get("key"), "contract primary metric")
@@ -1922,7 +2099,10 @@ def reconstruct_expected_stage9_14_metric_authority(
     if contract_path is None:
         raise CanonicalExperimentEvidenceError("canonical experiment contract is missing")
     try:
-        contract = load_contract(contract_path)
+        contract = load_contract(
+            contract_path,
+            allow_domain_evaluator_capture=config_allows_domain_evaluator_capture(config),
+        )
         selection = replay_metric_authority(
             run_dir=run_dir,
             topic=config.research.topic,
@@ -1931,6 +2111,7 @@ def reconstruct_expected_stage9_14_metric_authority(
             metric_units=contract.metric_units,
             metric_display_labels=contract.metric_display_labels,
             evaluator_authority=contract.evaluator_authority,
+            allow_domain_evaluator_capture=config_allows_domain_evaluator_capture(config),
         )
     except (ContractValidationError, MetricAuthorityError) as exc:
         raise CanonicalExperimentEvidenceError(
@@ -2802,7 +2983,10 @@ def _validate_common_run_bindings(
         raise CanonicalExperimentEvidenceError("canonical experiment contract is missing")
     try:
         relative = contract_path.relative_to(run_dir).as_posix()
-        contract = load_contract(contract_path)
+        contract = load_contract(
+            contract_path,
+            allow_domain_evaluator_capture=config_allows_domain_evaluator_capture(config),
+        )
     except (ValueError, ContractValidationError) as exc:
         raise CanonicalExperimentEvidenceError(f"canonical contract is invalid: {exc}") from exc
     if payload["experiment_contract_path"] != relative:
@@ -2811,7 +2995,7 @@ def _validate_common_run_bindings(
         raise CanonicalExperimentEvidenceError("experiment contract hash mismatch")
     if payload["claim_scope"] != contract.claim_scope or payload["dataset_origin"] != contract.dataset_origin:
         raise CanonicalExperimentEvidenceError("contract scope/origin binding mismatch")
-    if payload["evaluator_schema"] != "hpc_anomaly_detection_v1":
+    if payload["evaluator_schema"] != expected_stage12_evaluator_schema(contract):
         raise CanonicalExperimentEvidenceError("unsupported evaluator schema")
     try:
         replay_metric_authority(
@@ -2821,6 +3005,7 @@ def _validate_common_run_bindings(
             stored_identity=contract.metric_authority,
             metric_units=contract.metric_units,
             metric_display_labels=contract.metric_display_labels,
+            allow_domain_evaluator_capture=config_allows_domain_evaluator_capture(config),
         )
     except MetricAuthorityError as exc:
         raise CanonicalExperimentEvidenceError(

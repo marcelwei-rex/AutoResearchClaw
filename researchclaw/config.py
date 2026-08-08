@@ -221,6 +221,7 @@ class LlmConfig:
     provider: str
     base_url: str = ""
     wire_api: str = "chat_completions"
+    thinking_mode: str = ""
     api_key_env: str = ""
     api_key: str = ""
     primary_model: str = ""
@@ -245,6 +246,12 @@ class LlmConfig:
     timeout_sec: int = 600
     max_retries: int = 3
     retry_base_delay: float = 2.0
+    transport_request_cap: int = 0
+    transport_token_cap: int = 0
+    transport_cost_cap_usd: float = 0.0
+    transport_input_token_reserve: int = 0
+    transport_price_version: str = ""
+    transport_prices: tuple[tuple[str, float, float, float], ...] = ()
     acp: AcpConfig = field(default_factory=AcpConfig)
 
 
@@ -620,6 +627,7 @@ class ExperimentConfig:
     claim_scope: str = "pipeline_validation"
     dataset_origin: str = "synthetic"
     allow_legacy_experiment_path: bool = False
+    allow_domain_evaluator_capture: bool = True
     keep_threshold: float = 0.0
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     docker: DockerSandboxConfig = field(default_factory=DockerSandboxConfig)
@@ -1185,6 +1193,17 @@ def validate_config(
     ):
         errors.append(f"Invalid llm.wire_api: {llm_wire_api}")
 
+    llm_thinking_mode = _get_by_path(data, "llm.thinking_mode")
+    if llm_thinking_mode is not None and (
+        type(llm_thinking_mode) is not str
+        or llm_thinking_mode not in {"", "enabled", "disabled"}
+    ):
+        errors.append(f"Invalid llm.thinking_mode: {llm_thinking_mode}")
+    elif llm_thinking_mode and llm_wire_api not in (None, "chat_completions"):
+        errors.append(
+            "llm.thinking_mode requires llm.wire_api=chat_completions"
+        )
+
     if not _is_blank(llm_provider) and llm_provider not in LLM_PROVIDERS:
         errors.append(f"Invalid llm.provider: {llm_provider}")
 
@@ -1405,10 +1424,12 @@ def validate_config(
 
 def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
     acp_data = data.get("acp") or {}
+    prices = data.get("transport_prices") or {}
     return LlmConfig(
         provider=data.get("provider", "openai-compatible"),
         base_url=data.get("base_url", ""),
         wire_api=data.get("wire_api", "chat_completions"),
+        thinking_mode=data.get("thinking_mode", ""),
         api_key_env=data.get("api_key_env", ""),
         api_key=data.get("api_key", ""),
         primary_model=data.get("primary_model", ""),
@@ -1421,6 +1442,12 @@ def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
         timeout_sec=_safe_int(data.get("timeout_sec"), 600),
         max_retries=_safe_int(data.get("max_retries"), 3),
         retry_base_delay=_safe_float(data.get("retry_base_delay"), 2.0),
+        transport_request_cap=_safe_int(data.get("transport_request_cap"), 0),
+        transport_token_cap=_safe_int(data.get("transport_token_cap"), 0),
+        transport_cost_cap_usd=_safe_float(data.get("transport_cost_cap_usd"), 0.0),
+        transport_input_token_reserve=_safe_int(data.get("transport_input_token_reserve"), 0),
+        transport_price_version=str(data.get("transport_price_version", "")),
+        transport_prices=tuple((str(model), rate.get("input_usd_per_million"), rate.get("cached_input_usd_per_million"), rate.get("output_usd_per_million")) for model, rate in sorted(prices.items())),
         acp=AcpConfig(
             agent=acp_data.get("agent", "claude"),
             cwd=acp_data.get("cwd", "."),
@@ -1562,6 +1589,11 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
         raise ValueError(
             "experiment.allow_legacy_experiment_path must be a boolean"
         )
+    allow_domain_evaluator_capture = data.get("allow_domain_evaluator_capture", True)
+    if type(allow_domain_evaluator_capture) is not bool:
+        raise ValueError(
+            "experiment.allow_domain_evaluator_capture must be a boolean"
+        )
     return ExperimentConfig(
         mode=data.get("mode", "simulated"),
         time_budget_sec=_safe_int(data.get("time_budget_sec"), 300),
@@ -1572,6 +1604,7 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
         claim_scope=data.get("claim_scope", "pipeline_validation"),
         dataset_origin=data.get("dataset_origin", "synthetic"),
         allow_legacy_experiment_path=allow_legacy_experiment_path,
+        allow_domain_evaluator_capture=allow_domain_evaluator_capture,
         keep_threshold=_safe_float(data.get("keep_threshold"), 0.0),
         sandbox=SandboxConfig(
             python_path=sandbox_data.get("python_path", DEFAULT_PYTHON_PATH),
